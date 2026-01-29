@@ -25,10 +25,13 @@
     kernelPackage = lib.mkOption {
       type = lib.types.package;
       default = pkgs.linux_6_6;
+      defaultText = lib.literalExpression "pkgs.linux_6_6";
       description = lib.mdDoc ''
-        Pinned kernel version for the bootloader.
-        This kernel is separate from your system kernel and should be
-        kept minimal and stable.
+        Kernel package for the bootloader.
+        It's recommended to use a pinned, stable kernel version (like linux_6_6)
+        for the bootloader to ensure stability and predictability.
+        The bootloader will automatically inherit the necessary kernel modules
+        from your system's initrd configuration.
       '';
     };
 

@@ -15,11 +15,25 @@ let
   # Get filesystems needed for boot (same logic as stage-1)
   fileSystems = builtins.filter utils.fsNeededForBoot (builtins.attrValues config.fileSystems);
 
-  # Create modules closure with all needed kernel modules (same as stage-1)
+  # Automatically inherit kernel modules from system's initrd configuration
+  # These are the modules the system already knows it needs for boot
+  autoKernelModules = config.boot.initrd.availableKernelModules ++ config.boot.initrd.kernelModules;
+
+  # Combine system modules with user-specified modules for the bootloader
+  allKernelModules = lib.unique (autoKernelModules ++ cfg.kernelModules);
+
+  # Create modules tree for our bootloader kernel (same as system.modulesTree in kernel.nix)
+  # This gets the "modules" output from the kernel package
+  bootloaderModulesTree = pkgs.aggregateModules [
+    (lib.getOutput "modules" cfg.kernelPackage)
+  ];
+
+  # Create modules closure with kernel modules for our bootloader kernel
+  # Note: If modules aren't found, they may be built-in to the kernel
   modulesClosure = pkgs.makeModulesClosure {
-    rootModules =
-      config.boot.initrd.availableKernelModules ++ config.boot.initrd.kernelModules ++ cfg.kernelModules;
-    kernel = cfg.kernelPackage;
+    rootModules = allKernelModules;
+    kernel = bootloaderModulesTree;
+    # Inherit firmware from system configuration (same as stage-1)
     firmware = config.hardware.firmware;
     allowMissing = true;
   };
@@ -33,6 +47,7 @@ let
       fileSystems
       utils
       ;
+    kernelModules = allKernelModules;
   };
 
 in

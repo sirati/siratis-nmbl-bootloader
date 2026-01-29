@@ -8,6 +8,7 @@
   cfg,
   fileSystems,
   utils,
+  kernelModules,
 }:
 
 let
@@ -54,17 +55,32 @@ in
   # Part 2: Load Kernel Modules
   # ============================================
 
+  # Debug: Check module directory structure
+  echo "DEBUG: Checking for kernel modules..."
+  if [ -d /lib/modules ]; then
+    echo "DEBUG: /lib/modules exists"
+    ${pkgs.busybox}/bin/ls -la /lib/modules/ || true
+    for kver in /lib/modules/*; do
+      if [ -d "$kver" ]; then
+        echo "DEBUG: Found kernel version: $(${pkgs.busybox}/bin/basename $kver)"
+        ${pkgs.busybox}/bin/ls -la "$kver/" | ${pkgs.busybox}/bin/head -20 || true
+      fi
+    done
+  else
+    echo "DEBUG: /lib/modules does NOT exist!"
+  fi
+
   # Generate module dependencies if modules exist
   if [ -d /lib/modules ]; then
     echo "Generating module dependencies..."
-    ${pkgs.kmod}/bin/depmod -a 2>/dev/null || echo "Warning: depmod failed (modules may not be available)"
+    ${pkgs.kmod}/bin/depmod -a 2>&1 || echo "Warning: depmod failed (modules may not be available)"
   fi
 
   # Load kernel modules needed for storage and filesystems
   ${lib.concatMapStringsSep "\n" (mod: ''
     echo "Loading kernel module: ${mod}"
     ${pkgs.kmod}/bin/modprobe ${mod} 2>/dev/null || echo "Warning: Failed to load ${mod}"
-  '') cfg.kernelModules}
+  '') kernelModules}
 
   # Wait for devices to settle after loading modules
   echo "Waiting for devices to settle..."

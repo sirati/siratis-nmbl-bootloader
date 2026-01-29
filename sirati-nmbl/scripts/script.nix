@@ -7,6 +7,7 @@
   cfg,
   fileSystems,
   utils,
+  kernelModules,
 }:
 
 let
@@ -18,6 +19,7 @@ let
       cfg
       fileSystems
       utils
+      kernelModules
       ;
   };
   findGenerationsScript = import ./find-generations.sh.nix { inherit lib pkgs cfg; };
