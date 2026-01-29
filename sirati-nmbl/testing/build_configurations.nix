@@ -51,33 +51,8 @@ let
               "sd_mod"
             ];
 
-            fileSystems =
-              if bootMode == "mbr" then
-                {
-                  "/mnt-boot" = {
-                    device = "/dev/vda1";
-                    fsType = diskLayout.boot.fsType;
-                    options = [ "ro" ];
-                  };
-                  "/mnt-root" = {
-                    device = "/dev/vda2";
-                    fsType = diskLayout.root.fsType;
-                    options = [ "ro" ];
-                  };
-                }
-              else
-                {
-                  "/mnt-boot" = {
-                    device = "/dev/vda1";
-                    fsType = "vfat";
-                    options = [ "ro" ];
-                  };
-                  "/mnt-root" = {
-                    device = "/dev/vda2";
-                    fsType = diskLayout.root.fsType;
-                    options = [ "ro" ];
-                  };
-                };
+            # Mount prefix for bootloader environment
+            mountPrefix = "/mnt";
 
             # Serial console for headless testing
             kernelParams = [
@@ -124,6 +99,9 @@ let
           # Set root password for testing (insecure, only for testing!)
           users.users.root.password = "test";
 
+          # Enable autologin for root
+          services.getty.autologinUser = "root";
+
           # Networking
           networking.hostName = name;
           networking.useDHCP = true;
@@ -142,6 +120,9 @@ let
 
               # Use serial console
               graphics = false;
+
+              # Boot from disk with bootloader installed
+              useBootLoader = true;
 
               # QEMU options
               qemu = {

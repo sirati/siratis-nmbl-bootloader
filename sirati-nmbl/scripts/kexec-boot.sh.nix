@@ -5,15 +5,22 @@
   lib,
   pkgs,
   cfg,
+  fileSystems,
+  utils,
 }:
 
+let
+  # Get mount points in reverse order for unmounting
+  # (unmount children before parents)
+  reversedFileSystems = lib.reverseList fileSystems;
+in
 ''
   # ============================================
   # Part 4: Kexec Boot Execution
   # ============================================
 
-  echo ""
-  echo "Booting generation ''${GENERATIONS[$SELECTED]}..."
+  ${pkgs.busybox}/bin/echo ""
+  ${pkgs.busybox}/bin/echo "Booting generation ''${GENERATIONS[$SELECTED]}..."
 
   # Prepare for kexec
   KERNEL_PATH="''${KERNELS[$SELECTED]}"
@@ -36,25 +43,44 @@
     FINAL_PARAMS="$FINAL_PARAMS $CUSTOM_PARAMS"
   fi
 
-  echo "Final kernel parameters: $FINAL_PARAMS"
+  ${pkgs.busybox}/bin/echo "Final kernel parameters: $FINAL_PARAMS"
+
+  # Verify kernel and initrd exist
+  if [ ! -f "$KERNEL_PATH" ]; then
+    ${pkgs.busybox}/bin/echo "ERROR: Kernel not found at $KERNEL_PATH"
+    exit 1
+  fi
+
+  if [ ! -f "$INITRD_PATH" ]; then
+    ${pkgs.busybox}/bin/echo "ERROR: Initrd not found at $INITRD_PATH"
+    exit 1
+  fi
 
   # Load kernel and initrd into RAM
-  echo "Loading kernel and initrd..."
-  ${pkgs.kexec-tools}/bin/kexec -l "$KERNEL_PATH" \
+  ${pkgs.busybox}/bin/echo "Loading kernel and initrd into RAM..."
+  if ! ${pkgs.kexec-tools}/bin/kexec -l "$KERNEL_PATH" \
     --initrd="$INITRD_PATH" \
-    --command-line="$FINAL_PARAMS"
+    --command-line="$FINAL_PARAMS"; then
+    ${pkgs.busybox}/bin/echo "ERROR: Failed to load kernel with kexec"
+    exit 1
+  fi
 
-  # Unmount filesystems
-  echo "Unmounting filesystems..."
-  ${lib.concatStringsSep "\n" (
-    lib.mapAttrsToList (mountPoint: fs: ''
-      umount ${mountPoint} || true
-    '') cfg.fileSystems
-  )}
+  ${pkgs.busybox}/bin/echo "Kernel loaded successfully"
 
-  sync
+  # Unmount filesystems in reverse order (children before parents)
+  ${pkgs.busybox}/bin/echo "Unmounting filesystems..."
+  ${lib.concatMapStringsSep "\n" (fs: ''
+    ${pkgs.busybox}/bin/echo "  Unmounting ${cfg.mountPrefix}${fs.mountPoint}..."
+    ${pkgs.busybox}/bin/umount "${cfg.mountPrefix}${fs.mountPoint}" 2>/dev/null || ${pkgs.busybox}/bin/echo "    (already unmounted or busy)"
+  '') reversedFileSystems}
+
+  # Sync to ensure all writes are flushed
+  ${pkgs.busybox}/bin/echo "Syncing filesystems..."
+  ${pkgs.busybox}/bin/sync
 
   # Execute kexec
-  echo "Executing kexec..."
+  ${pkgs.busybox}/bin/echo ""
+  ${pkgs.busybox}/bin/echo "Executing kexec to boot selected system..."
+  ${pkgs.busybox}/bin/echo "====================================="
   exec ${pkgs.kexec-tools}/bin/kexec -e
 ''

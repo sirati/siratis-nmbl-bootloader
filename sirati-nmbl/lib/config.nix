@@ -5,15 +5,34 @@
   config,
   lib,
   pkgs,
+  utils,
   ...
 }:
 
 let
   cfg = config.boot.nmbl;
 
+  # Get filesystems needed for boot (same logic as stage-1)
+  fileSystems = builtins.filter utils.fsNeededForBoot (builtins.attrValues config.fileSystems);
+
+  # Create modules closure with all needed kernel modules (same as stage-1)
+  modulesClosure = pkgs.makeModulesClosure {
+    rootModules =
+      config.boot.initrd.availableKernelModules ++ config.boot.initrd.kernelModules ++ cfg.kernelModules;
+    kernel = cfg.kernelPackage;
+    firmware = config.hardware.firmware;
+    allowMissing = true;
+  };
+
   # Build the complete init script by importing script.nix
   buildInitScript = import ../scripts/script.nix {
-    inherit lib pkgs cfg;
+    inherit
+      lib
+      pkgs
+      cfg
+      fileSystems
+      utils
+      ;
   };
 
 in
@@ -44,10 +63,13 @@ in
               object = pkgs.kexec-tools;
               symlink = "/bin/kexec";
             }
-            # Include necessary kernel modules
             {
-              object = "${kernel}/lib/modules";
-              symlink = "/lib/modules";
+              object = pkgs.kmod;
+              symlink = "/bin/kmod";
+            }
+            {
+              object = "${modulesClosure}/lib/modules";
+              symlink = "/lib";
             }
           ];
 
@@ -78,6 +100,22 @@ in
     # Boot loader installation - disable standard bootloaders
     boot.loader.grub.enable = lib.mkDefault false;
     boot.loader.systemd-boot.enable = lib.mkDefault false;
+
+    # Register NMBL as the active bootloader (required by NixOS)
+    system.boot.loader.id = "nmbl";
+
+    # NMBL supports initrd secrets since it has an initramfs
+    boot.loader.supportsInitrdSecrets = true;
+
+    # Hook for NixOS to install NMBL bootloader during VM builds and system installations
+    system.build.installBootLoader = import ./install-bootloader.nix {
+      inherit
+        lib
+        pkgs
+        config
+        cfg
+        ;
+    };
 
     # Custom installation script
     system.build.installNmbl = pkgs.writeShellScriptBin "install-nmbl" ''

@@ -12,11 +12,12 @@
   # Part 2: Find NixOS Generations
   # ============================================
 
-  BOOT_DIR="/mnt-root/boot"
-  if [ ! -d "$BOOT_DIR" ]; then
-    echo "Error: $BOOT_DIR not found"
-    echo "Dropping into shell..."
-    exec ${pkgs.bash}/bin/bash
+  echo "NMBL: Discovering NixOS generations..."
+
+  # Check if root filesystem is mounted
+  if [ ! -d "${cfg.mountPrefix}" ]; then
+    echo "ERROR: Mount prefix ${cfg.mountPrefix} not found!"
+    exit 1
   fi
 
   # Find all generations
@@ -25,17 +26,17 @@
   INITRDS=()
   KERNEL_PARAMS=()
 
-  # Parse NixOS system profiles
-  for system in $(ls -d /mnt-root/nix/var/nix/profiles/system-*-link 2>/dev/null | sort -V -r); do
+  # Parse NixOS system profiles (sorted by version, newest first)
+  for system in $(${pkgs.busybox}/bin/ls -d ${cfg.mountPrefix}/nix/var/nix/profiles/system-*-link 2>/dev/null | ${pkgs.busybox}/bin/sort -V -r); do
     if [ -f "$system/kernel" ] && [ -f "$system/initrd" ]; then
-      gen_num=$(basename "$system" | sed 's/system-\(.*\)-link/\1/')
+      gen_num=$(${pkgs.busybox}/bin/basename "$system" | ${pkgs.busybox}/bin/sed 's/system-\(.*\)-link/\1/')
       GENERATIONS+=("$gen_num")
       KERNELS+=("$system/kernel")
       INITRDS+=("$system/initrd")
 
       # Extract kernel parameters
       if [ -f "$system/kernel-params" ]; then
-        KERNEL_PARAMS+=("$(cat $system/kernel-params)")
+        KERNEL_PARAMS+=("$(${pkgs.busybox}/bin/cat $system/kernel-params)")
       else
         KERNEL_PARAMS+=("")
       fi
@@ -43,14 +44,14 @@
   done
 
   # Also check current system
-  if [ -L "/mnt-root/nix/var/nix/profiles/system" ]; then
-    system="/mnt-root/nix/var/nix/profiles/system"
+  if [ -L "${cfg.mountPrefix}/nix/var/nix/profiles/system" ]; then
+    system="${cfg.mountPrefix}/nix/var/nix/profiles/system"
     if [ -f "$system/kernel" ] && [ -f "$system/initrd" ]; then
       GENERATIONS=("current" "''${GENERATIONS[@]}")
       KERNELS=("$system/kernel" "''${KERNELS[@]}")
       INITRDS=("$system/initrd" "''${INITRDS[@]}")
       if [ -f "$system/kernel-params" ]; then
-        KERNEL_PARAMS=("$(cat $system/kernel-params)" "''${KERNEL_PARAMS[@]}")
+        KERNEL_PARAMS=("$(${pkgs.busybox}/bin/cat $system/kernel-params)" "''${KERNEL_PARAMS[@]}")
       else
         KERNEL_PARAMS=("" "''${KERNEL_PARAMS[@]}")
       fi
@@ -58,8 +59,10 @@
   fi
 
   if [ ''${#GENERATIONS[@]} -eq 0 ]; then
-    echo "No NixOS generations found!"
-    echo "Dropping into shell..."
-    exec ${pkgs.bash}/bin/bash
+    echo "ERROR: No NixOS generations found in ${cfg.mountPrefix}/nix/var/nix/profiles/"
+    echo "Checked for system-*-link directories with kernel and initrd files."
+    exit 1
   fi
+
+  echo "Found ''${#GENERATIONS[@]} generation(s)"
 ''

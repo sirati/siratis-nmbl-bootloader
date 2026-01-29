@@ -13,7 +13,7 @@
   # ============================================
 
   # Get current kernel parameters
-  CURRENT_PARAMS=$(cat /proc/cmdline)
+  CURRENT_PARAMS=$(${pkgs.busybox}/bin/cat /proc/cmdline)
 
   # Filter out NMBL-specific params for passthrough
   PASSTHROUGH_PARAMS=""
@@ -21,7 +21,7 @@
     for param in $CURRENT_PARAMS; do
       skip=0
       ${lib.concatMapStringsSep "\n" (p: ''
-        if echo "$param" | grep -q "^${lib.escapeShellArg (lib.head (lib.splitString "=" p))}"; then
+        if ${pkgs.busybox}/bin/echo "$param" | ${pkgs.busybox}/bin/grep -q "^${lib.escapeShellArg (lib.head (lib.splitString "=" p))}"; then
           skip=1
         fi
       '') cfg.kernelParams}
@@ -43,41 +43,41 @@
   EDIT_MODE=0
 
   while true; do
-    clear
-    echo "=== NixOS Linux Bootloader ==="
-    echo ""
-    echo "Bootloader Kernel Params: $NMBL_PARAMS"
-    echo "Passthrough Params: $PASSTHROUGH_PARAMS"
-    echo ""
+    ${pkgs.busybox}/bin/clear
+    ${pkgs.busybox}/bin/echo "=== NixOS Linux Bootloader ==="
+    ${pkgs.busybox}/bin/echo ""
+    ${pkgs.busybox}/bin/echo "Bootloader Kernel Params: $NMBL_PARAMS"
+    ${pkgs.busybox}/bin/echo "Passthrough Params: $PASSTHROUGH_PARAMS"
+    ${pkgs.busybox}/bin/echo ""
 
     if [ $EDIT_MODE -eq 1 ]; then
-      echo "[Custom params mode: $CUSTOM_PARAMS]"
-      echo ""
+      ${pkgs.busybox}/bin/echo "[Custom params mode: $CUSTOM_PARAMS]"
+      ${pkgs.busybox}/bin/echo ""
     fi
 
-    echo "Available Generations:"
-    for i in $(seq 0 $((''${#GENERATIONS[@]} - 1))); do
-      echo "  [$i] Generation ''${GENERATIONS[$i]}"
+    ${pkgs.busybox}/bin/echo "Available Generations:"
+    for i in $(${pkgs.busybox}/bin/seq 0 $((''${#GENERATIONS[@]} - 1))); do
+      ${pkgs.busybox}/bin/echo "  [$i] Generation ''${GENERATIONS[$i]}"
     done
-    echo ""
+    ${pkgs.busybox}/bin/echo ""
 
     if [ $PASSTHROUGH_ENABLED -eq 1 ]; then
-      echo "[X] Passthrough kernel params (enabled)"
+      ${pkgs.busybox}/bin/echo "[X] Passthrough kernel params (enabled)"
     else
-      echo "[ ] Passthrough kernel params (disabled)"
+      ${pkgs.busybox}/bin/echo "[ ] Passthrough kernel params (disabled)"
     fi
-    echo ""
-    echo "Commands:"
-    echo "  0-9: Select generation to boot"
-    echo "  p: Toggle passthrough kernel params"
-    echo "  e: Edit kernel params"
-    echo "  s: Drop to shell"
-    echo ""
-    echo -n "Select option (auto-boot 0 in ${toString cfg.timeoutSeconds}s): "
+    ${pkgs.busybox}/bin/echo ""
+    ${pkgs.busybox}/bin/echo "Commands:"
+    ${pkgs.busybox}/bin/echo "  0-9: Select generation to boot"
+    ${pkgs.busybox}/bin/echo "  p: Toggle passthrough kernel params"
+    ${pkgs.busybox}/bin/echo "  e: Edit kernel params"
+    ${pkgs.busybox}/bin/echo "  s: Drop to shell"
+    ${pkgs.busybox}/bin/echo ""
+    ${pkgs.busybox}/bin/echo -n "Select option (auto-boot 0 in ${toString cfg.timeoutSeconds}s): "
 
     # Read with timeout
     INPUT=""
-    if read -t ${toString cfg.timeoutSeconds} INPUT; then
+    if ${pkgs.busybox}/bin/read -t ${toString cfg.timeoutSeconds} INPUT; then
       # Process input
       case "$INPUT" in
         p|P)
@@ -89,15 +89,15 @@
           continue
           ;;
         e|E)
-          echo ""
-          echo "Enter custom kernel parameters:"
-          read -e -i "$CUSTOM_PARAMS" CUSTOM_PARAMS
+          ${pkgs.busybox}/bin/echo ""
+          ${pkgs.busybox}/bin/echo "Enter custom kernel parameters:"
+          ${pkgs.busybox}/bin/read -e -i "$CUSTOM_PARAMS" CUSTOM_PARAMS
           EDIT_MODE=1
           continue
           ;;
         s|S)
-          echo ""
-          echo "Dropping into shell..."
+          ${pkgs.busybox}/bin/echo ""
+          ${pkgs.busybox}/bin/echo "Dropping into shell..."
           exec ${pkgs.bash}/bin/bash
           ;;
         [0-9])
@@ -105,14 +105,14 @@
             SELECTED=$INPUT
             break
           else
-            echo "Invalid selection!"
-            sleep 1
+            ${pkgs.busybox}/bin/echo "Invalid selection!"
+            ${pkgs.busybox}/bin/sleep 1
             continue
           fi
           ;;
         *)
-          echo "Invalid input!"
-          sleep 1
+          ${pkgs.busybox}/bin/echo "Invalid input!"
+          ${pkgs.busybox}/bin/sleep 1
           continue
           ;;
       esac

@@ -50,42 +50,17 @@
       '';
     };
 
-    fileSystems = lib.mkOption {
-      type = lib.types.attrsOf (
-        lib.types.submodule {
-          options = {
-            device = lib.mkOption {
-              type = lib.types.str;
-              description = lib.mdDoc "Device to mount (e.g., /dev/sda1)";
-            };
-            fsType = lib.mkOption {
-              type = lib.types.str;
-              default = "ext4";
-              description = lib.mdDoc "Filesystem type (ext4, btrfs, xfs, etc.)";
-            };
-            options = lib.mkOption {
-              type = lib.types.listOf lib.types.str;
-              default = [ "ro" ];
-              description = lib.mdDoc ''
-                Mount options. Default is read-only (ro).
-                The bootloader should mount filesystems read-only for safety.
-              '';
-            };
-          };
-        }
-      );
-      default = { };
-      example = {
-        "/mnt-root" = {
-          device = "/dev/sda1";
-          fsType = "ext4";
-          options = [ "ro" ];
-        };
-      };
+    mountPrefix = lib.mkOption {
+      type = lib.types.str;
+      default = "/mnt";
+      example = "/mnt";
       description = lib.mdDoc ''
-        Filesystems to mount in the bootloader environment.
-        These should be mounted read-only.
-        The main filesystem is typically mounted at /mnt-root.
+        Prefix path where filesystems will be mounted in the bootloader environment.
+        For example, if set to "/mnt", the root filesystem (/) will be mounted at /mnt,
+        /boot will be mounted at /mnt/boot, etc.
+
+        This allows the bootloader to access all system filesystems read-only
+        to find available NixOS generations for kexec.
       '';
     };
 
