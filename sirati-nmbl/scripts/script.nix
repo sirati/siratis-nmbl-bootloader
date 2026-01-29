@@ -38,6 +38,9 @@ in
 pkgs.writeScript "init" ''
   #!${pkgs.busybox}/bin/sh
 
+  # Set PATH early so all tools are available
+  export PATH="${pkgs.busybox}/bin:${pkgs.kmod}/bin:${pkgs.kexec-tools}/bin:/sbin:/usr/sbin:/bin:/usr/bin"
+
   # Fallback shell function for debugging
   fallback_shell() {
     echo ""
@@ -46,6 +49,19 @@ pkgs.writeScript "init" ''
     echo "=========================================="
     echo "Dropping to emergency shell for debugging."
     echo "You can inspect /proc, /sys, /dev, etc."
+    echo ""
+    echo "PATH is set to: $PATH"
+    echo ""
+    echo "Debug Info:"
+    echo "  Kernel: $(uname -r)"
+    echo "  Available modules: $(ls /lib/modules 2>/dev/null || echo 'none')"
+    echo "  Block devices: $(ls /dev/sd* /dev/vd* 2>/dev/null | tr '\n' ' ' || echo 'none')"
+    echo ""
+    echo "Useful commands:"
+    echo "  modprobe <module>  - Load a kernel module"
+    echo "  lsmod              - List loaded modules"
+    echo "  ls /lib/modules/   - See available module versions"
+    echo "  mount              - Show mounted filesystems"
     echo ""
     exec ${pkgs.busybox}/bin/sh
   }

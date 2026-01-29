@@ -49,6 +49,10 @@ let
               "ata_piix"
               "ahci"
               "sd_mod"
+              # Crypto modules needed for ext4
+              "crc32c"
+              "crc32c_generic"
+              "crc32c_intel"
             ];
 
             # Mount prefix for bootloader environment
@@ -71,14 +75,10 @@ let
           ];
 
           # Minimal filesystem configuration for the actual NixOS system
+          # Note: test-mbr-serial.qcow2 currently has a single partition setup
           fileSystems."/" = {
-            device = "/dev/vda2";
+            device = "/dev/sda1"; # Changed from vda2 to sda1 to match actual disk
             fsType = diskLayout.root.fsType;
-          };
-
-          fileSystems."/boot" = {
-            device = "/dev/vda1";
-            fsType = diskLayout.boot.fsType;
           };
 
           # Remove default packages to keep VM minimal

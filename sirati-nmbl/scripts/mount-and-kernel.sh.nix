@@ -15,14 +15,19 @@ let
   # Helper to escape mount options
   escape = s: builtins.replaceStrings [ " " "\t" ] [ "\\040" "\\011" ] s;
 
+  # Filter out systemd-specific mount options that shouldn't be passed to mount(8)
+  # These are options like "x-initrd.mount", "x-systemd.*", "nofail", etc.
+  filterMountOptions =
+    opts: lib.filter (opt: !(lib.hasPrefix "x-" opt) && opt != "nofail" && opt != "_netdev") opts;
+
   # Format filesystem info for mounting
   formatFS = fs: {
     mountPoint = fs.mountPoint;
     device = if fs.device != null then fs.device else "/dev/disk/by-label/${escape fs.label}";
     fsType = fs.fsType;
     options = builtins.concatStringsSep "," (
-      # Force read-only for bootloader safety
-      lib.unique (fs.options ++ [ "ro" ])
+      # Force read-only for bootloader safety, filter out systemd options
+      lib.unique (filterMountOptions fs.options ++ [ "ro" ])
     );
   };
 
@@ -56,30 +61,61 @@ in
   # ============================================
 
   # Debug: Check module directory structure
-  echo "DEBUG: Checking for kernel modules..."
+  echo "NMBL: Checking for kernel modules..."
+  KERNEL_VERSION=$(${pkgs.busybox}/bin/uname -r)
+  echo "NMBL: Running kernel version: $KERNEL_VERSION"
+
   if [ -d /lib/modules ]; then
-    echo "DEBUG: /lib/modules exists"
+    echo "NMBL: /lib/modules exists"
+    echo "NMBL: Available kernel module directories:"
     ${pkgs.busybox}/bin/ls -la /lib/modules/ || true
-    for kver in /lib/modules/*; do
-      if [ -d "$kver" ]; then
-        echo "DEBUG: Found kernel version: $(${pkgs.busybox}/bin/basename $kver)"
-        ${pkgs.busybox}/bin/ls -la "$kver/" | ${pkgs.busybox}/bin/head -20 || true
-      fi
-    done
+
+    # Check if we have modules for the running kernel
+    if [ -d "/lib/modules/$KERNEL_VERSION" ]; then
+      echo "NMBL: ✓ Found modules for running kernel: $KERNEL_VERSION"
+      echo "NMBL: Module directory contents:"
+      ${pkgs.busybox}/bin/ls -la "/lib/modules/$KERNEL_VERSION/" | ${pkgs.busybox}/bin/head -20 || true
+    else
+      echo "NMBL: ✗ WARNING: No modules found for running kernel $KERNEL_VERSION"
+      echo "NMBL: Available versions:"
+      for kver in /lib/modules/*; do
+        if [ -d "$kver" ]; then
+          echo "NMBL:   - $(${pkgs.busybox}/bin/basename $kver)"
+        fi
+      done
+    fi
   else
-    echo "DEBUG: /lib/modules does NOT exist!"
+    echo "NMBL: ✗ WARNING: /lib/modules does NOT exist!"
   fi
 
   # Generate module dependencies if modules exist
-  if [ -d /lib/modules ]; then
-    echo "Generating module dependencies..."
-    ${pkgs.kmod}/bin/depmod -a 2>&1 || echo "Warning: depmod failed (modules may not be available)"
+  if [ -d "/lib/modules/$KERNEL_VERSION" ]; then
+    echo "NMBL: Generating module dependencies with depmod..."
+    if depmod -a 2>&1; then
+      echo "NMBL: ✓ Module dependencies generated successfully"
+    else
+      echo "NMBL: ✗ WARNING: depmod failed (modules may not load correctly)"
+    fi
+  else
+    echo "NMBL: Skipping depmod (no modules for running kernel)"
   fi
 
   # Load kernel modules needed for storage and filesystems
+  echo "NMBL: Loading required kernel modules..."
   ${lib.concatMapStringsSep "\n" (mod: ''
-    echo "Loading kernel module: ${mod}"
-    ${pkgs.kmod}/bin/modprobe ${mod} 2>/dev/null || echo "Warning: Failed to load ${mod}"
+    echo -n "NMBL: Loading ${mod}... "
+    if modprobe ${mod} 2>&1; then
+      echo "✓"
+    else
+      # Module might already be built-in or loaded
+      if ${pkgs.busybox}/bin/grep -q "^${mod} " /proc/modules 2>/dev/null; then
+        echo "✓ (already loaded)"
+      elif ${pkgs.busybox}/bin/test -e "/sys/module/${mod}" 2>/dev/null; then
+        echo "✓ (built-in)"
+      else
+        echo "✗ FAILED"
+      fi
+    fi
   '') kernelModules}
 
   # Wait for devices to settle after loading modules

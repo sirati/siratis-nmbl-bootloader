@@ -84,7 +84,7 @@ in
             }
             {
               object = "${modulesClosure}/lib/modules";
-              symlink = "/lib";
+              symlink = "/lib/modules";
             }
           ];
 
