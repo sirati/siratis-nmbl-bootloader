@@ -1,0 +1,30 @@
+# VS Code settings
+.vscode/
+
+# Direnv
+.direnv/
+
+# macOS
+.DS_Store
+
+
+# Logs
+*.log
+ic generation field by index
+# Build artifacts
+build/
+dist/
+
+# MACOS
+__MACOSX
+
+# src and out and queue
+src/
+out/
+queue/
+run/
+
+
+# output articacts from nix build
+result*
+docker*
