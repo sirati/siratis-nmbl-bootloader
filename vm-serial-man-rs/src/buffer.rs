@@ -44,7 +44,17 @@ impl OutputBuffer {
 
     /// Get recent lines: returns lines from last min_age OR last min_lines (whichever is MORE)
     pub fn get_recent(&self) -> Vec<String> {
-        let cutoff = Utc::now() - chrono::Duration::from_std(self.min_age).unwrap();
+        self.get_recent_custom(self.min_lines, self.min_age, None)
+    }
+
+    /// Get recent lines with custom parameters
+    pub fn get_recent_custom(
+        &self,
+        min_lines: usize,
+        min_age: Duration,
+        max_lines: Option<usize>,
+    ) -> Vec<String> {
+        let cutoff = Utc::now() - chrono::Duration::from_std(min_age).unwrap();
 
         // Find lines within time window
         let time_based: Vec<_> = self
@@ -55,7 +65,12 @@ impl OutputBuffer {
             .collect();
 
         // Determine how many lines to return (at least min_lines, or all time-based lines)
-        let count = time_based.len().max(self.min_lines);
+        let mut count = time_based.len().max(min_lines);
+
+        // Apply max_lines cap if specified
+        if let Some(max) = max_lines {
+            count = count.min(max);
+        }
 
         // Return last 'count' lines
         self.lines
@@ -141,6 +156,20 @@ impl OutputBuffer {
     /// Get the timestamp of the last output line
     pub fn last_output_timestamp(&self) -> Option<DateTime<Utc>> {
         self.lines.back().map(|l| l.timestamp)
+    }
+
+    /// Get a specific range of lines (1-indexed, inclusive)
+    pub fn get_lines_range(&self, start: usize, end: usize) -> Vec<String> {
+        if start == 0 || start > end || end > self.lines.len() {
+            return Vec::new();
+        }
+
+        self.lines
+            .iter()
+            .skip(start - 1)
+            .take(end - start + 1)
+            .map(|l| l.line.clone())
+            .collect()
     }
 }
 

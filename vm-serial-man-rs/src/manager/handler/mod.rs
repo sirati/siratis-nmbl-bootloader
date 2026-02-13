@@ -100,6 +100,8 @@ pub async fn handle_client(
             )
             .await
         }
+
+        CommandType::Lines(lines_req) => handle_lines(lines_req, writer_half, buffer).await,
     }
 }
 
@@ -114,9 +116,13 @@ async fn handle_command(
 ) -> Result<()> {
     debug!("Processing command: {}", cmd_req.command);
 
-    // Get recent buffered output with metadata
+    // Get recent buffered output with metadata using custom parameters
     let buffer_guard = buffer.lock().await;
-    let recent_lines = buffer_guard.get_recent();
+    let recent_lines = buffer_guard.get_recent_custom(
+        cmd_req.min_prev_lines,
+        cmd_req.prev_lines_within,
+        Some(cmd_req.max_prev_lines),
+    );
     let total_lines = buffer_guard.len();
     let start_line = if total_lines > 0 {
         total_lines.saturating_sub(recent_lines.len()) + 1
@@ -244,5 +250,58 @@ async fn handle_command(
         "Command completed successfully with {} output lines",
         line_count
     );
+    Ok(())
+}
+
+/// Handle a lines request - get specific line range
+async fn handle_lines(
+    lines_req: crate::protocol::LinesRequest,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    buffer: Arc<Mutex<OutputBuffer>>,
+) -> Result<()> {
+    debug!(
+        "Processing lines request: {}-{}",
+        lines_req.start, lines_req.end
+    );
+
+    let buffer_guard = buffer.lock().await;
+    let total_lines = buffer_guard.len();
+
+    // Validate range
+    if lines_req.start == 0 {
+        let resp = CommandResponse::Error("Line numbers are 1-indexed".to_string());
+        writer.write_all(&resp.to_bytes()).await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    if lines_req.start > lines_req.end {
+        let resp = CommandResponse::Error(format!(
+            "Invalid range: start ({}) > end ({})",
+            lines_req.start, lines_req.end
+        ));
+        writer.write_all(&resp.to_bytes()).await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    if lines_req.end > total_lines {
+        let resp = CommandResponse::Error(format!(
+            "End line ({}) exceeds buffer size ({})",
+            lines_req.end, total_lines
+        ));
+        writer.write_all(&resp.to_bytes()).await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    let lines = buffer_guard.get_lines_range(lines_req.start, lines_req.end);
+    drop(buffer_guard);
+
+    let resp = CommandResponse::Lines(lines);
+    writer.write_all(&resp.to_bytes()).await?;
+    writer.flush().await?;
+
+    debug!("Lines request completed successfully");
     Ok(())
 }

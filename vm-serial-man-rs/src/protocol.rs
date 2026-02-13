@@ -21,6 +21,8 @@ pub enum CommandType {
     Trigger(TriggerRequest),
     /// Attach to console (interactive mode)
     Attach(AttachRequest),
+    /// Get specific lines from history
+    Lines(LinesRequest),
 }
 
 /// Command request with parameters
@@ -30,6 +32,12 @@ pub struct CommandRequest {
     pub command: String,
     /// Duration to capture output
     pub duration: Duration,
+    /// Minimum number of previous lines to show
+    pub min_prev_lines: usize,
+    /// Time window for previous lines (seconds)
+    pub prev_lines_within: Duration,
+    /// Maximum number of previous lines to show
+    pub max_prev_lines: usize,
 }
 
 /// Find request - search through history
@@ -69,6 +77,15 @@ pub struct AttachRequest {
     pub initial_lines: usize,
 }
 
+/// Lines request - get specific line range
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinesRequest {
+    /// Starting line number (1-indexed)
+    pub start: usize,
+    /// Ending line number (inclusive)
+    pub end: usize,
+}
+
 /// Metadata about buffered output
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferedOutputInfo {
@@ -104,15 +121,18 @@ pub enum CommandResponse {
     /// Trigger timed out without match
     TriggerTimeout,
     /// Total number of matches found (sent before filtered results)
+    /// Total number of matches found
     TotalMatches(usize),
-    /// Attach info - (last_output_timestamp, total_lines)
+    /// Attach initial info - (last_output_timestamp, total_lines)
     AttachInfo(String, usize),
-    /// Attached - streaming mode active
+    /// Attached successfully
     Attached,
-    /// Input from attached client
+    /// Input from attach client
     AttachInput(String),
-    /// Detach from console
+    /// Detached from console
     Detached,
+    /// Lines response - specific line range
+    Lines(Vec<String>),
 }
 
 impl CommandType {
@@ -152,6 +172,9 @@ mod tests {
         let cmd = CommandType::Command(CommandRequest {
             command: "help".to_string(),
             duration: Duration::from_secs(5),
+            min_prev_lines: 10,
+            prev_lines_within: Duration::from_secs(10),
+            max_prev_lines: 30,
         });
 
         let bytes = cmd.to_bytes();

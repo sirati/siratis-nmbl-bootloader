@@ -107,6 +107,18 @@ pub enum Commands {
         #[arg(short, long, default_value = "5")]
         duration: u64,
 
+        /// Minimum number of previous lines to show
+        #[arg(long, default_value = "10")]
+        min_prev_lines: usize,
+
+        /// Time window for previous lines (seconds)
+        #[arg(long, default_value = "10")]
+        prev_lines_within: u64,
+
+        /// Maximum number of previous lines to show
+        #[arg(long, default_value = "30")]
+        max_prev_lines: usize,
+
         /// Control socket path (auto-detected if not specified)
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -184,4 +196,21 @@ pub enum Commands {
 
     /// Show status of running VM managers
     Status,
+
+    /// Show specific lines from output history
+    Lines {
+        /// Starting line number (1-indexed)
+        start: usize,
+
+        /// Ending line number (inclusive), or length if --length is used
+        end: usize,
+
+        /// Treat 'end' parameter as length instead of end line number
+        #[arg(short, long)]
+        length: bool,
+
+        /// Control socket path (auto-detected if not specified)
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 }

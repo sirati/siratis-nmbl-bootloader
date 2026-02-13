@@ -83,9 +83,23 @@ async fn main() -> Result<()> {
         Commands::Send {
             command,
             duration,
+            min_prev_lines,
+            prev_lines_within,
+            max_prev_lines,
             socket,
             stdin,
-        } => client::send_command(command, duration, socket, stdin).await,
+        } => {
+            client::send_command(
+                command,
+                duration,
+                min_prev_lines,
+                prev_lines_within,
+                max_prev_lines,
+                socket,
+                stdin,
+            )
+            .await
+        }
         Commands::Find {
             pattern,
             before,
@@ -115,5 +129,14 @@ async fn main() -> Result<()> {
         Commands::Attach { socket } => client::attach_console(socket).await,
         Commands::Stop { socket } => client::stop_manager(socket).await,
         Commands::Status => client::show_status().await,
+        Commands::Lines {
+            start,
+            end,
+            length,
+            socket,
+        } => {
+            let actual_end = if length { start + end - 1 } else { end };
+            client::get_lines(start, actual_end, socket).await
+        }
     }
 }

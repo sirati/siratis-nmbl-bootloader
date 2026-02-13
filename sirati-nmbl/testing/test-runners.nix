@@ -1,7 +1,10 @@
 # Test runner script builders for NMBL testing
 # Creates scripts that build artifacts and launch vm-serial-man
 
-{ nixpkgs, system ? "x86_64-linux" }:
+{
+  nixpkgs,
+  system ? "x86_64-linux",
+}:
 
 let
   pkgs = nixpkgs.legacyPackages.${system};
@@ -42,14 +45,17 @@ let
       fi
       echo "✓ Disk: ${diskName}"
 
-      # Launch VM
-      echo "[3/3] Starting VM with vm-serial-man..."
+      # Launch VM in screen
+      echo "[3/3] Starting VM with vm-serial-man in screen session..."
       echo
       echo "VM will boot with direct kernel boot (no bootloader)"
+      echo "Manager running in screen session '${name}-direct'"
       echo "Use 'vm-serial-man send <command>' to interact"
-      echo "Press Ctrl-C to stop"
+      echo "Use 'screen -r ${name}-direct' to attach to VM console"
       echo
-      exec ${vmSerialMan}/bin/vm-serial-man manager-direct-kernel \
+
+      # Start vm-serial-man in detached screen session
+      ${pkgs.screen}/bin/screen -dmS "${name}-direct" ${vmSerialMan}/bin/vm-serial-man manager-direct-kernel \
         --name "${name}-direct" \
         --disk "${diskName}" \
         --kernel "$WORK_DIR/kernel" \
@@ -57,6 +63,33 @@ let
         --kernel-args "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200" \
         --memory 2048 \
         --cores 4
+
+      # Wait for VM manager to be ready (socket to appear)
+      echo "Waiting for VM manager to be ready..."
+      for i in {1..10}; do
+        if ${vmSerialMan}/bin/vm-serial-man status | grep -q "Running"; then
+          echo "✓ VM manager ready!"
+          echo
+          echo "========================================"
+          ${vmSerialMan}/bin/vm-serial-man --help
+          echo
+          echo "========================================"
+          ${vmSerialMan}/bin/vm-serial-man send --help
+          echo
+          echo "========================================"
+          ${vmSerialMan}/bin/vm-serial-man find --help
+          echo
+          echo "========================================"
+          ${vmSerialMan}/bin/vm-serial-man trigger --help
+          echo
+          echo "========================================"
+          ${vmSerialMan}/bin/vm-serial-man lines --help
+          exit 0
+        fi
+        sleep 0.2
+      done
+      echo "Warning: VM manager may still be starting..."
+      echo "Run 'vm-serial-man status' to check"
     '';
 
   # Build a UEFI boot test runner
@@ -88,17 +121,47 @@ let
         chmod 644 "$OVMF_VARS"
       fi
 
-      echo "Starting VM with UEFI boot..."
+      echo "Starting VM with UEFI boot in screen session..."
+      echo "Manager running in screen session '${name}-uefi'"
       echo "Use 'vm-serial-man send <command>' to interact"
-      echo "Press Ctrl-C to stop"
+      echo "Use 'screen -r ${name}-uefi' to attach to VM console"
       echo
-      exec ${vmSerialMan}/bin/vm-serial-man manager-uefi \
+
+      # Start vm-serial-man in detached screen session
+      ${pkgs.screen}/bin/screen -dmS "${name}-uefi" ${vmSerialMan}/bin/vm-serial-man manager-uefi \
         --name "${name}-uefi" \
         --disk "${diskName}" \
         --ovmf-code "$OVMF_CODE" \
         --ovmf-vars "$OVMF_VARS" \
         --memory 2048 \
         --cores 4
+
+      # Wait for VM manager to be ready (socket to appear)
+      echo "Waiting for VM manager to be ready..."
+      for i in {1..10}; do
+        if ${vmSerialMan}/bin/vm-serial-man status | grep -q "Running"; then
+          echo "✓ VM manager ready!"
+          echo
+          echo "========================================"
+          ${vmSerialMan}/bin/vm-serial-man --help
+          echo
+          echo "========================================"
+          ${vmSerialMan}/bin/vm-serial-man send --help
+          echo
+          echo "========================================"
+          ${vmSerialMan}/bin/vm-serial-man find --help
+          echo
+          echo "========================================"
+          ${vmSerialMan}/bin/vm-serial-man trigger --help
+          echo
+          echo "========================================"
+          ${vmSerialMan}/bin/vm-serial-man lines --help
+          exit 0
+        fi
+        sleep 0.2
+      done
+      echo "Warning: VM manager may still be starting..."
+      echo "Run 'vm-serial-man status' to check"
     '';
 
 in
