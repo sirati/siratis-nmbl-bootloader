@@ -74,6 +74,8 @@ impl SerialHandler {
                         let trimmed = line.trim_end().to_string();
                         if !trimmed.is_empty() {
                             trace!("Serial output: {}", trimmed);
+                            // Print to stdout for console visibility
+                            println!("{}", trimmed);
                             // Add to buffer
                             buffer.lock().await.push(trimmed.clone());
                             // Broadcast to listeners

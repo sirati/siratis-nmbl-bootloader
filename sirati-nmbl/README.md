@@ -122,6 +122,71 @@ See `lib/options.nix` for all available options:
 - `boot.nmbl.timeoutSeconds` - Auto-boot timeout
 - `boot.nmbl.serialConsole` - Serial console configuration
 
+## Testing
+
+### Quick Testing with `nix run` (Recommended)
+
+Everything is automated - just run:
+
+```bash
+# Direct kernel boot (fast testing - 5-10x faster)
+nix run .#test-test-mbr-serial-direct
+nix run .#test-test-gpt-bios-direct
+nix run .#test-test-gpt-uefi-direct
+
+# UEFI boot (full boot chain testing)
+nix run .#test-test-gpt-uefi-uefi
+```
+
+**What happens automatically:**
+1. Builds NMBL kernel and initramfs
+2. Creates disk image (if needed)
+3. Starts VM with vm-serial-man
+4. Shows serial console output
+
+**Interact with running VM:**
+```bash
+# In another terminal
+vm-serial-man send 'ls -la /boot'
+vm-serial-man send 'cat /proc/cmdline'
+vm-serial-man status
+vm-serial-man stop
+```
+
+See [testing/README.md](./testing/README.md) for complete testing guide.
+
+### Alternative: Manual Testing Scripts
+
+For more control, use the shell scripts:
+
+```bash
+# Quick demo
+./demo-direct-kernel.sh
+
+# Full testing with specific config
+./test-direct-kernel.sh test-mbr-serial
+./test-uefi-boot.sh test-gpt-uefi
+```
+
+See [TESTING-WITH-VM-SERIAL-MAN.md](./TESTING-WITH-VM-SERIAL-MAN.md) for comprehensive guide.
+
+### Traditional VM Testing
+
+Build and run test VMs (old method):
+
+```bash
+# Build VM
+nix build .#nixosConfigurations.test-mbr-serial.config.system.build.vm
+
+# Run VM
+./result/bin/run-test-mbr-serial-vm
+
+# SSH into VM (from another terminal)
+ssh -p 2222 root@localhost  # password: test
+```
+
+See [debug.md](./debug.md) for more details.
+
 ## Development
 
 ### Adding New Script Components
@@ -161,19 +226,22 @@ pkgs.writeScript "init" ''
 ''
 ```
 
-### Testing
+### Building Individual Components
 
-Build the example configuration:
-
-```bash
-cd sirati-nmbl
-nix build .#nixosConfigurations.example.config.system.build.nmblInitramfs
-```
-
-Check the generated init script:
+Build specific parts:
 
 ```bash
-nix eval .#nixosConfigurations.example.config.system.build.nmblInitramfs --apply 'x: x.contents'
+# Build NMBL kernel
+nix build .#nixosConfigurations.test-mbr-serial.config.system.build.nmblKernel
+
+# Build NMBL initramfs
+nix build .#nixosConfigurations.test-mbr-serial.config.system.build.nmblInitramfs
+
+# Build bootloader installation script
+nix build .#nixosConfigurations.test-mbr-serial.config.system.build.installBootLoader
+
+# Check the generated init script
+nix eval .#nixosConfigurations.test-mbr-serial.config.system.build.nmblInitramfs --apply 'x: x.contents'
 ```
 
 ## Design Decisions

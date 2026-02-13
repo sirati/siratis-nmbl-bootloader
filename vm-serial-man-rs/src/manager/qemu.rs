@@ -9,12 +9,27 @@ use tokio::fs;
 use tokio::process::{Child, Command};
 use tracing::{debug, trace};
 
+/// Boot mode for QEMU
+#[derive(Debug, Clone)]
+pub enum BootMode {
+    /// Boot with UEFI firmware (OVMF)
+    Uefi {
+        ovmf_code: PathBuf,
+        ovmf_vars: PathBuf,
+    },
+    /// Direct kernel boot (bypass bootloader)
+    DirectKernel {
+        kernel: PathBuf,
+        initrd: PathBuf,
+        kernel_args: String,
+    },
+}
+
 /// QEMU configuration
 pub struct QemuConfig {
     pub name: String,
     pub disk: PathBuf,
-    pub ovmf_code: PathBuf,
-    pub ovmf_vars: PathBuf,
+    pub boot_mode: BootMode,
     pub memory: u32,
     pub cores: u32,
     pub socket_dir: PathBuf,
@@ -31,21 +46,27 @@ impl QemuConfig {
     pub async fn start(&self) -> Result<QemuProcess> {
         debug!("Starting QEMU VM: {}", self.name);
 
-        // Ensure OVMF vars is writable
-        if !self.ovmf_vars.exists() {
-            let vars_template = self.ovmf_code.parent().unwrap().join("OVMF_VARS.fd");
-            fs::copy(&vars_template, &self.ovmf_vars)
-                .await
-                .context("Failed to create OVMF_VARS")?;
+        // Handle UEFI boot mode - ensure OVMF vars is writable
+        if let BootMode::Uefi {
+            ovmf_code,
+            ovmf_vars,
+        } = &self.boot_mode
+        {
+            if !ovmf_vars.exists() {
+                let vars_template = ovmf_code.parent().unwrap().join("OVMF_VARS.fd");
+                fs::copy(&vars_template, ovmf_vars)
+                    .await
+                    .context("Failed to create OVMF_VARS")?;
 
-            // Ensure the file is writable
-            let mut perms = fs::metadata(&self.ovmf_vars).await?.permissions();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                perms.set_mode(0o644);
+                // Ensure the file is writable
+                let mut perms = fs::metadata(ovmf_vars).await?.permissions();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    perms.set_mode(0o644);
+                }
+                fs::set_permissions(ovmf_vars, perms).await?;
             }
-            fs::set_permissions(&self.ovmf_vars, perms).await?;
         }
 
         // Create socket path for serial
@@ -58,26 +79,46 @@ impl QemuConfig {
 
         let mut cmd = Command::new("qemu-system-x86_64");
 
-        cmd
-            .arg("-machine")
+        cmd.arg("-machine")
             .arg("q35,accel=kvm:tcg")
             .arg("-cpu")
             .arg("max")
             .arg("-m")
             .arg(self.memory.to_string())
             .arg("-smp")
-            .arg(self.cores.to_string())
-            .arg("-drive")
-            .arg(format!(
-                "if=pflash,format=raw,readonly=on,file={}",
-                self.ovmf_code.display()
-            ))
-            .arg("-drive")
-            .arg(format!(
-                "if=pflash,format=raw,file={}",
-                self.ovmf_vars.display()
-            ))
-            .arg("-drive")
+            .arg(self.cores.to_string());
+
+        // Add boot-mode-specific arguments
+        match &self.boot_mode {
+            BootMode::Uefi {
+                ovmf_code,
+                ovmf_vars,
+            } => {
+                debug!("Using UEFI boot mode");
+                cmd.arg("-drive")
+                    .arg(format!(
+                        "if=pflash,format=raw,readonly=on,file={}",
+                        ovmf_code.display()
+                    ))
+                    .arg("-drive")
+                    .arg(format!("if=pflash,format=raw,file={}", ovmf_vars.display()));
+            }
+            BootMode::DirectKernel {
+                kernel,
+                initrd,
+                kernel_args,
+            } => {
+                debug!("Using direct kernel boot mode");
+                cmd.arg("-kernel")
+                    .arg(kernel)
+                    .arg("-initrd")
+                    .arg(initrd)
+                    .arg("-append")
+                    .arg(kernel_args);
+            }
+        }
+
+        cmd.arg("-drive")
             .arg(format!(
                 "file={},format=qcow2,if=virtio",
                 self.disk.display()
@@ -88,7 +129,9 @@ impl QemuConfig {
             .arg("virtio-net-pci,netdev=net0")
             .arg("-nographic")
             .arg("-serial")
-            .arg(format!("unix:{},server,nowait", serial_socket.display()));
+            .arg(format!("unix:{},server,nowait", serial_socket.display()))
+            .arg("-monitor")
+            .arg("none");
 
         // Print the actual QEMU command for debugging
         eprintln!("=== QEMU Command ===");
@@ -100,12 +143,16 @@ impl QemuConfig {
         eprintln!("====================");
 
         let child = cmd
+            .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
             .context("Failed to spawn QEMU")?;
 
-        debug!("QEMU started with serial socket: {}", serial_socket.display());
+        debug!(
+            "QEMU started with serial socket: {}",
+            serial_socket.display()
+        );
 
         Ok(QemuProcess {
             child,

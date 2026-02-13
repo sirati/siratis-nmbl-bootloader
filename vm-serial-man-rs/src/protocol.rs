@@ -15,6 +15,12 @@ pub enum CommandType {
     Stop,
     /// Execute a command
     Command(CommandRequest),
+    /// Search through history
+    Find(FindRequest),
+    /// Trigger on pattern match
+    Trigger(TriggerRequest),
+    /// Attach to console (interactive mode)
+    Attach(AttachRequest),
 }
 
 /// Command request with parameters
@@ -26,11 +32,61 @@ pub struct CommandRequest {
     pub duration: Duration,
 }
 
+/// Find request - search through history
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindRequest {
+    /// Regex pattern to search for
+    pub pattern: String,
+    /// Number of lines before match to show
+    pub before: usize,
+    /// Number of lines after match to show
+    pub after: usize,
+    /// Only return first N matches
+    pub first_n: Option<usize>,
+    /// Only return last N matches
+    pub last_n: Option<usize>,
+}
+
+/// Trigger request - monitor new output for pattern
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerRequest {
+    /// Regex pattern to trigger on
+    pub pattern: String,
+    /// Number of lines before match to capture
+    pub lines_before: usize,
+    /// Number of lines after match to capture
+    pub lines_after: usize,
+    /// Timeout to wait for pattern match
+    pub match_timeout: Duration,
+    /// Timeout to wait for each line after match
+    pub line_timeout: Duration,
+}
+
+/// Attach request - interactive console
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachRequest {
+    /// Number of recent lines to send initially
+    pub initial_lines: usize,
+}
+
+/// Metadata about buffered output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BufferedOutputInfo {
+    /// Lines being sent
+    pub lines: Vec<String>,
+    /// Total number of lines in buffer
+    pub total_lines: usize,
+    /// Starting line number (1-indexed)
+    pub start_line: usize,
+    /// Seconds since last output was received
+    pub last_output_age_secs: Option<f64>,
+}
+
 /// Response from manager to client
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CommandResponse {
-    /// Buffered output before command
-    BufferedOutput(Vec<String>),
+    /// Buffered output before command with metadata
+    BufferedOutput(BufferedOutputInfo),
     /// Command injection marker
     CommandInjected(String),
     /// Captured output line
@@ -41,6 +97,22 @@ pub enum CommandResponse {
     Error(String),
     /// Manager stopped
     Stopped,
+    /// Find result - (line_number, context_lines)
+    FindMatch(usize, Vec<String>),
+    /// Trigger matched - matched line followed by N lines
+    TriggerMatch(Vec<String>),
+    /// Trigger timed out without match
+    TriggerTimeout,
+    /// Total number of matches found (sent before filtered results)
+    TotalMatches(usize),
+    /// Attach info - (last_output_timestamp, total_lines)
+    AttachInfo(String, usize),
+    /// Attached - streaming mode active
+    Attached,
+    /// Input from attached client
+    AttachInput(String),
+    /// Detach from console
+    Detached,
 }
 
 impl CommandType {

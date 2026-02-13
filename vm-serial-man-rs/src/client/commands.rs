@@ -67,12 +67,30 @@ pub async fn send_command(
         trace!("Parsed response #{}: {:?}", response_count, response);
 
         match response {
-            CommandResponse::BufferedOutput(lines) => {
-                println!("=== Buffered Output (last 10s/100 lines) ===");
-                if lines.is_empty() {
-                    println!("(no buffered output available)");
+            CommandResponse::BufferedOutput(info) => {
+                // Build header with metadata
+                let header = if info.total_lines == 0 {
+                    "=== Buffered Output: empty ===".to_string()
                 } else {
-                    for line in lines {
+                    let end_line = info.start_line + info.lines.len() - 1;
+                    let age_str = match info.last_output_age_secs {
+                        Some(age) if age < 1.0 => "just now".to_string(),
+                        Some(age) if age < 60.0 => format!("{:.0}s ago", age),
+                        Some(age) if age < 3600.0 => format!("{:.0}m ago", age / 60.0),
+                        Some(age) => format!("{:.1}h ago", age / 3600.0),
+                        None => "unknown".to_string(),
+                    };
+                    format!(
+                        "=== Buffered Output: lines {}-{} of {} total (last: {}) ===",
+                        info.start_line, end_line, info.total_lines, age_str
+                    )
+                };
+                println!("{}", header);
+
+                if info.lines.is_empty() {
+                    println!("(no recent output)");
+                } else {
+                    for line in info.lines {
                         println!("{}", line);
                     }
                 }
@@ -88,7 +106,10 @@ pub async fn send_command(
             CommandResponse::Complete => {
                 println!();
                 println!("=== Command Complete ===");
-                trace!("Received Complete response, total responses: {}", response_count);
+                trace!(
+                    "Received Complete response, total responses: {}",
+                    response_count
+                );
                 break;
             }
             CommandResponse::Error(err) => {
@@ -101,10 +122,37 @@ pub async fn send_command(
                 debug!("Received Stopped response");
                 break;
             }
+            CommandResponse::FindMatch(_, _) => {
+                warn!("Unexpected FindMatch response in send command");
+            }
+            CommandResponse::TriggerMatch(_) => {
+                warn!("Unexpected TriggerMatch response in send command");
+            }
+            CommandResponse::TriggerTimeout => {
+                warn!("Unexpected TriggerTimeout response in send command");
+            }
+            CommandResponse::TotalMatches(_) => {
+                warn!("Unexpected TotalMatches response in send command");
+            }
+            CommandResponse::AttachInfo(_, _) => {
+                warn!("Unexpected AttachInfo response in send command");
+            }
+            CommandResponse::Attached => {
+                warn!("Unexpected Attached response in send command");
+            }
+            CommandResponse::AttachInput(_) => {
+                warn!("Unexpected AttachInput response in send command");
+            }
+            CommandResponse::Detached => {
+                warn!("Unexpected Detached response in send command");
+            }
         }
     }
 
-    debug!("Client completed, received {} responses total", response_count);
+    debug!(
+        "Client completed, received {} responses total",
+        response_count
+    );
     Ok(())
 }
 

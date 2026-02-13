@@ -4,92 +4,17 @@
 //! with proper buffering and command handling.
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 
-mod manager;
-mod client;
-mod protocol;
 mod buffer;
+mod cli;
+mod client;
 mod log;
+mod manager;
+mod protocol;
 
-#[derive(Parser)]
-#[command(name = "vm-serial-man")]
-#[command(about = "VM Serial Manager - Manage QEMU VM serial I/O", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Start the VM manager daemon
-    Manager {
-        /// Name of the VM
-        #[arg(short, long, default_value = "test-vm")]
-        name: String,
-
-        /// Path to disk image
-        #[arg(short, long)]
-        disk: PathBuf,
-
-        /// Path to OVMF code
-        #[arg(long)]
-        ovmf_code: PathBuf,
-
-        /// Path to OVMF vars
-        #[arg(long)]
-        ovmf_vars: PathBuf,
-
-        /// Memory size in MB
-        #[arg(short, long, default_value = "1024")]
-        memory: u32,
-
-        /// Number of CPU cores
-        #[arg(short, long, default_value = "4")]
-        cores: u32,
-
-        /// Control socket path (auto-generated if not specified)
-        #[arg(long)]
-        socket: Option<PathBuf>,
-
-        /// Buffer size (number of lines)
-        #[arg(long, default_value = "100")]
-        buffer_lines: usize,
-
-        /// Buffer time window (seconds)
-        #[arg(long, default_value = "10")]
-        buffer_seconds: u64,
-    },
-
-    /// Send a command to a running VM manager
-    Send {
-        /// Command to send
-        command: String,
-
-        /// Duration to capture output (seconds)
-        #[arg(short, long, default_value = "5")]
-        duration: u64,
-
-        /// Control socket path (auto-detected if not specified)
-        #[arg(long)]
-        socket: Option<PathBuf>,
-
-        /// Additional input lines from stdin
-        #[arg(long)]
-        stdin: bool,
-    },
-
-    /// Stop a running VM manager
-    Stop {
-        /// Control socket path (auto-detected if not specified)
-        #[arg(long)]
-        socket: Option<PathBuf>,
-    },
-
-    /// Show status of running VM managers
-    Status,
-}
+use clap::Parser;
+use cli::{Cli, Commands};
+use manager::BootMode;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -99,7 +24,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Manager {
+        Commands::ManagerUefi {
             name,
             disk,
             ovmf_code,
@@ -110,11 +35,43 @@ async fn main() -> Result<()> {
             buffer_lines,
             buffer_seconds,
         } => {
+            let boot_mode = BootMode::Uefi {
+                ovmf_code,
+                ovmf_vars,
+            };
             manager::run_manager(
                 name,
                 disk,
-                ovmf_code,
-                ovmf_vars,
+                boot_mode,
+                memory,
+                cores,
+                socket,
+                buffer_lines,
+                buffer_seconds,
+            )
+            .await
+        }
+        Commands::ManagerDirectKernel {
+            name,
+            disk,
+            kernel,
+            initrd,
+            kernel_args,
+            memory,
+            cores,
+            socket,
+            buffer_lines,
+            buffer_seconds,
+        } => {
+            let boot_mode = BootMode::DirectKernel {
+                kernel,
+                initrd,
+                kernel_args,
+            };
+            manager::run_manager(
+                name,
+                disk,
+                boot_mode,
                 memory,
                 cores,
                 socket,
@@ -129,6 +86,33 @@ async fn main() -> Result<()> {
             socket,
             stdin,
         } => client::send_command(command, duration, socket, stdin).await,
+        Commands::Find {
+            pattern,
+            before,
+            after,
+            first,
+            last,
+            socket,
+        } => client::find_in_history(pattern, before, after, first, last, socket).await,
+        Commands::Trigger {
+            pattern,
+            lines_before,
+            lines_after,
+            match_timeout,
+            line_timeout,
+            socket,
+        } => {
+            client::trigger_on_pattern(
+                pattern,
+                lines_before,
+                lines_after,
+                match_timeout,
+                line_timeout,
+                socket,
+            )
+            .await
+        }
+        Commands::Attach { socket } => client::attach_console(socket).await,
         Commands::Stop { socket } => client::stop_manager(socket).await,
         Commands::Status => client::show_status().await,
     }

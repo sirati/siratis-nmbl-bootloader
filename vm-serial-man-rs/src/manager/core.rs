@@ -15,15 +15,14 @@ use crate::buffer::OutputBuffer;
 
 use super::handler::handle_client;
 use super::pty::SerialHandler;
-use super::qemu::QemuConfig;
+use super::qemu::{BootMode, QemuConfig};
 use super::utils::{cleanup_stale_sockets, shutdown_qemu_gracefully};
 
 /// VM Manager state
 pub struct VmManager {
     name: String,
     disk: PathBuf,
-    ovmf_code: PathBuf,
-    ovmf_vars: PathBuf,
+    boot_mode: BootMode,
     memory: u32,
     cores: u32,
     socket_path: PathBuf,
@@ -35,8 +34,7 @@ impl VmManager {
     pub fn new(
         name: String,
         disk: PathBuf,
-        ovmf_code: PathBuf,
-        ovmf_vars: PathBuf,
+        boot_mode: BootMode,
         memory: u32,
         cores: u32,
         socket: Option<PathBuf>,
@@ -50,8 +48,7 @@ impl VmManager {
         Self {
             name,
             disk,
-            ovmf_code,
-            ovmf_vars,
+            boot_mode,
             memory,
             cores,
             socket_path,
@@ -77,8 +74,7 @@ impl VmManager {
         let qemu_config = QemuConfig {
             name: self.name.clone(),
             disk: self.disk.clone(),
-            ovmf_code: self.ovmf_code.clone(),
-            ovmf_vars: self.ovmf_vars.clone(),
+            boot_mode: self.boot_mode.clone(),
             memory: self.memory,
             cores: self.cores,
             socket_dir,
@@ -188,8 +184,7 @@ impl VmManager {
 pub async fn run_manager(
     name: String,
     disk: PathBuf,
-    ovmf_code: PathBuf,
-    ovmf_vars: PathBuf,
+    boot_mode: BootMode,
     memory: u32,
     cores: u32,
     socket: Option<PathBuf>,
@@ -199,8 +194,7 @@ pub async fn run_manager(
     let manager = VmManager::new(
         name,
         disk,
-        ovmf_code,
-        ovmf_vars,
+        boot_mode,
         memory,
         cores,
         socket,

@@ -2,6 +2,10 @@
 //!
 //! This module handles individual client connections and command processing
 
+mod handler_attach;
+mod handler_find;
+mod handler_trigger;
+
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -13,6 +17,10 @@ use tracing::{debug, trace, warn};
 use crate::buffer::OutputBuffer;
 use crate::protocol::{CommandRequest, CommandResponse, CommandType};
 
+pub use handler_attach::handle_attach;
+pub use handler_find::handle_find;
+pub use handler_trigger::handle_trigger;
+
 /// Handle a client connection
 pub async fn handle_client(
     stream: UnixStream,
@@ -21,9 +29,13 @@ pub async fn handle_client(
     buffer: Arc<Mutex<OutputBuffer>>,
     shutdown_tx: mpsc::Sender<()>,
 ) -> Result<()> {
-    let (reader, writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut writer = writer;
+    // Peek at the command type to decide how to handle the stream
+    let mut peek_buf = vec![0u8; 1024];
+    let mut temp_stream = stream;
+
+    // Read first line to determine command type
+    let (reader_half, mut writer_half) = temp_stream.into_split();
+    let mut reader = BufReader::new(reader_half);
     let mut line = String::new();
 
     debug!("New client connected");
@@ -47,8 +59,8 @@ pub async fn handle_client(
             let resp = CommandResponse::Stopped;
             let resp_bytes = resp.to_bytes();
             trace!("Sending response: {} bytes", resp_bytes.len());
-            writer.write_all(&resp_bytes).await?;
-            writer.flush().await?;
+            writer_half.write_all(&resp_bytes).await?;
+            writer_half.flush().await?;
             debug!("Stop response sent successfully");
             // Signal shutdown
             let _ = shutdown_tx.send(()).await;
@@ -56,7 +68,37 @@ pub async fn handle_client(
         }
 
         CommandType::Command(cmd_req) => {
-            handle_command(cmd_req, serial_writer, writer, output_tx, buffer, reader).await
+            handle_command(
+                cmd_req,
+                serial_writer,
+                writer_half,
+                output_tx,
+                buffer,
+                reader,
+            )
+            .await
+        }
+
+        CommandType::Find(find_req) => handle_find(find_req, writer_half, buffer).await,
+
+        CommandType::Trigger(trigger_req) => {
+            handle_trigger(trigger_req, writer_half, output_tx, buffer).await
+        }
+
+        CommandType::Attach(attach_req) => {
+            // Attach needs the full stream - reunite the split halves
+            let reunited_stream = reader
+                .into_inner()
+                .reunite(writer_half)
+                .context("Failed to reunite stream")?;
+            handle_attach(
+                attach_req,
+                reunited_stream,
+                serial_writer,
+                output_tx,
+                buffer,
+            )
+            .await
         }
     }
 }
@@ -72,14 +114,36 @@ async fn handle_command(
 ) -> Result<()> {
     debug!("Processing command: {}", cmd_req.command);
 
-    // Get buffered output
-    let buffer_snapshot = buffer.lock().await.get_all();
-    trace!("Buffer snapshot has {} lines", buffer_snapshot.len());
+    // Get recent buffered output with metadata
+    let buffer_guard = buffer.lock().await;
+    let recent_lines = buffer_guard.get_recent();
+    let total_lines = buffer_guard.len();
+    let start_line = if total_lines > 0 {
+        total_lines.saturating_sub(recent_lines.len()) + 1
+    } else {
+        0
+    };
+    let last_output_age_secs = buffer_guard.last_output_timestamp().map(|ts| {
+        let now = chrono::Utc::now();
+        (now - ts).num_milliseconds() as f64 / 1000.0
+    });
+    drop(buffer_guard);
 
-    // Send buffered output
-    let resp = CommandResponse::BufferedOutput(buffer_snapshot);
+    trace!("Buffer snapshot has {} lines", recent_lines.len());
+
+    // Send buffered output with metadata
+    let output_info = crate::protocol::BufferedOutputInfo {
+        lines: recent_lines,
+        total_lines,
+        start_line,
+        last_output_age_secs,
+    };
+    let resp = CommandResponse::BufferedOutput(output_info);
     let resp_bytes = resp.to_bytes();
-    trace!("Sending BufferedOutput response: {} bytes", resp_bytes.len());
+    trace!(
+        "Sending BufferedOutput response: {} bytes",
+        resp_bytes.len()
+    );
     writer.write_all(&resp_bytes).await?;
     writer.flush().await?;
     trace!("BufferedOutput sent and flushed");
@@ -87,7 +151,10 @@ async fn handle_command(
     // Send command injected marker
     let resp = CommandResponse::CommandInjected(cmd_req.command.clone());
     let resp_bytes = resp.to_bytes();
-    trace!("Sending CommandInjected response: {} bytes", resp_bytes.len());
+    trace!(
+        "Sending CommandInjected response: {} bytes",
+        resp_bytes.len()
+    );
     writer.write_all(&resp_bytes).await?;
     writer.flush().await?;
     trace!("CommandInjected sent and flushed");
@@ -101,8 +168,7 @@ async fn handle_command(
         let mut serial = serial_writer.lock().await;
         let cmd_bytes = format!("{}\n", cmd_req.command);
         trace!("Writing command to serial: {:?}", cmd_bytes.trim());
-        serial.write_all(cmd_bytes.as_bytes())
-            .await?;
+        serial.write_all(cmd_bytes.as_bytes()).await?;
         serial.flush().await?;
         trace!("Command written to serial and flushed");
     }
@@ -174,6 +240,9 @@ async fn handle_command(
     writer.flush().await?;
     trace!("Complete response sent and flushed");
 
-    debug!("Command completed successfully with {} output lines", line_count);
+    debug!(
+        "Command completed successfully with {} output lines",
+        line_count
+    );
     Ok(())
 }

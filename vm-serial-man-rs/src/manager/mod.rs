@@ -13,3 +13,4 @@ mod core;
 mod utils;
 
 pub use core::run_manager;
+pub use qemu::BootMode;

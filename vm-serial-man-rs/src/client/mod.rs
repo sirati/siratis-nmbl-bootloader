@@ -10,9 +10,15 @@
 //! - `commands`: Command execution (send, stop)
 //! - `status`: Status display functionality
 
-mod utils;
+mod attach;
 mod commands;
+mod find;
 mod status;
+mod trigger;
+mod utils;
 
+pub use attach::attach_console;
 pub use commands::{send_command, stop_manager};
+pub use find::find_in_history;
 pub use status::show_status;
+pub use trigger::trigger_on_pattern;

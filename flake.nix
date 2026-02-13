@@ -3,12 +3,17 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
     {
       self,
       nixpkgs,
+      rust-overlay,
     }:
     let
       # Support multiple systems
@@ -19,72 +24,79 @@
         "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-
-      # Package definitions
-      devPackages =
-        pkgs: with pkgs; [
-          # Nix language servers and formatters
-          nil
-          nixd
-          nixfmt
-          alejandra
-          statix
-
-          # General development tools
-          git
-          vim
-          nano
-
-          # Nix development and testing tools
-          nix-tree
-          nix-diff
-          nix-output-monitor
-          nixos-rebuild
-
-          # Shell and scripting
-          bash-language-server
-          shellcheck
-          shfmt
-
-          # JSON/YAML tools (for flake.lock and configs)
-          jq
-          yq-go
-          vscode-json-languageserver
-
-          # Documentation and markdown
-          marksman
-          mdl
-
-          # Version control helpers
-          package-version-server
-        ];
     in
     {
       devShells = forAllSystems (
         system:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          overlays = [ (import rust-overlay) ];
+          pkgs = import nixpkgs {
+            inherit system overlays;
+          };
+
+          rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+            extensions = [ "rust-src" "rust-analyzer" ];
+          };
         in
         {
           default = pkgs.mkShell {
-            packages = devPackages pkgs;
+            packages = with pkgs; [
+              # Nix language servers and formatters
+              nil
+              nixd
+              nixfmt
+              alejandra
+              statix
 
-            shellHook = ''
-              echo "╔════════════════════════════════════════════════════════════╗"
-              echo "║     Nix development environment for nixos-linux-as-bootloader     ║"
-              echo "╚════════════════════════════════════════════════════════════╝"
-              echo ""
-              echo "Nix version: $(nix --version)"
-              echo ""
-              echo "Available tools:"
-              echo "  - nil, nixd: Nix language servers"
-              echo "  - nixfmt-rfc-style, alejandra: Nix formatters"
-              echo "  - statix: Nix linter"
-              echo "  - nix-tree, nix-diff: Nix inspection tools"
-              echo "  - shellcheck, shfmt: Shell script tools"
-              echo ""
-              echo "Ready to develop!"
-            '';
+              # General development tools
+              git
+              vim
+              nano
+
+              # Nix development and testing tools
+              nix-tree
+              nix-diff
+              nix-output-monitor
+              nixos-rebuild
+
+              # Shell and scripting
+              bash-language-server
+              shellcheck
+              shfmt
+
+              # JSON/YAML tools (for flake.lock and configs)
+              jq
+              yq-go
+              vscode-json-languageserver
+
+              # Documentation and markdown
+              marksman
+              mdl
+
+              # Version control helpers
+              package-version-server
+
+              # Rust toolchain and tools
+              rustToolchain
+              pkg-config
+              openssl
+              cargo-watch
+              cargo-edit
+              cargo-outdated
+              clippy
+              rustfmt
+
+              # C/C++ build tools for Rust dependencies
+              gcc
+              gnumake
+              cmake
+            ];
+
+            buildInputs = with pkgs; [
+              openssl
+            ];
+
+            RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
           };
         }
       );
