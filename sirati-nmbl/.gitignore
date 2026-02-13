@@ -1,0 +1,6 @@
+OVMF_VARS*.fd
+*.qcow2
+
+
+debug.md
+/debug/

@@ -208,3 +208,6 @@ in
     };
   };
 }
+# nix build .#nixosConfigurations.test-mbr-serial.config.system.build.vm
+# nix build .#nixosConfigurations.test-gpt-bios.config.system.build.vm
+# nix build .#nixosConfigurations.test-gpt-uefi.config.system.build.vm

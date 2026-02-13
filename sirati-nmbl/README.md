@@ -202,4 +202,4 @@ The bootloader needs to be minimal and fast. Busybox provides:
 
 ## License
 
-[Your license here]
+MIT License (the scripts here, the generated content has various licenses)

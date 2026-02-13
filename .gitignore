@@ -19,12 +19,14 @@ dist/
 __MACOSX
 
 # src and out and queue
-src/
-out/
-queue/
-run/
+./src/
+./out/
+./queue/
+./run/
 
 
 # output articacts from nix build
 result*
 docker*
+
+
