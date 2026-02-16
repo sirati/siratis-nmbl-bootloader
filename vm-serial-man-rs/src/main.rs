@@ -13,7 +13,7 @@ mod manager;
 mod protocol;
 
 use clap::Parser;
-use cli::{Cli, Commands};
+use cli::{BootModeArgs, Cli, Commands};
 use manager::BootMode;
 
 #[tokio::main]
@@ -24,59 +24,35 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::ManagerUefi {
-            name,
-            disk,
-            ovmf_code,
-            ovmf_vars,
-            memory,
-            cores,
-            socket,
-            buffer_lines,
-            buffer_seconds,
-        } => {
-            let boot_mode = BootMode::Uefi {
-                ovmf_code,
-                ovmf_vars,
+        Commands::Manager { config, boot_mode } => {
+            let boot_mode = match boot_mode {
+                BootModeArgs::Bios => BootMode::Bios,
+                BootModeArgs::Uefi {
+                    ovmf_code,
+                    ovmf_vars,
+                } => BootMode::Uefi {
+                    ovmf_code,
+                    ovmf_vars,
+                },
+                BootModeArgs::DirectKernel {
+                    kernel,
+                    initrd,
+                    kernel_args,
+                } => BootMode::DirectKernel {
+                    kernel,
+                    initrd,
+                    kernel_args,
+                },
             };
             manager::run_manager(
-                name,
-                disk,
+                config.name,
+                config.disk,
                 boot_mode,
-                memory,
-                cores,
-                socket,
-                buffer_lines,
-                buffer_seconds,
-            )
-            .await
-        }
-        Commands::ManagerDirectKernel {
-            name,
-            disk,
-            kernel,
-            initrd,
-            kernel_args,
-            memory,
-            cores,
-            socket,
-            buffer_lines,
-            buffer_seconds,
-        } => {
-            let boot_mode = BootMode::DirectKernel {
-                kernel,
-                initrd,
-                kernel_args,
-            };
-            manager::run_manager(
-                name,
-                disk,
-                boot_mode,
-                memory,
-                cores,
-                socket,
-                buffer_lines,
-                buffer_seconds,
+                config.memory,
+                config.cores,
+                config.socket,
+                config.buffer_lines,
+                config.buffer_seconds,
             )
             .await
         }

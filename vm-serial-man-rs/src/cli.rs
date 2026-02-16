@@ -1,6 +1,6 @@
 //! CLI command definitions for VM Serial Manager
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -11,18 +11,11 @@ pub struct Cli {
     pub command: Commands,
 }
 
+/// Boot mode specific arguments
 #[derive(Subcommand)]
-pub enum Commands {
-    /// Start the VM manager daemon with UEFI boot
-    ManagerUefi {
-        /// Name of the VM
-        #[arg(short, long, default_value = "test-vm")]
-        name: String,
-
-        /// Path to disk image
-        #[arg(short, long)]
-        disk: PathBuf,
-
+pub enum BootModeArgs {
+    /// Boot with UEFI firmware (OVMF)
+    Uefi {
         /// Path to OVMF code
         #[arg(long)]
         ovmf_code: PathBuf,
@@ -30,38 +23,13 @@ pub enum Commands {
         /// Path to OVMF vars
         #[arg(long)]
         ovmf_vars: PathBuf,
-
-        /// Memory size in MB
-        #[arg(short, long, default_value = "1024")]
-        memory: u32,
-
-        /// Number of CPU cores
-        #[arg(short, long, default_value = "4")]
-        cores: u32,
-
-        /// Control socket path (auto-generated if not specified)
-        #[arg(long)]
-        socket: Option<PathBuf>,
-
-        /// Buffer size (number of lines)
-        #[arg(long, default_value = "10")]
-        buffer_lines: usize,
-
-        /// Buffer time window (seconds)
-        #[arg(long, default_value = "10")]
-        buffer_seconds: u64,
     },
 
-    /// Start the VM manager daemon with direct kernel boot (fast testing)
-    ManagerDirectKernel {
-        /// Name of the VM
-        #[arg(short, long, default_value = "test-vm")]
-        name: String,
+    /// Boot with legacy BIOS (SeaBIOS)
+    Bios,
 
-        /// Path to disk image
-        #[arg(short, long)]
-        disk: PathBuf,
-
+    /// Direct kernel boot (bypass bootloader)
+    DirectKernel {
         /// Path to kernel binary
         #[arg(short, long)]
         kernel: PathBuf,
@@ -76,26 +44,50 @@ pub enum Commands {
             default_value = "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200"
         )]
         kernel_args: String,
+    },
+}
 
-        /// Memory size in MB
-        #[arg(short, long, default_value = "2048")]
-        memory: u32,
+/// Common manager configuration
+#[derive(Args)]
+pub struct ManagerConfig {
+    /// Name of the VM
+    #[arg(short, long, default_value = "test-vm")]
+    pub name: String,
 
-        /// Number of CPU cores
-        #[arg(short, long, default_value = "4")]
-        cores: u32,
+    /// Path to disk image
+    #[arg(short, long)]
+    pub disk: PathBuf,
 
-        /// Control socket path (auto-generated if not specified)
-        #[arg(long)]
-        socket: Option<PathBuf>,
+    /// Memory size in MB
+    #[arg(short, long, default_value = "1024")]
+    pub memory: u32,
 
-        /// Buffer size (number of lines)
-        #[arg(long, default_value = "10")]
-        buffer_lines: usize,
+    /// Number of CPU cores
+    #[arg(short, long, default_value = "4")]
+    pub cores: u32,
 
-        /// Buffer time window (seconds)
-        #[arg(long, default_value = "10")]
-        buffer_seconds: u64,
+    /// Control socket path (auto-generated if not specified)
+    #[arg(long)]
+    pub socket: Option<PathBuf>,
+
+    /// Buffer size (number of lines)
+    #[arg(long, default_value = "10")]
+    pub buffer_lines: usize,
+
+    /// Buffer time window (seconds)
+    #[arg(long, default_value = "10")]
+    pub buffer_seconds: u64,
+}
+
+#[derive(Subcommand)]
+pub enum Commands {
+    /// Start the VM manager daemon
+    Manager {
+        #[command(flatten)]
+        config: ManagerConfig,
+
+        #[command(subcommand)]
+        boot_mode: BootModeArgs,
     },
 
     /// Send a command to a running VM manager

@@ -160,7 +160,7 @@ let
 
       ${startVMAndWait {
         inherit name vmSerialMan;
-        screenCommand = "${vmSerialMan}/bin/vm-serial-man manager-direct-kernel --name \"${name}-direct\" --disk \"${diskName}\" --kernel \"$WORK_DIR/kernel\" --initrd \"$WORK_DIR/initrd\" --kernel-args \"$KERNEL_ARGS\" --memory 2048 --cores 4";
+        screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}-direct\" --disk \"${diskName}\" --memory 2048 --cores 4 direct-kernel --kernel \"$WORK_DIR/kernel\" --initrd \"$WORK_DIR/initrd\" --kernel-args \"$KERNEL_ARGS\"";
         sessionName = "${name}-direct";
       }}
     '';
@@ -228,7 +228,7 @@ let
 
       ${startVMAndWait {
         inherit name vmSerialMan;
-        screenCommand = "${vmSerialMan}/bin/vm-serial-man manager-uefi --name \"${name}-uefi\" --disk \"${diskName}\" --ovmf-code \"$OVMF_CODE\" --ovmf-vars \"$OVMF_VARS\" --memory 2048 --cores 4";
+        screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}-uefi\" --disk \"${diskName}\" --memory 2048 --cores 4 uefi --ovmf-code \"$OVMF_CODE\" --ovmf-vars \"$OVMF_VARS\"";
         sessionName = "${name}-uefi";
       }}
     '';

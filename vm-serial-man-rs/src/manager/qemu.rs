@@ -23,6 +23,8 @@ pub enum BootMode {
         initrd: PathBuf,
         kernel_args: String,
     },
+    /// Boot with legacy BIOS (SeaBIOS)
+    Bios,
 }
 
 /// QEMU configuration
@@ -115,6 +117,10 @@ impl QemuConfig {
                     .arg(initrd)
                     .arg("-append")
                     .arg(kernel_args);
+            }
+            BootMode::Bios => {
+                debug!("Using legacy BIOS boot mode");
+                // No additional arguments needed - QEMU uses SeaBIOS by default
             }
         }
 
