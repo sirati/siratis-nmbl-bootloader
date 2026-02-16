@@ -72,7 +72,6 @@ pkgs.writeScript "install-nmbl-bootloader" ''
 
   KERNEL="${config.system.build.nmblKernel}/bzImage"
   INITRD="${config.system.build.nmblInitramfs}/initrd"
-  KERNEL_PARAMS="${lib.concatStringsSep " " cfg.kernelParams}"
 
   # Copy NMBL kernel and initrd to boot partition
   echo "Copying NMBL bootloader files to /boot..."
@@ -86,13 +85,13 @@ pkgs.writeScript "install-nmbl-bootloader" ''
         mkdir -p /boot/grub
 
         # Create GRUB config
-        cat > /boot/grub/grub.cfg << 'EOF'
+        cat > /boot/grub/grub.cfg << EOF
     set timeout=${toString actualLoaderExtraArgs.timeout}
     set default=${actualLoaderExtraArgs.default}
     ${actualLoaderExtraArgs.extraConfig}
 
     menuentry "NMBL Bootloader" {
-      linux /nmbl-kernel $KERNEL_PARAMS
+      linux /nmbl-kernel ${lib.concatStringsSep " " cfg.kernelParams}
       initrd /nmbl-initrd
     }
     ${actualLoaderExtraArgs.extraEntries}
@@ -111,13 +110,13 @@ pkgs.writeScript "install-nmbl-bootloader" ''
         mkdir -p /boot/EFI/BOOT /boot/grub
 
         # Create GRUB config
-        cat > /boot/grub/grub.cfg << 'EOF'
+        cat > /boot/grub/grub.cfg << EOF
     set timeout=${toString actualLoaderExtraArgs.timeout}
     set default=${actualLoaderExtraArgs.default}
     ${actualLoaderExtraArgs.extraConfig}
 
     menuentry "NMBL Bootloader" {
-      linux /nmbl-kernel $KERNEL_PARAMS
+      linux /nmbl-kernel ${lib.concatStringsSep " " cfg.kernelParams}
       initrd /nmbl-initrd
     }
     ${actualLoaderExtraArgs.extraEntries}
@@ -168,11 +167,11 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     EOF
 
         # Create boot entry
-        cat > /boot/loader/entries/nmbl.conf << 'EOF'
+        cat > /boot/loader/entries/nmbl.conf << EOF
     title NMBL Bootloader
     linux /nmbl-kernel
     initrd /nmbl-initrd
-    options $KERNEL_PARAMS
+    options ${lib.concatStringsSep " " cfg.kernelParams}
     EOF
 
         # Install systemd-boot if device exists
