@@ -32,10 +32,10 @@ let
               kernelPackage = pkgs.linux_6_6;
 
               # availableKernelModules defaults to ["crc32c"]
-              # extraKernelModules can be added if needed
+              # kernelModules can be added if needed for explicit loading
               # Don't manually specify modules - they are inherited from
-              # boot.initrd.availableKernelModules automatically
-              extraKernelModules = [ ];
+              # boot.initrd.kernelModules automatically
+              kernelModules = [ ];
 
               mountPrefix = "/mnt";
               kernelParams = [
@@ -58,6 +58,16 @@ let
             # See: https://github.com/NixOS/nixpkgs/blob/master/nixos/modules/tasks/filesystems/ext.nix
             # The module only adds "ext2" and "ext4" but ext4 depends on crc32c at runtime
             boot.initrd.availableKernelModules = [ "crc32c" ];
+
+            # VirtIO drivers must be explicitly loaded for NMBL bootloader
+            # NMBL doesn't have udev, so storage drivers from availableKernelModules won't auto-load
+            # qemu-guest.nix adds these to availableKernelModules, but we need them in kernelModules
+            # so NMBL loads them before trying to mount /dev/vda* devices
+            # virtio_pci is required for PCI bus, virtio_blk is the actual block device driver
+            boot.initrd.kernelModules = [
+              "virtio_pci"
+              "virtio_blk"
+            ];
 
             boot.loader.grub.enable = false;
             boot.loader.systemd-boot.enable = false;

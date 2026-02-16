@@ -20,8 +20,8 @@ in
   # Part 4: Kexec Boot Execution
   # ============================================
 
-  echo ""
-  echo "NMBL: Preparing to kexec into selected generation..."
+  info ""
+  info "NMBL: Preparing to kexec into selected generation..."
 
   # Selected generation info is already in variables from previous step:
   # - SELECTED_GEN
@@ -29,7 +29,7 @@ in
   # - SELECTED_INITRD
   # - SELECTED_PARAMS
 
-  echo "NMBL: Booting generation $SELECTED_GEN"
+  info "NMBL: Booting generation $SELECTED_GEN"
 
   # Resolve symlinks to actual kernel and initrd files
   # The paths from the system profile are symlinks with absolute targets
@@ -58,8 +58,8 @@ in
   SELECTED_KERNEL=$(resolve_file_path "$SELECTED_KERNEL")
   SELECTED_INITRD=$(resolve_file_path "$SELECTED_INITRD")
 
-  echo "NMBL: Resolved kernel: $SELECTED_KERNEL"
-  echo "NMBL: Resolved initrd: $SELECTED_INITRD"
+  info "NMBL: Resolved kernel: $SELECTED_KERNEL"
+  info "NMBL: Resolved initrd: $SELECTED_INITRD"
 
   # Verify kernel and initrd exist
   if [ ! -f "$SELECTED_KERNEL" ]; then
@@ -77,13 +77,13 @@ in
   # so we don't need to add root= parameter - it's already known
   FINAL_PARAMS="$SELECTED_PARAMS"
 
-  echo "NMBL: Final kernel parameters: $FINAL_PARAMS"
-  echo ""
+  info "NMBL: Final kernel parameters: $FINAL_PARAMS"
+  info ""
 
   # Load kernel and initrd into RAM
-  echo "NMBL: Loading kernel into memory..."
-  echo "  Kernel: $SELECTED_KERNEL"
-  echo "  Initrd: $SELECTED_INITRD"
+  info "NMBL: Loading kernel into memory..."
+  info "  Kernel: $SELECTED_KERNEL"
+  info "  Initrd: $SELECTED_INITRD"
 
   if ! ${pkgs.kexec-tools}/bin/kexec -s -l "$SELECTED_KERNEL" \
     --initrd="$SELECTED_INITRD" \
@@ -93,22 +93,22 @@ in
     exit 1
   fi
 
-  echo "NMBL: ✓ Kernel loaded successfully into memory"
-  echo ""
+  info "NMBL: ✓ Kernel loaded successfully into memory"
+  info ""
 
   # Unmount filesystems in reverse order (children before parents)
-  echo "NMBL: Unmounting filesystems..."
+  info "NMBL: Unmounting filesystems..."
   ${lib.concatMapStringsSep "\n" (fs: ''
-    echo "  Unmounting ${cfg.mountPrefix}${fs.mountPoint}..."
-    ${pkgs.busybox}/bin/umount "${cfg.mountPrefix}${fs.mountPoint}" 2>/dev/null || echo "    (already unmounted or busy)"
+    info "  Unmounting ${cfg.mountPrefix}${fs.mountPoint}..."
+    ${pkgs.busybox}/bin/umount "${cfg.mountPrefix}${fs.mountPoint}" 2>/dev/null || info "    (already unmounted or busy)"
   '') reversedFileSystems}
 
   # Sync to ensure all writes are flushed
-  echo "NMBL: Syncing filesystems..."
+  info "NMBL: Syncing filesystems..."
   ${pkgs.busybox}/bin/sync
 
   # Drop caches for cleaner kexec transition
-  echo "NMBL: Dropping caches..."
+  info "NMBL: Dropping caches..."
   echo 3 > /proc/sys/vm/drop_caches
 
   echo ""

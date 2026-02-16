@@ -13,7 +13,7 @@
   # Part 2: Find NixOS Generations
   # ============================================
 
-  echo "NMBL: Discovering NixOS generations..."
+  info "NMBL: Discovering NixOS generations..."
 
   # Check if root filesystem is mounted
   if [ ! -d "${cfg.mountPrefix}" ]; then
@@ -106,11 +106,11 @@
     exit 1
   fi
 
-  echo "Found $GEN_COUNT generation(s)"
+  info "Found $GEN_COUNT generation(s)"
 
   # Debug: show what we found
-  echo "NMBL: Available generations:"
+  info "NMBL: Available generations:"
   ${pkgs.busybox}/bin/cat "$GEN_FILE" | while IFS='|' read -r gen_id kernel initrd params; do
-    echo "  - Generation $gen_id: kernel=$kernel"
+    info "  - Generation $gen_id: kernel=$kernel"
   done
 ''

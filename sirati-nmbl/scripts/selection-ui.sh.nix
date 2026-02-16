@@ -13,7 +13,7 @@
   # Part 3: Selection UI
   # ============================================
 
-  echo "NMBL: Preparing boot selection interface..."
+  info "NMBL: Preparing boot selection interface..."
 
   # Check for nmbl.shell kernel parameter to drop to emergency shell
   if ${pkgs.busybox}/bin/cat /proc/cmdline | ${pkgs.busybox}/bin/grep -q "nmbl.shell"; then
@@ -36,13 +36,13 @@
   GEN_COUNT=$(${pkgs.busybox}/bin/wc -l < /tmp/generations.txt)
 
   # Auto-select first generation with timeout countdown
-  echo "NMBL: Auto-selecting first generation in ${toString cfg.timeoutSeconds} seconds..."
-  echo "NMBL: (Press any key to drop to emergency shell)"
+  info "NMBL: Auto-selecting first generation in ${toString cfg.timeoutSeconds} seconds..."
+  info "NMBL: (Press any key to drop to emergency shell)"
 
   # Countdown with visual feedback
   TIMEOUT=${toString cfg.timeoutSeconds}
   while [ $TIMEOUT -gt 0 ]; do
-    echo "NMBL: Booting in $TIMEOUT..."
+    info "NMBL: Booting in $TIMEOUT..."
 
     # Sleep for 1 second
     ${pkgs.busybox}/bin/sleep 1
@@ -50,7 +50,7 @@
     TIMEOUT=$((TIMEOUT - 1))
   done
 
-  echo ""
+  info ""
 
   # Read first line from generations file
   SELECTED_LINE=$(${pkgs.busybox}/bin/head -n 1 /tmp/generations.txt)
@@ -61,10 +61,10 @@
   SELECTED_INITRD=$(echo "$SELECTED_LINE" | ${pkgs.busybox}/bin/cut -d'|' -f3)
   SELECTED_PARAMS=$(echo "$SELECTED_LINE" | ${pkgs.busybox}/bin/cut -d'|' -f4)
 
-  echo "NMBL: Selected generation: $SELECTED_GEN"
-  echo "NMBL:   Kernel: $SELECTED_KERNEL"
-  echo "NMBL:   Initrd: $SELECTED_INITRD"
-  echo "NMBL:   Params: $SELECTED_PARAMS"
+  info "NMBL: Selected generation: $SELECTED_GEN"
+  info "NMBL:   Kernel: $SELECTED_KERNEL"
+  info "NMBL:   Initrd: $SELECTED_INITRD"
+  info "NMBL:   Params: $SELECTED_PARAMS"
 
   # TODO: Implement full interactive menu with:
   # - List all generations with numbered menu

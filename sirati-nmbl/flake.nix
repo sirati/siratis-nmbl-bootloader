@@ -73,6 +73,13 @@
       # Test configurations
       nixosConfigurations = testing.mkTestConfigurations;
 
+      # Debug info for each test configuration
+      # Access with: nix build .#debugInfo.test-gpt-bios
+      # Or view with: nix eval .#debugInfo.test-gpt-bios --raw
+      debugInfo = builtins.mapAttrs (
+        name: config: config.config.system.build.nmblDebugInfo
+      ) testing.mkTestConfigurations;
+
       # Test runner apps
       # Run with: nix run .#test-gpt-bios
       # Run with: nix run .#test-gpt-uefi-grub

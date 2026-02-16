@@ -41,6 +41,14 @@ pkgs.writeScript "init" ''
   # Set PATH early so all tools are available
   export PATH="${pkgs.busybox}/bin:${pkgs.kmod}/bin:${pkgs.kexec-tools}/bin:/sbin:/usr/sbin:/bin:/usr/bin"
 
+  # Verbose output control (like NixOS stage-1)
+  verbose="${toString cfg.verbose}"
+  info() {
+    if [ -n "$verbose" ]; then
+      echo "$@"
+    fi
+  }
+
   # Fallback shell function for debugging
   fallback_shell() {
     echo ""
@@ -68,6 +76,10 @@ pkgs.writeScript "init" ''
 
   # Trap errors and drop to shell
   trap 'fallback_shell' EXIT
+
+  # Print banner in light green (like NixOS does)
+  echo -e "\033[1;32m<<< NixOS Stage 0 - sirati's nmbl >>>\033[0m"
+  echo ""
 
   ${mountAndKernelScript}
 

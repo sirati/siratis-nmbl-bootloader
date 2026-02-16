@@ -38,42 +38,61 @@ let
   # All filesystems that NMBL needs to mount
   nmblFileSystems = fileSystems;
 
-  # Automatically inherit kernel modules from system's initrd configuration
-  # These are the modules the system already knows it needs for boot
-  autoKernelModules = config.boot.initrd.availableKernelModules ++ config.boot.initrd.kernelModules;
+  # Import storage validation module
+  storageValidation = import ./modules/storage-validation.nix { inherit lib; };
 
-  # Combine system modules with user-specified modules for the bootloader
-  # availableKernelModules (crc32c by default) + extraKernelModules + auto-detected modules
-  allKernelModules = lib.unique (
-    cfg.availableKernelModules ++ cfg.extraKernelModules ++ autoKernelModules
-  );
-
-  # Create modules tree for our bootloader kernel (same as system.modulesTree in kernel.nix)
-  # This gets the "modules" output from the kernel package
-  bootloaderModulesTree = pkgs.aggregateModules [
-    (lib.getOutput "modules" cfg.kernelPackage)
-  ];
-
-  # Create modules closure with kernel modules for our bootloader kernel
-  # Note: If modules aren't found, they may be built-in to the kernel
-  modulesClosure = pkgs.makeModulesClosure {
-    rootModules = allKernelModules;
-    kernel = bootloaderModulesTree;
-    # Inherit firmware from system configuration (same as stage-1)
-    firmware = config.hardware.firmware;
-    allowMissing = true;
+  # Import kernel modules management module
+  kernelModulesManager = import ./modules/kernel-modules.nix {
+    inherit
+      lib
+      pkgs
+      config
+      cfg
+      ;
   };
+
+  # Import assertions module
+  assertionsModule = import ./modules/assertions.nix {
+    inherit
+      lib
+      config
+      cfg
+      bootstrapper
+      actualLoader
+      actualLoaderExtraArgs
+      storageValidation
+      nmblFileSystems
+      ;
+  };
+
+  # Import installation script module
+  installScriptModule = import ./modules/install-script.nix {
+    inherit
+      lib
+      pkgs
+      config
+      cfg
+      bootstrapper
+      actualLoader
+      actualLoaderExtraArgs
+      ;
+  };
+
+  # Determine actual verbose value (use boot.initrd.verbose if cfg.verbose is null)
+  actualVerbose = if cfg.verbose == null then config.boot.initrd.verbose else cfg.verbose;
 
   # Build the complete init script by importing script.nix
   buildInitScript = import ../scripts/script.nix {
     inherit
       lib
       pkgs
-      cfg
       utils
       ;
+    cfg = cfg // {
+      verbose = actualVerbose;
+    };
     fileSystems = nmblFileSystems;
-    kernelModules = allKernelModules;
+    kernelModules = kernelModulesManager.explicitKernelModules;
   };
 
   # Determine legacy boot mode string for compatibility
@@ -96,79 +115,24 @@ in
     # This ensures vfat kernel modules are automatically included in the system initrd
     fileSystems."/boot".neededForBoot = lib.mkOverride 1000 true;
 
-    # Assertions to verify boot configuration
-    assertions = [
-      {
-        assertion = bootstrapper.partition_table == "gpt";
-        message = "boot.nmbl.bootstrapper.partition_table must be 'gpt' (only GPT is supported)";
-      }
-      {
-        assertion =
-          bootstrapper.bootMode == "bios"
-          || bootstrapper.bootMode == "uefi"
-          || bootstrapper.bootMode == "qemu_kernel_invoke";
-        message = "boot.nmbl.bootstrapper.bootMode must be 'bios', 'uefi', or 'qemu_kernel_invoke'";
-      }
-      {
-        assertion = actualLoader == null || actualLoader == "grub" || actualLoader == "systemd";
-        message = "boot.nmbl.bootstrapper.loader must be 'grub', 'systemd', or null";
-      }
-      {
-        assertion = bootstrapper.bootMode == "qemu_kernel_invoke" || actualLoader != null;
-        message = "loader must be set for bios/uefi boot modes (should default to 'grub')";
-      }
-      {
-        assertion = bootstrapper.bootMode != "qemu_kernel_invoke" || bootstrapper.loader == null;
-        message = "loader must not be set when bootMode is 'qemu_kernel_invoke' (QEMU directly invokes kernel, no bootloader needed)";
-      }
-      {
-        assertion = bootstrapper.bootMode != "qemu_kernel_invoke" || bootstrapper.loader_extra_args == null;
-        message = "loader_extra_args must not be set when bootMode is 'qemu_kernel_invoke' (no bootloader is used)";
-      }
-      {
-        assertion = actualLoader != "systemd" || bootstrapper.bootMode == "uefi";
-        message = "systemd-boot (loader='systemd') requires UEFI boot mode. Use loader='grub' for BIOS boot.";
-      }
-      {
-        assertion =
-          bootstrapper.bootMode == "qemu_kernel_invoke"
-          || config.fileSystems ? "/boot"
-          || (bootstrapper.bootMode == "uefi" && config.fileSystems ? "/efi");
-        message = ''
-          NMBL requires a separate boot partition (except for qemu_kernel_invoke mode).
-          For UEFI boot, declare fileSystems."/boot" or fileSystems."/efi" with fsType = "vfat".
-          For BIOS boot, declare fileSystems."/boot" with fsType = "vfat".
+    # Import assertions from assertions module
+    assertions = assertionsModule.assertions;
 
-          Example:
-            fileSystems."/boot" = {
-              device = "/dev/sda1";  # or /dev/vda1 for VirtIO
-              fsType = "vfat";
-            };
-        '';
-      }
-      {
-        assertion =
-          let
-            bootFS =
-              if config.fileSystems ? "/boot" then
-                config.fileSystems."/boot"
-              else if config.fileSystems ? "/efi" then
-                config.fileSystems."/efi"
-              else
-                null;
-          in
-          (bootstrapper.bootMode == "qemu_kernel_invoke") || (bootFS != null -> bootFS.fsType == "vfat");
-        message = "NMBL boot partition must be FAT32 (fsType = \"vfat\")";
-      }
-      {
-        assertion =
-          bootstrapper.bootMode == "qemu_kernel_invoke"
-          || actualLoaderExtraArgs == null
-          || !actualLoaderExtraArgs.efiInstallAsRemovable
-          || !actualLoaderExtraArgs.canTouchEfiVariables;
-        message = "Cannot use both efiInstallAsRemovable and canTouchEfiVariables. Choose one.";
-      }
-    ];
+    # Force assertion checking - this will fail the build if any assertions are false
+    # NixOS checks assertions in system.build.toplevel, but we need to ensure they're
+    # checked even when building intermediate outputs like nmblInitramfs
+    system.build.nmblAssertionCheck =
+      let
+        failedAssertions = lib.filter (x: !x.assertion) config.assertions;
+        assertionMessages = lib.concatMapStringsSep "\n" (x: "- ${x.message}") failedAssertions;
+      in
+      if failedAssertions != [ ] then
+        throw ''
+          Failed assertions:
+          ${assertionMessages}
+        ''
+      else
+        pkgs.writeText "nmbl-assertions-ok" "All NMBL assertions passed\n";
 
     # Build the minimal initramfs
     system.build.nmblInitramfs =
@@ -199,18 +163,57 @@ in
               symlink = "/bin/kmod";
             }
             {
-              object = "${modulesClosure}/lib/modules";
+              object = "${kernelModulesManager.modulesClosure}/lib/modules";
               symlink = "/lib/modules";
+            }
+            {
+              object = kernelModulesManager.modprobeConf;
+              symlink = "/etc/modprobe.d/nixos.conf";
             }
           ];
 
           compressor = "gzip -9";
         };
       in
-      initramfs;
+      # Force assertion checking before returning initramfs
+      # builtins.seq forces evaluation of the first argument before returning the second
+      builtins.seq config.system.build.nmblAssertionCheck initramfs;
 
     # Build the bootloader kernel
     system.build.nmblKernel = cfg.kernelPackage;
+
+    # Debug output to verify module configuration
+    system.build.nmblDebugInfo = pkgs.writeText "nmbl-debug-info" ''
+      NMBL Bootloader Configuration Debug Info
+      ========================================
+
+      Filesystems to mount (neededForBoot):
+      ${lib.concatMapStringsSep "\n" (
+        fs: "  - ${fs.mountPoint}: ${fs.fsType} (${fs.device or "no device"})"
+      ) nmblFileSystems}
+
+      boot.initrd.supportedFilesystems:
+      ${lib.concatStringsSep "\n" (
+        lib.mapAttrsToList (
+          fsType: enabled: "  - ${fsType}: ${if enabled then "true" else "false"}"
+        ) config.boot.initrd.supportedFilesystems
+      )}
+
+      Kernel modules to load explicitly:
+      ${lib.concatMapStringsSep "\n" (mod: "  - ${mod}") kernelModulesManager.explicitKernelModules}
+
+      All kernel modules in initramfs (available):
+      ${lib.concatMapStringsSep "\n" (mod: "  - ${mod}") kernelModulesManager.allKernelModules}
+
+      Modules from config.boot.initrd.kernelModules:
+      ${lib.concatMapStringsSep "\n" (mod: "  - ${mod}") config.boot.initrd.kernelModules}
+
+      Modules from config.boot.initrd.availableKernelModules:
+      ${lib.concatMapStringsSep "\n" (mod: "  - ${mod}") config.boot.initrd.availableKernelModules}
+
+      Blacklisted modules:
+      ${lib.concatMapStringsSep "\n" (mod: "  - ${mod}") cfg.blacklistedKernelModules}
+    '';
 
     # Generate bootloader configuration based on boot mode
     system.build.nmblBootConfig =
@@ -243,6 +246,19 @@ in
     # NMBL supports initrd secrets since it has an initramfs
     boot.loader.supportsInitrdSecrets = true;
 
+    # Populate boot.initrd.supportedFilesystems using the same logic as stage-1.nix
+    # This triggers filesystem-specific modules (vfat.nix, ext.nix, etc.) to add their
+    # kernel modules to boot.initrd.availableKernelModules and boot.initrd.kernelModules
+    # which we then include in our bootloader's initramfs
+    #
+    # stage-1.nix does: boot.initrd.supportedFilesystems = map (fs: fs.fsType) fileSystems;
+    # where fileSystems = filter utils.fsNeededForBoot config.system.build.fileSystems;
+    #
+    # We do the same but convert the list to an attrset as expected by filesystem modules
+    boot.initrd.supportedFilesystems = lib.mkOptionDefault (
+      lib.listToAttrs (map (fs: lib.nameValuePair fs.fsType true) nmblFileSystems)
+    );
+
     # Hook for NixOS to install NMBL bootloader during VM builds and system installations
     system.build.installBootLoader = import ./install-bootloader.nix {
       inherit
@@ -255,111 +271,13 @@ in
         ;
     };
 
-    # Custom installation script
-    system.build.installNmbl = pkgs.writeShellScriptBin "install-nmbl" ''
-      set -e
+    # Custom installation script (imported from module)
+    system.build.installNmbl = installScriptModule.installNmbl;
 
-      DEVICE=$1
-      if [ -z "$DEVICE" ]; then
-        echo "Usage: install-nmbl <device>"
-        echo "Example: install-nmbl /dev/sda"
-        exit 1
-      fi
-
-      KERNEL="${config.system.build.nmblKernel}/bzImage"
-      INITRD="${config.system.build.nmblInitramfs}/initrd"
-      KERNEL_PARAMS="${lib.concatStringsSep " " cfg.kernelParams}"
-
-      ${lib.optionalString (bootstrapper.bootMode == "bios" && actualLoader == "grub") ''
-        echo "Installing GPT+BIOS bootloader..."
-        # Install GRUB for GPT+BIOS
-        ${pkgs.grub2}/bin/grub-install --target=i386-pc $DEVICE
-
-        # Create GRUB config
-        cat > /boot/grub/grub.cfg << EOF
-        set timeout=${toString actualLoaderExtraArgs.timeout}
-        ${actualLoaderExtraArgs.extraConfig}
-        menuentry "NMBL" {
-          linux /nmbl-kernel $KERNEL_PARAMS
-          initrd /nmbl-initrd
-        }
-        ${actualLoaderExtraArgs.extraEntries}
-        EOF
-
-        cp $KERNEL /boot/nmbl-kernel
-        cp $INITRD /boot/nmbl-initrd
-      ''}
-
-      ${lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "grub") ''
-        echo "Installing GPT+UEFI bootloader with GRUB..."
-        mkdir -p /boot/EFI/BOOT /boot/grub
-
-        # Create GRUB config
-        cat > /boot/grub/grub.cfg << EOF
-        set timeout=${toString actualLoaderExtraArgs.timeout}
-        ${actualLoaderExtraArgs.extraConfig}
-        menuentry "NMBL" {
-          linux /nmbl-kernel $KERNEL_PARAMS
-          initrd /nmbl-initrd
-        }
-        ${actualLoaderExtraArgs.extraEntries}
-        EOF
-
-        # Install GRUB EFI
-        ${pkgs.grub2_efi}/bin/grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=NMBL \
-          ${lib.optionalString (!actualLoaderExtraArgs.canTouchEfiVariables) "--no-nvram"} \
-          ${lib.optionalString actualLoaderExtraArgs.efiInstallAsRemovable "--removable"}
-
-        # Copy to fallback location if needed
-        if [ -f /boot/EFI/NMBL/grubx64.efi ] && [ "${toString actualLoaderExtraArgs.efiInstallAsRemovable}" != "true" ]; then
-          cp /boot/EFI/NMBL/grubx64.efi /boot/EFI/BOOT/BOOTX64.EFI
-        fi
-
-        cp $KERNEL /boot/nmbl-kernel
-        cp $INITRD /boot/nmbl-initrd
-      ''}
-
-      ${lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "systemd") ''
-        echo "Installing GPT+UEFI bootloader with systemd-boot..."
-        mkdir -p /boot/EFI/BOOT /boot/loader/entries
-
-        # Create systemd-boot loader config
-        cat > /boot/loader/loader.conf << EOF
-        default nmbl.conf
-        timeout ${toString actualLoaderExtraArgs.timeout}
-        console-mode max
-        editor no
-        ${actualLoaderExtraArgs.extraConfig}
-        EOF
-
-        # Create boot entry
-        cat > /boot/loader/entries/nmbl.conf << EOF
-        title NMBL Bootloader
-        linux /nmbl-kernel
-        initrd /nmbl-initrd
-        options $KERNEL_PARAMS
-        EOF
-
-        # Install systemd-boot
-        ${pkgs.systemd}/bin/bootctl install --esp-path=/boot \
-          ${lib.optionalString (!actualLoaderExtraArgs.canTouchEfiVariables) "--no-variables"}
-
-        # Copy to fallback location
-        if [ -f /boot/EFI/systemd/systemd-bootx64.efi ]; then
-          cp /boot/EFI/systemd/systemd-bootx64.efi /boot/EFI/BOOT/BOOTX64.EFI
-        fi
-
-        cp $KERNEL /boot/nmbl-kernel
-        cp $INITRD /boot/nmbl-initrd
-      ''}
-
-      echo "NMBL bootloader installed successfully!"
-    '';
-
-    # Add kexec-tools to system packages
+    # Add kexec-tools and install-nmbl to system packages
     environment.systemPackages = [
       pkgs.kexec-tools
-      config.system.build.installNmbl
+      installScriptModule.installNmbl
     ];
   };
 }

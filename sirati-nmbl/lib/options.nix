@@ -187,7 +187,7 @@
       '';
     };
 
-    extraKernelModules = lib.mkOption {
+    kernelModules = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
       example = [
@@ -196,12 +196,27 @@
         "sd_mod"
       ];
       description = lib.mdDoc ''
-        Additional kernel modules to include in the bootloader initramfs.
-        These are added to availableKernelModules and the modules inherited
-        from your system configuration (boot.initrd.availableKernelModules).
+        Kernel modules to load explicitly in the bootloader initramfs.
+        These are added to boot.initrd.kernelModules from your system configuration.
+        The bootloader will also include all modules from boot.initrd.availableKernelModules
+        in the initramfs (available but not loaded explicitly).
         Include modules needed for:
         - Your filesystem (ext4, btrfs, xfs, etc.)
         - Your storage controller (ahci, nvme, virtio_blk, etc.)
+      '';
+    };
+
+    blacklistedKernelModules = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [
+        "nouveau"
+        "i915"
+      ];
+      description = lib.mdDoc ''
+        List of kernel modules to blacklist in the bootloader initramfs.
+        These modules will not be loaded even if requested.
+        Useful for preventing problematic drivers from loading during boot.
       '';
     };
 
@@ -251,6 +266,34 @@
         Serial console configuration for input/output.
         Useful for headless systems or virtual machines.
         Format: device,baudrate (e.g., ttyS0,115200)
+      '';
+    };
+
+    verbose = lib.mkOption {
+      type = lib.types.nullOr lib.types.bool;
+      default = null;
+      description = lib.mdDoc ''
+        Whether to show verbose messages during NMBL boot.
+        When null (default), inherits the value from boot.initrd.verbose.
+        Set to true for verbose output, false for silent boot (only critical messages will be shown).
+      '';
+    };
+
+    ignoreMissingDiskModules = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = lib.mdDoc ''
+        Whether to skip validation for missing storage driver kernel modules.
+
+        NMBL validates that required storage drivers (like virtio_blk for /dev/vda*,
+        nvme for NVMe drives, etc.) are available in boot.initrd.kernelModules or
+        boot.initrd.availableKernelModules. This prevents boot failures where devices
+        don't appear because drivers weren't loaded.
+
+        Set to true to disable this validation if you know what you're doing or are
+        using a custom kernel with built-in drivers.
+
+        Default: false (validation enabled for safety)
       '';
     };
   };
