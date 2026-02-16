@@ -42,19 +42,15 @@
   # Countdown with visual feedback
   TIMEOUT=${toString cfg.timeoutSeconds}
   while [ $TIMEOUT -gt 0 ]; do
-    echo -n "NMBL: Booting in $TIMEOUT... "
+    echo "NMBL: Booting in $TIMEOUT..."
 
-    # Try to read input with 1 second timeout
-    # If user presses a key, drop to shell
-    if ${pkgs.busybox}/bin/timeout -t 1 ${pkgs.busybox}/bin/dd bs=1 count=1 2>/dev/null; then
-      echo ""
-      echo "NMBL: User interrupt detected - dropping to emergency shell"
-      exec ${pkgs.busybox}/bin/sh
-    fi
+    # Sleep for 1 second
+    ${pkgs.busybox}/bin/sleep 1
 
-    echo ""
     TIMEOUT=$((TIMEOUT - 1))
   done
+
+  echo ""
 
   # Read first line from generations file
   SELECTED_LINE=$(${pkgs.busybox}/bin/head -n 1 /tmp/generations.txt)

@@ -88,6 +88,7 @@
 
       # Test runner apps
       # Run with: nix run .#test-mbr-serial-direct
+      # Run with: nix run .#test-mbr-serial-direct -- --debug-shell  (drops to emergency shell)
       # Run with: nix run .#test-gpt-uefi-direct
       # Run with: nix run .#test-gpt-uefi-uefi
       apps.${system} = testApps;

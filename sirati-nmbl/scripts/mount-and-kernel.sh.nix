@@ -26,8 +26,12 @@ let
     device = if fs.device != null then fs.device else "/dev/disk/by-label/${escape fs.label}";
     fsType = fs.fsType;
     options = builtins.concatStringsSep "," (
-      # Force read-only for bootloader safety, filter out systemd options
-      lib.unique (filterMountOptions fs.options ++ [ "ro" ])
+      # Mount /boot read-write so NMBL can write bootloader files
+      # Mount other filesystems read-only for safety
+      lib.unique (
+        filterMountOptions fs.options
+        ++ (if fs.mountPoint == "/boot" || fs.mountPoint == "/efi" then [ "rw" ] else [ "ro" ])
+      )
     );
   };
 

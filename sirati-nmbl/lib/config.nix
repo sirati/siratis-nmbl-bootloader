@@ -12,8 +12,12 @@
 let
   cfg = config.boot.nmbl;
 
-  # Get filesystems needed for boot (same logic as stage-1)
+  # Get filesystems needed for boot
+  # This includes filesystems marked with neededForBoot = true and those in critical paths
   fileSystems = builtins.filter utils.fsNeededForBoot (builtins.attrValues config.fileSystems);
+
+  # All filesystems that NMBL needs to mount
+  nmblFileSystems = fileSystems;
 
   # Automatically inherit kernel modules from system's initrd configuration
   # These are the modules the system already knows it needs for boot
@@ -44,19 +48,66 @@ let
       lib
       pkgs
       cfg
-      fileSystems
       utils
       ;
+    fileSystems = nmblFileSystems;
     kernelModules = allKernelModules;
   };
 
 in
 {
   config = lib.mkIf cfg.enable {
+    # Mark boot partition as neededForBoot to ensure:
+    # 1. Proper kernel modules are included (vfat, nls_cp437, nls_iso8859-1)
+    # 2. Boot partition is treated as boot-critical by the system
+    # 3. x-initrd.mount option is automatically added
+    # Use mkOverride with priority 1000 (higher than default 1500) to ensure boot partition is marked as needed
+    # This ensures vfat kernel modules are automatically included in the system initrd
+    fileSystems."/boot".neededForBoot = lib.mkOverride 1000 true;
+
+    # Assertions to verify boot configuration
+    assertions = [
+      {
+        assertion =
+          cfg.bootMode == "mbr"
+          || cfg.bootMode == "gpt-bios"
+          || cfg.bootMode == "gpt-uefi"
+          || cfg.bootMode == "hybrid";
+        message = "boot.nmbl.bootMode must be one of: mbr, gpt-bios, gpt-uefi, hybrid";
+      }
+      {
+        assertion =
+          config.fileSystems ? "/boot" || (cfg.bootMode == "gpt-uefi" && config.fileSystems ? "/efi");
+        message = ''
+          NMBL requires a separate boot partition.
+          For UEFI boot (gpt-uefi), declare fileSystems."/boot" or fileSystems."/efi" with fsType = "vfat".
+          For legacy boot (mbr, gpt-bios, hybrid), declare fileSystems."/boot" with fsType = "vfat".
+
+          Example:
+            fileSystems."/boot" = {
+              device = "/dev/sda1";  # or /dev/vda1 for VirtIO
+              fsType = "vfat";
+            };
+        '';
+      }
+      {
+        assertion =
+          let
+            bootFS =
+              if config.fileSystems ? "/boot" then
+                config.fileSystems."/boot"
+              else if config.fileSystems ? "/efi" then
+                config.fileSystems."/efi"
+              else
+                null;
+          in
+          bootFS != null -> bootFS.fsType == "vfat";
+        message = "NMBL boot partition must be FAT32 (fsType = \"vfat\")";
+      }
+    ];
     # Build the minimal initramfs
     system.build.nmblInitramfs =
       let
-        kernel = cfg.kernelPackage;
         initScript = buildInitScript;
 
         # Build minimal initramfs with only essential tools

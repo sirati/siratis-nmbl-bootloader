@@ -84,6 +84,31 @@ let
     pkgs.writeShellScript "run-${name}-direct" ''
       set -e
 
+      # Parse arguments
+      DEBUG_SHELL=false
+      while [[ $# -gt 0 ]]; do
+        case $1 in
+          --debug-shell)
+            DEBUG_SHELL=true
+            shift
+            ;;
+          *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--debug-shell]"
+            echo "  --debug-shell: Boot into emergency shell before kexec"
+            exit 1
+            ;;
+        esac
+      done
+
+      # Build kernel arguments
+      KERNEL_ARGS="console=ttyS0,115200 earlyprintk=serial,ttyS0,115200"
+      if [ "$DEBUG_SHELL" = "true" ]; then
+        KERNEL_ARGS="$KERNEL_ARGS nmbl.shell"
+        echo "DEBUG MODE: Will drop to emergency shell before kexec"
+        echo
+      fi
+
       echo "=== NMBL Direct Kernel Boot Test: ${name} ==="
       echo
 
@@ -135,7 +160,7 @@ let
 
       ${startVMAndWait {
         inherit name vmSerialMan;
-        screenCommand = "${vmSerialMan}/bin/vm-serial-man manager-direct-kernel --name \"${name}-direct\" --disk \"${diskName}\" --kernel \"$WORK_DIR/kernel\" --initrd \"$WORK_DIR/initrd\" --kernel-args \"console=ttyS0,115200 earlyprintk=serial,ttyS0,115200\" --memory 2048 --cores 4";
+        screenCommand = "${vmSerialMan}/bin/vm-serial-man manager-direct-kernel --name \"${name}-direct\" --disk \"${diskName}\" --kernel \"$WORK_DIR/kernel\" --initrd \"$WORK_DIR/initrd\" --kernel-args \"$KERNEL_ARGS\" --memory 2048 --cores 4";
         sessionName = "${name}-direct";
       }}
     '';
@@ -149,6 +174,7 @@ let
       vmSerialMan,
     }:
     let
+      vmDiskImage = config.config.system.build.vmDiskImage;
       testArtifacts = config.config.system.build.testArtifacts;
     in
     pkgs.writeShellScript "run-${name}-uefi" ''
@@ -157,11 +183,17 @@ let
       echo "=== NMBL UEFI Boot Test: ${name} ==="
       echo
 
+      # Use pre-built VM disk image from NixOS configuration
       if [ ! -f "${diskName}" ]; then
-        echo "Error: Disk image ${diskName} not found"
-        echo "Run the direct kernel boot test first to create it"
-        exit 1
+        echo "Copying VM disk image from Nix store..."
+        echo "Source: ${vmDiskImage}"
+        cp "${vmDiskImage}/nixos.qcow2" "${diskName}"
+        chmod 644 "${diskName}"
+        echo "✓ Disk image copied successfully"
+      else
+        echo "✓ Using existing disk: ${diskName}"
       fi
+      echo
 
       WORK_DIR="$PWD/.nmbl-test-${name}"
       mkdir -p "$WORK_DIR"
@@ -205,4 +237,3 @@ in
 {
   inherit mkDirectKernelRunner mkUefiRunner;
 }
-

@@ -15,16 +15,6 @@ let
     {
       name,
       bootMode,
-      diskLayout ? {
-        boot = {
-          size = "200M";
-          fsType = "vfat";
-        };
-        root = {
-          size = "5G";
-          fsType = "ext4";
-        };
-      },
     }:
     let
       # Base NixOS system configuration
@@ -32,6 +22,8 @@ let
         inherit system;
         modules = [
           self.nixosModules.default
+          # Use NixOS QEMU guest profile for automatic VirtIO module detection
+          "${nixpkgs}/nixos/modules/profiles/qemu-guest.nix"
           {
             # Use NMBL bootloader
             boot.nmbl = {
@@ -39,19 +31,10 @@ let
               inherit bootMode;
               kernelPackage = pkgs.linux_6_6;
 
-              kernelModules = [
-                "ext4"
-                "vfat"
-                "virtio_blk"
-                "virtio_pci"
-                "virtio_net"
-                "ata_piix"
-                "ahci"
-                "sd_mod"
-                "crc32c"
-                "crc32c_generic"
-                "crc32c_intel"
-              ];
+              # Don't manually specify modules - they are inherited from
+              # boot.initrd.availableKernelModules automatically based on
+              # filesystem declarations
+              kernelModules = [ ];
 
               mountPrefix = "/mnt";
               kernelParams = [
@@ -69,12 +52,26 @@ let
               "loglevel=7"
             ];
 
+            # WORKAROUND: crc32c is required by ext4 but not automatically included by NixOS's ext.nix module
+            # This is needed for the system's initrd (after kexec) to mount the root filesystem
+            # See: https://github.com/NixOS/nixpkgs/blob/master/nixos/modules/tasks/filesystems/ext.nix
+            # The module only adds "ext2" and "ext4" but ext4 depends on crc32c at runtime
+            boot.initrd.availableKernelModules = [ "crc32c" ];
+
             boot.loader.grub.enable = false;
             boot.loader.systemd-boot.enable = false;
 
-            fileSystems."/" = {
+            # Filesystem configuration
+            # MBR (legacy+boot): vda1 = FAT32 boot, vda2 = ext4 root
+            # GPT (hybrid): vda1 = FAT32 ESP, vda2 = BIOS boot partition, vda3 = ext4 root
+            fileSystems."/boot" = {
               device = "/dev/vda1";
-              fsType = diskLayout.root.fsType;
+              fsType = "vfat";
+            };
+
+            fileSystems."/" = {
+              device = if bootMode == "mbr" then "/dev/vda2" else "/dev/vda3";
+              fsType = "ext4";
             };
 
             environment.defaultPackages = [ ];
@@ -107,7 +104,12 @@ let
         name = "${name}-disk-image";
 
         # Partition layout for VirtIO disk (/dev/vda)
-        partitionTableType = if bootMode == "mbr" then "legacy" else "hybrid";
+        # legacy+boot: FAT32 boot partition + ext4 root partition (MBR)
+        # hybrid: FAT32 ESP + ext4 root partition (GPT with BIOS compat)
+        partitionTableType = if bootMode == "mbr" then "legacy+boot" else "hybrid";
+
+        # Size of the boot partition
+        bootSize = "512M";
 
         # Install the bootloader and system
         installBootLoader = true;
