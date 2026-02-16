@@ -15,6 +15,7 @@ let
     {
       name,
       bootMode,
+      uefiBootloader ? "grub",
     }:
     let
       # Base NixOS system configuration
@@ -28,7 +29,7 @@ let
             # Use NMBL bootloader
             boot.nmbl = {
               enable = true;
-              inherit bootMode;
+              inherit bootMode uefiBootloader;
               kernelPackage = pkgs.linux_6_6;
 
               # Don't manually specify modules - they are inherited from

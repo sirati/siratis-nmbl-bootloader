@@ -22,6 +22,21 @@
       '';
     };
 
+    uefiBootloader = lib.mkOption {
+      type = lib.types.enum [
+        "grub"
+        "systemd-boot"
+        "efi-stub"
+      ];
+      default = "grub";
+      description = lib.mdDoc ''
+        UEFI bootloader type (only used when bootMode is "gpt-uefi").
+        - grub: GRUB bootloader for UEFI
+        - systemd-boot: systemd-boot (formerly gummiboot)
+        - efi-stub: Direct EFI stub - kernel is invoked directly by UEFI firmware
+      '';
+    };
+
     kernelPackage = lib.mkOption {
       type = lib.types.package;
       default = pkgs.linux_6_6;

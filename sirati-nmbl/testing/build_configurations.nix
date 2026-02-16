@@ -20,16 +20,27 @@ let
       bootMode = "gpt-bios";
     };
 
-    test-gpt-uefi = {
-      name = "test-gpt-uefi";
+    test-gpt-uefi-grub = {
+      name = "test-gpt-uefi-grub";
       bootMode = "gpt-uefi";
+      uefiBootloader = "grub";
+    };
+
+    test-gpt-uefi-systemd = {
+      name = "test-gpt-uefi-systemd";
+      bootMode = "gpt-uefi";
+      uefiBootloader = "systemd-boot";
+    };
+
+    test-gpt-uefi-efi = {
+      name = "test-gpt-uefi-efi";
+      bootMode = "gpt-uefi";
+      uefiBootloader = "efi-stub";
     };
   };
 
   # Build VM configurations
-  mkTestConfigurations = builtins.mapAttrs
-    (name: cfg: vmConfig.mkTestVM cfg)
-    configs;
+  mkTestConfigurations = builtins.mapAttrs (name: cfg: vmConfig.mkTestVM cfg) configs;
 
 in
 {

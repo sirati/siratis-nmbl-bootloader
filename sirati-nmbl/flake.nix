@@ -37,7 +37,7 @@
               let
                 config = testing.mkTestConfigurations.${name};
                 directApp = {
-                  name = "test-${name}-direct";
+                  name = "${name}-direct";
                   value = {
                     type = "app";
                     program = "${testRunners.mkDirectKernelRunner {
@@ -45,11 +45,27 @@
                     }}";
                   };
                 };
+                biosApp =
+                  if cfg.bootMode == "mbr" || cfg.bootMode == "gpt-bios" then
+                    [
+                      {
+                        name = "${name}";
+                        value = {
+                          type = "app";
+                          program = "${testRunners.mkRunner {
+                            inherit name config vmSerialMan;
+                            bootMode = cfg.bootMode;
+                          }}";
+                        };
+                      }
+                    ]
+                  else
+                    [ ];
                 uefiApp =
                   if cfg.bootMode == "gpt-uefi" then
                     [
                       {
-                        name = "test-${name}-uefi";
+                        name = "${name}";
                         value = {
                           type = "app";
                           program = "${testRunners.mkUefiRunner {
@@ -61,7 +77,7 @@
                   else
                     [ ];
               in
-              [ directApp ] ++ uefiApp
+              [ directApp ] ++ biosApp ++ uefiApp
             ) testing.configs
           )
         )
@@ -89,8 +105,15 @@
       # Test runner apps
       # Run with: nix run .#test-mbr-serial-direct
       # Run with: nix run .#test-mbr-serial-direct -- --debug-shell  (drops to emergency shell)
-      # Run with: nix run .#test-gpt-uefi-direct
-      # Run with: nix run .#test-gpt-uefi-uefi
+      # Run with: nix run .#test-mbr-serial
+      # Run with: nix run .#test-gpt-bios-direct
+      # Run with: nix run .#test-gpt-bios
+      # Run with: nix run .#test-gpt-uefi-grub-direct
+      # Run with: nix run .#test-gpt-uefi-grub
+      # Run with: nix run .#test-gpt-uefi-systemd-direct
+      # Run with: nix run .#test-gpt-uefi-systemd
+      # Run with: nix run .#test-gpt-uefi-efi-direct
+      # Run with: nix run .#test-gpt-uefi-efi
       apps.${system} = testApps;
     };
 }

@@ -109,7 +109,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
         fi
   ''}
 
-  ${lib.optionalString (cfg.bootMode == "gpt-uefi") ''
+  ${lib.optionalString (cfg.bootMode == "gpt-uefi" && cfg.uefiBootloader == "grub") ''
         echo "Configuring GPT+UEFI bootloader with GRUB..."
         mkdir -p /boot/EFI/BOOT /boot/grub
 
@@ -143,6 +143,70 @@ pkgs.writeScript "install-nmbl-bootloader" ''
 
           echo "✓ GRUB EFI bootloader installed"
         fi
+  ''}
+
+  ${lib.optionalString (cfg.bootMode == "gpt-uefi" && cfg.uefiBootloader == "systemd-boot") ''
+        echo "Configuring GPT+UEFI bootloader with systemd-boot..."
+        mkdir -p /boot/EFI/BOOT /boot/loader/entries
+
+        # Create systemd-boot loader config
+        cat > /boot/loader/loader.conf << EOF
+    default nmbl.conf
+    timeout 0
+    console-mode max
+    editor no
+    EOF
+
+        # Create boot entry
+        cat > /boot/loader/entries/nmbl.conf << EOF
+    title NMBL Bootloader
+    linux /nmbl-kernel
+    initrd /nmbl-initrd
+    options $KERNEL_PARAMS
+    EOF
+
+        # Install systemd-boot if device exists
+        if [ -b /dev/vda ]; then
+          echo "Installing systemd-boot to /boot ESP..."
+          ${pkgs.systemd}/bin/bootctl install --esp-path=/boot --no-variables || true
+
+          # Copy systemd-boot to fallback location for UEFI firmware boot
+          if [ -f /boot/EFI/systemd/systemd-bootx64.efi ]; then
+            echo "Copying systemd-boot to fallback location /EFI/BOOT/BOOTX64.EFI..."
+            cp /boot/EFI/systemd/systemd-bootx64.efi /boot/EFI/BOOT/BOOTX64.EFI
+            echo "✓ systemd-boot fallback bootloader installed"
+          else
+            echo "WARNING: systemd-boot EFI binary not found"
+          fi
+
+          echo "✓ systemd-boot bootloader installed"
+        fi
+  ''}
+
+  ${lib.optionalString (cfg.bootMode == "gpt-uefi" && cfg.uefiBootloader == "efi-stub") ''
+        echo "Configuring GPT+UEFI with EFI stub (direct kernel boot)..."
+        mkdir -p /boot/EFI/BOOT
+
+        # For EFI stub, we need to create a unified kernel image with embedded initrd and cmdline
+        # Or simply copy the kernel as BOOTX64.EFI and rely on UEFI to pass parameters
+        echo "Creating EFI stub boot entry..."
+
+        # Copy kernel directly as the EFI bootloader
+        # Note: This requires the kernel to be built with CONFIG_EFI_STUB=y
+        echo "Copying kernel with EFI stub to /EFI/BOOT/BOOTX64.EFI..."
+        cp -f /boot/nmbl-kernel /boot/EFI/BOOT/BOOTX64.EFI
+
+        # For EFI stub boot, we need the initrd in a specific location
+        # Some UEFI implementations look for initrd.img in the same directory
+        cp -f /boot/nmbl-initrd /boot/EFI/BOOT/initrd.img
+
+        # Create a startup.nsh script for automatic boot
+        cat > /boot/startup.nsh << EOF
+    \EFI\BOOT\BOOTX64.EFI initrd=\EFI\BOOT\initrd.img $KERNEL_PARAMS
+    EOF
+
+        echo "✓ EFI stub bootloader configured"
+        echo "Note: EFI stub requires kernel built with CONFIG_EFI_STUB=y"
   ''}
 
   # Create /init symlink for NixOS stage-1

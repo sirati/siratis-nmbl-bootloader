@@ -67,173 +67,225 @@ let
       echo "Run 'vm-serial-man status' to check"
     '';
 
-  # Build a direct kernel boot test runner
+  # Build a unified test runner that supports BIOS, UEFI, and direct kernel boot
+  mkRunner =
+    {
+      name,
+      config,
+      vmSerialMan,
+      bootMode, # "mbr", "gpt-bios", "gpt-uefi", or "direct-kernel"
+    }:
+    let
+      vmDiskImage = config.config.system.build.vmDiskImage;
+      testArtifacts = config.config.system.build.testArtifacts;
+      diskName = "${name}.qcow2";
+
+      # Only needed for direct kernel boot
+      kernel = if bootMode == "direct-kernel" then config.config.system.build.nmblKernel else null;
+      initrd = if bootMode == "direct-kernel" then config.config.system.build.nmblInitramfs else null;
+
+      # Determine firmware type based on bootMode
+      isBios = bootMode == "mbr" || bootMode == "gpt-bios";
+      isUefi = bootMode == "gpt-uefi";
+      isDirectKernel = bootMode == "direct-kernel";
+
+      bootModeLabel =
+        if isDirectKernel then
+          "Direct Kernel"
+        else if isBios then
+          "BIOS"
+        else if isUefi then
+          "UEFI"
+        else
+          "Unknown";
+    in
+    pkgs.writeShellScript "run-${name}" ''
+      set -e
+
+      ${
+        if isDirectKernel then
+          ''
+            # Parse arguments (only for direct kernel boot)
+            DEBUG_SHELL=false
+            while [[ $# -gt 0 ]]; do
+              case $1 in
+                --debug-shell)
+                  DEBUG_SHELL=true
+                  shift
+                  ;;
+                *)
+                  echo "Unknown option: $1"
+                  echo "Usage: $0 [--debug-shell]"
+                  echo "  --debug-shell: Boot into emergency shell before kexec"
+                  exit 1
+                  ;;
+              esac
+            done
+
+            # Build kernel arguments
+            KERNEL_ARGS="console=ttyS0,115200 earlyprintk=serial,ttyS0,115200"
+            if [ "$DEBUG_SHELL" = "true" ]; then
+              KERNEL_ARGS="$KERNEL_ARGS nmbl.shell"
+              echo "DEBUG MODE: Will drop to emergency shell before kexec"
+              echo
+            fi
+          ''
+        else
+          ""
+      }
+
+      echo "=== NMBL ${bootModeLabel} Boot Test: ${name} ==="
+      echo
+
+      WORK_DIR="$PWD/.nmbl-test-${name}"
+      mkdir -p "$WORK_DIR"
+
+      ${
+        if isDirectKernel then
+          ''
+            # Link kernel and initrd
+            echo "[1/4] Preparing kernel and initrd..."
+            ln -sf ${kernel}/bzImage "$WORK_DIR/kernel"
+            ln -sf ${initrd}/initrd "$WORK_DIR/initrd"
+            echo "✓ Kernel: $(du -h "$WORK_DIR/kernel" | cut -f1)"
+            echo "✓ Initrd: $(du -h "$WORK_DIR/initrd" | cut -f1)"
+
+            # Use pre-built VM disk image from NixOS configuration
+            echo "[2/4] Preparing disk image..."
+          ''
+        else
+          ''
+            # Use pre-built VM disk image from NixOS configuration
+            echo "[1/3] Preparing disk image..."
+          ''
+      }
+      if [ ! -f "${diskName}" ]; then
+        echo "Copying VM disk image from Nix store..."
+        echo "Source: ${vmDiskImage}"
+        cp "${vmDiskImage}/nixos.qcow2" "${diskName}"
+        chmod 644 "${diskName}"
+        echo "✓ Disk image copied successfully"
+      else
+        echo "✓ Using existing disk: ${diskName}"
+      fi
+      echo
+
+      # Create convenience link to vm-serial-man
+      ${
+        if isDirectKernel then
+          ''echo "[3/4] Linking vm-serial-man..."''
+        else
+          ''echo "[2/3] Linking vm-serial-man..."''
+      }
+      ln -sf ${vmSerialMan}/bin/vm-serial-man "$WORK_DIR/vm-serial-man"
+      echo "✓ vm-serial-man available at: $WORK_DIR/vm-serial-man"
+
+      ${
+        if isUefi then
+          ''
+            # Find OVMF
+            OVMF_CODE="${pkgs.OVMF.fd}/FV/OVMF_CODE.fd"
+            OVMF_VARS="${name}_OVMF_VARS.fd"
+
+            if [ ! -f "$OVMF_VARS" ]; then
+              echo "Creating OVMF_VARS..."
+              cp "${pkgs.OVMF.fd}/FV/OVMF_VARS.fd" "$OVMF_VARS"
+              chmod 644 "$OVMF_VARS"
+            fi
+          ''
+        else
+          ""
+      }
+
+      echo
+      echo "Test artifacts:"
+      ${
+        if isDirectKernel then
+          ''
+            echo "  Kernel:        $WORK_DIR/kernel"
+            echo "  Initrd:        $WORK_DIR/initrd"
+          ''
+        else
+          ""
+      }
+      echo "  Disk:          ${diskName}"
+      ${
+        if isUefi then
+          ''
+            echo "  OVMF Code:     $OVMF_CODE"
+            echo "  OVMF Vars:     $OVMF_VARS"
+          ''
+        else
+          ""
+      }
+      echo "  VM Manager:    $WORK_DIR/vm-serial-man"
+      echo "  All artifacts: ${testArtifacts}"
+      echo
+
+      # Launch VM in screen
+      ${
+        if isDirectKernel then
+          ''echo "[4/4] Starting VM with vm-serial-man in screen session..."''
+        else
+          ''echo "[3/3] Starting VM with vm-serial-man in screen session..."''
+      }
+      echo
+      echo "VM will boot with ${bootModeLabel} boot mode"
+      echo "Manager running in screen session '${name}'"
+      echo "Use 'vm-serial-man send <command>' to interact"
+      echo "Use 'screen -r ${name}' to attach to VM console"
+      echo
+
+      ${
+        if isDirectKernel then
+          startVMAndWait {
+            inherit name vmSerialMan;
+            screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}\" --disk \"${diskName}\" --memory 2048 --cores 4 direct-kernel --kernel \"$WORK_DIR/kernel\" --initrd \"$WORK_DIR/initrd\" --kernel-args \"$KERNEL_ARGS\"";
+            sessionName = name;
+          }
+        else if isUefi then
+          startVMAndWait {
+            inherit name vmSerialMan;
+            screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}\" --disk \"${diskName}\" --memory 2048 --cores 4 uefi --ovmf-code \"$OVMF_CODE\" --ovmf-vars \"$OVMF_VARS\"";
+            sessionName = name;
+          }
+        else if isBios then
+          startVMAndWait {
+            inherit name vmSerialMan;
+            screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}\" --disk \"${diskName}\" --memory 2048 --cores 4 bios";
+            sessionName = name;
+          }
+        else
+          throw "Unknown boot mode: ${bootMode}"
+      }
+    '';
+
+  # Backwards compatibility: direct kernel boot runner
   mkDirectKernelRunner =
     {
       name,
       config,
       vmSerialMan,
     }:
-    let
-      kernel = config.config.system.build.nmblKernel;
-      initrd = config.config.system.build.nmblInitramfs;
-      vmDiskImage = config.config.system.build.vmDiskImage;
-      testArtifacts = config.config.system.build.testArtifacts;
-      diskName = "${name}.qcow2";
-    in
-    pkgs.writeShellScript "run-${name}-direct" ''
-      set -e
+    mkRunner {
+      inherit name config vmSerialMan;
+      bootMode = "direct-kernel";
+    };
 
-      # Parse arguments
-      DEBUG_SHELL=false
-      while [[ $# -gt 0 ]]; do
-        case $1 in
-          --debug-shell)
-            DEBUG_SHELL=true
-            shift
-            ;;
-          *)
-            echo "Unknown option: $1"
-            echo "Usage: $0 [--debug-shell]"
-            echo "  --debug-shell: Boot into emergency shell before kexec"
-            exit 1
-            ;;
-        esac
-      done
-
-      # Build kernel arguments
-      KERNEL_ARGS="console=ttyS0,115200 earlyprintk=serial,ttyS0,115200"
-      if [ "$DEBUG_SHELL" = "true" ]; then
-        KERNEL_ARGS="$KERNEL_ARGS nmbl.shell"
-        echo "DEBUG MODE: Will drop to emergency shell before kexec"
-        echo
-      fi
-
-      echo "=== NMBL Direct Kernel Boot Test: ${name} ==="
-      echo
-
-      WORK_DIR="$PWD/.nmbl-test-${name}"
-      mkdir -p "$WORK_DIR"
-
-      # Link kernel and initrd
-      echo "[1/4] Preparing kernel and initrd..."
-      ln -sf ${kernel}/bzImage "$WORK_DIR/kernel"
-      ln -sf ${initrd}/initrd "$WORK_DIR/initrd"
-      echo "✓ Kernel: $(du -h "$WORK_DIR/kernel" | cut -f1)"
-      echo "✓ Initrd: $(du -h "$WORK_DIR/initrd" | cut -f1)"
-
-      # Use pre-built VM disk image from NixOS configuration
-      echo "[2/4] Preparing disk image..."
-      if [ ! -f "${diskName}" ]; then
-        echo "Copying VM disk image from Nix store..."
-        echo "Source: ${vmDiskImage}"
-        cp "${vmDiskImage}/nixos.qcow2" "${diskName}"
-        chmod 644 "${diskName}"
-        echo "✓ Disk image copied successfully"
-      else
-        echo "✓ Using existing disk: ${diskName}"
-      fi
-
-      # Create convenience link to vm-serial-man
-      echo "[3/4] Linking vm-serial-man..."
-      ln -sf ${vmSerialMan}/bin/vm-serial-man "$WORK_DIR/vm-serial-man"
-      echo "✓ vm-serial-man available at: $WORK_DIR/vm-serial-man"
-
-      # All test artifacts available at: ${testArtifacts}
-      echo
-      echo "Test artifacts:"
-      echo "  Kernel:        $WORK_DIR/kernel"
-      echo "  Initrd:        $WORK_DIR/initrd"
-      echo "  Disk:          ${diskName}"
-      echo "  VM Manager:    $WORK_DIR/vm-serial-man"
-      echo "  All artifacts: ${testArtifacts}"
-      echo
-
-      # Launch VM in screen
-      echo "[4/4] Starting VM with vm-serial-man in screen session..."
-      echo
-      echo "VM will boot with direct kernel boot (no bootloader)"
-      echo "Manager running in screen session '${name}-direct'"
-      echo "Use 'vm-serial-man send <command>' to interact"
-      echo "Use 'screen -r ${name}-direct' to attach to VM console"
-      echo
-
-      ${startVMAndWait {
-        inherit name vmSerialMan;
-        screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}-direct\" --disk \"${diskName}\" --memory 2048 --cores 4 direct-kernel --kernel \"$WORK_DIR/kernel\" --initrd \"$WORK_DIR/initrd\" --kernel-args \"$KERNEL_ARGS\"";
-        sessionName = "${name}-direct";
-      }}
-    '';
-
-  # Build a UEFI boot test runner
+  # Backwards compatibility: UEFI boot runner
   mkUefiRunner =
     {
       name,
       config,
-      diskName ? "${name}.qcow2",
       vmSerialMan,
+      diskName ? "${name}.qcow2",
     }:
-    let
-      vmDiskImage = config.config.system.build.vmDiskImage;
-      testArtifacts = config.config.system.build.testArtifacts;
-    in
-    pkgs.writeShellScript "run-${name}-uefi" ''
-      set -e
-
-      echo "=== NMBL UEFI Boot Test: ${name} ==="
-      echo
-
-      # Use pre-built VM disk image from NixOS configuration
-      if [ ! -f "${diskName}" ]; then
-        echo "Copying VM disk image from Nix store..."
-        echo "Source: ${vmDiskImage}"
-        cp "${vmDiskImage}/nixos.qcow2" "${diskName}"
-        chmod 644 "${diskName}"
-        echo "✓ Disk image copied successfully"
-      else
-        echo "✓ Using existing disk: ${diskName}"
-      fi
-      echo
-
-      WORK_DIR="$PWD/.nmbl-test-${name}"
-      mkdir -p "$WORK_DIR"
-
-      # Create convenience link to vm-serial-man
-      ln -sf ${vmSerialMan}/bin/vm-serial-man "$WORK_DIR/vm-serial-man"
-
-      # Find OVMF
-      OVMF_CODE="${pkgs.OVMF.fd}/FV/OVMF_CODE.fd"
-      OVMF_VARS="${name}_OVMF_VARS.fd"
-
-      if [ ! -f "$OVMF_VARS" ]; then
-        echo "Creating OVMF_VARS..."
-        cp "${pkgs.OVMF.fd}/FV/OVMF_VARS.fd" "$OVMF_VARS"
-        chmod 644 "$OVMF_VARS"
-      fi
-
-      echo
-      echo "Test artifacts:"
-      echo "  Disk:          ${diskName}"
-      echo "  OVMF Code:     $OVMF_CODE"
-      echo "  OVMF Vars:     $OVMF_VARS"
-      echo "  VM Manager:    $WORK_DIR/vm-serial-man"
-      echo "  All artifacts: ${testArtifacts}"
-      echo
-
-      echo "Starting VM with UEFI boot in screen session..."
-      echo "Manager running in screen session '${name}-uefi'"
-      echo "Use 'vm-serial-man send <command>' to interact"
-      echo "Use 'screen -r ${name}-uefi' to attach to VM console"
-      echo
-
-      ${startVMAndWait {
-        inherit name vmSerialMan;
-        screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}-uefi\" --disk \"${diskName}\" --memory 2048 --cores 4 uefi --ovmf-code \"$OVMF_CODE\" --ovmf-vars \"$OVMF_VARS\"";
-        sessionName = "${name}-uefi";
-      }}
-    '';
+    mkRunner {
+      inherit name config vmSerialMan;
+      bootMode = "gpt-uefi";
+    };
 
 in
 {
-  inherit mkDirectKernelRunner mkUefiRunner;
+  inherit mkRunner mkDirectKernelRunner mkUefiRunner;
 }
