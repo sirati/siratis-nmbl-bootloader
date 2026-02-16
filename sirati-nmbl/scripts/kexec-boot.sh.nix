@@ -85,7 +85,7 @@ in
   echo "  Kernel: $SELECTED_KERNEL"
   echo "  Initrd: $SELECTED_INITRD"
 
-  if ! ${pkgs.kexec-tools}/bin/kexec -l "$SELECTED_KERNEL" \
+  if ! ${pkgs.kexec-tools}/bin/kexec -s -l "$SELECTED_KERNEL" \
     --initrd="$SELECTED_INITRD" \
     --command-line="$FINAL_PARAMS"; then
     echo "ERROR: Failed to load kernel with kexec"
@@ -106,6 +106,10 @@ in
   # Sync to ensure all writes are flushed
   echo "NMBL: Syncing filesystems..."
   ${pkgs.busybox}/bin/sync
+
+  # Drop caches for cleaner kexec transition
+  echo "NMBL: Dropping caches..."
+  echo 3 > /proc/sys/vm/drop_caches
 
   echo ""
   echo "=========================================="

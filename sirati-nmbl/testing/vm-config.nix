@@ -14,8 +14,7 @@ let
   mkTestVM =
     {
       name,
-      bootMode,
-      uefiBootloader ? "grub",
+      bootstrapper,
     }:
     let
       # Base NixOS system configuration
@@ -29,13 +28,14 @@ let
             # Use NMBL bootloader
             boot.nmbl = {
               enable = true;
-              inherit bootMode uefiBootloader;
+              inherit bootstrapper;
               kernelPackage = pkgs.linux_6_6;
 
+              # availableKernelModules defaults to ["crc32c"]
+              # extraKernelModules can be added if needed
               # Don't manually specify modules - they are inherited from
-              # boot.initrd.availableKernelModules automatically based on
-              # filesystem declarations
-              kernelModules = [ ];
+              # boot.initrd.availableKernelModules automatically
+              extraKernelModules = [ ];
 
               mountPrefix = "/mnt";
               kernelParams = [
@@ -63,15 +63,15 @@ let
             boot.loader.systemd-boot.enable = false;
 
             # Filesystem configuration
-            # MBR (legacy+boot): vda1 = FAT32 boot, vda2 = ext4 root
-            # GPT (hybrid): vda1 = FAT32 ESP, vda2 = BIOS boot partition, vda3 = ext4 root
+            # GPT+BIOS: vda1 = FAT32 boot, vda2 = BIOS boot partition, vda3 = ext4 root
+            # GPT+UEFI: vda1 = FAT32 ESP, vda2 = BIOS boot partition, vda3 = ext4 root
             fileSystems."/boot" = {
               device = "/dev/vda1";
               fsType = "vfat";
             };
 
             fileSystems."/" = {
-              device = if bootMode == "mbr" then "/dev/vda2" else "/dev/vda3";
+              device = "/dev/vda3";
               fsType = "ext4";
             };
 
@@ -105,9 +105,9 @@ let
         name = "${name}-disk-image";
 
         # Partition layout for VirtIO disk (/dev/vda)
-        # legacy+boot: FAT32 boot partition + ext4 root partition (MBR)
-        # hybrid: FAT32 ESP + ext4 root partition (GPT with BIOS compat)
-        partitionTableType = if bootMode == "mbr" then "legacy+boot" else "hybrid";
+        # Always use hybrid (GPT with BIOS compatibility)
+        # This creates: FAT32 ESP + BIOS boot partition + ext4 root
+        partitionTableType = "hybrid";
 
         # Size of the boot partition
         bootSize = "512M";

@@ -73,21 +73,41 @@ let
       name,
       config,
       vmSerialMan,
-      bootMode, # "mbr", "gpt-bios", "gpt-uefi", or "direct-kernel"
+      bootMode ? null, # Optional: "gpt-bios", "gpt-uefi", or "direct-kernel" (derived from config if null)
     }:
     let
+      # Derive bootMode from config if not explicitly provided (must be first)
+      actualBootMode =
+        if bootMode != null then
+          bootMode
+        else if config.config.boot.nmbl ? bootstrapper then
+          let
+            bs = config.config.boot.nmbl.bootstrapper;
+          in
+          if bs.bootMode == "bios" then
+            "gpt-bios"
+          else if bs.bootMode == "uefi" then
+            "gpt-uefi"
+          else if bs.bootMode == "qemu_kernel_invoke" then
+            "direct-kernel"
+          else
+            throw "Unknown bootstrapper bootMode: ${bs.bootMode}"
+        else
+          "direct-kernel"; # Fallback for configs without bootstrapper
+
       vmDiskImage = config.config.system.build.vmDiskImage;
       testArtifacts = config.config.system.build.testArtifacts;
       diskName = "${name}.qcow2";
 
       # Only needed for direct kernel boot
-      kernel = if bootMode == "direct-kernel" then config.config.system.build.nmblKernel else null;
-      initrd = if bootMode == "direct-kernel" then config.config.system.build.nmblInitramfs else null;
+      kernel = if actualBootMode == "direct-kernel" then config.config.system.build.nmblKernel else null;
+      initrd =
+        if actualBootMode == "direct-kernel" then config.config.system.build.nmblInitramfs else null;
 
       # Determine firmware type based on bootMode
-      isBios = bootMode == "mbr" || bootMode == "gpt-bios";
-      isUefi = bootMode == "gpt-uefi";
-      isDirectKernel = bootMode == "direct-kernel";
+      isBios = actualBootMode == "gpt-bios";
+      isUefi = actualBootMode == "gpt-uefi";
+      isDirectKernel = actualBootMode == "direct-kernel";
 
       bootModeLabel =
         if isDirectKernel then
@@ -256,7 +276,7 @@ let
             sessionName = name;
           }
         else
-          throw "Unknown boot mode: ${bootMode}"
+          throw "Unknown boot mode: ${actualBootMode}"
       }
     '';
 
@@ -282,7 +302,7 @@ let
     }:
     mkRunner {
       inherit name config vmSerialMan;
-      bootMode = "gpt-uefi";
+      bootMode = null; # Will be derived from config
     };
 
 in

@@ -10,20 +10,44 @@
 #   * Boot partition is treated as boot-critical by the system
 #
 # For UEFI systems: boot partition can be /boot or /efi (ESP)
-# For legacy systems: boot partition should be /boot
+# For BIOS systems: boot partition should be /boot
 
 {
   lib,
   pkgs,
   config,
   cfg,
+  bootstrapper,
+  legacyBootMode,
 }:
+
+let
+  # Use the same logic as config.nix to get actual loader values
+  actualLoader =
+    if bootstrapper.loader != null then
+      bootstrapper.loader
+    else if bootstrapper.bootMode == "qemu_kernel_invoke" then
+      null
+    else
+      "grub";
+
+  actualLoaderExtraArgs =
+    if bootstrapper.loader_extra_args != null then
+      bootstrapper.loader_extra_args
+    else if bootstrapper.bootMode == "qemu_kernel_invoke" then
+      null
+    else
+      { };
+in
 
 pkgs.writeScript "install-nmbl-bootloader" ''
   #!${pkgs.runtimeShell}
   set -e
 
   echo "Installing NMBL bootloader..."
+  echo "  Partition Table: ${bootstrapper.partition_table}"
+  echo "  Boot Mode: ${bootstrapper.bootMode}"
+  echo "  Loader: ${if actualLoader == null then "none (qemu_kernel_invoke)" else actualLoader}"
 
   # Verify boot partition is mounted and writable
   if [ ! -d /boot ]; then
@@ -57,48 +81,21 @@ pkgs.writeScript "install-nmbl-bootloader" ''
   cp -f "$INITRD" /boot/nmbl-initrd
   echo "✓ Bootloader files installed: /boot/nmbl-kernel, /boot/nmbl-initrd"
 
-  ${lib.optionalString (cfg.bootMode == "mbr") ''
-        echo "Configuring MBR bootloader with syslinux..."
-        mkdir -p /boot/syslinux
-
-        # Create syslinux config
-        cat > /boot/syslinux/syslinux.cfg << EOF
-    DEFAULT nmbl
-    PROMPT 0
-    TIMEOUT 0
-    SERIAL 0 115200
-
-    LABEL nmbl
-      KERNEL /nmbl-kernel
-      INITRD /nmbl-initrd
-      APPEND $KERNEL_PARAMS
-    EOF
-
-        # Install syslinux MBR if device exists
-        if [ -b /dev/vda ]; then
-          echo "Installing syslinux to /dev/vda1 (boot partition)..."
-          ${pkgs.syslinux}/bin/syslinux --install /dev/vda1 || true
-          echo "Installing MBR boot code to /dev/vda..."
-          ${pkgs.util-linux}/bin/dd bs=440 count=1 conv=notrunc if=${pkgs.syslinux}/share/syslinux/mbr.bin of=/dev/vda || true
-          echo "✓ Syslinux MBR bootloader installed"
-        fi
-  ''}
-
-  ${lib.optionalString (cfg.bootMode == "gpt-bios") ''
+  ${lib.optionalString (bootstrapper.bootMode == "bios" && actualLoader == "grub") ''
         echo "Configuring GPT+BIOS bootloader with GRUB..."
         mkdir -p /boot/grub
 
         # Create GRUB config
-        cat > /boot/grub/grub.cfg << EOF
-    set timeout=0
-    serial --unit=0 --speed=115200
-    terminal_input serial
-    terminal_output serial
+        cat > /boot/grub/grub.cfg << 'EOF'
+    set timeout=${toString actualLoaderExtraArgs.timeout}
+    set default=${actualLoaderExtraArgs.default}
+    ${actualLoaderExtraArgs.extraConfig}
 
     menuentry "NMBL Bootloader" {
       linux /nmbl-kernel $KERNEL_PARAMS
       initrd /nmbl-initrd
     }
+    ${actualLoaderExtraArgs.extraEntries}
     EOF
 
         # Install GRUB if device exists
@@ -109,56 +106,69 @@ pkgs.writeScript "install-nmbl-bootloader" ''
         fi
   ''}
 
-  ${lib.optionalString (cfg.bootMode == "gpt-uefi" && cfg.uefiBootloader == "grub") ''
+  ${lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "grub") ''
         echo "Configuring GPT+UEFI bootloader with GRUB..."
         mkdir -p /boot/EFI/BOOT /boot/grub
 
         # Create GRUB config
-        cat > /boot/grub/grub.cfg << EOF
-    set timeout=0
-    serial --unit=0 --speed=115200
-    terminal_input serial
-    terminal_output serial
+        cat > /boot/grub/grub.cfg << 'EOF'
+    set timeout=${toString actualLoaderExtraArgs.timeout}
+    set default=${actualLoaderExtraArgs.default}
+    ${actualLoaderExtraArgs.extraConfig}
 
     menuentry "NMBL Bootloader" {
       linux /nmbl-kernel $KERNEL_PARAMS
       initrd /nmbl-initrd
     }
+    ${actualLoaderExtraArgs.extraEntries}
     EOF
 
         # Install GRUB EFI if device exists
         if [ -b /dev/vda ]; then
           echo "Installing GRUB (UEFI mode) to /boot ESP..."
-          ${pkgs.grub2_efi}/bin/grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=NMBL --no-nvram || true
+          GRUB_INSTALL_ARGS="--target=x86_64-efi --efi-directory=/boot --bootloader-id=NMBL"
+
+          ${lib.optionalString (!actualLoaderExtraArgs.canTouchEfiVariables) ''
+            GRUB_INSTALL_ARGS="$GRUB_INSTALL_ARGS --no-nvram"
+          ''}
+
+          ${lib.optionalString actualLoaderExtraArgs.efiInstallAsRemovable ''
+            GRUB_INSTALL_ARGS="$GRUB_INSTALL_ARGS --removable"
+          ''}
+
+          ${pkgs.grub2_efi}/bin/grub-install $GRUB_INSTALL_ARGS || true
 
           # Copy GRUB EFI to fallback location for UEFI firmware boot
           # UEFI looks for /EFI/BOOT/BOOTX64.EFI when no NVRAM entries exist
-          if [ -f /boot/EFI/NMBL/grubx64.efi ]; then
-            echo "Copying GRUB EFI to fallback location /EFI/BOOT/BOOTX64.EFI..."
-            cp /boot/EFI/NMBL/grubx64.efi /boot/EFI/BOOT/BOOTX64.EFI
-            echo "✓ GRUB EFI fallback bootloader installed"
-          else
-            echo "WARNING: GRUB EFI binary not found at /boot/EFI/NMBL/grubx64.efi"
-          fi
+          ${lib.optionalString (!actualLoaderExtraArgs.efiInstallAsRemovable) ''
+            if [ -f /boot/EFI/NMBL/grubx64.efi ]; then
+              echo "Copying GRUB EFI to fallback location /EFI/BOOT/BOOTX64.EFI..."
+              cp /boot/EFI/NMBL/grubx64.efi /boot/EFI/BOOT/BOOTX64.EFI
+              echo "✓ GRUB EFI fallback bootloader installed"
+            else
+              echo "WARNING: GRUB EFI binary not found at /boot/EFI/NMBL/grubx64.efi"
+            fi
+          ''}
 
           echo "✓ GRUB EFI bootloader installed"
         fi
   ''}
 
-  ${lib.optionalString (cfg.bootMode == "gpt-uefi" && cfg.uefiBootloader == "systemd-boot") ''
+  ${lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "systemd") ''
         echo "Configuring GPT+UEFI bootloader with systemd-boot..."
         mkdir -p /boot/EFI/BOOT /boot/loader/entries
 
         # Create systemd-boot loader config
-        cat > /boot/loader/loader.conf << EOF
+        cat > /boot/loader/loader.conf << 'EOF'
     default nmbl.conf
-    timeout 0
+    timeout ${toString actualLoaderExtraArgs.timeout}
     console-mode max
     editor no
+    ${actualLoaderExtraArgs.extraConfig}
     EOF
 
         # Create boot entry
-        cat > /boot/loader/entries/nmbl.conf << EOF
+        cat > /boot/loader/entries/nmbl.conf << 'EOF'
     title NMBL Bootloader
     linux /nmbl-kernel
     initrd /nmbl-initrd
@@ -168,7 +178,13 @@ pkgs.writeScript "install-nmbl-bootloader" ''
         # Install systemd-boot if device exists
         if [ -b /dev/vda ]; then
           echo "Installing systemd-boot to /boot ESP..."
-          ${pkgs.systemd}/bin/bootctl install --esp-path=/boot --no-variables || true
+          BOOTCTL_ARGS="install --esp-path=/boot"
+
+          ${lib.optionalString (!actualLoaderExtraArgs.canTouchEfiVariables) ''
+            BOOTCTL_ARGS="$BOOTCTL_ARGS --no-variables"
+          ''}
+
+          ${pkgs.systemd}/bin/bootctl $BOOTCTL_ARGS || true
 
           # Copy systemd-boot to fallback location for UEFI firmware boot
           if [ -f /boot/EFI/systemd/systemd-bootx64.efi ]; then
@@ -181,32 +197,6 @@ pkgs.writeScript "install-nmbl-bootloader" ''
 
           echo "✓ systemd-boot bootloader installed"
         fi
-  ''}
-
-  ${lib.optionalString (cfg.bootMode == "gpt-uefi" && cfg.uefiBootloader == "efi-stub") ''
-        echo "Configuring GPT+UEFI with EFI stub (direct kernel boot)..."
-        mkdir -p /boot/EFI/BOOT
-
-        # For EFI stub, we need to create a unified kernel image with embedded initrd and cmdline
-        # Or simply copy the kernel as BOOTX64.EFI and rely on UEFI to pass parameters
-        echo "Creating EFI stub boot entry..."
-
-        # Copy kernel directly as the EFI bootloader
-        # Note: This requires the kernel to be built with CONFIG_EFI_STUB=y
-        echo "Copying kernel with EFI stub to /EFI/BOOT/BOOTX64.EFI..."
-        cp -f /boot/nmbl-kernel /boot/EFI/BOOT/BOOTX64.EFI
-
-        # For EFI stub boot, we need the initrd in a specific location
-        # Some UEFI implementations look for initrd.img in the same directory
-        cp -f /boot/nmbl-initrd /boot/EFI/BOOT/initrd.img
-
-        # Create a startup.nsh script for automatic boot
-        cat > /boot/startup.nsh << EOF
-    \EFI\BOOT\BOOTX64.EFI initrd=\EFI\BOOT\initrd.img $KERNEL_PARAMS
-    EOF
-
-        echo "✓ EFI stub bootloader configured"
-        echo "Note: EFI stub requires kernel built with CONFIG_EFI_STUB=y"
   ''}
 
   # Create /init symlink for NixOS stage-1

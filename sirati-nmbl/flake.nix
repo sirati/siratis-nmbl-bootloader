@@ -36,48 +36,19 @@
               name: cfg:
               let
                 config = testing.mkTestConfigurations.${name};
-                directApp = {
-                  name = "${name}-direct";
+                # Only create the main app - bootMode is derived from config.bootstrapper
+                app = {
+                  name = "${name}";
                   value = {
                     type = "app";
-                    program = "${testRunners.mkDirectKernelRunner {
+                    program = "${testRunners.mkRunner {
                       inherit name config vmSerialMan;
+                      bootMode = null; # Will be derived from config.bootstrapper
                     }}";
                   };
                 };
-                biosApp =
-                  if cfg.bootMode == "mbr" || cfg.bootMode == "gpt-bios" then
-                    [
-                      {
-                        name = "${name}";
-                        value = {
-                          type = "app";
-                          program = "${testRunners.mkRunner {
-                            inherit name config vmSerialMan;
-                            bootMode = cfg.bootMode;
-                          }}";
-                        };
-                      }
-                    ]
-                  else
-                    [ ];
-                uefiApp =
-                  if cfg.bootMode == "gpt-uefi" then
-                    [
-                      {
-                        name = "${name}";
-                        value = {
-                          type = "app";
-                          program = "${testRunners.mkUefiRunner {
-                            inherit name config vmSerialMan;
-                          }}";
-                        };
-                      }
-                    ]
-                  else
-                    [ ];
               in
-              [ directApp ] ++ biosApp ++ uefiApp
+              [ app ]
             ) testing.configs
           )
         )
@@ -103,17 +74,11 @@
       nixosConfigurations = testing.mkTestConfigurations;
 
       # Test runner apps
-      # Run with: nix run .#test-mbr-serial-direct
-      # Run with: nix run .#test-mbr-serial-direct -- --debug-shell  (drops to emergency shell)
-      # Run with: nix run .#test-mbr-serial
-      # Run with: nix run .#test-gpt-bios-direct
       # Run with: nix run .#test-gpt-bios
-      # Run with: nix run .#test-gpt-uefi-grub-direct
       # Run with: nix run .#test-gpt-uefi-grub
-      # Run with: nix run .#test-gpt-uefi-systemd-direct
       # Run with: nix run .#test-gpt-uefi-systemd
-      # Run with: nix run .#test-gpt-uefi-efi-direct
-      # Run with: nix run .#test-gpt-uefi-efi
+      # Run with: nix run .#test-gpt-qemu-kernel-invoke
+      # Run with: nix run .#test-gpt-qemu-kernel-invoke -- --debug-shell  (drops to emergency shell)
       apps.${system} = testApps;
     };
 }

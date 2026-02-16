@@ -7,33 +7,155 @@
   options.boot.nmbl = {
     enable = lib.mkEnableOption "Linux-as-bootloader (NMBL)";
 
-    bootMode = lib.mkOption {
-      type = lib.types.enum [
-        "mbr"
-        "gpt-bios"
-        "gpt-uefi"
-      ];
-      default = "gpt-uefi";
-      description = lib.mdDoc ''
-        Boot mode configuration for the bootloader.
-        - mbr: Master Boot Record (legacy BIOS)
-        - gpt-bios: GPT partition table with BIOS boot
-        - gpt-uefi: GPT partition table with UEFI boot
-      '';
-    };
+    bootstrapper = lib.mkOption {
+      type = lib.types.submodule {
+        options = {
+          partition_table = lib.mkOption {
+            type = lib.types.enum [ "gpt" ];
+            default = "gpt";
+            description = lib.mdDoc ''
+              Partition table type for the bootloader.
+              Currently only GPT is supported.
+            '';
+          };
 
-    uefiBootloader = lib.mkOption {
-      type = lib.types.enum [
-        "grub"
-        "systemd-boot"
-        "efi-stub"
-      ];
-      default = "grub";
+          bootMode = lib.mkOption {
+            type = lib.types.enum [
+              "bios"
+              "uefi"
+              "qemu_kernel_invoke"
+            ];
+            default = "uefi";
+            description = lib.mdDoc ''
+              Boot mode for the system:
+              - bios: Legacy BIOS boot with GPT partition table (requires BIOS boot partition)
+              - uefi: UEFI boot with GPT partition table (requires ESP)
+              - qemu_kernel_invoke: Direct kernel invocation by QEMU (bypasses bootloader installation)
+            '';
+          };
+
+          loader = lib.mkOption {
+            type = lib.types.nullOr (
+              lib.types.enum [
+                "grub"
+                "systemd"
+              ]
+            );
+            default = null;
+            description = lib.mdDoc ''
+              Bootloader to use:
+              - grub: GRUB bootloader (supports both BIOS and UEFI)
+              - systemd: systemd-boot (UEFI only, formerly gummiboot)
+              - null: No loader (used for qemu_kernel_invoke mode)
+
+              Defaults to "grub" for bios/uefi modes, null for qemu_kernel_invoke.
+            '';
+          };
+
+          loader_extra_args = lib.mkOption {
+            type = lib.types.nullOr (
+              lib.types.submodule {
+                options = {
+                  timeout = lib.mkOption {
+                    type = lib.types.int;
+                    default = 0;
+                    description = lib.mdDoc ''
+                      Timeout in seconds before auto-selecting the default boot entry.
+                      Set to 0 for immediate boot with no menu delay.
+                    '';
+                  };
+
+                  canTouchEfiVariables = lib.mkOption {
+                    type = lib.types.bool;
+                    default = false;
+                    description = lib.mdDoc ''
+                      Whether the installation process is allowed to modify EFI boot variables.
+                      Only applies to UEFI boot mode.
+                    '';
+                  };
+
+                  efiInstallAsRemovable = lib.mkOption {
+                    type = lib.types.bool;
+                    default = false;
+                    description = lib.mdDoc ''
+                      Whether to install the bootloader as a removable device.
+                      This installs to the fallback path (EFI/BOOT/BOOTX64.EFI) which
+                      firmware looks for when no NVRAM entries exist.
+                      Only applies to UEFI boot mode with GRUB.
+                    '';
+                  };
+
+                  default = lib.mkOption {
+                    type = lib.types.either lib.types.int lib.types.str;
+                    default = "0";
+                    apply = toString;
+                    description = lib.mdDoc ''
+                      Index of the default menu item to be booted.
+                      Can also be set to "saved" for GRUB to remember the last selection.
+                    '';
+                  };
+
+                  configurationLimit = lib.mkOption {
+                    type = lib.types.int;
+                    default = 100;
+                    description = lib.mdDoc ''
+                      Maximum number of configurations in boot menu.
+                    '';
+                  };
+
+                  extraConfig = lib.mkOption {
+                    type = lib.types.lines;
+                    default = "";
+                    example = ''
+                      # GRUB example
+                      set theme=$prefix/themes/starfield/theme.txt
+                    '';
+                    description = lib.mdDoc ''
+                      Additional bootloader-specific configuration.
+                      For GRUB: inserted before menu entries.
+                      For systemd-boot: additional loader.conf settings.
+                    '';
+                  };
+
+                  extraEntries = lib.mkOption {
+                    type = lib.types.lines;
+                    default = "";
+                    example = ''
+                      menuentry "Windows" {
+                        chainloader (hd0,2)+1
+                      }
+                    '';
+                    description = lib.mdDoc ''
+                      Additional boot entries (GRUB-specific).
+                    '';
+                  };
+
+                  theme = lib.mkOption {
+                    type = lib.types.nullOr lib.types.path;
+                    default = null;
+                    example = lib.literalExpression ''"''${pkgs.kdePackages.breeze-grub}/grub/themes/breeze"'';
+                    description = lib.mdDoc ''
+                      Path to the bootloader theme (GRUB-specific).
+                    '';
+                  };
+                };
+              }
+            );
+            default = null;
+            description = lib.mdDoc ''
+              Extra arguments to pass to the bootloader configuration.
+              These settings are merged with NMBL's bootloader configuration.
+              The timeout is set to 0 by default for immediate boot.
+
+              Set to null for qemu_kernel_invoke mode (no bootloader).
+            '';
+          };
+        };
+      };
+      default = { };
       description = lib.mdDoc ''
-        UEFI bootloader type (only used when bootMode is "gpt-uefi").
-        - grub: GRUB bootloader for UEFI
-        - systemd-boot: systemd-boot (formerly gummiboot)
-        - efi-stub: Direct EFI stub - kernel is invoked directly by UEFI firmware
+        Bootstrapper configuration for NMBL.
+        Defines partition table, boot mode, loader type, and loader-specific settings.
       '';
     };
 
@@ -50,18 +172,33 @@
       '';
     };
 
-    kernelModules = lib.mkOption {
+    availableKernelModules = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ "crc32c" ];
+      example = [
+        "crc32c"
+        "ext4"
+        "virtio_blk"
+      ];
+      description = lib.mdDoc ''
+        Base kernel modules available in the bootloader initramfs.
+        These modules are always included and available for loading.
+        The default includes crc32c which is required by ext4.
+      '';
+    };
+
+    extraKernelModules = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
       example = [
-        "ext4"
-        "virtio_blk"
+        "nvme"
         "ahci"
         "sd_mod"
       ];
       description = lib.mdDoc ''
-        Kernel modules to load in the bootloader initramfs.
-        These are NOT inherited from your system configuration.
+        Additional kernel modules to include in the bootloader initramfs.
+        These are added to availableKernelModules and the modules inherited
+        from your system configuration (boot.initrd.availableKernelModules).
         Include modules needed for:
         - Your filesystem (ext4, btrfs, xfs, etc.)
         - Your storage controller (ahci, nvme, virtio_blk, etc.)
@@ -102,6 +239,7 @@
       description = lib.mdDoc ''
         Timeout in seconds before auto-selecting the default boot entry.
         Set to 0 for no timeout (manual selection required).
+        Note: This is for NMBL's own menu, not the underlying bootloader.
       '';
     };
 

@@ -11,6 +11,25 @@
 
 let
   cfg = config.boot.nmbl;
+  bootstrapper = cfg.bootstrapper;
+
+  # Set default loader based on bootMode if not explicitly set
+  actualLoader =
+    if bootstrapper.loader != null then
+      bootstrapper.loader
+    else if bootstrapper.bootMode == "qemu_kernel_invoke" then
+      null
+    else
+      "grub"; # Default for bios/uefi
+
+  # Set default loader_extra_args if not explicitly set
+  actualLoaderExtraArgs =
+    if bootstrapper.loader_extra_args != null then
+      bootstrapper.loader_extra_args
+    else if bootstrapper.bootMode == "qemu_kernel_invoke" then
+      null
+    else
+      { }; # Default empty set for bios/uefi
 
   # Get filesystems needed for boot
   # This includes filesystems marked with neededForBoot = true and those in critical paths
@@ -24,7 +43,10 @@ let
   autoKernelModules = config.boot.initrd.availableKernelModules ++ config.boot.initrd.kernelModules;
 
   # Combine system modules with user-specified modules for the bootloader
-  allKernelModules = lib.unique (autoKernelModules ++ cfg.kernelModules);
+  # availableKernelModules (crc32c by default) + extraKernelModules + auto-detected modules
+  allKernelModules = lib.unique (
+    cfg.availableKernelModules ++ cfg.extraKernelModules ++ autoKernelModules
+  );
 
   # Create modules tree for our bootloader kernel (same as system.modulesTree in kernel.nix)
   # This gets the "modules" output from the kernel package
@@ -54,6 +76,15 @@ let
     kernelModules = allKernelModules;
   };
 
+  # Determine legacy boot mode string for compatibility
+  legacyBootMode =
+    if bootstrapper.partition_table == "gpt" && bootstrapper.bootMode == "bios" then
+      "gpt-bios"
+    else if bootstrapper.partition_table == "gpt" && bootstrapper.bootMode == "uefi" then
+      "gpt-uefi"
+    else
+      "gpt-${bootstrapper.bootMode}";
+
 in
 {
   config = lib.mkIf cfg.enable {
@@ -68,20 +99,45 @@ in
     # Assertions to verify boot configuration
     assertions = [
       {
-        assertion =
-          cfg.bootMode == "mbr"
-          || cfg.bootMode == "gpt-bios"
-          || cfg.bootMode == "gpt-uefi"
-          || cfg.bootMode == "hybrid";
-        message = "boot.nmbl.bootMode must be one of: mbr, gpt-bios, gpt-uefi, hybrid";
+        assertion = bootstrapper.partition_table == "gpt";
+        message = "boot.nmbl.bootstrapper.partition_table must be 'gpt' (only GPT is supported)";
       }
       {
         assertion =
-          config.fileSystems ? "/boot" || (cfg.bootMode == "gpt-uefi" && config.fileSystems ? "/efi");
+          bootstrapper.bootMode == "bios"
+          || bootstrapper.bootMode == "uefi"
+          || bootstrapper.bootMode == "qemu_kernel_invoke";
+        message = "boot.nmbl.bootstrapper.bootMode must be 'bios', 'uefi', or 'qemu_kernel_invoke'";
+      }
+      {
+        assertion = actualLoader == null || actualLoader == "grub" || actualLoader == "systemd";
+        message = "boot.nmbl.bootstrapper.loader must be 'grub', 'systemd', or null";
+      }
+      {
+        assertion = bootstrapper.bootMode == "qemu_kernel_invoke" || actualLoader != null;
+        message = "loader must be set for bios/uefi boot modes (should default to 'grub')";
+      }
+      {
+        assertion = bootstrapper.bootMode != "qemu_kernel_invoke" || bootstrapper.loader == null;
+        message = "loader must not be set when bootMode is 'qemu_kernel_invoke' (QEMU directly invokes kernel, no bootloader needed)";
+      }
+      {
+        assertion = bootstrapper.bootMode != "qemu_kernel_invoke" || bootstrapper.loader_extra_args == null;
+        message = "loader_extra_args must not be set when bootMode is 'qemu_kernel_invoke' (no bootloader is used)";
+      }
+      {
+        assertion = actualLoader != "systemd" || bootstrapper.bootMode == "uefi";
+        message = "systemd-boot (loader='systemd') requires UEFI boot mode. Use loader='grub' for BIOS boot.";
+      }
+      {
+        assertion =
+          bootstrapper.bootMode == "qemu_kernel_invoke"
+          || config.fileSystems ? "/boot"
+          || (bootstrapper.bootMode == "uefi" && config.fileSystems ? "/efi");
         message = ''
-          NMBL requires a separate boot partition.
-          For UEFI boot (gpt-uefi), declare fileSystems."/boot" or fileSystems."/efi" with fsType = "vfat".
-          For legacy boot (mbr, gpt-bios, hybrid), declare fileSystems."/boot" with fsType = "vfat".
+          NMBL requires a separate boot partition (except for qemu_kernel_invoke mode).
+          For UEFI boot, declare fileSystems."/boot" or fileSystems."/efi" with fsType = "vfat".
+          For BIOS boot, declare fileSystems."/boot" with fsType = "vfat".
 
           Example:
             fileSystems."/boot" = {
@@ -101,10 +157,19 @@ in
               else
                 null;
           in
-          bootFS != null -> bootFS.fsType == "vfat";
+          (bootstrapper.bootMode == "qemu_kernel_invoke") || (bootFS != null -> bootFS.fsType == "vfat");
         message = "NMBL boot partition must be FAT32 (fsType = \"vfat\")";
       }
+      {
+        assertion =
+          bootstrapper.bootMode == "qemu_kernel_invoke"
+          || actualLoaderExtraArgs == null
+          || !actualLoaderExtraArgs.efiInstallAsRemovable
+          || !actualLoaderExtraArgs.canTouchEfiVariables;
+        message = "Cannot use both efiInstallAsRemovable and canTouchEfiVariables. Choose one.";
+      }
     ];
+
     # Build the minimal initramfs
     system.build.nmblInitramfs =
       let
@@ -157,10 +222,15 @@ in
         );
       in
       pkgs.writeText "nmbl-boot-config" ''
-        Boot Mode: ${cfg.bootMode}
+        Partition Table: ${bootstrapper.partition_table}
+        Boot Mode: ${bootstrapper.bootMode}
+        Loader: ${if actualLoader == null then "none (qemu_kernel_invoke)" else actualLoader}
         Kernel: ${kernel}/bzImage
         Initrd: ${initrd}/initrd
         Kernel Parameters: ${kernelParams}
+        Loader Timeout: ${
+          if actualLoaderExtraArgs == null then "N/A" else toString actualLoaderExtraArgs.timeout
+        }
       '';
 
     # Boot loader installation - disable standard bootloaders
@@ -180,6 +250,8 @@ in
         pkgs
         config
         cfg
+        bootstrapper
+        legacyBootMode
         ;
     };
 
@@ -198,57 +270,84 @@ in
       INITRD="${config.system.build.nmblInitramfs}/initrd"
       KERNEL_PARAMS="${lib.concatStringsSep " " cfg.kernelParams}"
 
-      ${lib.optionalString (cfg.bootMode == "mbr") ''
-        echo "Installing MBR bootloader..."
-        # Install syslinux for MBR
-        ${pkgs.syslinux}/bin/syslinux --install $DEVICE
-
-        # Create syslinux config
-        cat > /boot/syslinux/syslinux.cfg << EOF
-        DEFAULT linux
-        LABEL linux
-          KERNEL /nmbl-kernel
-          INITRD /nmbl-initrd
-          APPEND $KERNEL_PARAMS
-        EOF
-
-        cp $KERNEL /boot/nmbl-kernel
-        cp $INITRD /boot/nmbl-initrd
-      ''}
-
-      ${lib.optionalString (cfg.bootMode == "gpt-bios") ''
+      ${lib.optionalString (bootstrapper.bootMode == "bios" && actualLoader == "grub") ''
         echo "Installing GPT+BIOS bootloader..."
         # Install GRUB for GPT+BIOS
         ${pkgs.grub2}/bin/grub-install --target=i386-pc $DEVICE
 
         # Create GRUB config
         cat > /boot/grub/grub.cfg << EOF
-        set timeout=0
+        set timeout=${toString actualLoaderExtraArgs.timeout}
+        ${actualLoaderExtraArgs.extraConfig}
         menuentry "NMBL" {
           linux /nmbl-kernel $KERNEL_PARAMS
           initrd /nmbl-initrd
         }
+        ${actualLoaderExtraArgs.extraEntries}
         EOF
 
         cp $KERNEL /boot/nmbl-kernel
         cp $INITRD /boot/nmbl-initrd
       ''}
 
-      ${lib.optionalString (cfg.bootMode == "gpt-uefi") ''
-        echo "Installing GPT+UEFI bootloader..."
-        # Install systemd-boot or GRUB for UESo Im hoping this gets extended in rustFI
-        mkdir -p /boot/EFI/BOOT
-
-        ${pkgs.grub2_efi}/bin/grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=NMBL
+      ${lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "grub") ''
+        echo "Installing GPT+UEFI bootloader with GRUB..."
+        mkdir -p /boot/EFI/BOOT /boot/grub
 
         # Create GRUB config
         cat > /boot/grub/grub.cfg << EOF
-        set timeout=0
+        set timeout=${toString actualLoaderExtraArgs.timeout}
+        ${actualLoaderExtraArgs.extraConfig}
         menuentry "NMBL" {
           linux /nmbl-kernel $KERNEL_PARAMS
           initrd /nmbl-initrd
         }
-        EOFSo Im hoping this gets extended in rust
+        ${actualLoaderExtraArgs.extraEntries}
+        EOF
+
+        # Install GRUB EFI
+        ${pkgs.grub2_efi}/bin/grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=NMBL \
+          ${lib.optionalString (!actualLoaderExtraArgs.canTouchEfiVariables) "--no-nvram"} \
+          ${lib.optionalString actualLoaderExtraArgs.efiInstallAsRemovable "--removable"}
+
+        # Copy to fallback location if needed
+        if [ -f /boot/EFI/NMBL/grubx64.efi ] && [ "${toString actualLoaderExtraArgs.efiInstallAsRemovable}" != "true" ]; then
+          cp /boot/EFI/NMBL/grubx64.efi /boot/EFI/BOOT/BOOTX64.EFI
+        fi
+
+        cp $KERNEL /boot/nmbl-kernel
+        cp $INITRD /boot/nmbl-initrd
+      ''}
+
+      ${lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "systemd") ''
+        echo "Installing GPT+UEFI bootloader with systemd-boot..."
+        mkdir -p /boot/EFI/BOOT /boot/loader/entries
+
+        # Create systemd-boot loader config
+        cat > /boot/loader/loader.conf << EOF
+        default nmbl.conf
+        timeout ${toString actualLoaderExtraArgs.timeout}
+        console-mode max
+        editor no
+        ${actualLoaderExtraArgs.extraConfig}
+        EOF
+
+        # Create boot entry
+        cat > /boot/loader/entries/nmbl.conf << EOF
+        title NMBL Bootloader
+        linux /nmbl-kernel
+        initrd /nmbl-initrd
+        options $KERNEL_PARAMS
+        EOF
+
+        # Install systemd-boot
+        ${pkgs.systemd}/bin/bootctl install --esp-path=/boot \
+          ${lib.optionalString (!actualLoaderExtraArgs.canTouchEfiVariables) "--no-variables"}
+
+        # Copy to fallback location
+        if [ -f /boot/EFI/systemd/systemd-bootx64.efi ]; then
+          cp /boot/EFI/systemd/systemd-bootx64.efi /boot/EFI/BOOT/BOOTX64.EFI
+        fi
 
         cp $KERNEL /boot/nmbl-kernel
         cp $INITRD /boot/nmbl-initrd

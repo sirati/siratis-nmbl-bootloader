@@ -8,34 +8,61 @@ let
 
   vmConfig = import ./vm-config.nix { inherit self nixpkgs system; };
 
-  # Define test configurations
+  # Define test configurations with new bootstrapper structure
   configs = {
-    test-mbr-serial = {
-      name = "test-mbr-serial";
-      bootMode = "mbr";
-    };
-
     test-gpt-bios = {
       name = "test-gpt-bios";
-      bootMode = "gpt-bios";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "bios";
+        loader = "grub";
+        loader_extra_args = {
+          timeout = 0;
+          extraConfig = ''
+            serial --unit=0 --speed=115200
+            terminal_input serial
+            terminal_output serial
+          '';
+        };
+      };
     };
 
     test-gpt-uefi-grub = {
       name = "test-gpt-uefi-grub";
-      bootMode = "gpt-uefi";
-      uefiBootloader = "grub";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "uefi";
+        loader = "grub";
+        loader_extra_args = {
+          timeout = 0;
+          extraConfig = ''
+            serial --unit=0 --speed=115200
+            terminal_input serial
+            terminal_output serial
+          '';
+        };
+      };
     };
 
     test-gpt-uefi-systemd = {
       name = "test-gpt-uefi-systemd";
-      bootMode = "gpt-uefi";
-      uefiBootloader = "systemd-boot";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "uefi";
+        loader = "systemd";
+        loader_extra_args = {
+          timeout = 0;
+        };
+      };
     };
 
-    test-gpt-uefi-efi = {
-      name = "test-gpt-uefi-efi";
-      bootMode = "gpt-uefi";
-      uefiBootloader = "efi-stub";
+    test-gpt-qemu-kernel-invoke = {
+      name = "test-gpt-qemu-kernel-invoke";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "qemu_kernel_invoke";
+        # loader and loader_extra_args are null by default for qemu_kernel_invoke
+      };
     };
   };
 
