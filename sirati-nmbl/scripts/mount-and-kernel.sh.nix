@@ -56,6 +56,10 @@ in
   echo "Mounting devpts at /dev/pts"
   ${pkgs.busybox}/bin/mount -t devpts devpts /dev/pts
 
+  ${pkgs.busybox}/bin/mkdir -p /tmp
+  echo "Mounting tmpfs at /tmp"
+  ${pkgs.busybox}/bin/mount -t tmpfs tmpfs /tmp
+
   # ============================================
   # Part 2: Load Kernel Modules
   # ============================================

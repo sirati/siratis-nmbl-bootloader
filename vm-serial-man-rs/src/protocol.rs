@@ -23,6 +23,8 @@ pub enum CommandType {
     Attach(AttachRequest),
     /// Get specific lines from history
     Lines(LinesRequest),
+    /// Get last N lines from history (tail)
+    Tail(TailRequest),
 }
 
 /// Command request with parameters
@@ -86,6 +88,13 @@ pub struct LinesRequest {
     pub end: usize,
 }
 
+/// Tail request - get last N lines
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TailRequest {
+    /// Number of lines to retrieve from the end
+    pub lines: usize,
+}
+
 /// Metadata about buffered output
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferedOutputInfo {
@@ -133,6 +142,8 @@ pub enum CommandResponse {
     Detached,
     /// Lines response - specific line range
     Lines(Vec<String>),
+    /// Tail response - last N lines
+    Tail(Vec<String>),
 }
 
 impl CommandType {

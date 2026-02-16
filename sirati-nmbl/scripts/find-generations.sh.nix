@@ -26,10 +26,38 @@
   GEN_FILE="/tmp/generations.txt"
   > "$GEN_FILE"  # Clear/create file
 
+  # Helper function to resolve symlinks with mount prefix
+  resolve_system_path() {
+    local link_path="$1"
+    if [ -L "$link_path" ]; then
+      # Read the symlink target
+      local target=$(${pkgs.busybox}/bin/readlink "$link_path")
+      # If target is absolute, prepend mount prefix
+      case "$target" in
+        /*)
+          echo "${cfg.mountPrefix}$target"
+          ;;
+        *)
+          # Relative path - resolve relative to link directory
+          echo "$(${pkgs.busybox}/bin/dirname "$link_path")/$target"
+          ;;
+      esac
+    else
+      echo "$link_path"
+    fi
+  }
+
   # Parse NixOS system profiles (sorted by version, newest first)
-  for system in $(${pkgs.busybox}/bin/ls -d ${cfg.mountPrefix}/nix/var/nix/profiles/system-*-link 2>/dev/null | ${pkgs.busybox}/bin/sort -V -r); do
-    if [ -f "$system/kernel" ] && [ -f "$system/initrd" ]; then
-      gen_num=$(${pkgs.busybox}/bin/basename "$system" | ${pkgs.busybox}/bin/sed 's/system-\(.*\)-link/\1/')
+  # Note: We use shell globbing directly because ls -d fails on broken symlinks
+  for system_link in ${cfg.mountPrefix}/nix/var/nix/profiles/system-*-link; do
+    # Skip if glob didn't match anything
+    [ -e "$system_link" ] || [ -L "$system_link" ] || continue
+
+    # Resolve the symlink to get actual system path
+    system=$(resolve_system_path "$system_link")
+
+    if [ -L "$system/kernel" ] && [ -L "$system/initrd" ]; then
+      gen_num=$(${pkgs.busybox}/bin/basename "$system_link" | ${pkgs.busybox}/bin/sed 's/system-\(.*\)-link/\1/')
       kernel_path="$system/kernel"
       initrd_path="$system/initrd"
 
@@ -47,8 +75,11 @@
 
   # Also check current system (add it at the beginning)
   if [ -L "${cfg.mountPrefix}/nix/var/nix/profiles/system" ]; then
-    system="${cfg.mountPrefix}/nix/var/nix/profiles/system"
-    if [ -f "$system/kernel" ] && [ -f "$system/initrd" ]; then
+    system_link="${cfg.mountPrefix}/nix/var/nix/profiles/system"
+    # Resolve the symlink to get actual system path
+    system=$(resolve_system_path "$system_link")
+
+    if [ -L "$system/kernel" ] && [ -L "$system/initrd" ]; then
       kernel_path="$system/kernel"
       initrd_path="$system/initrd"
 

@@ -213,4 +213,14 @@ pub enum Commands {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+
+    /// Show the last N lines from output history (like tail command)
+    Tail {
+        /// Number of lines to show
+        lines: usize,
+
+        /// Control socket path (auto-detected if not specified)
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 }

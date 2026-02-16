@@ -3,3 +3,4 @@ OVMF_VARS*.fd
 
 
 /debug/
+.nmbl-test*

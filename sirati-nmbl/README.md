@@ -246,20 +246,6 @@ nix eval .#nixosConfigurations.test-mbr-serial.config.system.build.nmblInitramfs
 
 ## Design Decisions
 
-### Why `.sh.nix` files?
-
-- **Modularity**: Each boot stage is in its own file
-- **Type Safety**: Nix ensures proper parameter passing
-- **Composability**: Easy to reuse or replace components
-- **Maintainability**: Clear separation of concerns
-
-### Why string concatenation instead of function calls?
-
-Shell scripts don't have a clean module system. By returning strings, we:
-- Avoid complex shell function exports
-- Keep variable scopes simple
-- Make the final script linear and debuggable
-- Allow Nix to do all the composition at build time
 
 ### Why busybox?
 

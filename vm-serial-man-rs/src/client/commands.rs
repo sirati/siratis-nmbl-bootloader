@@ -8,7 +8,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, trace, warn};
 
-use crate::protocol::{CommandRequest, CommandResponse, CommandType, LinesRequest};
+use crate::protocol::{CommandRequest, CommandResponse, CommandType, LinesRequest, TailRequest};
 
 use super::utils::find_socket;
 
@@ -155,6 +155,9 @@ pub async fn send_command(
             CommandResponse::Lines(_) => {
                 warn!("Unexpected Lines response in send command");
             }
+            CommandResponse::Tail(_) => {
+                warn!("Unexpected Tail response in send command");
+            }
         }
     }
 
@@ -276,6 +279,74 @@ pub async fn get_lines(start: usize, end: usize, socket: Option<PathBuf>) -> Res
         }
         CommandResponse::Error(err) => {
             anyhow::bail!("Failed to get lines: {}", err);
+        }
+        _ => {
+            anyhow::bail!("Unexpected response from VM manager");
+        }
+    }
+}
+
+/// Get last N lines from output history (tail)
+pub async fn get_tail(lines: usize, socket: Option<PathBuf>) -> Result<()> {
+    let socket_path = match socket {
+        Some(path) => path,
+        None => find_socket().await?,
+    };
+
+    debug!("Connecting to VM manager at: {}", socket_path.display());
+
+    let mut stream = UnixStream::connect(&socket_path)
+        .await
+        .context("Failed to connect to VM manager")?;
+
+    let (reader, mut writer) = stream.split();
+    let mut reader = BufReader::new(reader);
+
+    // Send tail request
+    let cmd_type = CommandType::Tail(TailRequest { lines });
+
+    let cmd_bytes = cmd_type.to_bytes();
+    trace!("Sending tail request: {} bytes", cmd_bytes.len());
+    writer.write_all(&cmd_bytes).await?;
+    writer.flush().await?;
+
+    debug!("Tail request sent: last {} lines", lines);
+
+    // Read response
+    let mut line = String::new();
+    let n = reader
+        .read_line(&mut line)
+        .await
+        .context("Failed to read response")?;
+
+    if n == 0 {
+        anyhow::bail!("Connection closed before receiving response");
+    }
+
+    trace!("Read {} bytes from server: {:?}", n, line.trim());
+
+    let response: CommandResponse = serde_json::from_str(line.trim())
+        .context(format!("Failed to parse response: {}", line.trim()))?;
+    trace!("Parsed response: {:?}", response);
+
+    match response {
+        CommandResponse::Tail(tail_lines) => {
+            if tail_lines.is_empty() {
+                println!("No lines in buffer");
+            } else {
+                println!(
+                    "=== Last {} lines (showing {} lines) ===",
+                    lines,
+                    tail_lines.len()
+                );
+                for line in tail_lines.iter() {
+                    println!("{}", line);
+                }
+            }
+            Ok(())
+        }
+        CommandResponse::Error(err) => {
+            anyhow::bail!("Failed to get tail: {}", err);
         }
         _ => {
             anyhow::bail!("Unexpected response from VM manager");

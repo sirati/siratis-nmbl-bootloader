@@ -102,6 +102,8 @@ pub async fn handle_client(
         }
 
         CommandType::Lines(lines_req) => handle_lines(lines_req, writer_half, buffer).await,
+
+        CommandType::Tail(tail_req) => handle_tail(tail_req, writer_half, buffer).await,
     }
 }
 
@@ -303,5 +305,43 @@ async fn handle_lines(
     writer.flush().await?;
 
     debug!("Lines request completed successfully");
+    Ok(())
+}
+
+/// Handle a tail request - get last N lines
+async fn handle_tail(
+    tail_req: crate::protocol::TailRequest,
+    mut writer: tokio::net::unix::OwnedWriteHalf,
+    buffer: Arc<Mutex<OutputBuffer>>,
+) -> Result<()> {
+    debug!("Processing tail request: last {} lines", tail_req.lines);
+
+    let buffer_guard = buffer.lock().await;
+    let total_lines = buffer_guard.len();
+
+    if tail_req.lines == 0 {
+        let resp = CommandResponse::Error("Number of lines must be greater than 0".to_string());
+        writer.write_all(&resp.to_bytes()).await?;
+        writer.flush().await?;
+        return Ok(());
+    }
+
+    // Get the last N lines
+    let lines = if tail_req.lines >= total_lines {
+        // Return all lines if requested more than available
+        buffer_guard.get_all()
+    } else {
+        // Get last N lines using range
+        let start = total_lines - tail_req.lines + 1;
+        let end = total_lines;
+        buffer_guard.get_lines_range(start, end)
+    };
+    drop(buffer_guard);
+
+    let resp = CommandResponse::Tail(lines);
+    writer.write_all(&resp.to_bytes()).await?;
+    writer.flush().await?;
+
+    debug!("Tail request completed successfully");
     Ok(())
 }

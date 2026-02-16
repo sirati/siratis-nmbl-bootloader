@@ -31,6 +31,36 @@ in
 
   echo "NMBL: Booting generation $SELECTED_GEN"
 
+  # Resolve symlinks to actual kernel and initrd files
+  # The paths from the system profile are symlinks with absolute targets
+  # We need to prepend the mount prefix to make them accessible
+  resolve_file_path() {
+    local link_path="$1"
+    if [ -L "$link_path" ]; then
+      # Read the symlink target
+      local target=$(${pkgs.busybox}/bin/readlink "$link_path")
+      # If target is absolute, prepend mount prefix
+      case "$target" in
+        /*)
+          echo "${cfg.mountPrefix}$target"
+          ;;
+        *)
+          # Relative path - resolve relative to link directory
+          echo "$(${pkgs.busybox}/bin/dirname "$link_path")/$target"
+          ;;
+      esac
+    else
+      echo "$link_path"
+    fi
+  }
+
+  # Resolve the symlinks
+  SELECTED_KERNEL=$(resolve_file_path "$SELECTED_KERNEL")
+  SELECTED_INITRD=$(resolve_file_path "$SELECTED_INITRD")
+
+  echo "NMBL: Resolved kernel: $SELECTED_KERNEL"
+  echo "NMBL: Resolved initrd: $SELECTED_INITRD"
+
   # Verify kernel and initrd exist
   if [ ! -f "$SELECTED_KERNEL" ]; then
     echo "ERROR: Kernel not found at $SELECTED_KERNEL"
@@ -43,15 +73,9 @@ in
   fi
 
   # Build final kernel parameters
-  # Start with the generation's kernel params
+  # NixOS stage-1 reads filesystem configuration from the initramfs,
+  # so we don't need to add root= parameter - it's already known
   FINAL_PARAMS="$SELECTED_PARAMS"
-
-  # Add root device parameter if not already present
-  if ! echo "$FINAL_PARAMS" | grep -q "root="; then
-    # Use the first filesystem's device as root
-    echo "NMBL: Adding root device parameter"
-    FINAL_PARAMS="root=/dev/sda1 $FINAL_PARAMS"
-  fi
 
   echo "NMBL: Final kernel parameters: $FINAL_PARAMS"
   echo ""

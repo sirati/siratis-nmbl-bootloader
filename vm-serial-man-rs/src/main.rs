@@ -138,5 +138,6 @@ async fn main() -> Result<()> {
             let actual_end = if length { start + end - 1 } else { end };
             client::get_lines(start, actual_end, socket).await
         }
+        Commands::Tail { lines, socket } => client::get_tail(lines, socket).await,
     }
 }

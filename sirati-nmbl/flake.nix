@@ -22,7 +22,11 @@
 
       # Import vm-serial-man package directly
       vmSerialManFlake = import ../vm-serial-man-rs/flake.nix;
-      vmSerialMan = (vmSerialManFlake.outputs { self = vmSerialManFlake; inherit nixpkgs; }).packages.${system}.default;
+      vmSerialMan =
+        (vmSerialManFlake.outputs {
+          self = vmSerialManFlake;
+          inherit nixpkgs;
+        }).packages.${system}.default;
 
       # Build test runner apps for each configuration
       testApps = builtins.listToAttrs (
@@ -49,7 +53,7 @@
                         value = {
                           type = "app";
                           program = "${testRunners.mkUefiRunner {
-                            inherit name vmSerialMan;
+                            inherit name config vmSerialMan;
                           }}";
                         };
                       }

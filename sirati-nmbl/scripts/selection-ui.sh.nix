@@ -15,11 +15,46 @@
 
   echo "NMBL: Preparing boot selection interface..."
 
+  # Check for nmbl.shell kernel parameter to drop to emergency shell
+  if ${pkgs.busybox}/bin/cat /proc/cmdline | ${pkgs.busybox}/bin/grep -q "nmbl.shell"; then
+    echo "NMBL: Kernel parameter 'nmbl.shell' detected"
+    echo "NMBL: Dropping to emergency shell as requested"
+    echo ""
+    echo "Available generations:"
+    ${pkgs.busybox}/bin/cat /tmp/generations.txt | while IFS='|' read -r gen_id kernel initrd params; do
+      echo "  Generation $gen_id: $kernel"
+    done
+    echo ""
+    echo "Use 'exit' to continue boot process with first generation"
+    echo ""
+    ${pkgs.busybox}/bin/sh
+    echo ""
+    echo "NMBL: Continuing boot process..."
+  fi
+
   # Count generations from our temp file
   GEN_COUNT=$(${pkgs.busybox}/bin/wc -l < /tmp/generations.txt)
 
-  # Simple selection for now - just boot the first (newest/current) generation
-  echo "NMBL: Auto-selecting first generation (timeout: ${toString cfg.timeoutSeconds}s)"
+  # Auto-select first generation with timeout countdown
+  echo "NMBL: Auto-selecting first generation in ${toString cfg.timeoutSeconds} seconds..."
+  echo "NMBL: (Press any key to drop to emergency shell)"
+
+  # Countdown with visual feedback
+  TIMEOUT=${toString cfg.timeoutSeconds}
+  while [ $TIMEOUT -gt 0 ]; do
+    echo -n "NMBL: Booting in $TIMEOUT... "
+
+    # Try to read input with 1 second timeout
+    # If user presses a key, drop to shell
+    if ${pkgs.busybox}/bin/timeout -t 1 ${pkgs.busybox}/bin/dd bs=1 count=1 2>/dev/null; then
+      echo ""
+      echo "NMBL: User interrupt detected - dropping to emergency shell"
+      exec ${pkgs.busybox}/bin/sh
+    fi
+
+    echo ""
+    TIMEOUT=$((TIMEOUT - 1))
+  done
 
   # Read first line from generations file
   SELECTED_LINE=$(${pkgs.busybox}/bin/head -n 1 /tmp/generations.txt)
@@ -38,8 +73,6 @@
   # TODO: Implement full interactive menu with:
   # - List all generations with numbered menu
   # - Keyboard input for selection
-  # - Timeout with countdown
   # - Toggle passthrough params
   # - Edit kernel params
-  # For now, we auto-select the first generation for testing
 ''
