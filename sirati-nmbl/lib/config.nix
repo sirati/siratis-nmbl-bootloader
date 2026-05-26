@@ -6,12 +6,21 @@
   lib,
   pkgs,
   utils,
+  nmblInit,
   ...
 }:
 
 let
   cfg = config.boot.nmbl;
   bootstrapper = cfg.bootstrapper;
+
+  # Activation options are contributed by ./modules/activation.nix. Read
+  # defensively so this file still evaluates if that module hasn't been
+  # imported yet (e.g. during sibling-subtask staggered merges). The
+  # activationBlocks list itself is consumed by ./config-toml.nix, not here.
+  activationCfg = cfg.activation or { };
+  activationExtraContents = activationCfg.extraContents or [ ];
+  activationAssertions = activationCfg.assertions or [ ];
 
   # Set default loader based on bootMode if not explicitly set
   actualLoader =
@@ -78,21 +87,11 @@ let
       ;
   };
 
-  # Determine actual verbose value (use boot.initrd.verbose if cfg.verbose is null)
-  actualVerbose = if cfg.verbose == null then config.boot.initrd.verbose else cfg.verbose;
-
-  # Build the complete init script by importing script.nix
-  buildInitScript = import ../scripts/script.nix {
-    inherit
-      lib
-      pkgs
-      utils
-      ;
-    cfg = cfg // {
-      verbose = actualVerbose;
-    };
-    fileSystems = nmblFileSystems;
-    kernelModules = kernelModulesManager.explicitKernelModules;
+  # Render the runtime configuration that the Rust /init reads at startup.
+  # All previously string-interpolated state (filesystems, modules, timeouts,
+  # serial console, verbosity, activation blocks) lives in this TOML file.
+  nmblConfigToml = import ./config-toml.nix {
+    inherit pkgs lib config;
   };
 
   # Determine legacy boot mode string for compatibility
@@ -115,8 +114,9 @@ in
     # This ensures vfat kernel modules are automatically included in the system initrd
     fileSystems."/boot".neededForBoot = lib.mkOverride 1000 true;
 
-    # Import assertions from assertions module
-    assertions = assertionsModule.assertions;
+    # Import assertions from assertions module, plus any contributed by the
+    # activation module (e.g. luks-tpm misconfiguration, missing TPM modules).
+    assertions = assertionsModule.assertions ++ activationAssertions;
 
     # Force assertion checking - this will fail the build if any assertions are false
     # NixOS checks assertions in system.build.toplevel, but we need to ensure they're
@@ -134,44 +134,46 @@ in
       else
         pkgs.writeText "nmbl-assertions-ok" "All NMBL assertions passed\n";
 
-    # Build the minimal initramfs
+    # Build the minimal initramfs around the Rust /init binary.
+    #
+    # Contents are deliberately small:
+    #   - /init                       : the static-musl Rust binary (PID 1)
+    #   - /etc/nmbl/config.toml       : runtime config it reads at startup
+    #   - /bin/sh                     : busybox, used ONLY for the emergency
+    #                                   shell on failure (never by /init itself)
+    #   - /lib/modules                : kernel modules closure
+    #   - /etc/modprobe.d/nixos.conf  : blacklist config
+    #
+    # Storage-activation tooling (cryptsetup / lvm2 / mdadm / zfs) is added
+    # conditionally via cfg.activation.extraContents — populated by
+    # ./modules/activation.nix only when fileSystems require it.
     system.build.nmblInitramfs =
       let
-        initScript = buildInitScript;
+        baseContents = [
+          {
+            object = "${nmblInit}/bin/nmbl-init";
+            symlink = "/init";
+          }
+          {
+            object = nmblConfigToml;
+            symlink = "/etc/nmbl/config.toml";
+          }
+          {
+            object = "${pkgs.busybox}/bin/busybox";
+            symlink = "/bin/sh";
+          }
+          {
+            object = "${kernelModulesManager.modulesClosure}/lib/modules";
+            symlink = "/lib/modules";
+          }
+          {
+            object = kernelModulesManager.modprobeConf;
+            symlink = "/etc/modprobe.d/nixos.conf";
+          }
+        ];
 
-        # Build minimal initramfs with only essential tools
         initramfs = pkgs.makeInitrd {
-          contents = [
-            {
-              object = initScript;
-              symlink = "/init";
-            }
-            {
-              object = pkgs.busybox;
-              symlink = "/bin/busybox";
-            }
-            {
-              object = pkgs.bash;
-              symlink = "/bin/bash";
-            }
-            {
-              object = pkgs.kexec-tools;
-              symlink = "/bin/kexec";
-            }
-            {
-              object = pkgs.kmod;
-              symlink = "/bin/kmod";
-            }
-            {
-              object = "${kernelModulesManager.modulesClosure}/lib/modules";
-              symlink = "/lib/modules";
-            }
-            {
-              object = kernelModulesManager.modprobeConf;
-              symlink = "/etc/modprobe.d/nixos.conf";
-            }
-          ];
-
+          contents = baseContents ++ activationExtraContents;
           compressor = "gzip -9";
         };
       in
@@ -274,9 +276,9 @@ in
     # Custom installation script (imported from module)
     system.build.installNmbl = installScriptModule.installNmbl;
 
-    # Add kexec-tools and install-nmbl to system packages
+    # Add install-nmbl to system packages. kexec-tools is no longer required:
+    # the Rust /init drives kexec via the kexec_file_load(2) syscall directly.
     environment.systemPackages = [
-      pkgs.kexec-tools
       installScriptModule.installNmbl
     ];
   };
