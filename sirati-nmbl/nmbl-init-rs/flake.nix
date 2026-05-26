@@ -138,6 +138,20 @@
           nmbl-init-fmt = craneLib.cargoFmt {
             src = commonArgs.src;
           };
+
+          # Enforce that the only sites that may exec a new process or
+          # invoke std::process::Command are the three allow-listed
+          # files: the emergency-shell exec site, the panic-recovery
+          # re-exec site, and the activation-runner fork/exec helper.
+          nmbl-init-no-exec = pkgs.runCommand "nmbl-init-no-exec" { } ''
+            cd ${./.}
+            if grep -RIn -E '\bCommand::|\bexecve\(' src/ \
+                 | grep -v -E '^src/(shell\.rs|panic\.rs|sys/activation\.rs)'; then
+              echo "ERROR: Command:: or execve() found outside allowlisted files"
+              exit 1
+            fi
+            touch $out
+          '';
         };
       }
     );
