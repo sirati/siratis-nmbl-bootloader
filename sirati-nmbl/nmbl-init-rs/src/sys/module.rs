@@ -154,6 +154,12 @@ pub enum LoadOutcome {
 ///   logic refuses with no hardware to bind to.
 /// * `ENOSYS` — syscall family unavailable / disabled.
 /// * `EINVAL` — kernel rejected the module's parameters or signature.
+/// * `ENOENT` — the module's own `init()` returned -ENOENT (typically
+///   "a backend the module wanted is unavailable" — e.g. encrypted_keys
+///   failing `aes_get_sizes()` when the trusted-keys cipher isn't
+///   built into the kernel). Safe to skip because file-not-found at the
+///   .ko path itself is caught earlier by [`load_module`]'s existence
+///   pre-check (returns [`LoadOutcome::FileMissing`]).
 ///
 /// `EEXIST` is handled separately as [`LoadOutcome::AlreadyLoaded`] and
 /// is NOT routed through this classifier. `ELOOP` (cycle detection from
@@ -162,7 +168,12 @@ pub enum LoadOutcome {
 pub fn is_recoverable_module_error(errno: Errno) -> bool {
     matches!(
         errno,
-        Errno::EOPNOTSUPP | Errno::ENOEXEC | Errno::ENODEV | Errno::ENOSYS | Errno::EINVAL
+        Errno::EOPNOTSUPP
+            | Errno::ENOEXEC
+            | Errno::ENODEV
+            | Errno::ENOSYS
+            | Errno::EINVAL
+            | Errno::ENOENT
     )
 }
 
@@ -582,13 +593,17 @@ kernel/drivers/md/dm-mod.ko.xz:
     fn recoverable_classifier_covers_kernel_refusals() {
         // Every errno that the task / `init_module(2)` manpage flags as
         // "kernel cannot load this module right now" must be classified
-        // as recoverable so we don't abort the boot for it.
+        // as recoverable so we don't abort the boot for it. ENOENT here
+        // is the module's own init() returning -ENOENT (e.g. a backend
+        // cipher is unavailable); file-not-found at the .ko path itself
+        // is intercepted earlier by load_module's existence pre-check.
         for errno in [
             Errno::EOPNOTSUPP,
             Errno::ENOEXEC,
             Errno::ENODEV,
             Errno::ENOSYS,
             Errno::EINVAL,
+            Errno::ENOENT,
         ] {
             assert!(
                 is_recoverable_module_error(errno),
@@ -599,13 +614,12 @@ kernel/drivers/md/dm-mod.ko.xz:
 
     #[test]
     fn recoverable_classifier_does_not_swallow_real_errors() {
-        // File-IO failures (ENOENT, EACCES, …) and dep-graph bugs
-        // (ELOOP) must NOT be classified as recoverable — they need to
-        // surface as `NmblError::Module`. EEXIST is also excluded
-        // because it has its own `LoadOutcome::AlreadyLoaded` variant
-        // and never reaches the classifier.
+        // Filesystem permission / OOM / generic IO failures and
+        // dep-graph bugs (ELOOP) must NOT be classified as recoverable.
+        // EEXIST is excluded because it has its own
+        // `LoadOutcome::AlreadyLoaded` variant and never reaches the
+        // classifier.
         for errno in [
-            Errno::ENOENT,
             Errno::EACCES,
             Errno::EPERM,
             Errno::ELOOP,
