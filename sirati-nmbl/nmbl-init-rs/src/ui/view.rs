@@ -30,7 +30,6 @@ pub struct EditScreenData<'a> {
 pub struct PassphraseScreenData<'a> {
     pub prompt_label: &'a str,
     pub buffer_len: usize,
-    pub error_message: Option<&'a str>,
 }
 
 /// Split frame into (header, body, footer). Small frames degrade gracefully.
@@ -70,6 +69,21 @@ fn render_header(frame: &mut Frame<'_>, area: Rect, countdown: Option<u64>) {
 /// Common footer line used on every screen.
 pub fn render_footer(frame: &mut Frame<'_>, area: Rect, hint: &str) {
     frame.render_widget(Paragraph::new(hint).alignment(Alignment::Right), area);
+}
+
+/// Convert a byte index into `s` into a char-column count suitable for
+/// caret positioning. Clamps to the end of `s`, then walks back to the
+/// nearest char boundary so a stale cursor mid-codepoint doesn't panic
+/// when sliced.
+fn char_column_for_byte_cursor(s: &str, byte_idx: usize) -> usize {
+    let clamped = byte_idx.min(s.len());
+    // Walk back to the nearest char boundary. Index 0 is always a
+    // boundary, so `(0..=clamped).rev().find(..)` is never empty —
+    // but pattern-match instead of unwrap to keep the code total.
+    let Some(safe) = (0..=clamped).rev().find(|&i| s.is_char_boundary(i)) else {
+        return 0;
+    };
+    s.get(..safe).map_or(0, |prefix| prefix.chars().count())
 }
 
 fn generation_item<'a>(g: &'a Generation, show_kernel_params: bool) -> ListItem<'a> {
@@ -120,12 +134,10 @@ pub fn render_list(frame: &mut Frame<'_>, data: &ListScreenData<'_>) {
 pub fn render_edit(frame: &mut Frame<'_>, data: &EditScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
-    // Caret indicator counts characters, not bytes.
-    let offset = data
-        .edited_cmdline
-        .chars()
-        .take(data.cursor_position)
-        .count();
+    // `cursor_position` is a BYTE index (per `Screen::Editing.cursor`).
+    // Convert to a CHAR-column count so multi-byte text (e.g. "héllo")
+    // doesn't shove the caret one cell too far to the right.
+    let offset = char_column_for_byte_cursor(data.edited_cmdline, data.cursor_position);
     let caret = format!("{}{}", " ".repeat(offset), "^");
     let title = format!("Edit cmdline — generation #{}", data.generation.number);
     let text = Text::from(vec![
@@ -147,18 +159,11 @@ pub fn render_passphrase(frame: &mut Frame<'_>, data: &PassphraseScreenData<'_>)
     frame.render_widget(Clear, modal);
     // Cap mask so a huge typo doesn't overflow the box.
     let dots: String = "*".repeat(data.buffer_len.min(40));
-    let mut lines: Vec<Line<'_>> = vec![
+    let lines: Vec<Line<'_>> = vec![
         Line::raw(data.prompt_label.to_owned()),
         Line::raw(String::new()),
         Line::from(vec![Span::raw(dots), Span::raw("|")]),
     ];
-    if let Some(err) = data.error_message {
-        lines.push(Line::raw(String::new()));
-        lines.push(Line::styled(
-            err.to_owned(),
-            Style::default().fg(Color::Red),
-        ));
-    }
     let para = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title("Passphrase"))
         .wrap(Wrap { trim: false });
@@ -248,18 +253,58 @@ mod tests {
     }
 
     #[test]
-    fn test_render_passphrase_dots_label_and_error() {
+    fn test_render_edit_caret_column_for_multibyte_cmdline() {
+        // "héllo" is 6 bytes ('h' 'é'×2 'l' 'l' 'o'); cursor at byte
+        // index 4 sits right after the 'l' that follows 'é', which
+        // is char column 3. A naive `chars().take(cursor).count()`
+        // would render the caret at column 4 — this test pins the
+        // byte→char conversion.
+        let g = fake_gen(7, "", &[]);
+        let data = EditScreenData {
+            generation: &g,
+            edited_cmdline: "héllo",
+            cursor_position: 4,
+        };
+        let mut term = new_term(40, 10);
+        term.draw(|f| render_edit(f, &data)).expect("draw");
+        let lines = buffer_lines(&term);
+
+        // Find the caret row (the line that contains '^') and the
+        // text row that precedes it.
+        let caret_row = lines
+            .iter()
+            .position(|l| l.contains('^'))
+            .expect("caret '^' must appear in rendered buffer");
+        let caret_line = &lines[caret_row];
+        // Count chars (not bytes) so multi-byte border glyphs like '│'
+        // don't throw the column off.
+        let caret_col = caret_line
+            .chars()
+            .position(|c| c == '^')
+            .expect("'^' present");
+
+        // The border draws on column 0, so the body starts at col 1.
+        // Column-3 of the edited string is column-4 of the row.
+        assert_eq!(
+            caret_col,
+            4,
+            "caret rendered at row col {caret_col}, expected 4 (string col 3) \
+             in rendered lines:\n{}",
+            lines.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_render_passphrase_dots_and_label() {
         let data = PassphraseScreenData {
             prompt_label: "Unlock /dev/sda2",
             buffer_len: 5,
-            error_message: Some("wrong passphrase"),
         };
         let mut term = new_term(80, 24);
         term.draw(|f| render_passphrase(f, &data)).expect("draw");
         let text = buffer_text(&term);
         assert!(text.contains("*****|"), "wrong mask count in:\n{text}");
         assert!(text.contains("Unlock /dev/sda2"));
-        assert!(text.contains("wrong passphrase"));
     }
 
     #[test]

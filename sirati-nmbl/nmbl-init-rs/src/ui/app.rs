@@ -48,7 +48,6 @@ pub enum Screen {
     Passphrase {
         prompt_label: String,
         buffer: Zeroizing<String>,
-        error_message: Option<String>,
     },
 }
 
@@ -125,6 +124,12 @@ impl<'a> App<'a> {
                 false
             }
             KeyCode::Enter => {
+                // Guard against an empty list: emitting a Boot
+                // decision with index 0 would crash the caller as
+                // soon as it tried to look up the generation.
+                if generations.is_empty() {
+                    return false;
+                }
                 *decision = Some(Decision::Boot {
                     generation_index: *selected_index,
                     cmdline_override: None,
@@ -411,6 +416,17 @@ mod tests {
     }
 
     #[test]
+    fn list_enter_with_empty_generations_does_not_decide() {
+        // Defence-in-depth: if the selector ever ran with zero
+        // generations, Enter would otherwise emit Boot{0,..} and
+        // main.rs would index out of bounds. Make Enter a no-op.
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        assert!(!app.on_key(press(KeyCode::Enter)));
+        assert!(app.decision.is_none(), "decision must stay None");
+    }
+
+    #[test]
     fn list_p_toggles_show_kernel_params() {
         let gens = vec![fake_gen(1, &[])];
         let mut app = App::new(&gens);
@@ -547,7 +563,6 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new(String::new()),
-            error_message: None,
         };
         for c in "hi".chars() {
             assert!(!app.on_key(press(KeyCode::Char(c))));
@@ -570,7 +585,6 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new(String::new()),
-            error_message: None,
         };
         assert!(app.on_key(press(KeyCode::Esc)));
         assert!(matches!(app.decision, Some(Decision::Shell)));
@@ -583,7 +597,6 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new("secret".to_string()),
-            error_message: None,
         };
         assert!(app.on_key(press(KeyCode::Enter)));
         assert!(app.decision.is_none(), "Enter must not set a Decision");

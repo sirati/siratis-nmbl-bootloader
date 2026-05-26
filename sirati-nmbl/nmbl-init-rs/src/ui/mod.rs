@@ -67,8 +67,10 @@ pub use app::{App, Decision, Screen};
 
 /// Default console path used for early-userspace TUI rendering.
 const CONSOLE_PATH: &str = "/dev/console";
-/// Slice we wait on `crossterm::event::poll` per iteration.
-const POLL_SLICE: Duration = Duration::from_millis(100);
+/// Slice we wait on `crossterm::event::poll` per iteration. Shared by
+/// the event loop and the countdown ticker so they have the same
+/// responsiveness profile and only one knob to tune.
+pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
 
 /// Run the boot-selection TUI and return the operator's decision.
 ///
@@ -142,17 +144,25 @@ fn run_event_loop<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     app: &mut App<'_>,
 ) -> Result<()> {
+    // Repaint only on state changes — every iteration without a key
+    // event used to redraw, burning CPU and flickering on slow
+    // serial-bridged terminals. The first frame is always dirty.
+    let mut dirty = true;
     loop {
-        terminal
-            .draw(|f| render_current_screen(f, app))
-            .map_err(tui_err)?;
+        if dirty {
+            terminal
+                .draw(|f| render_current_screen(f, app))
+                .map_err(tui_err)?;
+            dirty = false;
+        }
 
         if event::poll(POLL_SLICE).map_err(tui_err)? {
             let evt = event::read().map_err(tui_err)?;
-            if let Event::Key(key) = evt
-                && app.on_key(key)
-            {
-                return Ok(());
+            if let Event::Key(key) = evt {
+                if app.on_key(key) {
+                    return Ok(());
+                }
+                dirty = true;
             }
         }
 
@@ -183,12 +193,10 @@ fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
         Screen::Passphrase {
             prompt_label,
             buffer,
-            error_message,
         } => {
             let data = PassphraseScreenData {
                 prompt_label,
                 buffer_len: buffer.len(),
-                error_message: error_message.as_deref(),
             };
             render_passphrase(frame, &data);
         }
@@ -379,13 +387,16 @@ fn tui_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
     app.screen = Screen::Passphrase {
         prompt_label: label.to_string(),
         buffer: Zeroizing::new(String::new()),
-        error_message: None,
     };
 
+    let mut dirty = true;
     loop {
-        terminal
-            .draw(|f| render_current_screen(f, &app))
-            .map_err(tui_err)?;
+        if dirty {
+            terminal
+                .draw(|f| render_current_screen(f, &app))
+                .map_err(tui_err)?;
+            dirty = false;
+        }
 
         if event::poll(POLL_SLICE).map_err(tui_err)? {
             let evt = event::read().map_err(tui_err)?;
@@ -406,6 +417,7 @@ fn tui_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
                         source: std::io::Error::other("passphrase screen exited without a buffer"),
                     });
                 }
+                dirty = true;
             }
         }
     }
