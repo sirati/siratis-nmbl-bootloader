@@ -11,9 +11,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use nix::errno::Errno;
-use nix::fcntl::{OFlag, open};
 use nix::sys::reboot::{RebootMode, reboot};
-use nix::sys::stat::Mode;
+use rustix::fs::{Mode, OFlags};
 
 use crate::error::{NmblError, Result};
 
@@ -53,24 +52,20 @@ fn build_cmdline_cstring(
 /// `flags` automatically and `-1` is passed as the initrd fd. Both file
 /// descriptors are opened `O_RDONLY | O_CLOEXEC` and closed at drop.
 pub fn load(kernel: &Path, initrd: Option<&Path>, cmdline: &str, flags: u32) -> Result<()> {
-    let kernel_fd =
-        open(kernel, OFlag::O_RDONLY | OFlag::O_CLOEXEC, Mode::empty()).map_err(|e| {
-            NmblError::KexecLoad {
-                kernel: kernel.to_path_buf(),
-                initrd: initrd.map(Path::to_path_buf),
-                source: e,
-            }
+    let kernel_fd = rustix::fs::open(kernel, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|e| NmblError::KexecLoad {
+            kernel: kernel.to_path_buf(),
+            initrd: initrd.map(Path::to_path_buf),
+            source: nix::Error::from_raw(e.raw_os_error()),
         })?;
 
     let (initrd_fd_opt, effective_flags) = match initrd {
         Some(path) => {
-            let fd =
-                open(path, OFlag::O_RDONLY | OFlag::O_CLOEXEC, Mode::empty()).map_err(|e| {
-                    NmblError::KexecLoad {
-                        kernel: kernel.to_path_buf(),
-                        initrd: Some(path.to_path_buf()),
-                        source: e,
-                    }
+            let fd = rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+                .map_err(|e| NmblError::KexecLoad {
+                    kernel: kernel.to_path_buf(),
+                    initrd: Some(path.to_path_buf()),
+                    source: nix::Error::from_raw(e.raw_os_error()),
                 })?;
             (Some(fd), flags)
         }
@@ -84,9 +79,17 @@ pub fn load(kernel: &Path, initrd: Option<&Path>, cmdline: &str, flags: u32) -> 
         None => -1,
     };
 
-    // SAFETY: kernel_fd and (when present) initrd_fd are live OwnedFds we
-    // hold for the duration of the call. cmdline_buf is a Vec we own that
-    // outlives the syscall. The syscall reads, never writes, our buffers.
+    // SAFETY: Unavoidable raw syscall.
+    //   * Why no safe wrapper: no Rust crate wraps `kexec_file_load(2)`
+    //     — `nix` 0.29 only wraps `reboot(LINUX_REBOOT_CMD_KEXEC)`, not
+    //     the loader; `rustix` 0.38 has no covering API in the `system`
+    //     or `process` modules; `libkexec` is a C library we refuse to
+    //     link from PID 1.
+    //   * Why this is safe: `kernel_fd` and (when present) `initrd_fd`
+    //     are live `OwnedFd`s held by this function for the duration
+    //     of the call. `cmdline_buf` is a Vec we own that outlives the
+    //     syscall. The kernel reads, never writes, our buffers; the
+    //     return value + errno report failure.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_kexec_file_load,

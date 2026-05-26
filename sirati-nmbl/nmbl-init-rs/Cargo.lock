@@ -292,6 +292,7 @@ dependencies = [
  "libc",
  "nix",
  "ratatui",
+ "rustix",
  "serde",
  "thiserror",
  "toml",

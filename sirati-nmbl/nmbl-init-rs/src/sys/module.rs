@@ -6,12 +6,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
-use nix::fcntl::{OFlag, open};
-use nix::sys::stat::Mode;
+use rustix::fs::{Mode, OFlags};
 
 use crate::error::{NmblError, Result};
 
@@ -168,21 +167,29 @@ fn flags_for_path(path: &Path) -> u32 {
     }
 }
 
-/// Convert a `RawFd` from `nix::fcntl::open` into an owning handle so
-/// the file is closed on drop even if we early-return.
+/// Open the module file as an owning fd. `rustix::fs::open` returns an
+/// `OwnedFd` natively, so we avoid the `from_raw_fd` unsafe wrap that
+/// `nix::fcntl::open` would have forced.
 fn open_module_fd(path: &Path, name: &str) -> Result<OwnedFd> {
-    let raw = open(path, OFlag::O_RDONLY | OFlag::O_CLOEXEC, Mode::empty())
-        .map_err(|e| module_err(name, path, e))?;
-    // SAFETY: `open` just returned this fd to us and no other code owns
-    // it; wrapping it in `OwnedFd` transfers ownership unambiguously.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|e| module_err(name, path, Errno::from_raw(e.raw_os_error())))
 }
 
 /// Call `finit_module(fd, params, flags)` directly. Returns `Ok(())`
 /// on success or when the module is already loaded (`EEXIST`).
 fn finit_module(fd: &OwnedFd, params: &CString, flags: u32, name: &str, path: &Path) -> Result<()> {
-    // SAFETY: we pass a live fd, a valid NUL-terminated C string, and
-    // an integer flag word — the exact shape `finit_module(2)` expects.
+    // SAFETY: Unavoidable raw syscall.
+    //   * Why no safe wrapper: no Rust crate wraps `finit_module(2)` —
+    //     `nix` (0.29) exposes neither the syscall nor its flag bits;
+    //     `rustix` 0.38 has no covering API (the `rustix` issue tracker
+    //     has no open ticket for it either); `kmod`/`libkmod` is a
+    //     C-API binding that would re-introduce a dynamic-library
+    //     dependency we explicitly do not want in PID 1.
+    //   * Why this is safe: `fd` is a live `OwnedFd` borrowed by
+    //     reference for the duration of the call, `params` is a valid
+    //     NUL-terminated C string owned by the caller, and `flags` is
+    //     a plain integer. The syscall reads, never writes, our
+    //     pointers; failure is reported via the return value + errno.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_finit_module,
