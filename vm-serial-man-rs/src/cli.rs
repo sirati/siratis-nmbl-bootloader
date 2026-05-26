@@ -2,6 +2,46 @@
 
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
+use std::str::FromStr;
+
+/// CLI representation of [`crate::manager::Display`]. Parsed from strings such
+/// as `serial`, `sdl`, or `vnc:5901`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DisplayArg {
+    #[default]
+    Serial,
+    Sdl,
+    Vnc {
+        port: u16,
+    },
+}
+
+impl FromStr for DisplayArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let lower = s.to_ascii_lowercase();
+        match lower.as_str() {
+            "serial" => Ok(Self::Serial),
+            "sdl" => Ok(Self::Sdl),
+            _ => {
+                if let Some(rest) = lower.strip_prefix("vnc:") {
+                    let port: u16 = rest
+                        .parse()
+                        .map_err(|e| format!("invalid VNC port {rest:?}: {e}"))?;
+                    if port < 5900 {
+                        return Err(format!("VNC port {port} must be >= 5900"));
+                    }
+                    Ok(Self::Vnc { port })
+                } else {
+                    Err(format!(
+                        "expected one of 'serial', 'sdl', 'vnc:PORT', got {s:?}"
+                    ))
+                }
+            }
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "vm-serial-man")]
@@ -77,6 +117,11 @@ pub struct ManagerConfig {
     /// Buffer time window (seconds)
     #[arg(long, default_value = "10")]
     pub buffer_seconds: u64,
+
+    /// Display backend: `serial` (headless, default), `sdl`, or `vnc:PORT`
+    /// where `PORT` is a TCP port >= 5900.
+    #[arg(long, default_value = "serial")]
+    pub display: DisplayArg,
 }
 
 #[derive(Subcommand)]
@@ -214,5 +259,15 @@ pub enum Commands {
         /// Control socket path (auto-detected if not specified)
         #[arg(long)]
         socket: Option<PathBuf>,
+    },
+
+    /// Capture the current VM framebuffer to a PPM file via the QEMU monitor
+    Screenshot {
+        /// Destination path for the PPM file
+        output: PathBuf,
+
+        /// QEMU monitor Unix socket of the running VM
+        #[arg(long)]
+        monitor_socket: PathBuf,
     },
 }
