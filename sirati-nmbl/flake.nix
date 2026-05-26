@@ -34,7 +34,7 @@
       pkgs = nixpkgs.legacyPackages.${system};
 
       # Import testing utilities
-      testing = import ./testing/build_configurations.nix { inherit self nixpkgs; };
+      testing = import ./testing/build_configurations.nix { inherit self nixpkgs disko; };
 
       # Import test runners
       testRunners = import ./testing/test-runners.nix { inherit nixpkgs system; };
