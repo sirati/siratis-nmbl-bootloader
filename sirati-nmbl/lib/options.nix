@@ -1,8 +1,11 @@
 # NixOS Module Options for NMBL (NixOS Minimal BootLoader)
 # This file defines all configuration options available for the bootloader
 
-{ lib, pkgs, ... }:
+{ config, lib, pkgs, ... }:
 
+let
+  cfg = config.boot.nmbl;
+in
 {
   imports = [
     ./modules/activation.nix
@@ -299,6 +302,135 @@
 
         Default: false (validation enabled for safety)
       '';
+    };
+
+    # --- Runtime TOML options consumed by nmbl-init-rs -------------------
+    # The fields below are surfaced to /etc/nmbl/config.toml via
+    # lib/config-toml.nix. Their names follow Nix-side conventions
+    # (camelCase); the emitter rewrites them to snake_case keys that match
+    # the Rust serde structs in nmbl-init-rs/src/config.rs.
+
+    verbosity = lib.mkOption {
+      type = lib.types.enum [ "quiet" "info" "verbose" ];
+      default =
+        if cfg.verbose == true then "verbose"
+        else if cfg.verbose == false then "quiet"
+        else "info";
+      defaultText = lib.literalMD ''derived from `boot.nmbl.verbose`: `true` → "verbose", `false` → "quiet", `null` → "info".'';
+      description = lib.mdDoc ''
+        Verbosity level for the NMBL /init runtime (mapped to the Rust
+        `Verbosity` enum). Prefer this over the legacy nullable
+        `boot.nmbl.verbose` option, which is kept for backwards
+        compatibility.
+      '';
+    };
+
+    timeoutSecs = lib.mkOption {
+      type = lib.types.int;
+      default = cfg.timeoutSeconds;
+      defaultText = lib.literalMD "inherits from `boot.nmbl.timeoutSeconds`.";
+      description = lib.mdDoc ''
+        Alias for `boot.nmbl.timeoutSeconds` matching the snake_case
+        `timeout_secs` key in the runtime TOML config consumed by
+        nmbl-init-rs.
+      '';
+    };
+
+    panicReportDir = lib.mkOption {
+      type = lib.types.path;
+      default = "/run";
+      description = lib.mdDoc ''
+        Directory inside the initramfs where the Rust /init writes panic
+        reports before bailing into the emergency shell.
+      '';
+    };
+
+    explicitKernelModules = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = lib.unique (
+        lib.filter (m: !(lib.elem m cfg.blacklistedKernelModules)) (
+          cfg.kernelModules ++ config.boot.initrd.kernelModules
+        )
+      );
+      defaultText = lib.literalMD ''
+        union of `boot.nmbl.kernelModules` and `boot.initrd.kernelModules`,
+        with `boot.nmbl.blacklistedKernelModules` removed.
+      '';
+      description = lib.mdDoc ''
+        Kernel modules the NMBL /init will load explicitly at startup
+        (modprobe-style). Computed by default from
+        `boot.nmbl.kernelModules` plus `boot.initrd.kernelModules`; set
+        directly to override.
+      '';
+    };
+
+    fileSystems = lib.mkOption {
+      type = lib.types.attrsOf lib.types.attrs;
+      internal = true;
+      readOnly = true;
+      default = lib.filterAttrs
+        (_: fs: (fs.neededForBoot or false) || fs.mountPoint == "/")
+        config.fileSystems;
+      defaultText = lib.literalMD ''
+        the subset of `config.fileSystems` with `neededForBoot = true` or
+        mounted at `/`.
+      '';
+      description = lib.mdDoc ''
+        Filesystem set NMBL mounts before kexec'ing the target system.
+        Mirrors the standard NixOS stage-1 filter
+        (`utils.fsNeededForBoot`) but exposed as an attribute so
+        `lib/config-toml.nix` can serialise it without re-importing
+        `utils`.
+      '';
+    };
+
+    tui = {
+      enableEditor = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = lib.mdDoc ''
+          Whether the TUI allows in-place editing of the kernel
+          command line before kexec.
+        '';
+      };
+
+      showKernelParams = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = lib.mdDoc ''
+          Whether the TUI displays the resolved kernel command line for
+          the highlighted generation.
+        '';
+      };
+    };
+
+    paths = {
+      nixProfilesDir = lib.mkOption {
+        type = lib.types.path;
+        default = "/mnt/system/nix/var/nix/profiles";
+        description = lib.mdDoc ''
+          Path (inside the NMBL initramfs, after mounting the target
+          system) where NixOS system profile symlinks live.
+        '';
+      };
+
+      systemRoot = lib.mkOption {
+        type = lib.types.path;
+        default = "/mnt/system";
+        description = lib.mdDoc ''
+          Mount point inside the NMBL initramfs where the target
+          system's root filesystem is mounted.
+        '';
+      };
+
+      shell = lib.mkOption {
+        type = lib.types.path;
+        default = "/bin/sh";
+        description = lib.mdDoc ''
+          Path inside the initramfs to the emergency shell binary
+          (typically busybox `sh`) executed when /init bails out.
+        '';
+      };
     };
   };
 }
