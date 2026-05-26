@@ -52,12 +52,15 @@ let
 
   # --- extraKernelModules ---------------------------------------------------
 
-  # AES generic is usually built into the kernel (CONFIG_CRYPTO_AES=y);
-  # the hardware-accelerated variants ship as modules. We request
-  # aesni_intel for the common AES-NI path and let the resolver soft-
-  # skip aes_generic if it's built-in. xts is the LUKS2 default mode.
+  # Order matters: dm-crypt's transitive dep encrypted_keys init fails
+  # if no AES cipher is registered with the kernel crypto API yet, which
+  # then leaves dm_crypt with an unresolved key_type_encrypted symbol.
+  # Load the AES + cipher-mode + hash primitives BEFORE dm-crypt so its
+  # dep walk finds them already initialised. aesni_intel covers AES-NI
+  # CPUs; aes_generic is typically CONFIG_CRYPTO_AES_GENERIC=y (built-
+  # in), so it'll soft-skip on the modules.dep miss.
   extraKernelModules = lib.unique (
-    lib.optionals luksAny [ "dm_mod" "dm-crypt" "aesni_intel" "xts" "sha256_generic" ]
+    lib.optionals luksAny [ "dm_mod" "aesni_intel" "xts" "sha256_generic" "dm-crypt" ]
     ++ lib.optionals luksTpm [ "tpm_crb" "tpm_tis" ]
     ++ lib.optional lvmOn "dm_mod"
     ++ lib.optionals mdOn [ "md_mod" "raid0" "raid1" "raid10" "raid456" ]
