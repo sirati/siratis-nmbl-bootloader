@@ -39,6 +39,14 @@ pub enum NmblError {
         source: nix::Error,
     },
 
+    /// Catastrophic kernel-module load failure: the file could not be
+    /// opened (missing, permission denied, …), the dep graph references
+    /// an unknown module, or `modules.dep` describes a cycle. This
+    /// variant is reserved for situations that no `nmbl` install can
+    /// possibly recover from — it is **not** produced when the running
+    /// kernel merely refuses a particular module via `EOPNOTSUPP`,
+    /// `ENOEXEC`, or `ENODEV`; those are logged as warnings and the
+    /// boot is allowed to continue (see `sys::module::LoadOutcome`).
     #[error("kernel module {name} (path {path}) failed to load: {source}")]
     Module {
         name: String,

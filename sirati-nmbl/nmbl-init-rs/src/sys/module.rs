@@ -13,6 +13,7 @@ use nix::errno::Errno;
 use rustix::fs::{Mode, OFlags};
 
 use crate::error::{NmblError, Result};
+use crate::nmbl_warn;
 
 // `<linux/module.h>` flag bits for `finit_module(2)`. `nix` does not
 // expose the syscall or the flags, so we hard-code them here.
@@ -112,6 +113,48 @@ pub fn index_by_name(entries: &[ModuleEntry]) -> HashMap<String, &ModuleEntry> {
     map
 }
 
+/// Outcome of a single `finit_module(2)` call.
+///
+/// `load_module` returns this so that callers can distinguish a
+/// successful load from a kernel-side refusal — the latter is not a
+/// catastrophic NMBL error and the boot should continue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadOutcome {
+    /// Module was newly loaded.
+    Loaded,
+    /// Module was already loaded (`EEXIST`). Idempotent re-runs hit this.
+    AlreadyLoaded,
+    /// Kernel refused to load — typically `EOPNOTSUPP` / `ENOEXEC` /
+    /// `ENODEV` (see [`is_recoverable_module_error`]). Callers should
+    /// log a warning and continue; this is **not** fatal.
+    KernelRefused { source: nix::Error },
+}
+
+/// Errnos returned by `finit_module(2)` that mean "this kernel cannot
+/// load this particular module right now" rather than "NMBL is broken".
+///
+/// Covers:
+/// * `EOPNOTSUPP` / `ENOTSUP` — feature not supported by the running
+///   kernel (e.g. `CONFIG_*=n`, missing CPU feature, transport endpoint
+///   does not support the operation).
+/// * `ENOEXEC` — kernel cannot parse the module image (mismatched
+///   architecture, corrupted file, wrong format).
+/// * `ENODEV` — no matching device for the driver; the module loaded
+///   logic refuses with no hardware to bind to.
+/// * `ENOSYS` — syscall family unavailable / disabled.
+/// * `EINVAL` — kernel rejected the module's parameters or signature.
+///
+/// `EEXIST` is handled separately as [`LoadOutcome::AlreadyLoaded`] and
+/// is NOT routed through this classifier. `ELOOP` (cycle detection from
+/// our own dep walk) is intentionally **not** recoverable: it indicates
+/// a config/modules.dep bug that should propagate.
+pub fn is_recoverable_module_error(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::EOPNOTSUPP | Errno::ENOEXEC | Errno::ENODEV | Errno::ENOSYS | Errno::EINVAL
+    )
+}
+
 /// Synthesize a `NmblError::Module` from a raw errno + module name + path.
 fn module_err(name: &str, path: &Path, errno: Errno) -> NmblError {
     NmblError::Module {
@@ -195,9 +238,22 @@ fn open_module_fd(path: &Path, name: &str) -> Result<OwnedFd> {
         .map_err(|e| module_err(name, path, Errno::from_raw(e.raw_os_error())))
 }
 
-/// Call `finit_module(fd, params, flags)` directly. Returns `Ok(())`
-/// on success or when the module is already loaded (`EEXIST`).
-fn finit_module(fd: &OwnedFd, params: &CString, flags: u32, name: &str, path: &Path) -> Result<()> {
+/// Call `finit_module(fd, params, flags)` directly.
+///
+/// Returns:
+/// * `Ok(LoadOutcome::Loaded)` on success.
+/// * `Ok(LoadOutcome::AlreadyLoaded)` when the kernel reports `EEXIST`.
+/// * `Ok(LoadOutcome::KernelRefused { source })` for errnos classified
+///   as recoverable by [`is_recoverable_module_error`].
+/// * `Err(NmblError::Module)` for every other errno — those are real
+///   load failures the caller should propagate.
+fn finit_module(
+    fd: &OwnedFd,
+    params: &CString,
+    flags: u32,
+    name: &str,
+    path: &Path,
+) -> Result<LoadOutcome> {
     // SAFETY: Unavoidable raw syscall.
     //   * Why no safe wrapper: no Rust crate wraps `finit_module(2)` —
     //     `nix` (0.29) exposes neither the syscall nor its flag bits;
@@ -219,12 +275,15 @@ fn finit_module(fd: &OwnedFd, params: &CString, flags: u32, name: &str, path: &P
         )
     };
     if rc == 0 {
-        return Ok(());
+        return Ok(LoadOutcome::Loaded);
     }
     let errno = Errno::last();
     if errno == Errno::EEXIST {
         // Module is already in the kernel — treat as success.
-        return Ok(());
+        return Ok(LoadOutcome::AlreadyLoaded);
+    }
+    if is_recoverable_module_error(errno) {
+        return Ok(LoadOutcome::KernelRefused { source: errno });
     }
     Err(module_err(name, path, errno))
 }
@@ -232,8 +291,14 @@ fn finit_module(fd: &OwnedFd, params: &CString, flags: u32, name: &str, path: &P
 /// Open the module's file at `entry.path` and load it via
 /// `finit_module(2)`. Compressed `.ko.xz` / `.ko.zst` / `.ko.gz` are
 /// passed with `MODULE_INIT_COMPRESSED_FILE` so the kernel handles
-/// decompression. Returns `Ok(())` if loaded or already loaded.
-pub fn load_module(entry: &ModuleEntry) -> Result<()> {
+/// decompression.
+///
+/// File-IO errors (open) and unexpected errnos surface as
+/// `NmblError::Module`. Idempotent re-loads return
+/// `Ok(LoadOutcome::AlreadyLoaded)`; kernel-side refusals return
+/// `Ok(LoadOutcome::KernelRefused { … })` and must be logged + skipped
+/// by the caller rather than aborting the boot.
+pub fn load_module(entry: &ModuleEntry) -> Result<LoadOutcome> {
     let fd = open_module_fd(&entry.path, &entry.name)?;
     let flags = flags_for_path(&entry.path);
     // `modules.dep` carries no parameters and the bash bootloader never
@@ -243,11 +308,28 @@ pub fn load_module(entry: &ModuleEntry) -> Result<()> {
 }
 
 /// Resolve `name` against `by_name`, then load every entry in load
-/// order. Idempotent because individual `load_module` calls swallow
-/// `EEXIST`.
+/// order. Idempotent because individual `load_module` calls report
+/// `EEXIST` as [`LoadOutcome::AlreadyLoaded`].
+///
+/// A kernel-refused dep is logged as a warning and skipped — the parent
+/// module will most likely also be refused on the next iteration and
+/// the operator will see the cascade. If a downstream phase actually
+/// needs the missing module, it will fail with its own (more pointed)
+/// error there.
 pub fn load_with_deps(name: &str, by_name: &HashMap<String, &ModuleEntry>) -> Result<()> {
     for entry in resolve_load_order(name, by_name)? {
-        load_module(entry)?;
+        match load_module(entry)? {
+            LoadOutcome::Loaded | LoadOutcome::AlreadyLoaded => {}
+            LoadOutcome::KernelRefused { source } => {
+                nmbl_warn!(
+                    "module {} could not be loaded by the kernel ({}); \
+                     continuing — if a downstream phase needs it the \
+                     error will be clearer there",
+                    entry.name,
+                    source
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -385,5 +467,47 @@ kernel/drivers/md/dm-mod.ko.xz:
         let order = resolve_load_order("dm-mod", &idx).expect("resolve failed");
         assert_eq!(order.len(), 1);
         assert_eq!(order[0].name, "dm_mod");
+    }
+
+    #[test]
+    fn recoverable_classifier_covers_kernel_refusals() {
+        // Every errno that the task / `init_module(2)` manpage flags as
+        // "kernel cannot load this module right now" must be classified
+        // as recoverable so we don't abort the boot for it.
+        for errno in [
+            Errno::EOPNOTSUPP,
+            Errno::ENOEXEC,
+            Errno::ENODEV,
+            Errno::ENOSYS,
+            Errno::EINVAL,
+        ] {
+            assert!(
+                is_recoverable_module_error(errno),
+                "{errno:?} should be recoverable"
+            );
+        }
+    }
+
+    #[test]
+    fn recoverable_classifier_does_not_swallow_real_errors() {
+        // File-IO failures (ENOENT, EACCES, …) and dep-graph bugs
+        // (ELOOP) must NOT be classified as recoverable — they need to
+        // surface as `NmblError::Module`. EEXIST is also excluded
+        // because it has its own `LoadOutcome::AlreadyLoaded` variant
+        // and never reaches the classifier.
+        for errno in [
+            Errno::ENOENT,
+            Errno::EACCES,
+            Errno::EPERM,
+            Errno::ELOOP,
+            Errno::EEXIST,
+            Errno::ENOMEM,
+            Errno::EIO,
+        ] {
+            assert!(
+                !is_recoverable_module_error(errno),
+                "{errno:?} must NOT be recoverable"
+            );
+        }
     }
 }
