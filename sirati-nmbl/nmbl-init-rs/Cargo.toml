@@ -42,7 +42,7 @@ print_stderr     = "allow"   # we _do_ print to stderr — that's our log channe
 print_stdout     = "allow"
 
 [dependencies]
-nix = { version = "0.29", default-features = false, features = ["mount", "fs", "process", "term", "user", "signal"] }
+nix = { version = "0.29", default-features = false, features = ["mount", "fs", "process", "term", "user", "signal", "feature"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
