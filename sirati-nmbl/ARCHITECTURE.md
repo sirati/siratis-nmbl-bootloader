@@ -150,8 +150,9 @@ Grouped by role:
 
 Notable contracts:
 
-- `main` is the only caller of `install_panic_hook`,
-  `drop_to_emergency`, and `kexec_into`.
+- `main` is the only caller of `install_panic_hook` and
+  `drop_to_emergency`; `kexec_into` is invoked only through
+  `select_and_act` dispatch, which itself is only called from `main`.
 - `activation.rs` calls `devices::wait_for` after each activation step
   so the next phase finds the new `/dev/mapper/...` nodes ready.
 - `boot.rs` calls `devices::resolve_mountpoint` for its unmount targets
@@ -385,10 +386,17 @@ crash hard, not loop.
 - **Minimize `unsafe`.** `rustix` is preferred over `nix` for fd-safe
   primitives; `nix` is used where its coverage is broader (mount,
   module, reboot, uname). Every remaining `unsafe` block carries a
-  `// SAFETY:` comment explaining why the safe wrappers don't apply
-  — currently this is just `libc::_exit` in the post-fork child and in
-  the halt fallback, plus the `unsafe { fork() }` in
-  `sys/activation.rs`.
+  `// SAFETY:` comment explaining why the safe wrappers don't apply.
+  Run `grep -RIn unsafe src/` to enumerate; current blocks are:
+  - `unsafe { fork() }` in `sys/activation.rs` plus the two
+    `libc::_exit` post-fork child / exec-failed bailouts in the same
+    file.
+  - `libc::syscall(SYS_kexec_file_load, …)` in `sys/kexec.rs` — neither
+    `nix` nor `rustix` wraps this syscall.
+  - `libc::syscall(SYS_finit_module, …)` in `sys/module.rs` — same
+    reason; the syscall is wrapped by no portable Rust crate.
+  - `libc::_exit(1)` in `panic.rs` (halt fallback when re-exec fails)
+    and `shell.rs` (halt after the emergency-shell exec failure).
 - **`std::process::Command::` and any `execve(` are forbidden outside
   three files: `src/shell.rs`, `src/panic.rs`, `src/sys/activation.rs`.**
   Enforced by the `nmbl-init-no-exec` flake check, which `grep`s the
@@ -425,8 +433,10 @@ Rust path inside these end-to-end runs is still being expanded.
 
 - Static-musl Rust `nmbl-init` builds via crane, embedded into the
   initramfs as `/init` alongside the runtime TOML.
-- All six phases (pseudo-fs, modules, activations, system filesystems,
-  generation scan, TUI, kexec) wired end-to-end.
+- All seven phases (pseudo-fs, modules, activations, system filesystems,
+  generation scan, TUI, kexec) wired end-to-end — `run_phases` covers
+  1, 2, 3, and 3b; `select_and_act` runs 4, 5, and the dispatch into
+  phase 6 (kexec, emergency shell, or reboot).
 - TUI: list view, kernel-parameter editor (`e`), passthrough toggle
   (`p`), emergency-shell exit (`s`), reboot (`q`), auto-boot
   countdown with key-cancel and per-state dirty redraw.
