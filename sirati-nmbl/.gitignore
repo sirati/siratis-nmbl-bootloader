@@ -4,3 +4,5 @@
 
 /debug/
 .nmbl-test*
+.install-test*
+.rescue-vm-test*

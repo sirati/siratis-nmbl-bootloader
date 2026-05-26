@@ -71,8 +71,11 @@ impl QemuConfig {
             }
         }
 
-        // Create socket path for serial
-        let serial_socket = self.socket_dir.join("qemu-serial.sock");
+        // Create socket path for serial — per-PID to avoid collisions when
+        // multiple managers run in parallel (matches the control socket convention).
+        let serial_socket = self
+            .socket_dir
+            .join(format!("qemu-serial-{}.sock", std::process::id()));
 
         // Remove old socket if it exists
         if serial_socket.exists() {
