@@ -23,6 +23,11 @@ pub struct Generation {
     pub kernel: PathBuf,
     /// Resolved path to the initrd.
     pub initrd: PathBuf,
+    /// Path to the NixOS stage-2 `init` script as referenced from
+    /// `<profile_link>/init`. Intentionally NOT canonicalized: the chained
+    /// kernel needs the path through the profile symlink so the store path
+    /// it executes matches what we hand it on the cmdline.
+    pub init_path: PathBuf,
     /// Contents of `profile_link/kernel-params`, split on whitespace.
     pub kernel_params: Vec<String>,
     /// Best-effort label from `profile_link/nixos-version`. Empty when the
@@ -78,6 +83,22 @@ fn resolve_kernel_initrd(link: &Path) -> Result<(PathBuf, PathBuf)> {
     Ok((resolve("kernel")?, resolve("initrd")?))
 }
 
+/// Probe `<link>/init` WITHOUT following symlinks. We want the un-resolved
+/// path because the chained kernel boots its own initrd which will mount the
+/// store and execute exactly the string we hand it on the cmdline; resolving
+/// here would replace `<profile_link>/init` with the underlying store path,
+/// which is fine on disk but defeats the symlink indirection that lets
+/// rollbacks point a fixed cmdline at a moving target. Missing or unreadable
+/// → `Err`, caller skips the generation.
+fn resolve_init_path(link: &Path) -> Result<PathBuf> {
+    let p = link.join("init");
+    std::fs::symlink_metadata(&p).map_err(|source| NmblError::Io {
+        source,
+        context: format!("stat {}", p.display()),
+    })?;
+    Ok(p)
+}
+
 /// Scan `config.paths.nix_profiles_dir` for `system-*-link` entries and return
 /// the matching generations sorted by `number` DESCENDING (newest first).
 ///
@@ -114,6 +135,16 @@ pub fn scan_generations(config: &Config) -> Result<Vec<Generation>> {
                 continue;
             }
         };
+        let init_path = match resolve_init_path(&profile_link) {
+            Ok(p) => p,
+            Err(err) => {
+                nmbl_warn!(
+                    "skipping generation {number} at {} (no init): {err}",
+                    profile_link.display()
+                );
+                continue;
+            }
+        };
 
         generations.push(Generation {
             number,
@@ -122,6 +153,7 @@ pub fn scan_generations(config: &Config) -> Result<Vec<Generation>> {
             profile_link,
             kernel,
             initrd,
+            init_path,
         });
     }
 
@@ -160,6 +192,7 @@ mod tests {
         std::fs::create_dir_all(&p).expect("profile dir");
         std::fs::write(p.join("kernel"), b"k").expect("kernel");
         std::fs::write(p.join("initrd"), b"i").expect("initrd");
+        std::fs::write(p.join("init"), b"#!/bin/sh\n").expect("init");
         std::fs::write(p.join("kernel-params"), params).expect("params");
         p
     }
@@ -191,6 +224,34 @@ mod tests {
             [42, 10, 1]
         );
         assert_eq!(gens[0].kernel_params, vec!["root=/dev/sda42".to_string()]);
+        // init_path must be the un-canonicalized `<profile_link>/init` so the
+        // chained kernel keeps the profile-symlink indirection.
+        for g in &gens {
+            assert_eq!(g.init_path, g.profile_link.join("init"));
+        }
+    }
+
+    #[test]
+    fn skips_generation_without_init() {
+        let tmp = TempDir::new().expect("temp dir");
+        let profiles = tmp.path().join("profiles");
+        let backing = tmp.path().join("backing");
+        std::fs::create_dir_all(&profiles).expect("profiles");
+        std::fs::create_dir_all(&backing).expect("backing");
+        // Good generation: has init.
+        let good = make_profile(&backing, 7, "quiet");
+        symlink(&good, profiles.join("system-7-link")).expect("symlink");
+        // Broken generation: has kernel + initrd but no init.
+        let bad = backing.join("profile-9");
+        std::fs::create_dir_all(&bad).expect("bad dir");
+        std::fs::write(bad.join("kernel"), b"k").expect("kernel");
+        std::fs::write(bad.join("initrd"), b"i").expect("initrd");
+        std::fs::write(bad.join("kernel-params"), "x").expect("params");
+        symlink(&bad, profiles.join("system-9-link")).expect("symlink");
+
+        let gens = scan_generations(&config_for(&profiles)).expect("scan ok");
+        assert_eq!(gens.len(), 1);
+        assert_eq!(gens[0].number, 7);
     }
 
     #[test]

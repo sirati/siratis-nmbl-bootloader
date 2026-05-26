@@ -103,6 +103,7 @@ mod tests {
             profile_link: PathBuf::from("/mnt/system/nix/var/nix/profiles/system-42-link"),
             kernel: PathBuf::from("/mnt/system/boot/vmlinuz"),
             initrd: PathBuf::from("/mnt/system/boot/initrd"),
+            init_path: PathBuf::from("/mnt/system/nix/var/nix/profiles/system-42-link/init"),
             kernel_params: params.iter().map(|s| (*s).to_string()).collect(),
             label: String::new(),
         }
