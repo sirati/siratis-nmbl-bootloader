@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use nix::mount::MntFlags;
 
-use crate::config::{Config, FilesystemEntry};
+use crate::config::Config;
+use crate::devices::resolve_mountpoint;
 use crate::error::Result;
 use crate::generations::Generation;
 use crate::sys;
@@ -30,23 +31,6 @@ fn build_cmdline(generation: &Generation, cmdline_override: Option<&str>) -> Str
         Some(s) => s.to_string(),
         None => generation.kernel_params.join(" "),
     }
-}
-
-/// Mirror of `devices::resolve_mountpoint`. The two MUST agree on the
-/// path or unmount will silently miss live mounts.
-fn resolve_mountpoint(system_root: &Path, entry: &FilesystemEntry) -> PathBuf {
-    if entry.is_root {
-        return system_root.to_path_buf();
-    }
-    let mp = entry.mountpoint.as_path();
-    if mp.is_absolute() && mp.starts_with(system_root) {
-        return mp.to_path_buf();
-    }
-    if mp.is_absolute() {
-        let stripped = mp.strip_prefix("/").unwrap_or(mp);
-        return system_root.join(stripped);
-    }
-    system_root.join(mp)
 }
 
 /// Filesystems in REVERSE declaration order, paths resolved against
@@ -111,6 +95,7 @@ pub fn kexec_into(
 )]
 mod tests {
     use super::*;
+    use crate::config::FilesystemEntry;
 
     fn gen_for(params: &[&str]) -> Generation {
         Generation {
