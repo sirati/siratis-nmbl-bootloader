@@ -3,12 +3,18 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+    nmbl-init-rs = {
+      url = "path:./nmbl-init-rs";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
     {
       self,
       nixpkgs,
+      nmbl-init-rs,
     }:
     let
       system = "x86_64-linux";
@@ -27,6 +33,10 @@
           self = vmSerialManFlake;
           inherit nixpkgs;
         }).packages.${system}.default;
+
+      # The Rust /init binary that replaces the bash script bundle.
+      # Built by the sibling flake at ./nmbl-init-rs.
+      nmblInit = nmbl-init-rs.packages.${system}.default;
 
       # Build test runner apps for each configuration
       testApps = builtins.listToAttrs (
@@ -67,7 +77,12 @@
           imports = [
             ./lib/options.nix
             ./lib/config.nix
+            ./lib/modules/activation.nix
           ];
+
+          # Make the Rust /init binary available to lib/config.nix without
+          # forcing every caller to pass it explicitly.
+          _module.args.nmblInit = nmblInit;
         };
 
       # Test configurations
