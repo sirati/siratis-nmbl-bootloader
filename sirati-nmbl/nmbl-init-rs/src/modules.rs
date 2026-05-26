@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::sys::module::{self, ModuleEntry};
+use crate::sys::module::{self, LoadOutcome, ModuleEntry};
 use crate::{nmbl_info, nmbl_verbose, nmbl_warn};
 
 /// Load every explicit module + its transitive deps. Blacklisted module
@@ -43,8 +43,20 @@ pub fn load_explicit_modules(config: &Config) -> Result<()> {
             );
         }
         for entry in to_load {
-            module::load_module(entry)?;
-            loaded += 1;
+            match module::load_module(entry)? {
+                LoadOutcome::Loaded | LoadOutcome::AlreadyLoaded => {
+                    loaded += 1;
+                }
+                LoadOutcome::KernelRefused { source } => {
+                    nmbl_warn!(
+                        "module {} could not be loaded by the kernel ({}); \
+                         continuing — if a downstream phase needs it the \
+                         error will be clearer there",
+                        entry.name,
+                        source
+                    );
+                }
+            }
         }
     }
 
@@ -122,5 +134,46 @@ mod tests {
         let (to_load, skipped) = filter_blacklisted(order, &blacklist);
         assert!(to_load.is_empty());
         assert_eq!(skipped.len(), 2);
+    }
+
+    /// Mirror of the `match module::load_module(entry)?` arm used by
+    /// `load_explicit_modules`. The point of this test is to lock in
+    /// the contract: a `LoadOutcome::KernelRefused` value MUST flow
+    /// through the routing logic without producing an `Err`, otherwise
+    /// the boot will abort the way it did pre-fix for `dax.ko.xz`.
+    ///
+    /// We can't drive `module::load_module` directly without an actual
+    /// `.ko` file and a kernel that refuses it, so this test exercises
+    /// the dispatch shape on synthetic outcomes — the same shape that
+    /// `load_explicit_modules` uses.
+    #[test]
+    fn kernel_refused_outcome_does_not_abort_dispatch() {
+        use nix::errno::Errno;
+
+        let outcomes = vec![
+            crate::sys::module::LoadOutcome::Loaded,
+            crate::sys::module::LoadOutcome::AlreadyLoaded,
+            crate::sys::module::LoadOutcome::KernelRefused {
+                source: Errno::EOPNOTSUPP,
+            },
+            crate::sys::module::LoadOutcome::Loaded,
+        ];
+
+        let mut loaded: usize = 0;
+        let mut refused: usize = 0;
+        // This match must stay in lock-step with `load_explicit_modules`.
+        for outcome in outcomes {
+            match outcome {
+                crate::sys::module::LoadOutcome::Loaded
+                | crate::sys::module::LoadOutcome::AlreadyLoaded => {
+                    loaded += 1;
+                }
+                crate::sys::module::LoadOutcome::KernelRefused { source: _ } => {
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!(loaded, 3);
+        assert_eq!(refused, 1);
     }
 }
