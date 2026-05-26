@@ -7,12 +7,18 @@
   pkgs,
   utils,
   nmblInit,
+  nmblInitSplash,
   ...
 }:
 
 let
   cfg = config.boot.nmbl;
   bootstrapper = cfg.bootstrapper;
+
+  # Pick the /init binary based on whether the graphical splash is
+  # enabled. The splash variant is the same crate built with the
+  # `image-splash` cargo feature (drm + png + fontdue pulled in).
+  selectedNmblInit = if cfg.splash.enable then nmblInitSplash else nmblInit;
 
   # Activation options are contributed by ./modules/activation.nix. Read
   # defensively so this file still evaluates if that module hasn't been
@@ -92,8 +98,12 @@ let
   # Render the runtime configuration that the Rust /init reads at startup.
   # All previously string-interpolated state (filesystems, modules, timeouts,
   # serial console, verbosity, activation blocks) lives in this TOML file.
+  # The Rust binary used for `--validate-config` must match the one shipped
+  # in the initramfs, otherwise we could validate against a different schema
+  # than what actually runs at boot.
   nmblConfigToml = import ./config-toml.nix {
-    inherit pkgs lib config nmblInit;
+    inherit pkgs lib config;
+    nmblInit = selectedNmblInit;
   };
 
   # Determine legacy boot mode string for compatibility
@@ -158,7 +168,7 @@ in
       let
         baseContents = [
           {
-            object = "${nmblInit}/bin/nmbl-init";
+            object = "${selectedNmblInit}/bin/nmbl-init";
             symlink = "/init";
           }
           {
@@ -190,8 +200,22 @@ in
           }
         ];
 
+        # When the splash UI is enabled, ship the background image and
+        # the menu font at the fixed paths the Rust /init expects (see
+        # lib/config-toml.nix `splash.background_image`/`splash.font_path`).
+        splashContents = lib.optionals cfg.splash.enable [
+          {
+            object = cfg.splash.backgroundImage;
+            symlink = "/etc/splash/image.png";
+          }
+          {
+            object = cfg.splash.fontPath;
+            symlink = "/etc/splash/font.ttf";
+          }
+        ];
+
         initramfs = pkgs.makeInitrd {
-          contents = baseContents ++ activationExtraContents;
+          contents = baseContents ++ splashContents ++ activationExtraContents;
           compressor = "gzip -9";
         };
       in
@@ -201,6 +225,10 @@ in
 
     # Build the bootloader kernel
     system.build.nmblKernel = cfg.kernelPackage;
+
+    # Expose the actually-selected /init binary for downstream tooling
+    # (debug scripts, manual nix builds). Mirrors nmblKernel/nmblInitramfs.
+    system.build.nmblInit = selectedNmblInit;
 
     # Debug output to verify module configuration
     system.build.nmblDebugInfo = pkgs.writeText "nmbl-debug-info" ''

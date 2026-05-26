@@ -78,6 +78,19 @@ let
       system_root = toString cfg.paths.systemRoot;
       shell = toString cfg.paths.shell;
     };
+  }
+  # Splash rendering. Emitted only when the graphical splash is enabled
+  # so the validator (`deny_unknown_fields`) accepts the TOML on builds
+  # that don't pull in the Rust-side `splash` config struct. Runtime
+  # paths are fixed because the initramfs landing locations (see
+  # lib/config.nix `splashContents`) are fixed.
+  // lib.optionalAttrs cfg.splash.enable {
+    splash = {
+      enable           = true;
+      background_image = "/etc/splash/image.png";
+      font_path        = "/etc/splash/font.ttf";
+      dri_path         = "/dev/dri/card0";
+    };
   };
 
   rawToml = tomlFormat.generate "nmbl-config.toml" tomlValue;

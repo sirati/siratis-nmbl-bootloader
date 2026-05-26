@@ -87,11 +87,24 @@
             pname = "nmbl-init";
           }
         );
+
+        # Same crate built with the optional `image-splash` cargo feature
+        # (drm + png + fontdue + alacritty_terminal). Kept as a separate
+        # package so users who don't want the splash never pull those deps.
+        nmbl-init-splash = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            pname = "nmbl-init-splash";
+            cargoExtraArgs = "--features image-splash";
+          }
+        );
       in
       {
         packages = {
           default = nmbl-init;
           nmbl-init = nmbl-init;
+          nmbl-init-splash = nmbl-init-splash;
         };
 
         # Useful for hand-testing: just runs the binary in your shell. It will
