@@ -142,17 +142,25 @@ fn run_event_loop<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     app: &mut App<'_>,
 ) -> Result<()> {
+    // Repaint only on state changes — every iteration without a key
+    // event used to redraw, burning CPU and flickering on slow
+    // serial-bridged terminals. The first frame is always dirty.
+    let mut dirty = true;
     loop {
-        terminal
-            .draw(|f| render_current_screen(f, app))
-            .map_err(tui_err)?;
+        if dirty {
+            terminal
+                .draw(|f| render_current_screen(f, app))
+                .map_err(tui_err)?;
+            dirty = false;
+        }
 
         if event::poll(POLL_SLICE).map_err(tui_err)? {
             let evt = event::read().map_err(tui_err)?;
-            if let Event::Key(key) = evt
-                && app.on_key(key)
-            {
-                return Ok(());
+            if let Event::Key(key) = evt {
+                if app.on_key(key) {
+                    return Ok(());
+                }
+                dirty = true;
             }
         }
 
@@ -382,10 +390,14 @@ fn tui_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
         error_message: None,
     };
 
+    let mut dirty = true;
     loop {
-        terminal
-            .draw(|f| render_current_screen(f, &app))
-            .map_err(tui_err)?;
+        if dirty {
+            terminal
+                .draw(|f| render_current_screen(f, &app))
+                .map_err(tui_err)?;
+            dirty = false;
+        }
 
         if event::poll(POLL_SLICE).map_err(tui_err)? {
             let evt = event::read().map_err(tui_err)?;
@@ -406,6 +418,7 @@ fn tui_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
                         source: std::io::Error::other("passphrase screen exited without a buffer"),
                     });
                 }
+                dirty = true;
             }
         }
     }
