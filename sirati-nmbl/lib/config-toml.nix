@@ -46,8 +46,14 @@ let
       mountpoint = fs.mountPoint;
       fstype = fs.fsType;
       # The Rust `FilesystemEntry.options` is a single comma-joined
-      # String, not a Vec<String>.
-      options = lib.concatStringsSep "," fs.options;
+      # String, not a Vec<String>. Strip fstab/systemd pseudo-options
+      # (`x-*`, `nofail`, `_netdev`) — the kernel rejects them with
+      # EINVAL because they are not real mount(2) flags.
+      options = lib.concatStringsSep "," (
+        builtins.filter (
+          opt: !(lib.hasPrefix "x-" opt) && opt != "nofail" && opt != "_netdev"
+        ) fs.options
+      );
       is_root = fs.mountPoint == "/";
     }) (lib.attrValues cfg.fileSystems);
 
