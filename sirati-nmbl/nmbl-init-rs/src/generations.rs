@@ -144,34 +144,7 @@ pub fn scan_generations(config: &Config) -> Result<Vec<Generation>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    /// Scratch directory; deletes itself on Drop. Avoids the `tempfile` crate.
-    struct TempDir {
-        path: PathBuf,
-    }
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            static COUNTER: AtomicU64 = AtomicU64::new(0);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let seq = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let path = std::env::temp_dir().join(format!(
-                "nmbl-gen-{tag}-{pid}-{nanos}-{seq}",
-                pid = std::process::id()
-            ));
-            std::fs::create_dir_all(&path).expect("temp dir");
-            Self { path }
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
+    use tempfile::TempDir;
 
     fn config_for(dir: &Path) -> Config {
         let text = format!(
@@ -193,19 +166,19 @@ mod tests {
 
     #[test]
     fn empty_dir_yields_no_generations() {
-        let tmp = TempDir::new("empty");
-        let err = scan_generations(&config_for(&tmp.path)).expect_err("must error");
+        let tmp = TempDir::new().expect("temp dir");
+        let err = scan_generations(&config_for(tmp.path())).expect_err("must error");
         match err {
-            NmblError::NoGenerations { searched } => assert_eq!(searched, tmp.path),
+            NmblError::NoGenerations { searched } => assert_eq!(searched, tmp.path()),
             other => panic!("expected NoGenerations, got {other:?}"),
         }
     }
 
     #[test]
     fn descending_order_by_number() {
-        let tmp = TempDir::new("desc");
-        let profiles = tmp.path.join("profiles");
-        let backing = tmp.path.join("backing");
+        let tmp = TempDir::new().expect("temp dir");
+        let profiles = tmp.path().join("profiles");
+        let backing = tmp.path().join("backing");
         std::fs::create_dir_all(&profiles).expect("profiles");
         std::fs::create_dir_all(&backing).expect("backing");
         for n in [1u32, 10, 42] {
@@ -222,9 +195,9 @@ mod tests {
 
     #[test]
     fn ignores_garbage_entries() {
-        let tmp = TempDir::new("garbage");
-        let profiles = tmp.path.join("profiles");
-        let backing = tmp.path.join("backing");
+        let tmp = TempDir::new().expect("temp dir");
+        let profiles = tmp.path().join("profiles");
+        let backing = tmp.path().join("backing");
         std::fs::create_dir_all(&profiles).expect("profiles");
         std::fs::create_dir_all(&backing).expect("backing");
         let p = make_profile(&backing, 7, "quiet");
