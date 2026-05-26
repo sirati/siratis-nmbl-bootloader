@@ -442,6 +442,21 @@
           port = "22013";
           firmware = "uefi";
         };
+        install-test-gpt-bios-btrfs-raid1 = mkOrchestrator {
+          configName = "install-gpt-bios-btrfs-raid1";
+          port = "22021";
+          firmware = "bios";
+        };
+        install-test-gpt-uefi-grub-btrfs-raid1 = mkOrchestrator {
+          configName = "install-gpt-uefi-grub-btrfs-raid1";
+          port = "22022";
+          firmware = "uefi";
+        };
+        install-test-gpt-uefi-systemd-btrfs-raid1 = mkOrchestrator {
+          configName = "install-gpt-uefi-systemd-btrfs-raid1";
+          port = "22023";
+          firmware = "uefi";
+        };
       };
     in
     {
