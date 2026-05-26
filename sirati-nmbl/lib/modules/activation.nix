@@ -52,8 +52,12 @@ let
 
   # --- extraKernelModules ---------------------------------------------------
 
+  # AES generic is usually built into the kernel (CONFIG_CRYPTO_AES=y);
+  # the hardware-accelerated variants ship as modules. We request
+  # aesni_intel for the common AES-NI path and let the resolver soft-
+  # skip aes_generic if it's built-in. xts is the LUKS2 default mode.
   extraKernelModules = lib.unique (
-    lib.optionals luksAny [ "dm_mod" "dm-crypt" "aes" ]
+    lib.optionals luksAny [ "dm_mod" "dm-crypt" "aesni_intel" "xts" "sha256_generic" ]
     ++ lib.optionals luksTpm [ "tpm_crb" "tpm_tis" ]
     ++ lib.optional lvmOn "dm_mod"
     ++ lib.optionals mdOn [ "md_mod" "raid0" "raid1" "raid10" "raid456" ]
@@ -74,7 +78,7 @@ let
 
   # --- activationBlocks ([[activation]] TOML rows) --------------------------
 
-  luksBaseMods = [ "dm_mod" "dm-crypt" "aes" ];
+  luksBaseMods = [ "dm_mod" "dm-crypt" "aesni_intel" "xts" "sha256_generic" ];
   luksTpmMods = luksBaseMods ++ [ "tpm_crb" "tpm_tis" ];
 
   mkLuksBlock = l:
