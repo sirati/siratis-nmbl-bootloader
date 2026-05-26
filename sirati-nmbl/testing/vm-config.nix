@@ -4,17 +4,27 @@
 {
   self,
   nixpkgs,
+  disko ? null,
   system ? "x86_64-linux",
 }:
 
 let
   pkgs = nixpkgs.legacyPackages.${system};
+  lib = nixpkgs.lib;
 
   # Create a test VM configuration
   mkTestVM =
     {
       name,
       bootstrapper,
+      # Optional extra NixOS modules layered onto the base test config.
+      # Used by disko-backed variants to override fileSystems and inject
+      # boot.nmbl.activation.luks entries.
+      extraModules ? [ ],
+      # When set to a disko config module, build the disk image via
+      # disko.diskoImages instead of make-disk-image.nix. The disko module
+      # is also added to extraModules automatically.
+      diskoModule ? null,
     }:
     let
       # Base NixOS system configuration
@@ -24,6 +34,10 @@ let
           self.nixosModules.default
           # Use NixOS QEMU guest profile for automatic VirtIO module detection
           "${nixpkgs}/nixos/modules/profiles/qemu-guest.nix"
+        ] ++ lib.optional (diskoModule != null) disko.nixosModules.disko
+          ++ lib.optional (diskoModule != null) diskoModule
+          ++ extraModules
+          ++ [
           {
             # Use NMBL bootloader
             boot.nmbl = {
@@ -75,14 +89,17 @@ let
             # Filesystem configuration
             # GPT+BIOS: vda1 = FAT32 boot, vda2 = BIOS boot partition, vda3 = ext4 root
             # GPT+UEFI: vda1 = FAT32 ESP, vda2 = BIOS boot partition, vda3 = ext4 root
-            fileSystems."/boot" = {
-              device = "/dev/vda1";
-              fsType = "vfat";
-            };
-
-            fileSystems."/" = {
-              device = "/dev/vda3";
-              fsType = "ext4";
+            # When a diskoModule is supplied, disko owns the fileSystems
+            # config and we leave it alone here.
+            fileSystems = lib.mkIf (diskoModule == null) {
+              "/boot" = {
+                device = "/dev/vda1";
+                fsType = "vfat";
+              };
+              "/" = {
+                device = "/dev/vda3";
+                fsType = "ext4";
+              };
             };
 
             environment.defaultPackages = [ ];
@@ -104,27 +121,43 @@ let
         ];
       };
 
-      # Build VM disk image with the full NixOS system installed
-      vmDiskImage = import "${nixpkgs}/nixos/lib/make-disk-image.nix" {
-        inherit pkgs;
-        lib = nixpkgs.lib;
-        config = nixosSystem.config;
+      # Build VM disk image. With make-disk-image.nix (default) we get a
+      # qcow2 at $out/nixos.qcow2; with disko we get a raw image at
+      # $out/main.raw that we wrap into the same on-disk layout so the
+      # test runner can `cp $out/nixos.qcow2` either way.
+      vmDiskImage =
+        if diskoModule == null then
+          import "${nixpkgs}/nixos/lib/make-disk-image.nix" {
+            inherit pkgs;
+            inherit lib;
+            config = nixosSystem.config;
 
-        diskSize = "auto";
-        format = "qcow2";
-        name = "${name}-disk-image";
+            diskSize = "auto";
+            format = "qcow2";
+            name = "${name}-disk-image";
 
-        # Partition layout for VirtIO disk (/dev/vda)
-        # Always use hybrid (GPT with BIOS compatibility)
-        # This creates: FAT32 ESP + BIOS boot partition + ext4 root
-        partitionTableType = "hybrid";
+            # Partition layout for VirtIO disk (/dev/vda)
+            # Always use hybrid (GPT with BIOS compatibility)
+            # This creates: FAT32 ESP + BIOS boot partition + ext4 root
+            partitionTableType = "hybrid";
 
-        # Size of the boot partition
-        bootSize = "512M";
+            # Size of the boot partition
+            bootSize = "512M";
 
-        # Install the bootloader and system
-        installBootLoader = true;
-      };
+            # Install the bootloader and system
+            installBootLoader = true;
+          }
+        else
+          pkgs.runCommand "${name}-disk-image"
+            {
+              nativeBuildInputs = [ pkgs.qemu-utils ];
+            }
+            ''
+              mkdir -p $out
+              qemu-img convert -f raw -O qcow2 \
+                ${nixosSystem.config.system.build.diskoImages}/main.raw \
+                $out/nixos.qcow2
+            '';
 
     in
     nixosSystem

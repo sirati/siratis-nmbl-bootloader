@@ -1,12 +1,12 @@
 # Testing configurations for NMBL bootloader
 # Combines VM configurations and test runners
 
-{ self, nixpkgs }:
+{ self, nixpkgs, disko ? null }:
 
 let
   system = "x86_64-linux";
 
-  vmConfig = import ./vm-config.nix { inherit self nixpkgs system; };
+  vmConfig = import ./vm-config.nix { inherit self nixpkgs disko system; };
 
   # Define test configurations with new bootstrapper structure
   configs = {
@@ -64,10 +64,48 @@ let
         # loader and loader_extra_args are null by default for qemu_kernel_invoke
       };
     };
+  } // nixpkgs.lib.optionalAttrs (disko != null) {
+    # LUKS-password variant: same UEFI+GRUB chain as test-gpt-uefi-grub,
+    # but vda3 is a LUKS container that NMBL unlocks via the TUI passphrase
+    # modal before mounting /. The post-kexec NixOS initrd unlocks it a
+    # second time (no key handoff yet).
+    test-gpt-uefi-grub-luks-password = {
+      name = "test-gpt-uefi-grub-luks-password";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "uefi";
+        loader = "grub";
+        loader_extra_args = {
+          timeout = 0;
+          extraConfig = ''
+            serial --unit=0 --speed=115200
+            terminal_input serial
+            terminal_output serial
+          '';
+        };
+      };
+      diskoModule = ./disko-luks-password.nix;
+      extraModules = [
+        {
+          # disko already wires boot.initrd.luks.devices.cryptroot for the
+          # post-kexec NixOS stage-1; we only need to teach NMBL itself to
+          # unlock the volume in stage-0 before mounting /.
+          boot.nmbl.activation.luks = [
+            {
+              name = "cryptroot";
+              device = "/dev/vda3";
+              unlock = "password";
+              promptLabel = "Enter LUKS passphrase for cryptroot";
+            }
+          ];
+        }
+      ];
+    };
   };
 
-  # Build VM configurations
-  mkTestConfigurations = builtins.mapAttrs (name: cfg: vmConfig.mkTestVM cfg) configs;
+  # Build VM configurations. `cfg` may carry diskoModule / extraModules
+  # which the disko-backed variants use; mkTestVM handles their absence.
+  mkTestConfigurations = builtins.mapAttrs (_name: cfg: vmConfig.mkTestVM cfg) configs;
 
 in
 {
