@@ -5,11 +5,23 @@
 //! bash `mount-and-kernel.sh.nix`. It deliberately does not shell out.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
+use nix::fcntl::{OFlag, open};
+use nix::sys::stat::Mode;
 
 use crate::error::{NmblError, Result};
+
+// `<linux/module.h>` flag bits for `finit_module(2)`. `nix` does not
+// expose the syscall or the flags, so we hard-code them here.
+#[allow(dead_code, reason = "exposed for callers / future use")]
+const MODULE_INIT_IGNORE_MODVERSIONS: u32 = 1;
+#[allow(dead_code, reason = "exposed for callers / future use")]
+const MODULE_INIT_IGNORE_VERMAGIC: u32 = 2;
+const MODULE_INIT_COMPRESSED_FILE: u32 = 4;
 
 /// One entry parsed from `modules.dep`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,32 +35,22 @@ pub struct ModuleEntry {
     pub deps: Vec<String>,
 }
 
-/// Strip the `.ko` and any compression suffix from a filename, yielding
-/// the kernel's module name (with underscores intact — `modules.dep` and
-/// `/sys/module/<name>` both use the underscore form, so we don't
-/// canonicalize hyphens here).
-fn module_name_from_filename(file_name: &str) -> Option<String> {
-    // Order matters: strip the compression suffix first, then `.ko`.
-    let stripped = file_name
+/// Derive the kernel module name from a `.ko[.xz|.zst|.gz]` path.
+/// Underscores stay as-is — `modules.dep` and `/sys/module/<name>` both
+/// use the underscore form, so no hyphen canonicalization here.
+fn module_name_from_path(path: &Path) -> Option<String> {
+    let file = path.file_name().and_then(|s| s.to_str())?;
+    let stripped = file
         .strip_suffix(".xz")
-        .or_else(|| file_name.strip_suffix(".zst"))
-        .or_else(|| file_name.strip_suffix(".gz"))
-        .unwrap_or(file_name);
+        .or_else(|| file.strip_suffix(".zst"))
+        .or_else(|| file.strip_suffix(".gz"))
+        .unwrap_or(file);
     stripped.strip_suffix(".ko").map(str::to_owned)
 }
 
-/// Derive the module name from a path that points at the `.ko*` file.
-fn module_name_from_path(path: &Path) -> Option<String> {
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .and_then(module_name_from_filename)
-}
-
-/// Parse a `modules.dep` text body into entries, anchoring relative
-/// paths under `root` (which is normally `<modules_dir>/<release>/`).
-///
-/// Lines that don't contain a `:` are skipped. Empty dependency lists
-/// are valid — most modules have no deps.
+/// Parse a `modules.dep` text body, anchoring relative paths under
+/// `root` (typically `<modules_dir>/<release>/`). Comment / blank /
+/// malformed lines are skipped. Empty dep lists are valid.
 pub fn parse_modules_dep_text(text: &str, root: &Path) -> Vec<ModuleEntry> {
     let mut out: Vec<ModuleEntry> = Vec::new();
     for raw in text.lines() {
@@ -59,20 +61,13 @@ pub fn parse_modules_dep_text(text: &str, root: &Path) -> Vec<ModuleEntry> {
         let Some((lhs, rhs)) = line.split_once(':') else {
             continue;
         };
-        let mod_rel = lhs.trim();
-        if mod_rel.is_empty() {
-            continue;
-        }
-        let mod_path = root.join(mod_rel);
+        let mod_path = root.join(lhs.trim());
         let Some(name) = module_name_from_path(&mod_path) else {
             continue;
         };
         let deps: Vec<String> = rhs
             .split_whitespace()
-            .filter_map(|dep_rel| {
-                let dep_path = root.join(dep_rel);
-                module_name_from_path(&dep_path)
-            })
+            .filter_map(|d| module_name_from_path(&root.join(d)))
             .collect();
         out.push(ModuleEntry {
             name,
@@ -107,7 +102,7 @@ pub fn index_by_name(entries: &[ModuleEntry]) -> HashMap<String, &ModuleEntry> {
 /// Synthesize a `NmblError::Module` from a raw errno + module name.
 fn module_err(name: &str, errno: Errno) -> NmblError {
     NmblError::Module {
-        source: nix::Error::from(errno),
+        source: errno,
         name: name.to_owned(),
     }
 }
@@ -153,6 +148,77 @@ fn visit<'a>(
     Ok(())
 }
 
+/// Pick the right `finit_module` flag bits for a `.ko*` file based on
+/// its extension. Compressed variants get `MODULE_INIT_COMPRESSED_FILE`
+/// so the kernel decompresses in-place (Linux >= 5.17).
+fn flags_for_path(path: &Path) -> u32 {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return 0;
+    };
+    if name.ends_with(".ko.xz") || name.ends_with(".ko.zst") || name.ends_with(".ko.gz") {
+        MODULE_INIT_COMPRESSED_FILE
+    } else {
+        0
+    }
+}
+
+/// Convert a `RawFd` from `nix::fcntl::open` into an owning handle so
+/// the file is closed on drop even if we early-return.
+fn open_module_fd(path: &Path, name: &str) -> Result<OwnedFd> {
+    let raw = open(path, OFlag::O_RDONLY | OFlag::O_CLOEXEC, Mode::empty())
+        .map_err(|e| module_err(name, e))?;
+    // SAFETY: `open` just returned this fd to us and no other code owns
+    // it; wrapping it in `OwnedFd` transfers ownership unambiguously.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Call `finit_module(fd, params, flags)` directly. Returns `Ok(())`
+/// on success or when the module is already loaded (`EEXIST`).
+fn finit_module(fd: &OwnedFd, params: &CString, flags: u32, name: &str) -> Result<()> {
+    // SAFETY: we pass a live fd, a valid NUL-terminated C string, and
+    // an integer flag word — the exact shape `finit_module(2)` expects.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_finit_module,
+            fd.as_raw_fd(),
+            params.as_ptr(),
+            flags,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let errno = Errno::last();
+    if errno == Errno::EEXIST {
+        // Module is already in the kernel — treat as success.
+        return Ok(());
+    }
+    Err(module_err(name, errno))
+}
+
+/// Open the module's file at `entry.path` and load it via
+/// `finit_module(2)`. Compressed `.ko.xz` / `.ko.zst` / `.ko.gz` are
+/// passed with `MODULE_INIT_COMPRESSED_FILE` so the kernel handles
+/// decompression. Returns `Ok(())` if loaded or already loaded.
+pub fn load_module(entry: &ModuleEntry) -> Result<()> {
+    let fd = open_module_fd(&entry.path, &entry.name)?;
+    let flags = flags_for_path(&entry.path);
+    // `modules.dep` carries no parameters and the bash bootloader never
+    // set them — pass an empty string and move on.
+    let params = CString::default();
+    finit_module(&fd, &params, flags, &entry.name)
+}
+
+/// Resolve `name` against `by_name`, then load every entry in load
+/// order. Idempotent because individual `load_module` calls swallow
+/// `EEXIST`.
+pub fn load_with_deps(name: &str, by_name: &HashMap<String, &ModuleEntry>) -> Result<()> {
+    for entry in resolve_load_order(name, by_name)? {
+        load_module(entry)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -162,6 +228,14 @@ fn visit<'a>(
 )]
 mod tests {
     use super::*;
+
+    fn by(entries: &[ModuleEntry], name: &str) -> ModuleEntry {
+        entries
+            .iter()
+            .find(|e| e.name == name)
+            .cloned()
+            .expect("entry present")
+    }
 
     #[test]
     fn parses_names_and_deps() {
@@ -174,19 +248,10 @@ kernel/lib/crc32c_generic.ko.xz:
         let root = PathBuf::from("/lib/modules/6.6.71");
         let entries = parse_modules_dep_text(text, &root);
         assert_eq!(entries.len(), 4);
-
-        let ext4 = entries
-            .iter()
-            .find(|e| e.name == "ext4")
-            .expect("ext4 entry missing");
+        let ext4 = by(&entries, "ext4");
         assert_eq!(ext4.path, root.join("kernel/fs/ext4/ext4.ko.xz"));
         assert_eq!(ext4.deps, vec!["jbd2".to_owned(), "crc16".to_owned()]);
-
-        let crc16 = entries
-            .iter()
-            .find(|e| e.name == "crc16")
-            .expect("crc16 entry missing");
-        assert!(crc16.deps.is_empty());
+        assert!(by(&entries, "crc16").deps.is_empty());
     }
 
     #[test]
