@@ -78,7 +78,7 @@ in
   info "NMBL: Loading required kernel modules..."
   ${lib.concatMapStringsSep "\n" (mod: ''
     # Try to load the module and capture stderr
-    MOD_ERR=$(modprobe ${mod} 2>&1) || true
+    MOD_ERR=$(${pkgs.kmod}/bin/modprobe ${mod} 2>&1) || true
 
     # Check if module is now loaded (either we just loaded it, or it was already loaded/built-in)
     if ! ( ${pkgs.busybox}/bin/grep -q "^${mod} " /proc/modules 2>/dev/null || \
@@ -101,6 +101,16 @@ in
     fi
     ${pkgs.busybox}/bin/sleep 0.1
   done
+
+  # Scan for btrfs multi-device members. Idempotent — no-op if no btrfs
+  # devices are present. Must run before the mount step; otherwise a mount
+  # of any single member of a multi-device btrfs fails with "open ctree
+  # failed" because the kernel doesn't know the array's other members exist
+  # (no udev to auto-scan in NMBL).
+  info "NMBL: Scanning for btrfs devices (if any)..."
+  ${pkgs.btrfs-progs}/bin/btrfs device scan 2>&1 | while IFS= read -r _btrfsline; do
+    info "  $_btrfsline"
+  done || true
 
   # Assemble mdadm arrays. Idempotent — no-op when no md members exist.
   # Must run BEFORE the blkid scan below so /dev/md* arrays get their
