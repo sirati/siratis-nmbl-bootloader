@@ -7,10 +7,17 @@
 # arrays-of-tables `filesystems`, `activations`).
 #
 # Used as a pure function: callers `import` this file and apply it
-# with `{ pkgs, lib, config }` to get a `pkgs.writeText`-style
-# derivation. F.2 wires the result into the initramfs contents.
+# with `{ pkgs, lib, config, nmblInit }` to get a derivation that has
+# already been parse-validated by the Rust binary at build time. A
+# schema mismatch crashes `nix build` rather than surprising the
+# operator at boot.
 
-{ pkgs, lib, config }:
+{
+  pkgs,
+  lib,
+  config,
+  nmblInit,
+}:
 
 let
   cfg = config.boot.nmbl;
@@ -66,5 +73,10 @@ let
       shell = toString cfg.paths.shell;
     };
   };
+
+  rawToml = tomlFormat.generate "nmbl-config.toml" tomlValue;
 in
-tomlFormat.generate "nmbl-config.toml" tomlValue
+pkgs.runCommand "nmbl-config.toml" { } ''
+  ${nmblInit}/bin/nmbl-init --validate-config=${rawToml}
+  cp ${rawToml} $out
+''
