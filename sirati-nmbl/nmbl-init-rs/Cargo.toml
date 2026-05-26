@@ -1,0 +1,42 @@
+[package]
+name = "nmbl-init"
+version = "0.1.0"
+edition = "2024"
+description = "Rust /init for the NixOS Minimal BootLoader (NMBL)."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "nmbl-init"
+path = "src/main.rs"
+
+# Size-tuned release profile. The init lives in initramfs, every kilobyte
+# costs RAM and boot time. -Oz + fat LTO + 1 codegen unit + strip is the
+# canonical recipe; panic=abort shaves the unwinder out completely.
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+debug = false
+overflow-checks = true   # we'd rather abort than wrap silently
+incremental = false
+
+# We refuse to ship a binary that contains any of the panic-producing
+# constructs. These lints are enforced project-wide so reviewers don't have
+# to argue about them.
+[lints.clippy]
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+indexing_slicing = "deny"
+todo             = "deny"
+unimplemented    = "deny"
+unreachable      = "deny"
+dbg_macro        = "deny"
+print_stderr     = "allow"   # we _do_ print to stderr — that's our log channel
+print_stdout     = "allow"
+
+[dependencies]
+# Filled in as the implementation lands. See PLAN.md §"Crate inventory".

@@ -1,0 +1,10 @@
+[build]
+target = "x86_64-unknown-linux-musl"
+
+[target.x86_64-unknown-linux-musl]
+# Force a fully static binary so the initramfs needs no dynamic loader.
+rustflags = [
+    "-C", "target-feature=+crt-static",
+    "-C", "link-arg=-s",
+    "-C", "relocation-model=static",
+]
