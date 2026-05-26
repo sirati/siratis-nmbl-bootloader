@@ -22,6 +22,21 @@
 //! stdin/stdout. Many serial environments mangle escape sequences;
 //! line mode is reliable and the operator can still drop to the
 //! shell or pick a generation.
+//!
+//! ## Activation passphrase wiring
+//!
+//! [`TuiPasswordSupplier`] implements
+//! [`crate::activation::PasswordSupplier`] so the top-level boot
+//! flow can pass it to
+//! [`crate::activation::run_all_activations`] as
+//! `&mut dyn PasswordSupplier`. When the activation runner reaches
+//! a `luks-password` entry it calls `prompt(label)` once; we open
+//! the console, render the [`Screen::Passphrase`] modal, and return
+//! the entered string in a `Zeroizing<String>` so the buffer is
+//! wiped after `cryptsetup` drains it. Esc on the modal returns a
+//! [`NmblError::Tui`] which `run_all_activations` wraps as
+//! [`NmblError::Activation`] and the top-level driver routes to the
+//! emergency shell.
 
 pub mod app;
 pub mod timeout;
@@ -426,5 +441,29 @@ mod tests {
             config_serial: true,
         };
         assert!(sup.config_serial);
+    }
+
+    #[test]
+    fn tui_password_supplier_reads_serial_from_config() {
+        // serial_console = true → supplier picks the line-mode path.
+        let cfg: Config = toml::from_str("[general]\nserial_console = true\n").expect("parse cfg");
+        let sup = TuiPasswordSupplier::new(&cfg);
+        assert!(sup.config_serial);
+
+        // default config (no serial) leaves the raw-mode TUI path active.
+        let cfg_default: Config = toml::from_str("").expect("empty cfg parses");
+        let sup_default = TuiPasswordSupplier::new(&cfg_default);
+        assert!(!sup_default.config_serial);
+    }
+
+    #[test]
+    fn tui_password_supplier_satisfies_password_supplier_trait() {
+        // The integration contract: activation::run_all_activations
+        // accepts `Option<&mut dyn PasswordSupplier>`. This test pins
+        // that coercion so a future signature drift on either side
+        // breaks the build instead of breaking at boot.
+        let cfg: Config = toml::from_str("").expect("default cfg");
+        let mut sup = TuiPasswordSupplier::new(&cfg);
+        let _coerced: &mut dyn PasswordSupplier = &mut sup;
     }
 }
