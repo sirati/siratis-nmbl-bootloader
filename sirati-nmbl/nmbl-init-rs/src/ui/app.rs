@@ -48,7 +48,6 @@ pub enum Screen {
     Passphrase {
         prompt_label: String,
         buffer: Zeroizing<String>,
-        error_message: Option<String>,
     },
 }
 
@@ -564,7 +563,6 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new(String::new()),
-            error_message: None,
         };
         for c in "hi".chars() {
             assert!(!app.on_key(press(KeyCode::Char(c))));
@@ -587,7 +585,6 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new(String::new()),
-            error_message: None,
         };
         assert!(app.on_key(press(KeyCode::Esc)));
         assert!(matches!(app.decision, Some(Decision::Shell)));
@@ -600,7 +597,6 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new("secret".to_string()),
-            error_message: None,
         };
         assert!(app.on_key(press(KeyCode::Enter)));
         assert!(app.decision.is_none(), "Enter must not set a Decision");
