@@ -56,5 +56,24 @@ let
   # filters below collapse both "no mapping" and "explicitly null"
   # entries into the same drop.
   rawModules = map (fst: fsTypeToModule.${fst} or null) fsTypes;
+
+  baseModules = lib.unique (lib.filter (m: m != null) rawModules);
+
+  # Crypto helpers that the filesystem driver needs at mount(2) time.
+  # Modern NixOS kernels build crypto as separate modules and require
+  # them to be loaded explicitly when an fs driver requests an algo
+  # through the kernel crypto API. modules.dep does not link these
+  # because the relationship is runtime, not symbol-level — so our
+  # dep walker won't pull them in unless we list them here.
+  cryptoForFs = {
+    # ext4 uses crc32c for metadata checksums (default-on since e2fsprogs 1.43).
+    # Without it, `mount(2)` returns ENOENT with kernel printk
+    # "EXT4-fs: Cannot load crc32c driver".
+    "ext4" = [ "crc32c_generic" ];
+  };
+
+  cryptoModules = lib.unique (
+    lib.concatMap (mod: cryptoForFs.${mod} or [ ]) baseModules
+  );
 in
-lib.unique (lib.filter (m: m != null) rawModules)
+baseModules ++ cryptoModules
