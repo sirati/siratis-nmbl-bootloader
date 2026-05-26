@@ -4,6 +4,10 @@
 { lib, pkgs, ... }:
 
 {
+  imports = [
+    ./modules/activation.nix
+  ];
+
   options.boot.nmbl = {
     enable = lib.mkEnableOption "Linux-as-bootloader (NMBL)";
 
