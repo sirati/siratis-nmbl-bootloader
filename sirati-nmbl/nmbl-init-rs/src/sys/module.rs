@@ -1,27 +1,31 @@
-//! Kernel module loading via `finit_module(2)`, with a dep-graph
+//! Kernel module loading via `init_module(2)`, with a dep-graph
 //! resolver fed by `<modules_dir>/<release>/modules.dep`.
 //!
 //! This is the moral replacement of the `modprobe` invocation in the
 //! bash `mount-and-kernel.sh.nix`. It deliberately does not shell out.
+//!
+//! ## Why `init_module(2)` instead of `finit_module(2)`?
+//!
+//! The kernel-side `MODULE_INIT_COMPRESSED_FILE` flag (passed to
+//! `finit_module`) only works when the running kernel was built with
+//! `CONFIG_MODULE_DECOMPRESS=y`. NixOS kernels do **not** enable that
+//! option; userspace (`kmod`) is expected to decompress modules before
+//! handing them to the kernel. Passing the flag against such a kernel
+//! results in `EOPNOTSUPP` on every load and the boot can never
+//! progress past phase 3a. We therefore decompress `.ko.xz` /
+//! `.ko.zst` / `.ko.gz` in-process with pure-Rust crates and call the
+//! raw `init_module(2)` syscall with the resulting bytes.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io::Read;
+use std::os::raw::{c_ulong, c_void};
 use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
-use rustix::fs::{Mode, OFlags};
 
 use crate::error::{NmblError, Result};
 use crate::nmbl_warn;
-
-// `<linux/module.h>` flag bits for `finit_module(2)`. `nix` does not
-// expose the syscall or the flags, so we hard-code them here.
-#[allow(dead_code, reason = "exposed for callers / future use")]
-const MODULE_INIT_IGNORE_MODVERSIONS: u32 = 1;
-#[allow(dead_code, reason = "exposed for callers / future use")]
-const MODULE_INIT_IGNORE_VERMAGIC: u32 = 2;
-const MODULE_INIT_COMPRESSED_FILE: u32 = 4;
 
 /// One entry parsed from `modules.dep`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,7 +117,7 @@ pub fn index_by_name(entries: &[ModuleEntry]) -> HashMap<String, &ModuleEntry> {
     map
 }
 
-/// Outcome of a single `finit_module(2)` call.
+/// Outcome of a single `init_module(2)` call.
 ///
 /// `load_module` returns this so that callers can distinguish a
 /// successful load from a kernel-side refusal — the latter is not a
@@ -130,7 +134,7 @@ pub enum LoadOutcome {
     KernelRefused { source: nix::Error },
 }
 
-/// Errnos returned by `finit_module(2)` that mean "this kernel cannot
+/// Errnos returned by `init_module(2)` that mean "this kernel cannot
 /// load this particular module right now" rather than "NMBL is broken".
 ///
 /// Covers:
@@ -216,62 +220,147 @@ fn visit<'a>(
     Ok(())
 }
 
-/// Pick the right `finit_module` flag bits for a `.ko*` file based on
-/// its extension. Compressed variants get `MODULE_INIT_COMPRESSED_FILE`
-/// so the kernel decompresses in-place (Linux >= 5.17).
-fn flags_for_path(path: &Path) -> u32 {
+/// Compression scheme of a `.ko*` file, inferred from its extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compression {
+    /// No compression — raw ELF (`.ko`).
+    None,
+    /// XZ / LZMA2 (`.ko.xz`).
+    Xz,
+    /// Zstandard (`.ko.zst`).
+    Zst,
+    /// gzip / DEFLATE (`.ko.gz`).
+    Gz,
+}
+
+/// Classify a `.ko*` path by compression suffix. Paths whose
+/// `file_name()` is not UTF-8 or whose extension is unrecognised fall
+/// back to `Compression::None` — `decompress_module` will then try to
+/// load the file verbatim, and the kernel will reject it with
+/// `ENOEXEC` if it is not a valid ELF.
+fn compression_for_path(path: &Path) -> Compression {
     let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-        return 0;
+        return Compression::None;
     };
-    if name.ends_with(".ko.xz") || name.ends_with(".ko.zst") || name.ends_with(".ko.gz") {
-        MODULE_INIT_COMPRESSED_FILE
+    if name.ends_with(".ko.xz") {
+        Compression::Xz
+    } else if name.ends_with(".ko.zst") {
+        Compression::Zst
+    } else if name.ends_with(".ko.gz") {
+        Compression::Gz
     } else {
-        0
+        Compression::None
     }
 }
 
-/// Open the module file as an owning fd. `rustix::fs::open` returns an
-/// `OwnedFd` natively, so we avoid the `from_raw_fd` unsafe wrap that
-/// `nix::fcntl::open` would have forced.
-fn open_module_fd(path: &Path, name: &str) -> Result<OwnedFd> {
-    rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-        .map_err(|e| module_err(name, path, Errno::from_raw(e.raw_os_error())))
+/// Read `path` from disk and decompress it according to the suffix
+/// reported by [`compression_for_path`]. Returns the raw module image
+/// suitable for `init_module(2)`.
+///
+/// All compression backends are pure Rust — `lzma-rs` for XZ, `ruzstd`
+/// for Zstandard, `flate2`'s `rust_backend` (which is `miniz_oxide`
+/// under the hood) for gzip — so the static-musl build stays free of
+/// C library dependencies.
+///
+/// Decompression failures are surfaced as `NmblError::Module { …,
+/// source: Errno::EIO }` (we have no errno for "userspace
+/// decompressor blew up"); a `nmbl_warn!` immediately precedes the
+/// return so the operator sees the real decompressor message.
+fn decompress_module(path: &Path, name: &str) -> Result<Vec<u8>> {
+    let raw = std::fs::read(path).map_err(|source| NmblError::Io {
+        source,
+        context: format!("reading kernel module {}", path.display()),
+    })?;
+    match compression_for_path(path) {
+        Compression::None => Ok(raw),
+        Compression::Xz => {
+            // `lzma_rs::xz_decompress` wants a `BufRead`; wrap the
+            // owned `Vec<u8>` in a `Cursor` (which is `BufRead`).
+            let mut reader = std::io::Cursor::new(&raw);
+            let mut out = Vec::with_capacity(raw.len() * 3);
+            lzma_rs::xz_decompress(&mut reader, &mut out).map_err(|e| {
+                nmbl_warn!(
+                    "xz decompression failed for module {} ({}): {}",
+                    name,
+                    path.display(),
+                    e
+                );
+                module_err(name, path, Errno::EIO)
+            })?;
+            Ok(out)
+        }
+        Compression::Zst => {
+            let mut decoder = ruzstd::StreamingDecoder::new(raw.as_slice()).map_err(|e| {
+                nmbl_warn!(
+                    "zstd frame init failed for module {} ({}): {}",
+                    name,
+                    path.display(),
+                    e
+                );
+                module_err(name, path, Errno::EIO)
+            })?;
+            let mut out = Vec::with_capacity(raw.len() * 3);
+            decoder.read_to_end(&mut out).map_err(|e| {
+                nmbl_warn!(
+                    "zstd decompression failed for module {} ({}): {}",
+                    name,
+                    path.display(),
+                    e
+                );
+                module_err(name, path, Errno::EIO)
+            })?;
+            Ok(out)
+        }
+        Compression::Gz => {
+            let mut decoder = flate2::read::GzDecoder::new(raw.as_slice());
+            let mut out = Vec::with_capacity(raw.len() * 3);
+            decoder.read_to_end(&mut out).map_err(|e| {
+                nmbl_warn!(
+                    "gzip decompression failed for module {} ({}): {}",
+                    name,
+                    path.display(),
+                    e
+                );
+                module_err(name, path, Errno::EIO)
+            })?;
+            Ok(out)
+        }
+    }
 }
 
-/// Call `finit_module(fd, params, flags)` directly.
+/// Call `init_module(image, len, params)` — the original
+/// (non-`f`-prefixed) module-load syscall — on a raw module image.
+///
+/// We use this rather than `finit_module(2)` because NixOS kernels are
+/// not built with `CONFIG_MODULE_DECOMPRESS=y`; userspace must
+/// decompress (`decompress_module`) and then pass the resulting ELF
+/// bytes here. See module-level docs for the full rationale.
 ///
 /// Returns:
 /// * `Ok(LoadOutcome::Loaded)` on success.
 /// * `Ok(LoadOutcome::AlreadyLoaded)` when the kernel reports `EEXIST`.
 /// * `Ok(LoadOutcome::KernelRefused { source })` for errnos classified
 ///   as recoverable by [`is_recoverable_module_error`].
-/// * `Err(NmblError::Module)` for every other errno — those are real
-///   load failures the caller should propagate.
-fn finit_module(
-    fd: &OwnedFd,
-    params: &CString,
-    flags: u32,
-    name: &str,
-    path: &Path,
-) -> Result<LoadOutcome> {
+/// * `Err(NmblError::Module)` for every other errno.
+fn init_module(image: &[u8], params: &CString, name: &str, path: &Path) -> Result<LoadOutcome> {
     // SAFETY: Unavoidable raw syscall.
-    //   * Why no safe wrapper: no Rust crate wraps `finit_module(2)` —
-    //     `nix` (0.29) exposes neither the syscall nor its flag bits;
-    //     `rustix` 0.38 has no covering API (the `rustix` issue tracker
-    //     has no open ticket for it either); `kmod`/`libkmod` is a
-    //     C-API binding that would re-introduce a dynamic-library
-    //     dependency we explicitly do not want in PID 1.
-    //   * Why this is safe: `fd` is a live `OwnedFd` borrowed by
-    //     reference for the duration of the call, `params` is a valid
-    //     NUL-terminated C string owned by the caller, and `flags` is
-    //     a plain integer. The syscall reads, never writes, our
+    //   * Why no safe wrapper: no Rust crate wraps `init_module(2)` —
+    //     `nix` (0.29) exposes neither this nor `finit_module`;
+    //     `rustix` 0.38 has no covering API; `libkmod` is a C library
+    //     we explicitly do not want in PID 1. (Verified by inspecting
+    //     `nix` 0.29 and `rustix` 0.38 sources in the offline cache.)
+    //   * Why this is safe: `image` is a live borrow valid for the
+    //     duration of the call, `params` is a NUL-terminated C string
+    //     owned by the caller, and `image.len()` cannot exceed
+    //     `c_ulong::MAX` because a `Vec<u8>` can hold at most
+    //     `isize::MAX` bytes. The syscall reads, never writes, our
     //     pointers; failure is reported via the return value + errno.
     let rc = unsafe {
         libc::syscall(
-            libc::SYS_finit_module,
-            fd.as_raw_fd(),
+            libc::SYS_init_module,
+            image.as_ptr() as *const c_void,
+            image.len() as c_ulong,
             params.as_ptr(),
-            flags,
         )
     };
     if rc == 0 {
@@ -288,23 +377,20 @@ fn finit_module(
     Err(module_err(name, path, errno))
 }
 
-/// Open the module's file at `entry.path` and load it via
-/// `finit_module(2)`. Compressed `.ko.xz` / `.ko.zst` / `.ko.gz` are
-/// passed with `MODULE_INIT_COMPRESSED_FILE` so the kernel handles
-/// decompression.
+/// Read `entry.path` from disk, decompress it if its extension says
+/// so, and hand the raw module image to `init_module(2)`.
 ///
-/// File-IO errors (open) and unexpected errnos surface as
-/// `NmblError::Module`. Idempotent re-loads return
-/// `Ok(LoadOutcome::AlreadyLoaded)`; kernel-side refusals return
-/// `Ok(LoadOutcome::KernelRefused { … })` and must be logged + skipped
-/// by the caller rather than aborting the boot.
+/// File-IO and decompression errors surface as `NmblError::Module`.
+/// Idempotent re-loads return `Ok(LoadOutcome::AlreadyLoaded)`;
+/// kernel-side refusals return `Ok(LoadOutcome::KernelRefused { … })`
+/// and must be logged + skipped by the caller rather than aborting
+/// the boot.
 pub fn load_module(entry: &ModuleEntry) -> Result<LoadOutcome> {
-    let fd = open_module_fd(&entry.path, &entry.name)?;
-    let flags = flags_for_path(&entry.path);
+    let image = decompress_module(&entry.path, &entry.name)?;
     // `modules.dep` carries no parameters and the bash bootloader never
     // set them — pass an empty string and move on.
     let params = CString::default();
-    finit_module(&fd, &params, flags, &entry.name, &entry.path)
+    init_module(&image, &params, &entry.name, &entry.path)
 }
 
 /// Resolve `name` against `by_name`, then load every entry in load
@@ -508,6 +594,138 @@ kernel/drivers/md/dm-mod.ko.xz:
                 !is_recoverable_module_error(errno),
                 "{errno:?} must NOT be recoverable"
             );
+        }
+    }
+
+    #[test]
+    fn compression_for_path_classifies_known_suffixes() {
+        assert_eq!(
+            compression_for_path(Path::new("/lib/modules/6.6.71/kernel/fs/ext4/ext4.ko")),
+            Compression::None
+        );
+        assert_eq!(
+            compression_for_path(Path::new("/lib/modules/6.6.71/kernel/fs/ext4/ext4.ko.xz")),
+            Compression::Xz
+        );
+        assert_eq!(
+            compression_for_path(Path::new("/lib/modules/6.6.71/kernel/fs/ext4/ext4.ko.zst")),
+            Compression::Zst
+        );
+        assert_eq!(
+            compression_for_path(Path::new("/lib/modules/6.6.71/kernel/fs/ext4/ext4.ko.gz")),
+            Compression::Gz
+        );
+    }
+
+    #[test]
+    fn compression_for_path_falls_back_to_none_for_unknown_suffix() {
+        // Unrecognised suffixes are treated as "no compression" — the
+        // kernel will reject the bytes with ENOEXEC if they're not a
+        // valid ELF, which is the right failure mode (clear errno
+        // rather than a confused decompression attempt).
+        assert_eq!(
+            compression_for_path(Path::new("/m/weird.ko.lz4")),
+            Compression::None
+        );
+        assert_eq!(
+            compression_for_path(Path::new("/m/no_suffix_at_all")),
+            Compression::None
+        );
+    }
+
+    /// Helper: write `bytes` to a fresh temp file with the given
+    /// suffix and return the path + the holding `TempDir` so the file
+    /// lives until the dir is dropped.
+    fn write_temp(suffix: &str, bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(format!("widget{suffix}"));
+        std::fs::write(&path, bytes).expect("write temp module");
+        (dir, path)
+    }
+
+    #[test]
+    fn decompress_module_passes_through_uncompressed() {
+        let payload: Vec<u8> = (0u8..=63).collect();
+        let (_dir, path) = write_temp(".ko", &payload);
+        let got = decompress_module(&path, "widget").expect("decompress");
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn decompress_module_round_trips_xz() {
+        // Encode with the same crate, decode with `decompress_module`.
+        let payload: Vec<u8> = b"NMBL-MODULE-LOAD-TEST-XZ".repeat(8);
+        let mut compressed: Vec<u8> = Vec::new();
+        {
+            let mut reader = std::io::Cursor::new(&payload);
+            lzma_rs::xz_compress(&mut reader, &mut compressed).expect("xz_compress");
+        }
+        let (_dir, path) = write_temp(".ko.xz", &compressed);
+        let got = decompress_module(&path, "widget").expect("decompress");
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn decompress_module_round_trips_gz() {
+        use flate2::Compression as GzLevel;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let payload: Vec<u8> = b"NMBL-MODULE-LOAD-TEST-GZ".repeat(8);
+        let mut encoder = GzEncoder::new(Vec::new(), GzLevel::default());
+        encoder.write_all(&payload).expect("gz write");
+        let compressed = encoder.finish().expect("gz finish");
+        let (_dir, path) = write_temp(".ko.gz", &compressed);
+        let got = decompress_module(&path, "widget").expect("decompress");
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn decompress_module_decodes_zst_fixture() {
+        // `ruzstd` is decode-only, so we can't synthesize a fixture
+        // round-trip in-process. Embed a pre-compressed blob whose
+        // plaintext is `b"NMBL-MODULE-LOAD-TEST"` (21 bytes, produced
+        // once with `zstd -19`). If this ever needs regenerating:
+        //
+        //     printf '%s' 'NMBL-MODULE-LOAD-TEST' | zstd -19 | od -An -tx1
+        const ZST_FIXTURE: &[u8] = &[
+            0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x68, 0xa9, 0x00, 0x00, 0x4e, 0x4d, 0x42, 0x4c, 0x2d,
+            0x4d, 0x4f, 0x44, 0x55, 0x4c, 0x45, 0x2d, 0x4c, 0x4f, 0x41, 0x44, 0x2d, 0x54, 0x45,
+            0x53, 0x54, 0x62, 0xec, 0xd6, 0x51,
+        ];
+        let (_dir, path) = write_temp(".ko.zst", ZST_FIXTURE);
+        let got = decompress_module(&path, "widget").expect("decompress");
+        assert_eq!(got, b"NMBL-MODULE-LOAD-TEST");
+    }
+
+    #[test]
+    fn decompress_module_surfaces_corrupt_xz_as_module_error() {
+        // A 4-byte garbage payload labelled `.ko.xz` cannot possibly
+        // be a valid XZ stream. The contract is that decompression
+        // failure surfaces as `NmblError::Module { source: EIO }`
+        // (with the real backend message logged via nmbl_warn!) so
+        // the caller's match arms stay simple.
+        let (_dir, path) = write_temp(".ko.xz", b"junk");
+        let err = decompress_module(&path, "widget").expect_err("must fail");
+        match err {
+            NmblError::Module { name, source, .. } => {
+                assert_eq!(name, "widget");
+                assert_eq!(source, nix::Error::from(Errno::EIO));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decompress_module_surfaces_missing_file_as_io_error() {
+        // Reading the file itself failing is a real IO error, not a
+        // decompression error — surface it as `NmblError::Io` so
+        // operators can see the path in the context message.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does_not_exist.ko.xz");
+        let err = decompress_module(&path, "widget").expect_err("must fail");
+        match err {
+            NmblError::Io { .. } => {}
+            other => panic!("wrong variant: {other:?}"),
         }
     }
 }
