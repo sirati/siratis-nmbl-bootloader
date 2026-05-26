@@ -1,5 +1,10 @@
+pub mod activation;
+pub mod boot;
 pub mod config;
+pub mod devices;
 pub mod error;
+pub mod generations;
 pub mod log;
+pub mod modules;
 pub mod mount;
 pub mod sys;
