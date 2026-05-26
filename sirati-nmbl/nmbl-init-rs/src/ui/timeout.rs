@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyEventKind};
 
 use crate::error::{NmblError, Result};
+use crate::ui::POLL_SLICE;
 
 /// Outcome of running the countdown loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,11 +27,6 @@ pub enum TimeoutOutcome {
     /// User pressed a key (cancels the countdown).
     Cancelled,
 }
-
-/// Poll cadence. 100 ms is short enough that `on_tick` fires on the
-/// expected one-second cadence (worst-case skew ~100 ms) yet long
-/// enough that we don't busy-loop.
-const POLL_SLICE: Duration = Duration::from_millis(100);
 
 /// Block for at most `duration`, polling stdin for any key press.
 ///

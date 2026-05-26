@@ -30,7 +30,6 @@ pub struct EditScreenData<'a> {
 pub struct PassphraseScreenData<'a> {
     pub prompt_label: &'a str,
     pub buffer_len: usize,
-    pub error_message: Option<&'a str>,
 }
 
 /// Split frame into (header, body, footer). Small frames degrade gracefully.
@@ -160,18 +159,11 @@ pub fn render_passphrase(frame: &mut Frame<'_>, data: &PassphraseScreenData<'_>)
     frame.render_widget(Clear, modal);
     // Cap mask so a huge typo doesn't overflow the box.
     let dots: String = "*".repeat(data.buffer_len.min(40));
-    let mut lines: Vec<Line<'_>> = vec![
+    let lines: Vec<Line<'_>> = vec![
         Line::raw(data.prompt_label.to_owned()),
         Line::raw(String::new()),
         Line::from(vec![Span::raw(dots), Span::raw("|")]),
     ];
-    if let Some(err) = data.error_message {
-        lines.push(Line::raw(String::new()));
-        lines.push(Line::styled(
-            err.to_owned(),
-            Style::default().fg(Color::Red),
-        ));
-    }
     let para = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title("Passphrase"))
         .wrap(Wrap { trim: false });
@@ -303,18 +295,16 @@ mod tests {
     }
 
     #[test]
-    fn test_render_passphrase_dots_label_and_error() {
+    fn test_render_passphrase_dots_and_label() {
         let data = PassphraseScreenData {
             prompt_label: "Unlock /dev/sda2",
             buffer_len: 5,
-            error_message: Some("wrong passphrase"),
         };
         let mut term = new_term(80, 24);
         term.draw(|f| render_passphrase(f, &data)).expect("draw");
         let text = buffer_text(&term);
         assert!(text.contains("*****|"), "wrong mask count in:\n{text}");
         assert!(text.contains("Unlock /dev/sda2"));
-        assert!(text.contains("wrong passphrase"));
     }
 
     #[test]
