@@ -27,6 +27,23 @@ pub enum BootMode {
     Bios,
 }
 
+/// Display backend for QEMU.
+///
+/// - `Serial`: headless (`-nographic`), the historical default.
+/// - `Vnc { port }`: expose a VNC server on `port`. QEMU's `-display vnc=:N`
+///   syntax uses display numbers, where `N = port - 5900`, so `port` must be
+///   at least `5900`.
+/// - `Sdl`: open a local SDL window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Display {
+    #[default]
+    Serial,
+    Vnc {
+        port: u16,
+    },
+    Sdl,
+}
+
 /// QEMU configuration
 pub struct QemuConfig {
     pub name: String,
@@ -35,12 +52,14 @@ pub struct QemuConfig {
     pub memory: u32,
     pub cores: u32,
     pub socket_dir: PathBuf,
+    pub display: Display,
 }
 
 /// QEMU process with socket information
 pub struct QemuProcess {
     pub child: Child,
     pub serial_socket: PathBuf,
+    pub monitor_socket: PathBuf,
 }
 
 impl QemuConfig {
@@ -71,15 +90,19 @@ impl QemuConfig {
             }
         }
 
-        // Create socket path for serial — per-PID to avoid collisions when
-        // multiple managers run in parallel (matches the control socket convention).
-        let serial_socket = self
-            .socket_dir
-            .join(format!("qemu-serial-{}.sock", std::process::id()));
+        // Create socket paths for serial and monitor — per-PID to avoid
+        // collisions when multiple managers run in parallel (matches the
+        // control socket convention).
+        let pid = std::process::id();
+        let serial_socket = self.socket_dir.join(format!("qemu-serial-{pid}.sock"));
+        let monitor_socket = self.socket_dir.join(format!("qemu-monitor-{pid}.sock"));
 
-        // Remove old socket if it exists
+        // Remove old sockets if they exist
         if serial_socket.exists() {
             fs::remove_file(&serial_socket).await?;
+        }
+        if monitor_socket.exists() {
+            fs::remove_file(&monitor_socket).await?;
         }
 
         let mut cmd = Command::new("qemu-system-x86_64");
@@ -135,12 +158,39 @@ impl QemuConfig {
             .arg("-netdev")
             .arg("user,id=net0")
             .arg("-device")
-            .arg("virtio-net-pci,netdev=net0")
-            .arg("-nographic")
-            .arg("-serial")
+            .arg("virtio-net-pci,netdev=net0");
+
+        // Dispatch on display backend.
+        match self.display {
+            Display::Serial => {
+                debug!("Using headless (serial) display");
+                cmd.arg("-nographic");
+            }
+            Display::Vnc { port } => {
+                let display_num = port
+                    .checked_sub(5900)
+                    .with_context(|| format!("VNC port {port} must be >= 5900"))?;
+                debug!("Using VNC display on port {port} (display :{display_num})");
+                cmd.arg("-display")
+                    .arg(format!("vnc=:{display_num}"))
+                    .arg("-vga")
+                    .arg("std");
+            }
+            Display::Sdl => {
+                debug!("Using SDL display");
+                cmd.arg("-display").arg("sdl").arg("-vga").arg("std");
+            }
+        }
+
+        // Serial always goes to its Unix socket; the QEMU monitor gets its own
+        // Unix socket so the `screenshot` subcommand can drive `screendump`.
+        cmd.arg("-serial")
             .arg(format!("unix:{},server,nowait", serial_socket.display()))
             .arg("-monitor")
-            .arg("none");
+            .arg(format!(
+                "unix:{},server,nowait",
+                monitor_socket.display()
+            ));
 
         // Print the actual QEMU command for debugging
         eprintln!("=== QEMU Command ===");
@@ -159,13 +209,15 @@ impl QemuConfig {
             .context("Failed to spawn QEMU")?;
 
         debug!(
-            "QEMU started with serial socket: {}",
-            serial_socket.display()
+            "QEMU started with serial socket: {} (monitor: {})",
+            serial_socket.display(),
+            monitor_socket.display()
         );
 
         Ok(QemuProcess {
             child,
             serial_socket,
+            monitor_socket,
         })
     }
 }
