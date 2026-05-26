@@ -20,10 +20,17 @@ rec {
   );
 
   # Modules to include in the initrd (available but not necessarily loaded)
-  # Include both explicit and available modules so they can be loaded on-demand if needed
+  # Include both explicit and available modules so they can be loaded on-demand if needed.
+  # `activation.extraKernelModules` is contributed by ./activation.nix for storage
+  # activation (LUKS / LVM / mdraid / zfs); read defensively so this still
+  # evaluates if the activation module isn't imported.
+  activationExtraKernelModules = (cfg.activation or { }).extraKernelModules or [ ];
   allKernelModules = lib.unique (
     lib.filter (m: !(lib.elem m cfg.blacklistedKernelModules)) (
-      cfg.availableKernelModules ++ explicitKernelModules ++ config.boot.initrd.availableKernelModules
+      cfg.availableKernelModules
+      ++ explicitKernelModules
+      ++ config.boot.initrd.availableKernelModules
+      ++ activationExtraKernelModules
     )
   );
 
