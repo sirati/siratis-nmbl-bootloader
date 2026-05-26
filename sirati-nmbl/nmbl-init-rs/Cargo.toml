@@ -63,5 +63,22 @@ lzma-rs = { version = "0.3", default-features = false }
 ruzstd = { version = "0.7", default-features = false, features = ["std"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
+# Optional dependencies behind the `image-splash` feature. With the
+# feature off these are not compiled and the binary is byte-identical
+# to the pre-feature build. Default-features off everywhere so the
+# closure stays minimal; `alacritty_terminal` in particular pulls
+# `serde` by default which we don't want.
+drm = { version = "0.15", optional = true }
+png = { version = "0.17", optional = true, default-features = false }
+fontdue = { version = "0.9", optional = true, default-features = false }
+alacritty_terminal = { version = "0.26", optional = true, default-features = false }
+
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = []
+# Opt-in graphical boot splash. Adds DRM mode-set on simpledrm, a PNG
+# background, and a fontdue-rasterized overlay of the ratatui menu.
+# Any failure of the splash path falls back to today's tty UI.
+image-splash = ["dep:drm", "dep:png", "dep:fontdue", "dep:alacritty_terminal"]

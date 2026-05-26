@@ -9,5 +9,7 @@ pub mod modules;
 pub mod mount;
 pub mod panic;
 pub mod shell;
+#[cfg(feature = "image-splash")]
+pub mod splash;
 pub mod sys;
 pub mod ui;
