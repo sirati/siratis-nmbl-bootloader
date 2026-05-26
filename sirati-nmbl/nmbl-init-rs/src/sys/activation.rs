@@ -99,9 +99,15 @@ pub fn run(binary: &Path, argv: &[String], stdin_data: Option<&[u8]>) -> Result<
         None
     };
 
-    // SAFETY: the only post-fork code in the child path is
-    // async-signal-safe: dup2, close, execve, _exit. CString
-    // contents created above are reused without further allocation.
+    // SAFETY: `nix::unistd::fork` is `unsafe` by design — there is no
+    // safe wrapper in any Rust crate (the closest safe alternative is
+    // `std::process::Command`, which we cannot use: the CI grep
+    // restricts `Command::` to the emergency-shell and panic paths,
+    // and `Command` cannot run an in-process pre-exec child that pipes
+    // bytes into stdin without crossing the same fork boundary). The
+    // post-fork child path below is restricted to async-signal-safe
+    // operations (dup2, close, execve, _exit); all CString allocation
+    // happened in the parent before we got here.
     let fork_result = unsafe { fork() }
         .map_err(|e| nix_activation("fork", e, &format!("fork for {}", binary.display())))?;
 
@@ -123,6 +129,15 @@ pub fn run(binary: &Path, argv: &[String], stdin_data: Option<&[u8]>) -> Result<
                 // not close the target, which is what we want.
                 if read_fd != 0 {
                     if dup2(read_fd, 0).is_err() {
+                        // SAFETY: Unavoidable. We are in the post-fork
+                        // child where only async-signal-safe calls are
+                        // permitted; `std::process::exit` is *not*
+                        // async-signal-safe (it runs Rust destructors
+                        // and atexit handlers) so the only correct
+                        // primitive here is `_exit(2)`. No crate wraps
+                        // it safely — `rustix` 0.38 exposes neither
+                        // `_exit` nor `exit_group` (issues #844 / #845
+                        // open at rustix). The argument is a plain int.
                         unsafe { libc::_exit(EXEC_FAILED_EXIT_CODE) };
                     }
                     let _ = close(read_fd);
@@ -142,6 +157,12 @@ pub fn run(binary: &Path, argv: &[String], stdin_data: Option<&[u8]>) -> Result<
             // ENOEXEC, ELOOP, …). The conventional "command not
             // found" exit code lets the parent — and ultimately the
             // activation orchestrator — surface the right diagnostic.
+            //
+            // SAFETY: Unavoidable, same reasoning as the dup2-failure
+            // branch above — post-fork child, must use the
+            // async-signal-safe `_exit(2)` rather than Rust's
+            // destructor-running `process::exit`. No safe wrapper
+            // exists in `nix` or `rustix` today.
             unsafe { libc::_exit(EXEC_FAILED_EXIT_CODE) };
         }
         ForkResult::Parent { child } => {
