@@ -21,8 +21,11 @@ let
     general = {
       verbosity = cfg.verbosity;
       timeout_secs = cfg.timeoutSecs;
-      panic_report_dir = cfg.panicReportDir;
-      serial_console = cfg.serialConsole;
+      panic_report_dir = toString cfg.panicReportDir;
+      # cfg.serialConsole is the legacy nullable string ("ttyS0,115200" or
+      # null); the Rust struct wants a plain bool. Coerce here so users
+      # keep configuring a single option.
+      serial_console = cfg.serialConsole != null;
     };
 
     kernel_modules = {
@@ -58,9 +61,9 @@ let
     };
 
     paths = {
-      nix_profiles_dir = cfg.paths.nixProfilesDir;
-      system_root = cfg.paths.systemRoot;
-      shell = cfg.paths.shell;
+      nix_profiles_dir = toString cfg.paths.nixProfilesDir;
+      system_root = toString cfg.paths.systemRoot;
+      shell = toString cfg.paths.shell;
     };
   };
 in
