@@ -111,8 +111,10 @@ pub fn mount_fs(source: Option<&Path>, target: &Path, fstype: &str, options: &st
     let data_opt: Option<&str> = if data.is_empty() { None } else { Some(&data) };
 
     nix::mount::mount(source, target, Some(fstype), flags, data_opt).map_err(|e| NmblError::Mount {
+        src: source.map(PathBuf::from),
+        dst: PathBuf::from(target),
+        fstype: fstype.to_owned(),
         source: e,
-        target: PathBuf::from(target),
     })
 }
 
@@ -120,8 +122,8 @@ pub fn mount_fs(source: Option<&Path>, target: &Path, fstype: &str, options: &st
 /// lazy unmount the pre-kexec tear-down wants.
 pub fn umount(target: &Path, flags: MntFlags) -> Result<()> {
     nix::mount::umount2(target, flags).map_err(|e| NmblError::Umount {
+        dst: PathBuf::from(target),
         source: e,
-        target: PathBuf::from(target),
     })
 }
 

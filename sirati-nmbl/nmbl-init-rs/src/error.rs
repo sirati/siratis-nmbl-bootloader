@@ -20,36 +20,50 @@ pub enum NmblError {
         context: String,
     },
 
-    #[error("mount({target}) failed: {source}")]
+    #[error("config invalid ({context}): {reason}")]
+    ConfigInvalid { reason: String, context: String },
+
+    #[error("mount({src:?} -> {dst}, type={fstype}) failed: {source}", src = src.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".to_string()))]
     Mount {
+        src: Option<PathBuf>,
+        dst: PathBuf,
+        fstype: String,
         #[source]
         source: nix::Error,
-        target: PathBuf,
     },
 
-    #[error("umount({target}) failed: {source}")]
+    #[error("umount({dst}) failed: {source}")]
     Umount {
+        dst: PathBuf,
         #[source]
         source: nix::Error,
-        target: PathBuf,
     },
 
-    #[error("kernel module {name} failed to load: {source}")]
+    #[error("kernel module {name} (path {path}) failed to load: {source}")]
     Module {
-        #[source]
-        source: nix::Error,
         name: String,
-    },
-
-    #[error("kexec {stage} failed: {source}")]
-    Kexec {
+        path: PathBuf,
         #[source]
         source: nix::Error,
-        stage: &'static str,
     },
 
-    #[error("required block device {device} did not appear in time")]
-    DeviceTimeout { device: PathBuf },
+    #[error("kexec_file_load failed (kernel={kernel}, initrd={initrd:?}): {source}", initrd = initrd.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "<none>".to_string()))]
+    KexecLoad {
+        kernel: PathBuf,
+        initrd: Option<PathBuf>,
+        #[source]
+        source: nix::Error,
+    },
+
+    #[error("kexec {stage} returned (should not happen): {source}")]
+    KexecReturned {
+        stage: &'static str,
+        #[source]
+        source: nix::Error,
+    },
+
+    #[error("required block device {device} did not appear within {timeout_ms}ms")]
+    DeviceTimeout { device: PathBuf, timeout_ms: u64 },
 
     #[error("no NixOS generations found under {searched}")]
     NoGenerations { searched: PathBuf },
@@ -68,10 +82,7 @@ pub enum NmblError {
     },
 
     #[error("recovered from panic (report at {report_path})")]
-    Panicked {
-        report_path: PathBuf,
-        recovered: String,
-    },
+    Panicked { report_path: PathBuf },
 
     #[error("failed to exec emergency shell: {source}")]
     Shell {
