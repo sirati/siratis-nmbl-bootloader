@@ -1,259 +1,214 @@
-# NMBL - NixOS Minimal BootLoader
+# NMBL — NixOS Minimal BootLoader
 
-A Linux-as-bootloader implementation for NixOS that uses kexec to boot into different NixOS generations.
+Linux as a bootloader. NMBL boots a tiny pinned Linux kernel plus a
+minimal initramfs, lets the operator pick a NixOS generation, and
+`kexec`s straight into it. The bootloader never copies kernels or
+initrds onto a boot partition — it reads them in place from the
+target system's `/nix/var/nix/profiles/system-N-link/`, which is the
+whole point of NMBL.
 
-## Project Structure
+The userspace in that initramfs is a single static Rust binary,
+`nmbl-init`, that runs as PID 1.
 
-This project is organized into modular components for easy maintenance and understanding:
+## Why?
 
+Conventional bootloaders (GRUB, systemd-boot) duplicate kernel
+images onto an ESP and reimplement filesystem drivers in their own
+codebase. NMBL skips both: a real Linux kernel mounts the real
+root filesystem with the real kernel driver, walks the real Nix
+profile symlinks, and kexecs the generation the operator chose.
+
+That buys you:
+
+- Any storage stack Linux can mount is bootable (LVM, LUKS, mdraid,
+  ZFS, btrfs subvolumes, network block devices once you load the
+  module, …).
+- The boot partition only needs the NMBL kernel and initramfs; it
+  does not need to be kept in sync with every NixOS generation.
+- Boot-time interactivity (cmdline editing, passphrase entry,
+  emergency shell) lives in a TUI instead of a half-broken
+  bootloader scripting language.
+
+## What's in the initramfs
+
+| Path | Purpose |
+|------|---------|
+| `/init` | `nmbl-init` — static musl Rust binary, runs as PID 1. |
+| `/etc/nmbl/config.toml` | Runtime config rendered by Nix at build time. |
+| `/lib/modules/<ver>/…` | Kernel modules closure. |
+| `/etc/modprobe.d/nixos.conf` | Module blacklists. |
+| `/bin/sh` | busybox — **only** used as the emergency shell. |
+
+`nmbl-init` performs every boot-time operation itself via direct
+syscalls (`mount(2)`, `finit_module(2)`, `kexec_file_load(2)`,
+`reboot(2)`). It does not shell out to `mount`, `modprobe`, or
+`kexec`. The only binary the Rust init may `execve` is the
+emergency shell, and that only when a fatal error occurs.
+
+busybox is in the initramfs to satisfy the emergency-shell contract
+and nothing else.
+
+Storage-activation helpers (`cryptsetup`, `vgchange`/`lvchange`,
+`mdadm`, `zpool`/`zfs`) are added to the initramfs **only** when
+the corresponding `boot.nmbl.activation.*` options request them,
+and `pkgsStatic` variants are preferred when available.
+
+## What changed from the bash bootloader
+
+The pre-Rust NMBL was a busybox shell script driven by Nix string
+interpolation. That is gone. Concretely:
+
+- `init` is the `nmbl-init` static musl Rust binary (roughly 700 KiB
+  stripped), not a shell script.
+- Runtime state lives in `/etc/nmbl/config.toml`, rendered by
+  `lib/config-toml.nix` from your NixOS options. Changing
+  `boot.nmbl.*` regenerates the TOML; the binary itself does not
+  need rebuilding for config changes.
+- The TUI is a real `ratatui` interface — generation list, countdown
+  with first-key cancel, cmdline editor with caret, kernel-param
+  passthrough toggle, LUKS passphrase modal, emergency-shell key.
+  It works over `/dev/console`, including serial consoles.
+- Storage activation (LVM, LUKS via TPM / keyfile / passphrase,
+  mdraid, ZFS) is performed before mounting the target root.
+  Required tools are pulled into the initramfs conditionally based
+  on `boot.nmbl.activation.*`, so you do not pay for storage stacks
+  you don't use.
+- `nmbl-init` is forbidden from panicking: `panic`, `unwrap`,
+  `expect`, raw indexing, `todo!`, `unimplemented!`, and
+  `unreachable!` are clippy-denied. A panic hook installed at
+  startup re-`execve`s `/proc/self/exe` with `--errored=<path>` to
+  enter a recovery mode that drops to the emergency shell with the
+  panic report attached.
+- The `kexec-tools` and `kmod` userspace packages are no longer in
+  the initramfs; their work is done by the Rust binary directly.
+
+## Quick start
+
+Run a VM that exercises the full GPT+UEFI+GRUB bootstrap path into
+NMBL:
+
+```bash
+nix run .#test-gpt-uefi-grub
 ```
-sirati-nmbl/
-├── flake.nix              # Main flake entry point
-├── lib/
-│   ├── options.nix        # NixOS module options definitions
-│   └── config.nix         # NixOS module configuration implementation
-├── scripts/
-│   ├── script.nix         # Main script builder (combines all parts)
-│   ├── mount-and-kernel.sh.nix    # Part 1: Filesystem mounting & kernel modules
-│   ├── find-generations.sh.nix    # Part 2: NixOS generation discovery
-│   ├── selection-ui.sh.nix        # Part 3: Interactive selection menu
-│   └── kexec-boot.sh.nix          # Part 4: Kexec execution
-└── example.nix            # Example configuration
+
+Other prebuilt demo configurations:
+
+```bash
+nix run .#test-gpt-bios                  # legacy BIOS via GRUB
+nix run .#test-gpt-uefi-systemd          # systemd-boot bootstrap
+nix run .#test-gpt-qemu-kernel-invoke    # QEMU -kernel direct boot
+nix run .#test-gpt-qemu-kernel-invoke -- --debug-shell
 ```
 
-### Architecture
+All VMs are wired through `vm-serial-man`, which exposes a serial
+console you can drive from another shell:
 
-The bootloader works in four stages:
+```bash
+vm-serial-man status
+vm-serial-man send 'ls /mnt/system/nix/var/nix/profiles'
+vm-serial-man send $'\x1b[B'   # arrow keys etc. work too
+vm-serial-man stop
+```
 
-1. **Mount and Kernel Module Loading** (`mount-and-kernel.sh.nix`)
-   - Mounts essential filesystems (proc, sys, dev)
-   - Loads required kernel modules for storage access
-   - Mounts configured filesystems (typically the root partition)
+To inspect the TOML config that would be embedded in the initramfs
+for a given configuration, evaluate the corresponding builder
+output:
 
-2. **Find NixOS Generations** (`find-generations.sh.nix`)
-   - Discovers all available NixOS system generations
-   - Reads kernel parameters for each generation
-   - Validates that generations have required files (kernel, initrd)
+```bash
+nix build .#nixosConfigurations.test-gpt-uefi-grub.config.system.build.nmblInitramfs
+```
 
-3. **Interactive Selection UI** (`selection-ui.sh.nix`)
-   - Presents a menu of available generations
-   - Allows toggling kernel parameter passthrough
-   - Supports custom kernel parameter editing
-   - Auto-boots default after timeout
+The rendered config TOML is produced by `lib/config-toml.nix`.
 
-4. **Kexec Boot Execution** (`kexec-boot.sh.nix`)
-   - Loads selected kernel and initrd
-   - Constructs final kernel command line
-   - Unmounts filesystems cleanly
-   - Performs kexec into selected generation
+## NixOS module options
 
-### Script Structure
-
-Each `.sh.nix` file is a Nix expression that returns a shell script string:
+Users normally only set a handful of options. The full surface is
+in `lib/options.nix` and `lib/modules/activation.nix`.
 
 ```nix
-# Example structure
 {
-  lib,
-  pkgs,
-  cfg,
-}:
+  boot.nmbl = {
+    enable = true;
 
-''
-  # Shell script code here
-  echo "This is part of the init script"
-  ${lib.concatStringsSep "\n" cfg.someList}
-''
-```
-
-The `scripts/script.nix` file imports all parts and combines them into a single init script with proper shebang and error handling.
-
-## Usage
-
-### In a Flake
-
-```nix
-{
-  inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    nmbl.url = "path:./sirati-nmbl";  # or your preferred source
-  };
-
-  outputs = { self, nixpkgs, nmbl }: {
-    nixosConfigurations.mySystem = nixpkgs.lib.nixosSystem {
-      system = "x86_64-linux";
-      modules = [
-        nmbl.nixosModules.default
-        {
-          boot.nmbl = {
-            enable = true;
-            bootMode = "gpt-uefi";
-            
-            kernelModules = [
-              "ext4"
-              "nvme"
-            ];
-            
-            fileSystems."/mnt-root" = {
-              device = "/dev/nvme0n1p2";
-              fsType = "ext4";
-              options = [ "ro" ];
-            };
-          };
-          
-          # Your other configuration...
-        }
-      ];
+    bootstrapper = {
+      partition_table = "gpt";
+      bootMode = "uefi";          # "bios" | "uefi" | "qemu_kernel_invoke"
+      loader = "grub";            # "grub" | "systemd" | null
     };
+
+    timeoutSeconds = 3;           # countdown before auto-boot
+    serialConsole = "ttyS0,115200";  # null = video console
+
+    kernelModules = [ "nvme" "ahci" ];   # explicitly load at boot
+    blacklistedKernelModules = [ ];
+
+    # Storage activations — only what you actually use:
+    activation.lvm.enable = true;
+    activation.mdraid.enable = true;
+    activation.zfs.pools = [ "rpool" ];
+    activation.luks = [
+      { name = "cryptroot"; device = "/dev/nvme0n1p3"; unlock = "password"; }
+    ];
   };
 }
 ```
 
-### Configuration Options
+Notable points:
 
-See `lib/options.nix` for all available options:
+- `boot.nmbl.activation.{lvm,mdraid,zfs}` auto-detect from
+  `config.fileSystems`: if any filesystem sits on `/dev/mapper/*`,
+  `/dev/md*`, or has `fsType = "zfs"`, the corresponding activation
+  defaults to on.
+- `activation.luks[*].unlock` is one of `tpm` (TPM-sealed token),
+  `keyfile` (bundled into the initramfs), or `password` (entered in
+  the TUI passphrase modal).
+- `verbose` defaults to inheriting `boot.initrd.verbose`.
 
-- `boot.nmbl.enable` - Enable the bootloader
-- `boot.nmbl.bootMode` - Boot mode: "mbr", "gpt-bios", or "gpt-uefi"
-- `boot.nmbl.kernelPackage` - Pinned kernel for the bootloader
-- `boot.nmbl.kernelModules` - Kernel modules to load in initramfs
-- `boot.nmbl.fileSystems` - Filesystems to mount
-- `boot.nmbl.kernelParams` - Bootloader-specific kernel parameters
-- `boot.nmbl.timeoutSeconds` - Auto-boot timeout
-- `boot.nmbl.serialConsole` - Serial console configuration
+## Where to find things
 
-## Testing
+| Path | What it is |
+|------|------------|
+| `nmbl-init-rs/` | Rust crate — the `/init` binary. |
+| `nmbl-init-rs/PLAN.md` | Source-of-truth design contract. |
+| `nmbl-init-rs/src/config.rs` | Runtime TOML schema (`serde` types). |
+| `nmbl-init-rs/src/main.rs` | Phase orchestration, panic recovery. |
+| `nmbl-init-rs/src/ui/` | `ratatui` TUI (list, editor, passphrase modal). |
+| `lib/options.nix` | `boot.nmbl.*` NixOS option definitions. |
+| `lib/config.nix` | Module implementation (assembles the initramfs). |
+| `lib/config-toml.nix` | Renders `/etc/nmbl/config.toml` from `cfg`. |
+| `lib/modules/activation.nix` | Activation options + computed outputs. |
+| `lib/modules/kernel-modules.nix` | Module closure and `modprobe.conf`. |
+| `lib/modules/assertions.nix` | Build-time validation. |
+| `lib/install-bootloader.nix` | Hook NixOS calls during `nixos-rebuild`. |
+| `testing/` | VM harnesses and `nix run .#test-*` apps. |
+| `ARCHITECTURE.md` | Longer-form architecture notes. |
 
-### Quick Testing with `nix run` (Recommended)
+## Status
 
-Everything is automated - just run:
+Working:
 
-```bash
-# Direct kernel boot (fast testing - 5-10x faster)
-nix run .#test-test-mbr-serial-direct
-nix run .#test-test-gpt-bios-direct
-nix run .#test-test-gpt-uefi-direct
+- Pseudo-fs mount, explicit kernel module load (with `MODULE_INIT_COMPRESSED_FILE` for `.ko.xz`/`.ko.zst`).
+- Device-wait poll and configured filesystem mount.
+- NixOS generation discovery from `/nix/var/nix/profiles/`.
+- Ratatui TUI: generation list, countdown, cmdline editor, passthrough toggle, emergency shell, serial-console fallback.
+- Storage activation: LVM (`vgchange -ay`), mdraid (`mdadm --assemble --scan`), LUKS via TPM / keyfile / passphrase, ZFS (`zpool import -N`).
+- `kexec_file_load(2)` handover into the selected generation.
+- Panic hook with `--errored` recovery re-exec.
+- Bootstrapper installation via GRUB or systemd-boot on GPT for BIOS or UEFI, plus QEMU `-kernel` direct invocation.
 
-# UEFI boot (full boot chain testing)
-nix run .#test-test-gpt-uefi-uefi
-```
+Not supported in v1:
 
-**What happens automatically:**
-1. Builds NMBL kernel and initramfs
-2. Creates disk image (if needed)
-3. Starts VM with vm-serial-man
-4. Shows serial console output
+- `LABEL=`, `UUID=`, `PARTUUID=` filesystem specifiers — `nmbl-init` has no udev, so only raw `/dev/*` paths are resolved. The config loader rejects the others up front.
+- LUKS unlock via FIDO2 / YubiKey / smartcard.
+- MBR partition tables (only GPT is supported by the bootstrapper).
 
-**Interact with running VM:**
-```bash
-# In another terminal
-vm-serial-man send 'ls -la /boot'
-vm-serial-man send 'cat /proc/cmdline'
-vm-serial-man status
-vm-serial-man stop
-```
+Deferred:
 
-See [testing/README.md](./testing/README.md) for complete testing guide.
-
-### Alternative: Manual Testing Scripts
-
-For more control, use the shell scripts:
-
-```bash
-# Quick demo
-./demo-direct-kernel.sh
-
-# Full testing with specific config
-./test-direct-kernel.sh test-mbr-serial
-./test-uefi-boot.sh test-gpt-uefi
-```
-
-See [TESTING-WITH-VM-SERIAL-MAN.md](./TESTING-WITH-VM-SERIAL-MAN.md) for comprehensive guide.
-
-### Traditional VM Testing
-
-Build and run test VMs (old method):
-
-```bash
-# Build VM
-nix build .#nixosConfigurations.test-mbr-serial.config.system.build.vm
-
-# Run VM
-./result/bin/run-test-mbr-serial-vm
-
-# SSH into VM (from another terminal)
-ssh -p 2222 root@localhost  # password: test
-```
-
-See [debug.md](./debug.md) for more details.
-
-## Development
-
-### Adding New Script Components
-
-To add a new script component:
-
-1. Create a new `.sh.nix` file in `scripts/` that returns a string
-2. Import it in `scripts/script.nix`
-3. Add it to the concatenation in the appropriate location
-
-Example:
-
-```nix
-# scripts/my-feature.sh.nix
-{ lib, pkgs, cfg }:
-
-''
-  # My feature code
-  echo "Doing something..."
-''
-```
-
-Then in `scripts/script.nix`:
-
-```nix
-let
-  myFeatureScript = import ./my-feature.sh.nix { inherit lib pkgs cfg; };
-in
-pkgs.writeScript "init" ''
-  #!${pkgs.busybox}/bin/sh
-  set -e
-  
-  ${mountAndKernelScript}
-  ${myFeatureScript}  # Add your component
-  ${findGenerationsScript}
-  # ...
-''
-```
-
-### Building Individual Components
-
-Build specific parts:
-
-```bash
-# Build NMBL kernel
-nix build .#nixosConfigurations.test-mbr-serial.config.system.build.nmblKernel
-
-# Build NMBL initramfs
-nix build .#nixosConfigurations.test-mbr-serial.config.system.build.nmblInitramfs
-
-# Build bootloader installation script
-nix build .#nixosConfigurations.test-mbr-serial.config.system.build.installBootLoader
-
-# Check the generated init script
-nix eval .#nixosConfigurations.test-mbr-serial.config.system.build.nmblInitramfs --apply 'x: x.contents'
-```
-
-## Design Decisions
-
-
-### Why busybox?
-
-The bootloader needs to be minimal and fast. Busybox provides:
-- Small footprint
-- All essential Unix utilities
-- Single binary for easy initramfs inclusion
+- Reading `/etc/nmbl/config.toml` from the boot partition instead of the initramfs, so config edits don't require rebuilding the initramfs.
+- A squashfs rescue blob mounted on demand from the emergency shell.
 
 ## License
 
-MIT License (the scripts here, the generated content has various licenses)
+MIT License. The scripts and Rust source in this tree are MIT; the
+content rendered into the initramfs (kernel, busybox, storage
+tools, etc.) carries its own licenses.
