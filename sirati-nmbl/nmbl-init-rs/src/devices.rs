@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use nix::sys::stat::{SFlag, stat};
+use rustix::fs::{FileType, stat};
 
 use crate::config::{Config, FilesystemEntry};
 use crate::error::{NmblError, Result};
@@ -64,8 +64,10 @@ fn device_ready(device: &Path) -> bool {
         return false;
     };
 
-    let file_type_bits = st.st_mode & SFlag::S_IFMT.bits();
-    file_type_bits == SFlag::S_IFBLK.bits() || file_type_bits == SFlag::S_IFCHR.bits()
+    matches!(
+        FileType::from_raw_mode(st.st_mode as rustix::fs::RawMode),
+        FileType::BlockDevice | FileType::CharacterDevice,
+    )
 }
 
 /// Resolve the on-disk mountpoint for a single filesystem entry.
