@@ -163,6 +163,18 @@ in
               symlink = "/bin/kmod";
             }
             {
+              # util-linux gives us blkid for populating /dev/disk/by-partlabel/
+              # symlinks at boot (NMBL has no udev to do this automatically).
+              object = pkgs.util-linux;
+              symlink = "/bin/util-linux";
+            }
+            {
+              # mdadm so the mount-and-kernel stage can `--assemble --scan`
+              # any mdraid arrays present on disk before mounting.
+              object = pkgs.mdadm;
+              symlink = "/bin/mdadm";
+            }
+            {
               object = "${kernelModulesManager.modulesClosure}/lib/modules";
               symlink = "/lib/modules";
             }

@@ -94,6 +94,52 @@ in
     fi
   '') kernelModules}
 
+  # Wait briefly for kernel to expose partitions in /sys/class/block/
+  for _wait in 1 2 3 4 5 6 7 8 9 10; do
+    if ${pkgs.busybox}/bin/ls /sys/class/block/ 2>/dev/null | ${pkgs.busybox}/bin/grep -q '[0-9]$'; then
+      break
+    fi
+    ${pkgs.busybox}/bin/sleep 0.1
+  done
+
+  # Assemble mdadm arrays. Idempotent — no-op when no md members exist.
+  # Must run BEFORE the blkid scan below so /dev/md* arrays get their
+  # by-label / by-uuid symlinks alongside everything else.
+  info "NMBL: Assembling mdadm arrays (if any)..."
+  ${pkgs.mdadm}/bin/mdadm --assemble --scan --verbose 2>&1 | while IFS= read -r _mdline; do
+    info "  $_mdline"
+  done || true
+
+  # Populate /dev/disk/by-partlabel/ and /dev/disk/by-label/ symlinks.
+  # NMBL has no udev, so we walk /sys/class/block + use blkid to build them.
+  info "NMBL: Populating /dev/disk/by-partlabel/ and by-label/ symlinks..."
+  ${pkgs.busybox}/bin/mkdir -p /dev/disk/by-partlabel /dev/disk/by-label /dev/disk/by-uuid /dev/disk/by-partuuid
+  for _blockdev in $(${pkgs.busybox}/bin/ls /sys/class/block/ 2>/dev/null); do
+    _devpath="/dev/$_blockdev"
+    [ -b "$_devpath" ] || continue
+    # Query blkid for PARTLABEL/LABEL/UUID/PARTUUID
+    _blkid_out=$(${pkgs.util-linux}/bin/blkid -o export "$_devpath" 2>/dev/null || true)
+    [ -n "$_blkid_out" ] || continue
+    _partlabel=$(echo "$_blkid_out" | ${pkgs.busybox}/bin/grep '^PARTLABEL=' | ${pkgs.busybox}/bin/cut -d= -f2-)
+    _label=$(echo "$_blkid_out" | ${pkgs.busybox}/bin/grep '^LABEL=' | ${pkgs.busybox}/bin/cut -d= -f2-)
+    _uuid=$(echo "$_blkid_out" | ${pkgs.busybox}/bin/grep '^UUID=' | ${pkgs.busybox}/bin/cut -d= -f2-)
+    _partuuid=$(echo "$_blkid_out" | ${pkgs.busybox}/bin/grep '^PARTUUID=' | ${pkgs.busybox}/bin/cut -d= -f2-)
+    if [ -n "$_partlabel" ]; then
+      ${pkgs.busybox}/bin/ln -sf "$_devpath" "/dev/disk/by-partlabel/$_partlabel"
+      info "  by-partlabel/$_partlabel -> $_devpath"
+    fi
+    if [ -n "$_label" ]; then
+      ${pkgs.busybox}/bin/ln -sf "$_devpath" "/dev/disk/by-label/$_label"
+      info "  by-label/$_label -> $_devpath"
+    fi
+    if [ -n "$_uuid" ]; then
+      ${pkgs.busybox}/bin/ln -sf "$_devpath" "/dev/disk/by-uuid/$_uuid"
+    fi
+    if [ -n "$_partuuid" ]; then
+      ${pkgs.busybox}/bin/ln -sf "$_devpath" "/dev/disk/by-partuuid/$_partuuid"
+    fi
+  done
+
   # Wait for required devices to become available
   info "NMBL: Waiting for block devices to become available..."
 
