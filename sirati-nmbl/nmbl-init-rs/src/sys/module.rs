@@ -99,11 +99,12 @@ pub fn index_by_name(entries: &[ModuleEntry]) -> HashMap<String, &ModuleEntry> {
     map
 }
 
-/// Synthesize a `NmblError::Module` from a raw errno + module name.
-fn module_err(name: &str, errno: Errno) -> NmblError {
+/// Synthesize a `NmblError::Module` from a raw errno + module name + path.
+fn module_err(name: &str, path: &Path, errno: Errno) -> NmblError {
     NmblError::Module {
-        source: errno,
         name: name.to_owned(),
+        path: path.to_path_buf(),
+        source: errno,
     }
 }
 
@@ -132,13 +133,18 @@ fn visit<'a>(
         return Ok(());
     }
     if !visiting.insert(name.to_owned()) {
-        // We were already mid-visit on this node → cycle.
-        return Err(module_err(name, Errno::ELOOP));
+        // We were already mid-visit on this node → cycle. Re-look up the
+        // entry so the error carries the .ko path of the offender.
+        let path = by_name
+            .get(name)
+            .map(|e| e.path.clone())
+            .unwrap_or_default();
+        return Err(module_err(name, &path, Errno::ELOOP));
     }
     let entry = by_name
         .get(name)
         .copied()
-        .ok_or_else(|| module_err(name, Errno::ENOENT))?;
+        .ok_or_else(|| module_err(name, Path::new(""), Errno::ENOENT))?;
     for dep in &entry.deps {
         visit(dep, by_name, order, visited, visiting)?;
     }
@@ -166,7 +172,7 @@ fn flags_for_path(path: &Path) -> u32 {
 /// the file is closed on drop even if we early-return.
 fn open_module_fd(path: &Path, name: &str) -> Result<OwnedFd> {
     let raw = open(path, OFlag::O_RDONLY | OFlag::O_CLOEXEC, Mode::empty())
-        .map_err(|e| module_err(name, e))?;
+        .map_err(|e| module_err(name, path, e))?;
     // SAFETY: `open` just returned this fd to us and no other code owns
     // it; wrapping it in `OwnedFd` transfers ownership unambiguously.
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
@@ -174,7 +180,7 @@ fn open_module_fd(path: &Path, name: &str) -> Result<OwnedFd> {
 
 /// Call `finit_module(fd, params, flags)` directly. Returns `Ok(())`
 /// on success or when the module is already loaded (`EEXIST`).
-fn finit_module(fd: &OwnedFd, params: &CString, flags: u32, name: &str) -> Result<()> {
+fn finit_module(fd: &OwnedFd, params: &CString, flags: u32, name: &str, path: &Path) -> Result<()> {
     // SAFETY: we pass a live fd, a valid NUL-terminated C string, and
     // an integer flag word — the exact shape `finit_module(2)` expects.
     let rc = unsafe {
@@ -193,7 +199,7 @@ fn finit_module(fd: &OwnedFd, params: &CString, flags: u32, name: &str) -> Resul
         // Module is already in the kernel — treat as success.
         return Ok(());
     }
-    Err(module_err(name, errno))
+    Err(module_err(name, path, errno))
 }
 
 /// Open the module's file at `entry.path` and load it via
@@ -206,7 +212,7 @@ pub fn load_module(entry: &ModuleEntry) -> Result<()> {
     // `modules.dep` carries no parameters and the bash bootloader never
     // set them — pass an empty string and move on.
     let params = CString::default();
-    finit_module(&fd, &params, flags, &entry.name)
+    finit_module(&fd, &params, flags, &entry.name, &entry.path)
 }
 
 /// Resolve `name` against `by_name`, then load every entry in load
