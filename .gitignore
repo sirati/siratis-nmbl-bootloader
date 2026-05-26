@@ -4,6 +4,9 @@
 # Direnv
 .direnv/
 
+# Claude Code workspace metadata (per-agent worktrees, transcripts, memory)
+.claude/
+
 # macOS
 .DS_Store
 
