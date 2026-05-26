@@ -13,8 +13,16 @@ mod manager;
 mod protocol;
 
 use clap::Parser;
-use cli::{BootModeArgs, Cli, Commands};
-use manager::BootMode;
+use cli::{BootModeArgs, Cli, Commands, DisplayArg};
+use manager::{screenshot, BootMode, Display};
+
+fn display_from_arg(arg: DisplayArg) -> Display {
+    match arg {
+        DisplayArg::Serial => Display::Serial,
+        DisplayArg::Sdl => Display::Sdl,
+        DisplayArg::Vnc { port } => Display::Vnc { port },
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -44,6 +52,7 @@ async fn main() -> Result<()> {
                     kernel_args,
                 },
             };
+            let display = display_from_arg(config.display);
             manager::run_manager(
                 config.name,
                 config.disk,
@@ -53,6 +62,7 @@ async fn main() -> Result<()> {
                 config.socket,
                 config.buffer_lines,
                 config.buffer_seconds,
+                display,
             )
             .await
         }
@@ -115,5 +125,13 @@ async fn main() -> Result<()> {
             client::get_lines(start, actual_end, socket).await
         }
         Commands::Tail { lines, socket } => client::get_tail(lines, socket).await,
+        Commands::Screenshot {
+            output,
+            monitor_socket,
+        } => {
+            screenshot::capture(&monitor_socket, &output)
+                .map_err(|e| anyhow::anyhow!("screenshot failed: {e}"))?;
+            Ok(())
+        }
     }
 }
