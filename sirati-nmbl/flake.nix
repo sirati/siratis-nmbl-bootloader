@@ -51,6 +51,12 @@
       # Built by the sibling flake at ./nmbl-init-rs.
       nmblInit = nmbl-init-rs.packages.${system}.default;
 
+      # Same binary with the `image-splash` cargo feature compiled in.
+      # `lib/config.nix` selects between the two based on
+      # `boot.nmbl.splash.enable`; this attribute is injected
+      # unconditionally so the option can be toggled at evaluation time.
+      nmblInitSplash = nmbl-init-rs.packages.${system}.nmbl-init-splash;
+
       # Import rescue-vm-test app directly
       rescueVmTestFlake = import ../rescue-vm-test/flake.nix;
       rescueVmTestApp =
@@ -131,9 +137,12 @@
             ./lib/config.nix
           ];
 
-          # Make the Rust /init binary available to lib/config.nix without
-          # forcing every caller to pass it explicitly.
+          # Make the Rust /init binaries available to lib/config.nix
+          # without forcing every caller to pass them explicitly. Both
+          # are injected unconditionally; lib/config.nix picks one based
+          # on `boot.nmbl.splash.enable`.
           _module.args.nmblInit = nmblInit;
+          _module.args.nmblInitSplash = nmblInitSplash;
         };
 
       # Test configurations
