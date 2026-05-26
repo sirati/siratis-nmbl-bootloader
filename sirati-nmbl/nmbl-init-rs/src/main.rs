@@ -32,15 +32,17 @@ const DEFAULT_CONFIG_PATH: &str = "/etc/nmbl/config.toml";
 struct Args {
     config_path: PathBuf,
     errored_report: Option<PathBuf>,
+    validate_config: Option<PathBuf>,
 }
 
 /// Hand-rolled arg parsing: clap is too big for the size budget. We
 /// recognise `--config=<v>` / `--config <v>` and the same two forms
-/// for `--errored`. Anything else is silently ignored — PID 1 has no
-/// useful "usage" target to print to.
+/// for `--errored` and `--validate-config`. Anything else is silently
+/// ignored — PID 1 has no useful "usage" target to print to.
 fn parse_args() -> Args {
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut errored_report: Option<PathBuf> = None;
+    let mut validate_config: Option<PathBuf> = None;
 
     let mut iter = std::env::args_os().skip(1);
     while let Some(arg_os) = iter.next() {
@@ -57,12 +59,19 @@ fn parse_args() -> Args {
             && let Some(v) = iter.next()
         {
             errored_report = Some(PathBuf::from(v));
+        } else if let Some(rest) = arg.strip_prefix("--validate-config=") {
+            validate_config = Some(PathBuf::from(rest));
+        } else if arg == "--validate-config"
+            && let Some(v) = iter.next()
+        {
+            validate_config = Some(PathBuf::from(v));
         }
     }
 
     Args {
         config_path,
         errored_report,
+        validate_config,
     }
 }
 
@@ -177,6 +186,24 @@ fn select_and_act(config: &Config) -> Result<()> {
 )]
 fn main() -> ExitCode {
     let args = parse_args();
+
+    // Build-time validation hook: load and validate the given config
+    // file, print the outcome, and exit. Used by the Nix expression
+    // that emits the runtime TOML so a malformed config fails
+    // `nix build` instead of `nmbl-init` at PID 1 in front of the
+    // operator.
+    if let Some(path) = args.validate_config.as_deref() {
+        return match Config::load(path) {
+            Ok(_) => {
+                println!("nmbl-init: config OK: {}", path.display());
+                ExitCode::from(0)
+            }
+            Err(err) => {
+                eprintln!("nmbl-init: config invalid at {}: {err}", path.display());
+                ExitCode::from(1)
+            }
+        };
+    }
 
     if let Some(report_path) = args.errored_report.clone() {
         // Note: the panic hook must NOT be re-installed here — a

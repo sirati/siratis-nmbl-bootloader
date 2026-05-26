@@ -93,7 +93,7 @@ let
   # All previously string-interpolated state (filesystems, modules, timeouts,
   # serial console, verbosity, activation blocks) lives in this TOML file.
   nmblConfigToml = import ./config-toml.nix {
-    inherit pkgs lib config;
+    inherit pkgs lib config nmblInit;
   };
 
   # Determine legacy boot mode string for compatibility
