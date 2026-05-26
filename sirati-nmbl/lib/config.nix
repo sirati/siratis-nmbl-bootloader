@@ -175,6 +175,13 @@ in
               symlink = "/bin/mdadm";
             }
             {
+              # btrfs-progs so mount-and-kernel can `btrfs device scan` for
+              # multi-device btrfs filesystems before mounting (NMBL has no
+              # udev to auto-discover the other members).
+              object = pkgs.btrfs-progs;
+              symlink = "/bin/btrfs-progs";
+            }
+            {
               object = "${kernelModulesManager.modulesClosure}/lib/modules";
               symlink = "/lib/modules";
             }
