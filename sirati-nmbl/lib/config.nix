@@ -18,9 +18,11 @@ let
   # defensively so this file still evaluates if that module hasn't been
   # imported yet (e.g. during sibling-subtask staggered merges). The
   # activationBlocks list itself is consumed by ./config-toml.nix, not here.
+  # Activation assertions are written to top-level `assertions` by the
+  # activation module itself, so we deliberately do not re-append them
+  # here (doing so would duplicate every activation assertion).
   activationCfg = cfg.activation or { };
   activationExtraContents = activationCfg.extraContents or [ ];
-  activationAssertions = activationCfg.assertions or [ ];
 
   # Set default loader based on bootMode if not explicitly set
   actualLoader =
@@ -114,9 +116,11 @@ in
     # This ensures vfat kernel modules are automatically included in the system initrd
     fileSystems."/boot".neededForBoot = lib.mkOverride 1000 true;
 
-    # Import assertions from assertions module, plus any contributed by the
-    # activation module (e.g. luks-tpm misconfiguration, missing TPM modules).
-    assertions = assertionsModule.assertions ++ activationAssertions;
+    # Import assertions from assertions module. Activation-module
+    # assertions are written to `assertions` by ./modules/activation.nix
+    # itself; do not re-append them here or every activation assertion
+    # would fire twice.
+    assertions = assertionsModule.assertions;
 
     # Force assertion checking - this will fail the build if any assertions are false
     # NixOS checks assertions in system.build.toplevel, but we need to ensure they're

@@ -16,15 +16,24 @@ use std::ffi::CString;
 use std::fs::File;
 use std::io::Write as _;
 use std::panic::PanicHookInfo;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nix::unistd::execve;
 
-/// Default location for the panic report. `/run` is tmpfs — created in
-/// phase 1 — so a re-exec for panic recovery has somewhere to write
-/// even when the system filesystem isn't mounted.
-const PANIC_REPORT_DIR: &str = "/run";
+/// Fallback location for the panic report used when
+/// [`install_panic_hook`] hasn't been called yet (e.g. an early panic
+/// before main installs the hook with the configured directory). `/run`
+/// is tmpfs — created in phase 1 — so a re-exec for panic recovery has
+/// somewhere to write even when the system filesystem isn't mounted.
+const DEFAULT_PANIC_REPORT_DIR: &str = "/run";
+
+/// Process-wide override for the panic report directory. Populated once
+/// by [`install_panic_hook`] from the runtime config so the panic hook
+/// — which is a `'static + Send + Sync` closure with no captured state
+/// — can still honour the operator's choice.
+static PANIC_REPORT_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Path to the on-disk self for `execve(2)`. The kernel resolves this
 /// to the binary that is currently mapped into the panicking process,
@@ -38,7 +47,17 @@ const ARGV0: &str = "nmbl-init";
 /// Install the process-wide panic hook. Must run once at startup,
 /// before any other work, so a bug in early phases (config load,
 /// mount, …) is still caught by the recovery path.
-pub fn install_panic_hook() {
+///
+/// `report_dir` is the directory where the structured panic report
+/// will be written. This is recorded in a process-wide `OnceLock` so
+/// the `'static` panic-hook closure can pick it up without capturing
+/// non-`'static` config state. Subsequent calls to `install_panic_hook`
+/// do not change the directory (the first value wins) — `main` is the
+/// only caller, so this is just defensive.
+pub fn install_panic_hook(report_dir: &Path) {
+    // Ignore the result: a second install with a different dir is a
+    // programmer error, not a runtime concern. The first value wins.
+    let _ = PANIC_REPORT_DIR.set(report_dir.to_path_buf());
     std::panic::set_hook(Box::new(|info: &PanicHookInfo<'_>| {
         let report = build_report(info);
         let pid = std::process::id();
@@ -99,10 +118,23 @@ fn panic_payload_str(info: &PanicHookInfo<'_>) -> String {
     "<non-string panic payload>".to_string()
 }
 
-/// Per-PID report path. Encoded into the file name so concurrent
-/// crashes (extremely unlikely for PID 1) don't clobber each other.
+/// Per-PID report path under `dir`. Encoded into the file name so
+/// concurrent crashes (extremely unlikely for PID 1) don't clobber
+/// each other.
+fn report_path_in(dir: &Path, pid: u32) -> PathBuf {
+    dir.join(format!("nmbl-panic-{pid}.txt"))
+}
+
+/// Per-PID report path. Reads the configured directory from the
+/// [`PANIC_REPORT_DIR`] `OnceLock`, falling back to
+/// [`DEFAULT_PANIC_REPORT_DIR`] when the hook hasn't been installed
+/// yet.
 fn report_path_for(pid: u32) -> PathBuf {
-    PathBuf::from(PANIC_REPORT_DIR).join(format!("nmbl-panic-{pid}.txt"))
+    let dir = PANIC_REPORT_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PANIC_REPORT_DIR));
+    report_path_in(&dir, pid)
 }
 
 /// Write the report to disk. Best-effort: the caller logs the failure
@@ -155,8 +187,20 @@ mod tests {
 
     #[test]
     fn report_path_uses_pid() {
-        let p = report_path_for(42);
+        // `report_path_for` reads the process-wide OnceLock — which
+        // tests must not poison — so check the deterministic helper
+        // instead. Confirms the default-fallback shape.
+        let p = report_path_in(Path::new(DEFAULT_PANIC_REPORT_DIR), 42);
         assert_eq!(p, PathBuf::from("/run/nmbl-panic-42.txt"));
+    }
+
+    #[test]
+    fn report_path_honours_configured_dir() {
+        // Operator overrides the panic dir to e.g. /var/run/nmbl via
+        // boot.nmbl.panicReportDir; the filename pattern stays.
+        let dir = PathBuf::from("/var/run/nmbl");
+        let p = report_path_in(&dir, 1);
+        assert_eq!(p, PathBuf::from("/var/run/nmbl/nmbl-panic-1.txt"));
     }
 
     #[test]

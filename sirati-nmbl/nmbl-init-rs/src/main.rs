@@ -184,9 +184,6 @@ fn main() -> ExitCode {
         match recover_from_panic(args, report_path) {}
     }
 
-    // Normal boot path. Hook FIRST so any later panic gets caught.
-    install_panic_hook();
-
     // Config load is the chicken-and-egg moment: if it fails we have
     // no `shell` path, no verbosity, no nothing. Fall back to the
     // recovery default and route the load error through the shell.
@@ -194,6 +191,12 @@ fn main() -> ExitCode {
         Ok(c) => (c, None),
         Err(err) => (Config::recovery_default(), Some(err)),
     };
+
+    // Install the panic hook now that we know where to write reports.
+    // A panic during the brief window before this call would still
+    // unwind through the default Rust hook, abort PID 1, and let the
+    // kernel panic — the documented worst case.
+    install_panic_hook(&config.general.panic_report_dir);
 
     log::init(config.general.verbosity);
     nmbl_info!("nmbl-init starting");

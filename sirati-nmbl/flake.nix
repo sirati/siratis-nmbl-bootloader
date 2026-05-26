@@ -75,9 +75,11 @@
         }:
         {
           imports = [
+            # ./lib/options.nix already imports ./lib/modules/activation.nix,
+            # so listing it here too would be redundant (NixOS dedups by
+            # path but keeping a single import site avoids confusion).
             ./lib/options.nix
             ./lib/config.nix
-            ./lib/modules/activation.nix
           ];
 
           # Make the Rust /init binary available to lib/config.nix without
