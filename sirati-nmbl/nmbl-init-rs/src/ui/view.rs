@@ -72,6 +72,21 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, hint: &str) {
     frame.render_widget(Paragraph::new(hint).alignment(Alignment::Right), area);
 }
 
+/// Convert a byte index into `s` into a char-column count suitable for
+/// caret positioning. Clamps to the end of `s`, then walks back to the
+/// nearest char boundary so a stale cursor mid-codepoint doesn't panic
+/// when sliced.
+fn char_column_for_byte_cursor(s: &str, byte_idx: usize) -> usize {
+    let clamped = byte_idx.min(s.len());
+    // Walk back to the nearest char boundary. Index 0 is always a
+    // boundary, so `(0..=clamped).rev().find(..)` is never empty —
+    // but pattern-match instead of unwrap to keep the code total.
+    let Some(safe) = (0..=clamped).rev().find(|&i| s.is_char_boundary(i)) else {
+        return 0;
+    };
+    s.get(..safe).map_or(0, |prefix| prefix.chars().count())
+}
+
 fn generation_item<'a>(g: &'a Generation, show_kernel_params: bool) -> ListItem<'a> {
     let head = if g.label.is_empty() {
         format!("#{}", g.number)
@@ -120,12 +135,10 @@ pub fn render_list(frame: &mut Frame<'_>, data: &ListScreenData<'_>) {
 pub fn render_edit(frame: &mut Frame<'_>, data: &EditScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
-    // Caret indicator counts characters, not bytes.
-    let offset = data
-        .edited_cmdline
-        .chars()
-        .take(data.cursor_position)
-        .count();
+    // `cursor_position` is a BYTE index (per `Screen::Editing.cursor`).
+    // Convert to a CHAR-column count so multi-byte text (e.g. "héllo")
+    // doesn't shove the caret one cell too far to the right.
+    let offset = char_column_for_byte_cursor(data.edited_cmdline, data.cursor_position);
     let caret = format!("{}{}", " ".repeat(offset), "^");
     let title = format!("Edit cmdline — generation #{}", data.generation.number);
     let text = Text::from(vec![
@@ -245,6 +258,48 @@ mod tests {
         assert!(text.contains("#99"), "missing gen number");
         assert!(text.contains("init=/sbin/init"), "missing cmdline");
         assert!(text.contains('^'), "missing caret indicator");
+    }
+
+    #[test]
+    fn test_render_edit_caret_column_for_multibyte_cmdline() {
+        // "héllo" is 6 bytes ('h' 'é'×2 'l' 'l' 'o'); cursor at byte
+        // index 4 sits right after the 'l' that follows 'é', which
+        // is char column 3. A naive `chars().take(cursor).count()`
+        // would render the caret at column 4 — this test pins the
+        // byte→char conversion.
+        let g = fake_gen(7, "", &[]);
+        let data = EditScreenData {
+            generation: &g,
+            edited_cmdline: "héllo",
+            cursor_position: 4,
+        };
+        let mut term = new_term(40, 10);
+        term.draw(|f| render_edit(f, &data)).expect("draw");
+        let lines = buffer_lines(&term);
+
+        // Find the caret row (the line that contains '^') and the
+        // text row that precedes it.
+        let caret_row = lines
+            .iter()
+            .position(|l| l.contains('^'))
+            .expect("caret '^' must appear in rendered buffer");
+        let caret_line = &lines[caret_row];
+        // Count chars (not bytes) so multi-byte border glyphs like '│'
+        // don't throw the column off.
+        let caret_col = caret_line
+            .chars()
+            .position(|c| c == '^')
+            .expect("'^' present");
+
+        // The border draws on column 0, so the body starts at col 1.
+        // Column-3 of the edited string is column-4 of the row.
+        assert_eq!(
+            caret_col,
+            4,
+            "caret rendered at row col {caret_col}, expected 4 (string col 3) \
+             in rendered lines:\n{}",
+            lines.join("\n")
+        );
     }
 
     #[test]
