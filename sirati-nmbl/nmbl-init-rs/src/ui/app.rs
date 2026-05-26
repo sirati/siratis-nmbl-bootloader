@@ -125,6 +125,12 @@ impl<'a> App<'a> {
                 false
             }
             KeyCode::Enter => {
+                // Guard against an empty list: emitting a Boot
+                // decision with index 0 would crash the caller as
+                // soon as it tried to look up the generation.
+                if generations.is_empty() {
+                    return false;
+                }
                 *decision = Some(Decision::Boot {
                     generation_index: *selected_index,
                     cmdline_override: None,
@@ -408,6 +414,17 @@ mod tests {
             }
             other => panic!("expected Boot decision, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn list_enter_with_empty_generations_does_not_decide() {
+        // Defence-in-depth: if the selector ever ran with zero
+        // generations, Enter would otherwise emit Boot{0,..} and
+        // main.rs would index out of bounds. Make Enter a no-op.
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        assert!(!app.on_key(press(KeyCode::Enter)));
+        assert!(app.decision.is_none(), "decision must stay None");
     }
 
     #[test]
