@@ -193,13 +193,10 @@ impl Config {
             let dev = fs.device.as_str();
             if dev.starts_with("LABEL=") || dev.starts_with("UUID=") || dev.starts_with("PARTUUID=")
             {
-                return Err(NmblError::Io {
-                    source: std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "device {dev:?} uses LABEL=/UUID=/PARTUUID= which NMBL does not resolve; \
-                             use a raw /dev/* path"
-                        ),
+                return Err(NmblError::ConfigInvalid {
+                    reason: format!(
+                        "device {dev:?} uses LABEL=/UUID=/PARTUUID= which NMBL does not \
+                         resolve; use a raw /dev/* path"
                     ),
                     context: format!(
                         "validating filesystem entry for {}",
