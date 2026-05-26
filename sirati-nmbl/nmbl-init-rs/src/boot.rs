@@ -24,12 +24,52 @@ const PSEUDO_FS: &[&str] = &["/proc", "/sys", "/dev", "/run", "/tmp"];
 /// hardware needs a beat to commit before we cut the mounts out.
 const POST_SYNC_FLUSH: Duration = Duration::from_millis(50);
 
-/// Final cmdline. `cmdline_override` wins verbatim (TUI editor path);
-/// otherwise the generation's own params are space-joined.
-fn build_cmdline(generation: &Generation, cmdline_override: Option<&str>) -> String {
-    match cmdline_override {
-        Some(s) => s.to_string(),
-        None => generation.kernel_params.join(" "),
+/// Final cmdline.
+///
+/// * `cmdline_override` (TUI editor path) wins verbatim — an operator who has
+///   hand-edited the line must not have their text silently mutated. No
+///   `init=` injection happens in this branch.
+/// * Otherwise the generation's own `kernel_params` are space-joined, and
+///   `init=<stage2>` is appended unless the joined string already carries an
+///   `init=` token (split on whitespace). The init value is the generation's
+///   `init_path` stripped of `system_root`, with a leading `/` re-prepended so
+///   the chained kernel — which mounts the store at `/`, not under our
+///   `/mnt/system` prefix — sees a path that exists in its own namespace. If
+///   `init_path` is somehow outside `system_root`, fall back to the raw path
+///   with a warning rather than producing a broken cmdline.
+fn build_cmdline(
+    generation: &Generation,
+    cmdline_override: Option<&str>,
+    system_root: &Path,
+) -> String {
+    if let Some(s) = cmdline_override {
+        return s.to_string();
+    }
+
+    let joined = generation.kernel_params.join(" ");
+    if joined
+        .split_ascii_whitespace()
+        .any(|t| t.starts_with("init="))
+    {
+        return joined;
+    }
+
+    let init_arg = match generation.init_path.strip_prefix(system_root) {
+        Ok(rel) => format!("/{}", rel.display()),
+        Err(_) => {
+            nmbl_warn!(
+                "init path {} is not under system_root {}; passing through unchanged",
+                generation.init_path.display(),
+                system_root.display(),
+            );
+            generation.init_path.display().to_string()
+        }
+    };
+
+    if joined.is_empty() {
+        format!("init={init_arg}")
+    } else {
+        format!("{joined} init={init_arg}")
     }
 }
 
@@ -61,7 +101,7 @@ pub fn kexec_into(
     generation: &Generation,
     cmdline_override: Option<&str>,
 ) -> Result<Infallible> {
-    let cmdline = build_cmdline(generation, cmdline_override);
+    let cmdline = build_cmdline(generation, cmdline_override, &config.paths.system_root);
     nmbl_info!(
         "kexec: loading generation {} (kernel={}, initrd={})",
         generation.number,
@@ -126,23 +166,83 @@ mod tests {
         cfg
     }
 
+    fn root() -> PathBuf {
+        PathBuf::from("/mnt/system")
+    }
+
     #[test]
     fn build_cmdline_override_used_verbatim() {
         let g = gen_for(&["root=/dev/sda1", "quiet"]);
         let s = "init=/sbin/init debug";
-        assert_eq!(build_cmdline(&g, Some(s)), s);
+        assert_eq!(build_cmdline(&g, Some(s), &root()), s);
     }
 
     #[test]
-    fn build_cmdline_no_override_joins_params() {
+    fn build_cmdline_no_override_joins_params_and_appends_init() {
         let g = gen_for(&["root=/dev/sda1", "ro", "quiet"]);
-        assert_eq!(build_cmdline(&g, None), "root=/dev/sda1 ro quiet");
+        assert_eq!(
+            build_cmdline(&g, None, &root()),
+            "root=/dev/sda1 ro quiet init=/nix/var/nix/profiles/system-42-link/init",
+        );
     }
 
     #[test]
     fn build_cmdline_empty_override_yields_empty() {
         let g = gen_for(&["root=/dev/sda1"]);
-        assert_eq!(build_cmdline(&g, Some("")), "");
+        assert_eq!(build_cmdline(&g, Some(""), &root()), "");
+    }
+
+    #[test]
+    fn injects_init_when_missing() {
+        let mut g = gen_for(&["root=fstab"]);
+        g.init_path = PathBuf::from("/mnt/system/nix/store/abc/init");
+        let out = build_cmdline(&g, None, &root());
+        assert!(
+            out.ends_with(" init=/nix/store/abc/init"),
+            "unexpected cmdline: {out}",
+        );
+    }
+
+    #[test]
+    fn respects_existing_init_in_params() {
+        let mut g = gen_for(&["init=/explicit"]);
+        g.init_path = PathBuf::from("/mnt/system/nix/store/xyz/init");
+        assert_eq!(build_cmdline(&g, None, &root()), "init=/explicit");
+    }
+
+    #[test]
+    fn override_passes_through() {
+        let mut g = gen_for(&["root=fstab"]);
+        g.init_path = PathBuf::from("/mnt/system/nix/store/xyz/init");
+        assert_eq!(build_cmdline(&g, Some("foo bar"), &root()), "foo bar");
+    }
+
+    #[test]
+    fn init_outside_system_root_warns_but_uses_raw() {
+        let mut g = gen_for(&["root=fstab"]);
+        g.init_path = PathBuf::from("/elsewhere/init");
+        let out = build_cmdline(&g, None, &root());
+        assert!(
+            out.ends_with(" init=/elsewhere/init"),
+            "unexpected cmdline: {out}",
+        );
+    }
+
+    #[test]
+    fn empty_params_still_inject_init() {
+        let mut g = gen_for(&[]);
+        g.init_path = PathBuf::from("/mnt/system/nix/store/abc/init");
+        assert_eq!(build_cmdline(&g, None, &root()), "init=/nix/store/abc/init");
+    }
+
+    #[test]
+    fn init_token_matched_only_at_token_start() {
+        // A param ending in "init=" must NOT short-circuit injection — the
+        // check looks at whole whitespace tokens, not substrings.
+        let mut g = gen_for(&["weird_suffix_init=foo"]);
+        g.init_path = PathBuf::from("/mnt/system/nix/store/abc/init");
+        let out = build_cmdline(&g, None, &root());
+        assert!(out.contains(" init=/nix/store/abc/init"), "got: {out}");
     }
 
     #[test]
