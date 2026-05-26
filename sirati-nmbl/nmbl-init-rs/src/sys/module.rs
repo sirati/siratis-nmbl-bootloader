@@ -225,10 +225,20 @@ fn visit<'a>(
             .unwrap_or_default();
         return Err(module_err(name, &path, Errno::ELOOP));
     }
-    let entry = by_name
-        .get(name)
-        .copied()
-        .ok_or_else(|| module_err(name, Path::new(""), Errno::ENOENT))?;
+    let Some(entry) = by_name.get(name).copied() else {
+        // Name not in modules.dep — almost always means it's built
+        // into the kernel (CONFIG_FOO=y instead of =m). Soft-skip:
+        // if downstream code actually needs it the missing-symbol
+        // error there will be more specific than aborting the boot
+        // for what is, in the common case, a non-event.
+        nmbl_warn!(
+            "module {} not in modules.dep; assuming built-in and skipping",
+            name
+        );
+        visiting.remove(name);
+        visited.insert(name.to_owned());
+        return Ok(());
+    };
     for dep in &entry.deps {
         visit(dep, by_name, order, visited, visiting)?;
     }
@@ -505,14 +515,34 @@ c.ko:
     }
 
     #[test]
-    fn missing_module_errors() {
+    fn missing_module_resolves_to_empty_order() {
+        // A module name absent from modules.dep is treated as built-in
+        // (warn-and-skip), not as a fatal error — that's the bash-side
+        // modprobe semantics: built-in modules have nothing to load.
         let entries: Vec<ModuleEntry> = Vec::new();
         let idx = index_by_name(&entries);
-        let err = resolve_load_order("ghost", &idx).expect_err("must error");
-        match err {
-            NmblError::Module { name, .. } => assert_eq!(name, "ghost"),
-            other => panic!("wrong variant: {other:?}"),
+        let order = resolve_load_order("ghost", &idx).expect("must not error");
+        assert!(order.is_empty(), "built-in modules produce empty load order");
+    }
+
+    #[test]
+    fn missing_transitive_dep_is_skipped_not_fatal() {
+        // Realistic case: a .ko file lists encrypted-keys as a dep but
+        // encrypted-keys is built into the kernel. The parent's load
+        // order must still include the parent itself; the missing dep
+        // is silently skipped.
+        let text = "kernel/parent.ko.xz: kernel/builtin_dep.ko.xz\n";
+        let root = PathBuf::from("/m");
+        let entries = parse_modules_dep_text(text, &root);
+        // by_name has only 'parent'; 'builtin_dep' is intentionally
+        // not present to simulate kernel-built-in deps.
+        let mut idx: HashMap<String, &ModuleEntry> = HashMap::new();
+        if let Some(parent) = entries.iter().find(|e| e.name == "parent") {
+            idx.insert("parent".to_owned(), parent);
         }
+        let order = resolve_load_order("parent", &idx).expect("must not error");
+        let names: Vec<&str> = order.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["parent"]);
     }
 
     #[test]
