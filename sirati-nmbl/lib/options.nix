@@ -1,7 +1,7 @@
 # NixOS Module Options for NMBL (NixOS Minimal BootLoader)
 # This file defines all configuration options available for the bootloader
 
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, utils, ... }:
 
 let
   cfg = config.boot.nmbl;
@@ -368,19 +368,18 @@ in
       type = lib.types.attrsOf lib.types.attrs;
       internal = true;
       readOnly = true;
-      default = lib.filterAttrs
-        (_: fs: (fs.neededForBoot or false) || fs.mountPoint == "/")
-        config.fileSystems;
+      default = lib.filterAttrs (_: utils.fsNeededForBoot) config.fileSystems;
       defaultText = lib.literalMD ''
-        the subset of `config.fileSystems` with `neededForBoot = true` or
-        mounted at `/`.
+        the subset of `config.fileSystems` matched by `utils.fsNeededForBoot`
+        — i.e. `neededForBoot = true` plus stage-1's hardcoded
+        `pathsNeededForBoot` set (`/`, `/nix`, `/var`, `/etc`, `/usr`).
       '';
       description = lib.mdDoc ''
         Filesystem set NMBL mounts before kexec'ing the target system.
-        Mirrors the standard NixOS stage-1 filter
-        (`utils.fsNeededForBoot`) but exposed as an attribute so
-        `lib/config-toml.nix` can serialise it without re-importing
-        `utils`.
+        Uses the standard NixOS stage-1 filter `utils.fsNeededForBoot`
+        directly, so the set matches what initrd-1 would mount, and is
+        exposed as an attribute so `lib/config-toml.nix` can serialise
+        it without re-importing `utils`.
       '';
     };
 

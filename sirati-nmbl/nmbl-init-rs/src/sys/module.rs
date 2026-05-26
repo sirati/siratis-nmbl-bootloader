@@ -34,9 +34,23 @@ pub struct ModuleEntry {
     pub deps: Vec<String>,
 }
 
+/// Canonicalize a kernel module name: hyphens are folded to underscores.
+///
+/// Mirrors modprobe's `s/-/_/g` rule. The on-disk `.ko` filename can
+/// use either spelling (`dm-mod.ko.xz` ships in the upstream kernel
+/// tree, while `/sys/module/dm_mod` and most config knobs spell it with
+/// an underscore), and `modules.dep` preserves the file-system spelling
+/// verbatim. Folding both the parsed entry names and the lookup queries
+/// through this function lets either form resolve consistently.
+fn canonical_module_name(raw: &str) -> String {
+    raw.replace('-', "_")
+}
+
 /// Derive the kernel module name from a `.ko[.xz|.zst|.gz]` path.
-/// Underscores stay as-is — `modules.dep` and `/sys/module/<name>` both
-/// use the underscore form, so no hyphen canonicalization here.
+/// Hyphens in the filename are folded to underscores so that downstream
+/// lookups against `/sys/module/<name>` and caller-supplied module names
+/// (which conventionally use underscores) resolve regardless of the
+/// kernel's own filename spelling.
 fn module_name_from_path(path: &Path) -> Option<String> {
     let file = path.file_name().and_then(|s| s.to_str())?;
     let stripped = file
@@ -44,7 +58,7 @@ fn module_name_from_path(path: &Path) -> Option<String> {
         .or_else(|| file.strip_suffix(".zst"))
         .or_else(|| file.strip_suffix(".gz"))
         .unwrap_or(file);
-    stripped.strip_suffix(".ko").map(str::to_owned)
+    stripped.strip_suffix(".ko").map(canonical_module_name)
 }
 
 /// Parse a `modules.dep` text body, anchoring relative paths under
@@ -110,14 +124,20 @@ fn module_err(name: &str, path: &Path, errno: Errno) -> NmblError {
 /// Resolve a module name into the full load order including all
 /// transitive dependencies (deepest first, target last). Returns an
 /// `Err` if `name` is not in the dep map or if a cycle is detected.
+///
+/// The query is canonicalized (hyphens → underscores) so callers can
+/// pass either spelling. Entries inserted via [`index_by_name`] are
+/// already keyed by canonical names, since [`module_name_from_path`]
+/// folds the on-disk filename.
 pub fn resolve_load_order<'a>(
     name: &str,
     by_name: &'a HashMap<String, &'a ModuleEntry>,
 ) -> Result<Vec<&'a ModuleEntry>> {
+    let canonical = canonical_module_name(name);
     let mut order: Vec<&'a ModuleEntry> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
     let mut visiting: HashSet<String> = HashSet::new();
-    visit(name, by_name, &mut order, &mut visited, &mut visiting)?;
+    visit(&canonical, by_name, &mut order, &mut visited, &mut visiting)?;
     Ok(order)
 }
 
@@ -309,5 +329,61 @@ b.ko: a.ko
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_hyphenated_filename_as_underscored_name() {
+        // The upstream kernel ships `kernel/drivers/md/dm-mod.ko.xz` and
+        // `modules.dep` preserves that filename. The parser must fold
+        // the hyphen to an underscore so callers asking for `dm_mod`
+        // resolve against the same entry.
+        let text = "kernel/drivers/md/dm-mod.ko.xz:\n";
+        let root = PathBuf::from("/lib/modules/6.6.71");
+        let entries = parse_modules_dep_text(text, &root);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "dm_mod");
+        assert_eq!(entries[0].path, root.join("kernel/drivers/md/dm-mod.ko.xz"));
+    }
+
+    #[test]
+    fn parses_hyphenated_dep_name_as_underscored() {
+        // Deps in `modules.dep` are also expressed as on-disk paths, so
+        // the same hyphen-fold rule must apply to dependency names.
+        let text = "\
+kernel/foo/parent.ko.xz: kernel/drivers/md/dm-mod.ko.xz
+kernel/drivers/md/dm-mod.ko.xz:
+";
+        let root = PathBuf::from("/m");
+        let entries = parse_modules_dep_text(text, &root);
+        let parent = by(&entries, "parent");
+        assert_eq!(parent.deps, vec!["dm_mod".to_owned()]);
+    }
+
+    #[test]
+    fn resolve_underscore_query_against_hyphenated_entry() {
+        // Caller passes `dm_mod` (the conventional spelling, e.g. from
+        // boot.nmbl.kernelModules or the activation orchestrator), but
+        // the on-disk filename is `dm-mod.ko.xz`. The query must
+        // resolve, matching modprobe's behaviour.
+        let text = "kernel/drivers/md/dm-mod.ko.xz:\n";
+        let root = PathBuf::from("/lib/modules/6.6.71");
+        let entries = parse_modules_dep_text(text, &root);
+        let idx = index_by_name(&entries);
+        let order = resolve_load_order("dm_mod", &idx).expect("resolve failed");
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0].name, "dm_mod");
+    }
+
+    #[test]
+    fn resolve_hyphen_query_against_hyphenated_entry() {
+        // The reverse direction: caller passes the hyphen spelling,
+        // still must resolve.
+        let text = "kernel/drivers/md/dm-mod.ko.xz:\n";
+        let root = PathBuf::from("/lib/modules/6.6.71");
+        let entries = parse_modules_dep_text(text, &root);
+        let idx = index_by_name(&entries);
+        let order = resolve_load_order("dm-mod", &idx).expect("resolve failed");
+        assert_eq!(order.len(), 1);
+        assert_eq!(order[0].name, "dm_mod");
     }
 }
