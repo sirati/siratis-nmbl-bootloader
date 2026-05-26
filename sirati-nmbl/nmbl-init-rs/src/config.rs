@@ -185,9 +185,15 @@ fn default_shell() -> PathBuf {
 }
 
 impl Config {
-    /// Reject device specifiers that the v1 mount layer cannot resolve. NMBL
-    /// has no udev, so `/dev/disk/by-*` symlinks are never populated; the
-    /// user must point at raw `/dev/*` device nodes.
+    /// Reject device specifiers the mount layer cannot resolve.
+    ///
+    /// `LABEL=`/`UUID=`/`PARTUUID=` short forms remain rejected — NMBL
+    /// has no user-space resolver for them and the kernel does not
+    /// accept those strings as device arguments to `mount(2)`.
+    /// Absolute paths under `/dev/disk/by-*` are now ALLOWED: the
+    /// `sys::blkid::populate_disk_by_symlinks` pass that runs at the
+    /// start of [`crate::devices::mount_system_filesystems`] creates
+    /// those symlinks udev-less from `blkid -o export` output.
     pub fn validate(&self) -> Result<()> {
         for fs in &self.filesystems {
             let dev = fs.device.as_str();
@@ -195,8 +201,10 @@ impl Config {
             {
                 return Err(NmblError::ConfigInvalid {
                     reason: format!(
-                        "device {dev:?} uses LABEL=/UUID=/PARTUUID= which NMBL does not \
-                         resolve; use a raw /dev/* path"
+                        "device {dev:?} uses LABEL=/UUID=/PARTUUID= short form which NMBL \
+                         does not resolve; use the /dev/disk/by-label/<name> (or \
+                         by-uuid/by-partlabel/by-partuuid) symlink form instead — NMBL \
+                         populates those at boot via blkid"
                     ),
                     context: format!(
                         "validating filesystem entry for {}",
@@ -237,5 +245,85 @@ impl Config {
             tui: Tui::default(),
             paths: Paths::default(),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "tests can panic on assertion failure"
+)]
+mod tests {
+    use super::*;
+
+    fn fs_entry(device: &str, mountpoint: &str) -> FilesystemEntry {
+        FilesystemEntry {
+            device: device.to_string(),
+            mountpoint: PathBuf::from(mountpoint),
+            fstype: "ext4".to_string(),
+            options: String::new(),
+            is_root: false,
+        }
+    }
+
+    fn config_with(entries: Vec<FilesystemEntry>) -> Config {
+        let mut c = Config::recovery_default();
+        c.filesystems = entries;
+        c
+    }
+
+    #[test]
+    fn validate_accepts_dev_disk_by_label_paths() {
+        // After the udev-less symlink populator landed, by-* paths
+        // are valid `fileSystems[].device` strings.
+        let c = config_with(vec![
+            fs_entry("/dev/disk/by-label/boot", "/boot"),
+            fs_entry("/dev/disk/by-partlabel/disk-main-ESP", "/boot"),
+            fs_entry("/dev/disk/by-uuid/1234-ABCD", "/"),
+            fs_entry("/dev/disk/by-partuuid/abcdef01-1234", "/data"),
+        ]);
+        c.validate().expect("by-* paths must validate");
+    }
+
+    #[test]
+    fn validate_accepts_raw_dev_paths() {
+        let c = config_with(vec![fs_entry("/dev/vda1", "/boot")]);
+        c.validate().expect("raw /dev/* paths must validate");
+    }
+
+    #[test]
+    fn validate_still_rejects_label_short_form() {
+        let c = config_with(vec![fs_entry("LABEL=boot", "/boot")]);
+        let err = c
+            .validate()
+            .expect_err("LABEL= short form must be rejected");
+        match err {
+            NmblError::ConfigInvalid { reason, .. } => {
+                assert!(
+                    reason.contains("LABEL=") || reason.contains("short form"),
+                    "rejection message should mention LABEL=/short form, got: {reason}",
+                );
+                assert!(
+                    reason.contains("/dev/disk/by-"),
+                    "rejection should point at the by-* symlink form, got: {reason}",
+                );
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_still_rejects_uuid_short_form() {
+        let c = config_with(vec![fs_entry("UUID=1234-ABCD", "/")]);
+        c.validate().expect_err("UUID= short form must be rejected");
+    }
+
+    #[test]
+    fn validate_still_rejects_partuuid_short_form() {
+        let c = config_with(vec![fs_entry("PARTUUID=abc-123", "/data")]);
+        c.validate()
+            .expect_err("PARTUUID= short form must be rejected");
     }
 }
