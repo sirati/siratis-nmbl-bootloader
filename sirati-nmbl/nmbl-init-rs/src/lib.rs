@@ -7,5 +7,6 @@ pub mod generations;
 pub mod log;
 pub mod modules;
 pub mod mount;
+pub mod shell;
 pub mod sys;
 pub mod ui;
