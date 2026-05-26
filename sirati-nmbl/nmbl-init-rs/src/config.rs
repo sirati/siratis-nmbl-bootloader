@@ -222,4 +222,20 @@ impl Config {
         config.validate()?;
         Ok(config)
     }
+
+    /// Last-ditch fallback used when `/etc/nmbl/config.toml` can't be
+    /// loaded. Hard-coded defaults give the emergency shell enough to
+    /// function: a usable `shell` path for `execve`, default verbosity,
+    /// and empty filesystems / activations / explicit modules so no
+    /// phase tries to act on user data we don't actually have.
+    pub fn recovery_default() -> Self {
+        Self {
+            general: General::default(),
+            kernel_modules: KernelModules::default(),
+            filesystems: Vec::new(),
+            activations: Vec::new(),
+            tui: Tui::default(),
+            paths: Paths::default(),
+        }
+    }
 }
