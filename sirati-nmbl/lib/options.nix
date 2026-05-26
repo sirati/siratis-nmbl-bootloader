@@ -5,6 +5,15 @@
 
 let
   cfg = config.boot.nmbl;
+
+  # Filesystem-driver modules derived from `config.fileSystems.*.fsType`.
+  # NMBL has no udev to auto-load drivers on mount(2), so anything that
+  # gets mounted before kexec must appear in the explicit-load list.
+  # Pure function over `lib` + `config`, so importing it here at the
+  # let-binding level is safe (no extra module-system fixpoint).
+  fsDerivedKernelModules = import ./modules/fs-modules.nix {
+    inherit lib config;
+  };
 in
 {
   imports = [
@@ -349,18 +358,24 @@ in
       type = lib.types.listOf lib.types.str;
       default = lib.unique (
         lib.filter (m: !(lib.elem m cfg.blacklistedKernelModules)) (
-          cfg.kernelModules ++ config.boot.initrd.kernelModules
+          cfg.kernelModules
+          ++ config.boot.initrd.kernelModules
+          ++ fsDerivedKernelModules
         )
       );
       defaultText = lib.literalMD ''
-        union of `boot.nmbl.kernelModules` and `boot.initrd.kernelModules`,
+        union of `boot.nmbl.kernelModules`, `boot.initrd.kernelModules`,
+        and filesystem driver modules derived from
+        `config.fileSystems.*.fsType` (e.g. `ext4`, `vfat`, `btrfs`),
         with `boot.nmbl.blacklistedKernelModules` removed.
       '';
       description = lib.mdDoc ''
         Kernel modules the NMBL /init will load explicitly at startup
         (modprobe-style). Computed by default from
-        `boot.nmbl.kernelModules` plus `boot.initrd.kernelModules`; set
-        directly to override.
+        `boot.nmbl.kernelModules` plus `boot.initrd.kernelModules`
+        plus filesystem-driver modules derived from
+        `config.fileSystems.*.fsType` (NMBL has no udev to auto-load
+        them on mount(2)); set directly to override.
       '';
     };
 
