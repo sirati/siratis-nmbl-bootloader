@@ -54,6 +54,21 @@ in
     fi
   }
 
+  # Compute the NixOS system dir BEFORE resolving symlinks.
+  # SELECTED_KERNEL at this point is e.g.
+  #   /mnt/nix/store/52x7zj3...-nixos-system-.../kernel
+  # which is a symlink in the nixos-system directory.  dirname gives the
+  # nixos-system dir which contains /init (the NixOS stage-2 init script).
+  # After resolve_file_path, SELECTED_KERNEL becomes the kernel binary
+  # inside the kernel package (linux-*) which is NOT the right parent.
+  SELECTED_SYSTEM_DIR=$(${pkgs.busybox}/bin/dirname "$SELECTED_KERNEL")
+  # Strip the NMBL mount prefix to get a store-absolute path that will be
+  # valid on the root fs after NixOS stage-1 mounts /sysroot.
+  # ${cfg.mountPrefix} is Nix-interpolated to /mnt at build time.
+  SELECTED_INIT_ABS=$(echo "$SELECTED_SYSTEM_DIR" | ${pkgs.busybox}/bin/sed 's|^${cfg.mountPrefix}||')/init
+
+  info "NMBL: Injecting init= for NixOS stage-1: $SELECTED_INIT_ABS"
+
   # Resolve the symlinks
   SELECTED_KERNEL=$(resolve_file_path "$SELECTED_KERNEL")
   SELECTED_INITRD=$(resolve_file_path "$SELECTED_INITRD")
@@ -72,10 +87,9 @@ in
     exit 1
   fi
 
-  # Build final kernel parameters
-  # NixOS stage-1 reads filesystem configuration from the initramfs,
-  # so we don't need to add root= parameter - it's already known
-  FINAL_PARAMS="$SELECTED_PARAMS"
+  # Build final kernel parameters — always append init= so NixOS stage-1
+  # can locate the closure.
+  FINAL_PARAMS="$SELECTED_PARAMS init=$SELECTED_INIT_ABS"
 
   info "NMBL: Final kernel parameters: $FINAL_PARAMS"
   info ""

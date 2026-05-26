@@ -185,13 +185,19 @@ pkgs.writeScript "install-nmbl-bootloader" ''
 
           ${pkgs.systemd}/bin/bootctl $BOOTCTL_ARGS || true
 
-          # Copy systemd-boot to fallback location for UEFI firmware boot
-          if [ -f /boot/EFI/systemd/systemd-bootx64.efi ]; then
-            echo "Copying systemd-boot to fallback location /EFI/BOOT/BOOTX64.EFI..."
-            cp /boot/EFI/systemd/systemd-bootx64.efi /boot/EFI/BOOT/BOOTX64.EFI
-            echo "✓ systemd-boot fallback bootloader installed"
+          # Copy systemd-boot EFI binary directly from Nix store.
+          # bootctl install may fail silently (--graceful) when /boot is on an
+          # MD RAID device (not a raw GPT partition), so we always copy the EFI
+          # binary ourselves as a fallback.  UEFI firmware finds it at the
+          # well-known removable media path /EFI/BOOT/BOOTX64.EFI.
+          mkdir -p /boot/EFI/systemd /boot/EFI/BOOT
+          SDBOOT_EFI="${pkgs.systemd}/lib/systemd/boot/efi/systemd-bootx64.efi"
+          if [ -f "$SDBOOT_EFI" ]; then
+            cp "$SDBOOT_EFI" /boot/EFI/systemd/systemd-bootx64.efi
+            cp "$SDBOOT_EFI" /boot/EFI/BOOT/BOOTX64.EFI
+            echo "✓ systemd-boot EFI installed to /EFI/systemd/ and /EFI/BOOT/BOOTX64.EFI"
           else
-            echo "WARNING: systemd-boot EFI binary not found"
+            echo "WARNING: systemd-boot EFI binary not found at $SDBOOT_EFI"
           fi
 
           echo "✓ systemd-boot bootloader installed"

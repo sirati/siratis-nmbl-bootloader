@@ -44,10 +44,27 @@ rec {
         }
       ]
     else if lib.hasPrefix "/dev/md" device then
+      # Linux mdraid needs `md_mod` (the core layer) AND the per-level driver
+      # (e.g. `raid1`, `raid0`, `raid10`, `raid456`). We can't know the level
+      # from the device path alone, so we accept any RAID-level module as a
+      # valid alternative to the kernel's umbrella name "raid".
       [
         {
-          driver = "raid";
-          alternatives = [ ];
+          driver = "md_mod";
+          alternatives = [
+            "raid"
+          ];
+        }
+        {
+          driver = "raid1";
+          alternatives = [
+            "raid"
+            "raid0"
+            "raid10"
+            "raid456"
+            "raid5"
+            "raid6"
+          ];
         }
       ]
     else if lib.hasPrefix "/dev/mapper/" device then
