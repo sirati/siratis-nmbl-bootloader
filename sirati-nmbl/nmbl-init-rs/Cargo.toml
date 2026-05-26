@@ -54,3 +54,6 @@ zeroize = { version = "1", features = ["derive"] }
 # explicit dependency so its safe wrappers for open(2) / termios are visible
 # at the manifest level.
 rustix = { version = "0.38", default-features = false, features = ["fs", "termios", "std"] }
+
+[dev-dependencies]
+tempfile = "3"
