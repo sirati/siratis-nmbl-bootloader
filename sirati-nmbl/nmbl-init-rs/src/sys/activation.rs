@@ -22,7 +22,7 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, close, dup2, execve, fork, pipe, write};
+use nix::unistd::{ForkResult, Pid, close, dup2, execve, fork, pipe, read, write};
 
 use crate::error::{NmblError, Result};
 
@@ -184,6 +184,132 @@ pub fn run(binary: &Path, argv: &[String], stdin_data: Option<&[u8]>) -> Result<
             }
 
             wait_for_child(child, binary)
+        }
+    }
+}
+
+/// Run `binary` with `argv` and capture its stdout into a `Vec<u8>`.
+///
+/// Same fork/execve mechanism as [`run`], but a pipe is wired between
+/// the child's fd 1 and the parent's read end. Stderr is still
+/// inherited from the parent (we only care about diagnostic capture
+/// for tools like `blkid` that emit their machine-readable payload on
+/// stdout). Stdin is closed in the child by being left untouched —
+/// it stays whatever the parent passed in, which is fine for read-
+/// only tools that don't read from stdin.
+///
+/// Used by `sys::blkid` to capture `blkid -o export` payloads. A
+/// non-zero exit code is still reported via `ProcessOutcome`, not
+/// `Err` — `blkid` legitimately exits 2 for "no superblock", which
+/// the caller treats as "empty attributes" rather than a fault.
+pub fn run_capture(binary: &Path, argv: &[String]) -> Result<(ProcessOutcome, Vec<u8>)> {
+    // Same parent-side allocation discipline as `run`: anything that
+    // can allocate must happen here so the post-fork child path stays
+    // async-signal-safe.
+    let binary_c =
+        path_to_cstring(binary).map_err(|source| io_activation("execve-argv", source))?;
+
+    let argv0 = derive_argv0(binary);
+    let argv0_c =
+        CString::new(argv0).map_err(|e| io_activation("execve-argv", nul_to_io(e, "argv0")))?;
+
+    let mut full_argv: Vec<CString> = Vec::with_capacity(argv.len().saturating_add(1));
+    full_argv.push(argv0_c);
+    for (i, a) in argv.iter().enumerate() {
+        let c = CString::new(a.as_bytes()).map_err(|e| {
+            io_activation(
+                "execve-argv",
+                nul_to_io(e, &format!("argv[{}]", i.saturating_add(1))),
+            )
+        })?;
+        full_argv.push(c);
+    }
+
+    let env: Vec<CString> = Vec::new();
+
+    let (read_end, write_end): (OwnedFd, OwnedFd) =
+        pipe().map_err(|e| nix_activation("pipe", e, "create stdout pipe"))?;
+
+    // SAFETY: see the `run` function above for the full rationale on
+    // why `nix::unistd::fork` must remain unsafe and why we cannot
+    // delegate to `std::process::Command` (CI grep + Command's
+    // inability to pre-exec under our policy). Identical reasoning
+    // applies here.
+    let fork_result = unsafe { fork() }
+        .map_err(|e| nix_activation("fork", e, &format!("fork for {}", binary.display())))?;
+
+    match fork_result {
+        ForkResult::Child => {
+            // === CHILD ===
+            // Wire the write end of the pipe onto fd 1 (stdout).
+            // Close the read end — only the parent reads.
+            let write_fd = write_end.as_raw_fd();
+            let _ = close(read_end.as_raw_fd());
+
+            if write_fd != 1 {
+                if dup2(write_fd, 1).is_err() {
+                    // SAFETY: post-fork child — only async-signal-safe
+                    // calls permitted; `_exit(2)` rather than Rust's
+                    // destructor-running `process::exit`. See `run`.
+                    unsafe { libc::_exit(EXEC_FAILED_EXIT_CODE) };
+                }
+                let _ = close(write_fd);
+            }
+            // Prevent OwnedFd Drop from running — execve or _exit
+            // follows immediately, but be explicit.
+            std::mem::forget(read_end);
+            std::mem::forget(write_end);
+
+            // execve does not return on success.
+            let _ = execve(&binary_c, &full_argv, &env);
+
+            // SAFETY: see the analogous comment in `run`.
+            unsafe { libc::_exit(EXEC_FAILED_EXIT_CODE) };
+        }
+        ForkResult::Parent { child } => {
+            // === PARENT ===
+            // Drop the write end so the child's stdout is the only
+            // writer; once it exits or closes fd 1 our read loop
+            // sees EOF instead of blocking forever.
+            drop(write_end);
+
+            let captured = read_all(&read_end, binary)?;
+            drop(read_end);
+
+            let outcome = wait_for_child(child, binary)?;
+            Ok((outcome, captured))
+        }
+    }
+}
+
+/// Drain `fd` to EOF into a `Vec<u8>`, restarting on EINTR.
+///
+/// Errors are surfaced as `NmblError::Activation { kind = "stdout", … }`
+/// so the caller can distinguish a capture failure from a fork/exec
+/// failure or a non-zero exit.
+fn read_all(fd: &OwnedFd, binary: &Path) -> Result<Vec<u8>> {
+    // 4 KiB matches the default pipe buffer on Linux and balances
+    // syscall count vs. allocation for small payloads like blkid's.
+    let mut buf = [0u8; 4096];
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        match read(fd.as_raw_fd(), &mut buf) {
+            Ok(0) => return Ok(out),
+            Ok(n) => {
+                // Defensive slice — `n <= buf.len()` always holds on
+                // a healthy kernel, but `get(..n)` is total.
+                if let Some(chunk) = buf.get(..n) {
+                    out.extend_from_slice(chunk);
+                }
+            }
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => {
+                return Err(nix_activation(
+                    "stdout",
+                    e,
+                    &format!("read stdout from {}", binary.display()),
+                ));
+            }
         }
     }
 }
@@ -388,5 +514,49 @@ mod tests {
             out.exit_code, EXEC_FAILED_EXIT_CODE,
             "execve failure must surface as 127"
         );
+    }
+
+    #[test]
+    fn capture_echo_returns_stdout_bytes() {
+        let Some(bin) = which("echo") else {
+            eprintln!("skipping: `echo` not found on PATH");
+            return;
+        };
+        let (outcome, captured) = run_capture(&bin, &["hello".to_string()]).expect("run echo");
+        assert!(outcome.normal_exit);
+        assert_eq!(outcome.exit_code, 0);
+        // `echo` appends a newline; we should see it.
+        assert_eq!(captured, b"hello\n");
+    }
+
+    #[test]
+    fn capture_missing_binary_yields_127_and_empty_buffer() {
+        let bogus = PathBuf::from("/nonexistent/path/xyz-nmbl-capture-test");
+        let (outcome, captured) = run_capture(&bogus, &[]).expect("run_capture should report");
+        assert!(outcome.normal_exit, "missing-binary path uses _exit(127)");
+        assert_eq!(outcome.exit_code, EXEC_FAILED_EXIT_CODE);
+        assert!(
+            captured.is_empty(),
+            "no stdout should have been produced by a missing binary",
+        );
+    }
+
+    #[test]
+    fn capture_handles_payload_larger_than_pipe_buffer() {
+        // A payload bigger than the 4 KiB pipe read buffer exercises
+        // the multi-iteration path in `read_all`. We use `printf` to
+        // emit a deterministic string of known size.
+        let Some(bin) = which("printf") else {
+            eprintln!("skipping: `printf` not found on PATH");
+            return;
+        };
+        // 10 000 'x' characters, no trailing newline.
+        let pattern = "x".repeat(10_000);
+        let (outcome, captured) =
+            run_capture(&bin, &["%s".to_string(), pattern.clone()]).expect("run printf");
+        assert!(outcome.normal_exit);
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(captured.len(), pattern.len());
+        assert!(captured.iter().all(|b| *b == b'x'));
     }
 }

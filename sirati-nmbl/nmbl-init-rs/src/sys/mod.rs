@@ -1,4 +1,5 @@
 pub mod activation;
+pub mod blkid;
 pub mod kexec;
 pub mod module;
 pub mod mount;
