@@ -418,6 +418,41 @@ in
       };
     };
 
+    splash = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = lib.mdDoc ''
+          Render the boot menu as a PNG-backed graphical splash via
+          simpledrm. Falls back to the tty UI on any failure. Selecting
+          this also switches `system.build.nmblInit` to the
+          `nmbl-init-splash` package built with the `image-splash`
+          cargo feature.
+        '';
+      };
+
+      backgroundImage = lib.mkOption {
+        type = lib.types.path;
+        default = ../assets/splash-default.png;
+        defaultText = lib.literalExpression "sirati-nmbl/assets/splash-default.png";
+        description = lib.mdDoc ''
+          PNG to use as the splash background. Must be a real PNG, RGBA8.
+          Embedded into the initramfs at `/etc/splash/image.png`.
+        '';
+      };
+
+      fontPath = lib.mkOption {
+        type = lib.types.path;
+        default = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf";
+        defaultText = lib.literalExpression
+          ''"''${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf"'';
+        description = lib.mdDoc ''
+          TrueType font (monospaced) used to rasterize the splash menu.
+          Embedded into the initramfs at `/etc/splash/font.ttf`.
+        '';
+      };
+    };
+
     paths = {
       nixProfilesDir = lib.mkOption {
         type = lib.types.path;
