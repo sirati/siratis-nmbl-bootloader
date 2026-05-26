@@ -61,6 +61,11 @@
             "-C target-feature=+crt-static"
             "-C link-arg=-s"
             "-C relocation-model=static"
+            # rustix uses the linux_raw backend by default on linux-musl;
+            # `linux_latest` skips its pre-5.x kernel fallbacks. NixOS
+            # always runs a recent kernel so this is safe.
+            "--cfg linux_latest"
+            "--check-cfg cfg(linux_latest)"
           ];
 
           # We don't need anything from the host beyond the toolchain itself.

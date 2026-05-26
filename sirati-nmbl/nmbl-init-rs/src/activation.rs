@@ -9,12 +9,12 @@
 //! is pure exec mechanism.
 
 use std::collections::HashSet;
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use zeroize::Zeroizing;
 
 use crate::config::{Activation, ActivationKind, Config};
+use crate::devices::wait_for;
 use crate::error::{NmblError, Result};
 use crate::sys::activation::{ProcessOutcome, run};
 use crate::{nmbl_info, nmbl_warn};
@@ -22,8 +22,6 @@ use crate::{nmbl_info, nmbl_warn};
 const PROC_MODULES: &str = "/proc/modules";
 /// Per-device wait budget; matches the Phase 3 loop.
 const DEVICE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
-/// Poll interval inside `wait_for_local`.
-const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Pluggable passphrase prompt; TUI implements it, tests mock it.
 /// `Zeroizing` wipes the buffer on drop, including on error paths.
@@ -65,7 +63,7 @@ pub fn run_all_activations(
 
         let device_count = activation.produces_devices.len();
         for device in &activation.produces_devices {
-            wait_for_local(device, DEVICE_WAIT_TIMEOUT)?;
+            wait_for(device, DEVICE_WAIT_TIMEOUT)?;
         }
 
         nmbl_info!(
@@ -196,32 +194,6 @@ fn parse_loaded_modules(text: &str) -> HashSet<String> {
     out
 }
 
-// TEMP: inline until sibling C.3 lands `crate::devices`. At merge time
-// delete this and switch call sites to `crate::devices::wait_for`.
-fn wait_for_local(device: &Path, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match std::fs::metadata(device) {
-            Ok(_) => return Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(NmblError::Io {
-                    source,
-                    context: format!("stat({}) while waiting for device", device.display()),
-                });
-            }
-        }
-        if Instant::now() >= deadline {
-            let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-            return Err(NmblError::DeviceTimeout {
-                device: device.to_path_buf(),
-                timeout_ms,
-            });
-        }
-        std::thread::sleep(DEVICE_POLL_INTERVAL);
-    }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -293,20 +265,5 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
         assert_eq!(kind_label(ActivationKind::LuksKeyfile), "luks-keyfile");
         assert_eq!(kind_label(ActivationKind::LuksPassword), "luks-password");
         assert_eq!(kind_label(ActivationKind::Zfs), "zfs");
-    }
-
-    #[test]
-    fn wait_for_local_happy_and_timeout() {
-        wait_for_local(Path::new("/"), Duration::from_millis(1))
-            .expect("root directory always exists");
-        let err = wait_for_local(
-            Path::new("/nonexistent/nmbl-activation-test-device"),
-            Duration::from_millis(50),
-        )
-        .expect_err("missing device must error");
-        match err {
-            NmblError::DeviceTimeout { .. } => {}
-            other => panic!("expected DeviceTimeout, got {other:?}"),
-        }
     }
 }
