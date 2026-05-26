@@ -9,13 +9,13 @@ use tokio::fs;
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio::time::Duration;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::buffer::OutputBuffer;
 
 use super::handler::handle_client;
 use super::pty::SerialHandler;
-use super::qemu::{BootMode, QemuConfig};
+use super::qemu::{BootMode, Display, QemuConfig};
 use super::utils::{cleanup_stale_sockets, shutdown_qemu_gracefully};
 
 /// VM Manager state
@@ -28,9 +28,11 @@ pub struct VmManager {
     socket_path: PathBuf,
     buffer_lines: usize,
     buffer_seconds: u64,
+    display: Display,
 }
 
 impl VmManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         disk: PathBuf,
@@ -40,6 +42,7 @@ impl VmManager {
         socket: Option<PathBuf>,
         buffer_lines: usize,
         buffer_seconds: u64,
+        display: Display,
     ) -> Self {
         let socket_path = socket.unwrap_or_else(|| {
             PathBuf::from(format!("/tmp/vm-serial-man-{}.sock", std::process::id()))
@@ -54,6 +57,7 @@ impl VmManager {
             socket_path,
             buffer_lines,
             buffer_seconds,
+            display,
         }
     }
 
@@ -78,9 +82,14 @@ impl VmManager {
             memory: self.memory,
             cores: self.cores,
             socket_dir,
+            display: self.display,
         };
 
         let mut qemu_process = qemu_config.start().await?;
+        info!(
+            "QEMU monitor socket: {}",
+            qemu_process.monitor_socket.display()
+        );
 
         // Connect to QEMU serial socket
         let serial_handler = SerialHandler::connect(&qemu_process.serial_socket).await?;
@@ -181,6 +190,7 @@ impl VmManager {
 }
 
 /// Main entry point for manager
+#[allow(clippy::too_many_arguments)]
 pub async fn run_manager(
     name: String,
     disk: PathBuf,
@@ -190,6 +200,7 @@ pub async fn run_manager(
     socket: Option<PathBuf>,
     buffer_lines: usize,
     buffer_seconds: u64,
+    display: Display,
 ) -> Result<()> {
     let manager = VmManager::new(
         name,
@@ -200,6 +211,7 @@ pub async fn run_manager(
         socket,
         buffer_lines,
         buffer_seconds,
+        display,
     );
 
     manager.run().await
