@@ -25,6 +25,9 @@ pub struct Config {
 
     #[serde(default)]
     pub paths: Paths,
+
+    #[serde(default)]
+    pub splash: Splash,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +154,45 @@ fn default_true() -> bool {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Splash {
+    #[serde(default)]
+    pub enable: bool,
+
+    #[serde(default = "default_splash_background")]
+    pub background_image: PathBuf,
+
+    #[serde(default = "default_splash_font")]
+    pub font_path: PathBuf,
+
+    #[serde(default = "default_dri_path")]
+    pub dri_path: PathBuf,
+}
+
+impl Default for Splash {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            background_image: default_splash_background(),
+            font_path: default_splash_font(),
+            dri_path: default_dri_path(),
+        }
+    }
+}
+
+fn default_splash_background() -> PathBuf {
+    PathBuf::from("/etc/splash/image.png")
+}
+
+fn default_splash_font() -> PathBuf {
+    PathBuf::from("/etc/splash/font.ttf")
+}
+
+fn default_dri_path() -> PathBuf {
+    PathBuf::from("/dev/dri/card0")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Paths {
     #[serde(default = "default_nix_profiles_dir")]
     pub nix_profiles_dir: PathBuf,
@@ -244,6 +286,7 @@ impl Config {
             activations: Vec::new(),
             tui: Tui::default(),
             paths: Paths::default(),
+            splash: Splash::default(),
         }
     }
 }
@@ -325,5 +368,50 @@ mod tests {
         let c = config_with(vec![fs_entry("PARTUUID=abc-123", "/data")]);
         c.validate()
             .expect_err("PARTUUID= short form must be rejected");
+    }
+
+    #[test]
+    fn config_parses_without_splash_table() {
+        // A config that doesn't mention [splash] at all must still parse,
+        // because the feature defaults to off and existing on-disk configs
+        // predate the new table.
+        let toml_text = "[general]\ntimeout_secs = 3\n";
+        let config: Config = toml::from_str(toml_text).expect("config must parse");
+        assert!(!config.splash.enable, "splash must default to disabled");
+        assert_eq!(
+            config.splash.background_image,
+            PathBuf::from("/etc/splash/image.png"),
+        );
+        assert_eq!(
+            config.splash.font_path,
+            PathBuf::from("/etc/splash/font.ttf"),
+        );
+        assert_eq!(config.splash.dri_path, PathBuf::from("/dev/dri/card0"));
+    }
+
+    #[test]
+    fn config_parses_with_splash_table() {
+        let toml_text = "[splash]\nenable = true\nbackground_image = \"/foo.png\"\n";
+        let config: Config = toml::from_str(toml_text).expect("config must parse");
+        assert!(config.splash.enable, "enable = true must round-trip");
+        assert_eq!(config.splash.background_image, PathBuf::from("/foo.png"));
+        // Unset fields still pick up their defaults.
+        assert_eq!(
+            config.splash.font_path,
+            PathBuf::from("/etc/splash/font.ttf"),
+        );
+        assert_eq!(config.splash.dri_path, PathBuf::from("/dev/dri/card0"));
+    }
+
+    #[test]
+    fn config_rejects_unknown_splash_field() {
+        let toml_text = "[splash]\nfoo = 1\n";
+        let err = toml::from_str::<Config>(toml_text)
+            .expect_err("unknown splash field must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("foo") || msg.contains("unknown"),
+            "rejection should mention the unknown field, got: {msg}",
+        );
     }
 }
