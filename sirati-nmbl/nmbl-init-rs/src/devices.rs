@@ -118,6 +118,13 @@ pub fn mount_system_filesystems(config: &Config) -> Result<()> {
     let system_root = config.paths.system_root.as_path();
     ensure_dir(system_root)?;
 
+    // NMBL has no udev, so /dev/disk/by-{partlabel,label,uuid,partuuid}/
+    // is empty unless we populate it ourselves. Do that BEFORE the
+    // wait_for loop below — disko-style configs reference paths
+    // under /dev/disk/by-*, and waiting for a symlink we'll never
+    // create just burns the 30 s budget.
+    crate::sys::blkid::populate_disk_by_symlinks()?;
+
     for entry in &config.filesystems {
         let dev = Path::new(&entry.device);
         wait_for(dev, DEFAULT_DEVICE_TIMEOUT)?;
