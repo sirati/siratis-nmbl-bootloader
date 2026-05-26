@@ -26,6 +26,7 @@ pub struct Config {
     #[serde(default)]
     pub paths: Paths,
 
+    #[cfg(feature = "image-splash")]
     #[serde(default)]
     pub splash: Splash,
 }
@@ -152,6 +153,7 @@ fn default_true() -> bool {
     true
 }
 
+#[cfg(feature = "image-splash")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Splash {
@@ -168,6 +170,7 @@ pub struct Splash {
     pub dri_path: PathBuf,
 }
 
+#[cfg(feature = "image-splash")]
 impl Default for Splash {
     fn default() -> Self {
         Self {
@@ -179,14 +182,17 @@ impl Default for Splash {
     }
 }
 
+#[cfg(feature = "image-splash")]
 fn default_splash_background() -> PathBuf {
     PathBuf::from("/etc/splash/image.png")
 }
 
+#[cfg(feature = "image-splash")]
 fn default_splash_font() -> PathBuf {
     PathBuf::from("/etc/splash/font.ttf")
 }
 
+#[cfg(feature = "image-splash")]
 fn default_dri_path() -> PathBuf {
     PathBuf::from("/dev/dri/card0")
 }
@@ -286,6 +292,7 @@ impl Config {
             activations: Vec::new(),
             tui: Tui::default(),
             paths: Paths::default(),
+            #[cfg(feature = "image-splash")]
             splash: Splash::default(),
         }
     }
@@ -370,6 +377,7 @@ mod tests {
             .expect_err("PARTUUID= short form must be rejected");
     }
 
+    #[cfg(feature = "image-splash")]
     #[test]
     fn config_parses_without_splash_table() {
         // A config that doesn't mention [splash] at all must still parse,
@@ -389,6 +397,7 @@ mod tests {
         assert_eq!(config.splash.dri_path, PathBuf::from("/dev/dri/card0"));
     }
 
+    #[cfg(feature = "image-splash")]
     #[test]
     fn config_parses_with_splash_table() {
         let toml_text = "[splash]\nenable = true\nbackground_image = \"/foo.png\"\n";
@@ -403,6 +412,7 @@ mod tests {
         assert_eq!(config.splash.dri_path, PathBuf::from("/dev/dri/card0"));
     }
 
+    #[cfg(feature = "image-splash")]
     #[test]
     fn config_rejects_unknown_splash_field() {
         let toml_text = "[splash]\nfoo = 1\n";
