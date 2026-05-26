@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod kexec;
 pub mod module;
 pub mod mount;
