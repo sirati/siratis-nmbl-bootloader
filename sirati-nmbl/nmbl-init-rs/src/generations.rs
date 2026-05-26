@@ -44,10 +44,36 @@ fn parse_generation_number(name: &str) -> Option<u32> {
         .ok()
 }
 
-/// Read `<link>/kernel-params` and split on whitespace. IO failures degrade
-/// to an empty Vec with a warning — params are nice-to-have, not fatal.
-fn read_kernel_params(link: &Path) -> Vec<String> {
-    let path = link.join("kernel-params");
+/// Single-level symlink resolution that rewrites absolute targets to be
+/// reachable from NMBL's namespace.
+///
+/// The system disk's profile symlinks point at absolute store paths like
+/// `/nix/store/<hash>/...`, but NMBL has the system root mounted under
+/// `mount_prefix` (typically `/mnt/system`), so those targets don't exist
+/// from NMBL's view. Mirroring the bash bootloader's `resolve_*_path`
+/// helpers (commit e310b67), absolute targets are prefixed and relative
+/// targets are joined against the link's parent directory. Non-symlinks
+/// pass through unchanged.
+fn mount_aware_resolve(path: &Path, mount_prefix: &Path) -> std::io::Result<PathBuf> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_symlink() {
+        return Ok(path.to_path_buf());
+    }
+    let target = std::fs::read_link(path)?;
+    if target.is_absolute() {
+        let rel = target.strip_prefix("/").unwrap_or(&target);
+        Ok(mount_prefix.join(rel))
+    } else {
+        let parent = path.parent().unwrap_or_else(|| Path::new("/"));
+        Ok(parent.join(target))
+    }
+}
+
+/// Read `<toplevel>/kernel-params` and split on whitespace. IO failures
+/// degrade to an empty Vec with a warning — params are nice-to-have, not
+/// fatal.
+fn read_kernel_params(toplevel: &Path) -> Vec<String> {
+    let path = toplevel.join("kernel-params");
     match std::fs::read_to_string(&path) {
         Ok(text) => text.split_ascii_whitespace().map(String::from).collect(),
         Err(err) => {
@@ -57,10 +83,10 @@ fn read_kernel_params(link: &Path) -> Vec<String> {
     }
 }
 
-/// Best-effort: read `<link>/nixos-version` for a human label. Missing file
-/// → empty string (logged at verbose only).
-fn read_label(link: &Path) -> String {
-    let path = link.join("nixos-version");
+/// Best-effort: read `<toplevel>/nixos-version` for a human label. Missing
+/// file → empty string (logged at verbose only).
+fn read_label(toplevel: &Path) -> String {
+    let path = toplevel.join("nixos-version");
     match std::fs::read_to_string(&path) {
         Ok(text) => text.trim().to_string(),
         Err(err) => {
@@ -70,33 +96,37 @@ fn read_label(link: &Path) -> String {
     }
 }
 
-/// Canonicalize `<link>/kernel` and `<link>/initrd`. Either failing means the
-/// generation is broken and the caller should skip it.
-fn resolve_kernel_initrd(link: &Path) -> Result<(PathBuf, PathBuf)> {
+/// Resolve `<toplevel>/kernel` and `<toplevel>/initrd` through
+/// [`mount_aware_resolve`]. Either failing means the generation is broken
+/// and the caller should skip it.
+fn resolve_kernel_initrd(toplevel: &Path, mount_prefix: &Path) -> Result<(PathBuf, PathBuf)> {
     let resolve = |name: &str| -> Result<PathBuf> {
-        let p = link.join(name);
-        std::fs::canonicalize(&p).map_err(|source| NmblError::Io {
+        let p = toplevel.join(name);
+        mount_aware_resolve(&p, mount_prefix).map_err(|source| NmblError::Io {
             source,
-            context: format!("canonicalizing {}", p.display()),
+            context: format!("resolving {}", p.display()),
         })
     };
     Ok((resolve("kernel")?, resolve("initrd")?))
 }
 
-/// Probe `<link>/init` WITHOUT following symlinks. We want the un-resolved
-/// path because the chained kernel boots its own initrd which will mount the
-/// store and execute exactly the string we hand it on the cmdline; resolving
-/// here would replace `<profile_link>/init` with the underlying store path,
-/// which is fine on disk but defeats the symlink indirection that lets
-/// rollbacks point a fixed cmdline at a moving target. Missing or unreadable
-/// → `Err`, caller skips the generation.
-fn resolve_init_path(link: &Path) -> Result<PathBuf> {
-    let p = link.join("init");
-    std::fs::symlink_metadata(&p).map_err(|source| NmblError::Io {
+/// Probe `<profile_link>/init` WITHOUT following symlinks. We want the
+/// un-resolved path because the chained kernel boots its own initrd which
+/// will mount the store and execute exactly the string we hand it on the
+/// cmdline; resolving here would replace `<profile_link>/init` with the
+/// underlying store path, which is fine on disk but defeats the symlink
+/// indirection that lets rollbacks point a fixed cmdline at a moving
+/// target. We stat through the mount-aware toplevel (since accessing
+/// anything under the raw profile link would walk an absolute store path)
+/// but return the un-resolved profile-link path. Missing or unreadable →
+/// `Err`, caller skips the generation.
+fn resolve_init_path(profile_link: &Path, toplevel: &Path) -> Result<PathBuf> {
+    let probe = toplevel.join("init");
+    std::fs::symlink_metadata(&probe).map_err(|source| NmblError::Io {
         source,
-        context: format!("stat {}", p.display()),
+        context: format!("stat {}", probe.display()),
     })?;
-    Ok(p)
+    Ok(profile_link.join("init"))
 }
 
 /// Scan `config.paths.nix_profiles_dir` for `system-*-link` entries and return
@@ -106,6 +136,7 @@ fn resolve_init_path(link: &Path) -> Result<PathBuf> {
 /// has no usable entries.
 pub fn scan_generations(config: &Config) -> Result<Vec<Generation>> {
     let dir = config.paths.nix_profiles_dir.clone();
+    let mount_prefix = config.paths.system_root.as_path();
     let entries = match std::fs::read_dir(&dir) {
         Ok(it) => it,
         Err(err) => {
@@ -125,7 +156,17 @@ pub fn scan_generations(config: &Config) -> Result<Vec<Generation>> {
         };
 
         let profile_link = entry.path();
-        let (kernel, initrd) = match resolve_kernel_initrd(&profile_link) {
+        let toplevel = match mount_aware_resolve(&profile_link, mount_prefix) {
+            Ok(p) => p,
+            Err(err) => {
+                nmbl_warn!(
+                    "skipping generation {number} at {}: resolving profile link: {err}",
+                    profile_link.display()
+                );
+                continue;
+            }
+        };
+        let (kernel, initrd) = match resolve_kernel_initrd(&toplevel, mount_prefix) {
             Ok(pair) => pair,
             Err(err) => {
                 nmbl_warn!(
@@ -135,7 +176,7 @@ pub fn scan_generations(config: &Config) -> Result<Vec<Generation>> {
                 continue;
             }
         };
-        let init_path = match resolve_init_path(&profile_link) {
+        let init_path = match resolve_init_path(&profile_link, &toplevel) {
             Ok(p) => p,
             Err(err) => {
                 nmbl_warn!(
@@ -148,8 +189,8 @@ pub fn scan_generations(config: &Config) -> Result<Vec<Generation>> {
 
         generations.push(Generation {
             number,
-            kernel_params: read_kernel_params(&profile_link),
-            label: read_label(&profile_link),
+            kernel_params: read_kernel_params(&toplevel),
+            label: read_label(&toplevel),
             profile_link,
             kernel,
             initrd,
@@ -178,15 +219,16 @@ mod tests {
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
-    fn config_for(dir: &Path) -> Config {
+    fn config_for(profiles: &Path, system_root: &Path) -> Config {
         let text = format!(
-            "[paths]\nnix_profiles_dir = {dir:?}\nsystem_root = {dir:?}\nshell = \"/bin/sh\"\n",
+            "[paths]\nnix_profiles_dir = {profiles:?}\nsystem_root = {system_root:?}\nshell = \"/bin/sh\"\n",
         );
         toml::from_str::<Config>(&text).expect("config parses")
     }
 
-    /// Build a fake profile dir; canonicalize on a regular file resolves to
-    /// the file's own absolute path, which is all the scanner needs.
+    /// Build a fake profile dir; mount_aware_resolve on a regular file returns
+    /// the same path, which is all the scanner needs when the kernel/initrd
+    /// fixtures are plain files rather than symlinks.
     fn make_profile(root: &Path, n: u32, params: &str) -> PathBuf {
         let p = root.join(format!("profile-{n}"));
         std::fs::create_dir_all(&p).expect("profile dir");
@@ -197,10 +239,18 @@ mod tests {
         p
     }
 
+    /// Use a relative target for profile symlinks so mount_aware_resolve
+    /// joins against the link's parent instead of rewriting under
+    /// mount_prefix. Mirrors how the absolute-path code path is exercised
+    /// separately in [`tests::absolute_symlink_rewritten_under_mount_prefix`].
+    fn link_profile_relative(profiles: &Path, n: u32, backing_rel: &str) {
+        symlink(backing_rel, profiles.join(format!("system-{n}-link"))).expect("symlink");
+    }
+
     #[test]
     fn empty_dir_yields_no_generations() {
         let tmp = TempDir::new().expect("temp dir");
-        let err = scan_generations(&config_for(tmp.path())).expect_err("must error");
+        let err = scan_generations(&config_for(tmp.path(), tmp.path())).expect_err("must error");
         match err {
             NmblError::NoGenerations { searched } => assert_eq!(searched, tmp.path()),
             other => panic!("expected NoGenerations, got {other:?}"),
@@ -215,17 +265,17 @@ mod tests {
         std::fs::create_dir_all(&profiles).expect("profiles");
         std::fs::create_dir_all(&backing).expect("backing");
         for n in [1u32, 10, 42] {
-            let p = make_profile(&backing, n, &format!("root=/dev/sda{n}"));
-            symlink(&p, profiles.join(format!("system-{n}-link"))).expect("symlink");
+            make_profile(&backing, n, &format!("root=/dev/sda{n}"));
+            link_profile_relative(&profiles, n, &format!("../backing/profile-{n}"));
         }
-        let gens = scan_generations(&config_for(&profiles)).expect("scan ok");
+        let gens = scan_generations(&config_for(&profiles, tmp.path())).expect("scan ok");
         assert_eq!(
             gens.iter().map(|g| g.number).collect::<Vec<_>>(),
             [42, 10, 1]
         );
         assert_eq!(gens[0].kernel_params, vec!["root=/dev/sda42".to_string()]);
-        // init_path must be the un-canonicalized `<profile_link>/init` so the
-        // chained kernel keeps the profile-symlink indirection.
+        // init_path must remain `<profile_link>/init` so the chained kernel
+        // keeps the profile-symlink indirection.
         for g in &gens {
             assert_eq!(g.init_path, g.profile_link.join("init"));
         }
@@ -239,19 +289,71 @@ mod tests {
         std::fs::create_dir_all(&profiles).expect("profiles");
         std::fs::create_dir_all(&backing).expect("backing");
         // Good generation: has init.
-        let good = make_profile(&backing, 7, "quiet");
-        symlink(&good, profiles.join("system-7-link")).expect("symlink");
+        make_profile(&backing, 7, "quiet");
+        link_profile_relative(&profiles, 7, "../backing/profile-7");
         // Broken generation: has kernel + initrd but no init.
         let bad = backing.join("profile-9");
         std::fs::create_dir_all(&bad).expect("bad dir");
         std::fs::write(bad.join("kernel"), b"k").expect("kernel");
         std::fs::write(bad.join("initrd"), b"i").expect("initrd");
         std::fs::write(bad.join("kernel-params"), "x").expect("params");
-        symlink(&bad, profiles.join("system-9-link")).expect("symlink");
+        link_profile_relative(&profiles, 9, "../backing/profile-9");
 
-        let gens = scan_generations(&config_for(&profiles)).expect("scan ok");
+        let gens = scan_generations(&config_for(&profiles, tmp.path())).expect("scan ok");
         assert_eq!(gens.len(), 1);
         assert_eq!(gens[0].number, 7);
+    }
+
+    /// The real NixOS layout: profile symlinks target absolute store paths
+    /// (e.g. `/nix/store/<hash>/`). NMBL has the system root mounted under
+    /// `mount_prefix`, so those absolute targets must be rewritten to live
+    /// under that prefix.
+    #[test]
+    fn absolute_symlink_rewritten_under_mount_prefix() {
+        let tmp = TempDir::new().expect("temp dir");
+        let mount_prefix = tmp.path().join("mount");
+        let store_rel = "nix/store/abcdef-system";
+        let store_abs_on_disk = mount_prefix.join(store_rel);
+        let profiles_dir = mount_prefix.join("nix/var/nix/profiles");
+        std::fs::create_dir_all(&profiles_dir).expect("profiles");
+        std::fs::create_dir_all(&store_abs_on_disk).expect("store");
+
+        // The kernel/initrd inside the toplevel are themselves symlinks to
+        // store paths — exercise the second resolution step too.
+        let bz_store_rel = "nix/store/xyz-linux";
+        let bz_store_abs = mount_prefix.join(bz_store_rel);
+        std::fs::create_dir_all(&bz_store_abs).expect("kernel store");
+        std::fs::write(bz_store_abs.join("bzImage"), b"k").expect("bz");
+        std::fs::write(bz_store_abs.join("initrd"), b"i").expect("initrd");
+        symlink(
+            format!("/{bz_store_rel}/bzImage"),
+            store_abs_on_disk.join("kernel"),
+        )
+        .expect("kernel symlink");
+        symlink(
+            format!("/{bz_store_rel}/initrd"),
+            store_abs_on_disk.join("initrd"),
+        )
+        .expect("initrd symlink");
+        std::fs::write(store_abs_on_disk.join("init"), b"#!/bin/sh\n").expect("init");
+        std::fs::write(store_abs_on_disk.join("kernel-params"), "quiet").expect("params");
+
+        // Profile link with an absolute target (the bash bootloader's case).
+        symlink(format!("/{store_rel}"), profiles_dir.join("system-3-link"))
+            .expect("profile symlink");
+
+        let gens = scan_generations(&config_for(&profiles_dir, &mount_prefix)).expect("scan ok");
+        assert_eq!(gens.len(), 1);
+        assert_eq!(
+            gens[0].kernel,
+            mount_prefix.join(format!("{bz_store_rel}/bzImage"))
+        );
+        assert_eq!(
+            gens[0].initrd,
+            mount_prefix.join(format!("{bz_store_rel}/initrd"))
+        );
+        assert_eq!(gens[0].init_path, profiles_dir.join("system-3-link/init"));
+        assert_eq!(gens[0].kernel_params, vec!["quiet".to_string()]);
     }
 
     #[test]
@@ -261,11 +363,11 @@ mod tests {
         let backing = tmp.path().join("backing");
         std::fs::create_dir_all(&profiles).expect("profiles");
         std::fs::create_dir_all(&backing).expect("backing");
-        let p = make_profile(&backing, 7, "quiet");
-        symlink(&p, profiles.join("system-7-link")).expect("symlink");
+        make_profile(&backing, 7, "quiet");
+        link_profile_relative(&profiles, 7, "../backing/profile-7");
         std::fs::write(profiles.join("system-bogus-link"), b"x").expect("bogus");
         std::fs::write(profiles.join("random_file"), b"x").expect("random");
-        let gens = scan_generations(&config_for(&profiles)).expect("scan ok");
+        let gens = scan_generations(&config_for(&profiles, tmp.path())).expect("scan ok");
         assert_eq!(gens.len(), 1);
         assert_eq!(gens[0].number, 7);
         assert_eq!(gens[0].kernel_params, vec!["quiet".to_string()]);
