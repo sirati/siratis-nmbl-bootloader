@@ -95,16 +95,12 @@ impl<'a> App<'a> {
                 &mut self.show_kernel_params,
                 &mut self.decision,
             ),
-            Screen::Editing { .. } => Self::handle_editing_key(
-                key.code,
-                &mut self.screen,
-                &mut self.decision,
-            ),
-            Screen::Passphrase { .. } => Self::handle_passphrase_key(
-                key.code,
-                &mut self.screen,
-                &mut self.decision,
-            ),
+            Screen::Editing { .. } => {
+                Self::handle_editing_key(key.code, &mut self.screen, &mut self.decision)
+            }
+            Screen::Passphrase { .. } => {
+                Self::handle_passphrase_key(key.code, &mut self.screen, &mut self.decision)
+            }
         }
     }
 
