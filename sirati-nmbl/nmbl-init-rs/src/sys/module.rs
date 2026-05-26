@@ -132,6 +132,13 @@ pub enum LoadOutcome {
     /// `ENODEV` (see [`is_recoverable_module_error`]). Callers should
     /// log a warning and continue; this is **not** fatal.
     KernelRefused { source: nix::Error },
+    /// The `.ko` file referenced by `modules.dep` is absent from the
+    /// initrd. NixOS `makeModulesClosure { allowMissing = true; }`
+    /// leaves dangling dep entries in `modules.dep` for transitive
+    /// modules it pruned; the kernel usually has the relevant symbols
+    /// built-in (or the parent module doesn't actually need them at
+    /// runtime), so this is non-fatal — callers log + skip.
+    FileMissing,
 }
 
 /// Errnos returned by `init_module(2)` that mean "this kernel cannot
@@ -386,6 +393,13 @@ fn init_module(image: &[u8], params: &CString, name: &str, path: &Path) -> Resul
 /// and must be logged + skipped by the caller rather than aborting
 /// the boot.
 pub fn load_module(entry: &ModuleEntry) -> Result<LoadOutcome> {
+    // Shrunk module closures (NixOS `makeModulesClosure { allowMissing
+    // = true; }`) can leave `modules.dep` referencing `.ko` files that
+    // aren't on disk. Surface that as `FileMissing` so callers warn +
+    // skip instead of aborting the boot for an over-eager soft dep.
+    if !entry.path.exists() {
+        return Ok(LoadOutcome::FileMissing);
+    }
     let image = decompress_module(&entry.path, &entry.name)?;
     // `modules.dep` carries no parameters and the bash bootloader never
     // set them — pass an empty string and move on.
@@ -413,6 +427,15 @@ pub fn load_with_deps(name: &str, by_name: &HashMap<String, &ModuleEntry>) -> Re
                      error will be clearer there",
                     entry.name,
                     source
+                );
+            }
+            LoadOutcome::FileMissing => {
+                nmbl_warn!(
+                    "module {} listed in modules.dep but {} is not in the \
+                     initrd; skipping (closure was likely shrunk with \
+                     allowMissing=true)",
+                    entry.name,
+                    entry.path.display()
                 );
             }
         }
@@ -713,6 +736,23 @@ kernel/drivers/md/dm-mod.ko.xz:
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_module_returns_file_missing_for_absent_ko_file() {
+        // makeModulesClosure { allowMissing = true; } prunes transitive
+        // modules out of the closure but leaves them referenced in
+        // modules.dep. load_module must surface that as a non-fatal
+        // FileMissing outcome rather than propagating the underlying
+        // ENOENT as a fatal error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = ModuleEntry {
+            name: "ghostly".to_owned(),
+            path: dir.path().join("ghostly.ko.xz"),
+            deps: Vec::new(),
+        };
+        let outcome = load_module(&entry).expect("must not error");
+        assert!(matches!(outcome, LoadOutcome::FileMissing));
     }
 
     #[test]

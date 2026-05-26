@@ -56,6 +56,15 @@ pub fn load_explicit_modules(config: &Config) -> Result<()> {
                         source
                     );
                 }
+                LoadOutcome::FileMissing => {
+                    nmbl_warn!(
+                        "module {} listed in modules.dep but {} is not in the \
+                         initrd; skipping (closure was likely shrunk with \
+                         allowMissing=true)",
+                        entry.name,
+                        entry.path.display()
+                    );
+                }
             }
         }
     }
@@ -156,11 +165,13 @@ mod tests {
             crate::sys::module::LoadOutcome::KernelRefused {
                 source: Errno::EOPNOTSUPP,
             },
+            crate::sys::module::LoadOutcome::FileMissing,
             crate::sys::module::LoadOutcome::Loaded,
         ];
 
         let mut loaded: usize = 0;
         let mut refused: usize = 0;
+        let mut missing: usize = 0;
         // This match must stay in lock-step with `load_explicit_modules`.
         for outcome in outcomes {
             match outcome {
@@ -171,9 +182,13 @@ mod tests {
                 crate::sys::module::LoadOutcome::KernelRefused { source: _ } => {
                     refused += 1;
                 }
+                crate::sys::module::LoadOutcome::FileMissing => {
+                    missing += 1;
+                }
             }
         }
         assert_eq!(loaded, 3);
         assert_eq!(refused, 1);
+        assert_eq!(missing, 1);
     }
 }
