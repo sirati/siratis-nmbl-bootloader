@@ -145,6 +145,9 @@ in
     #   - /etc/nmbl/config.toml       : runtime config it reads at startup
     #   - /bin/sh                     : busybox, used ONLY for the emergency
     #                                   shell on failure (never by /init itself)
+    #   - /bin/blkid                  : util-linux's blkid, called by the
+    #                                   Rust /init to populate /dev/disk/by-*
+    #                                   symlinks (udev-less stage-0).
     #   - /lib/modules                : kernel modules closure
     #   - /etc/modprobe.d/nixos.conf  : blacklist config
     #
@@ -165,6 +168,17 @@ in
           {
             object = "${pkgs.busybox}/bin/busybox";
             symlink = "/bin/sh";
+          }
+          {
+            # util-linux's blkid is used by nmbl-init to populate
+            # /dev/disk/by-{partlabel,label,uuid,partuuid}/ symlinks
+            # at boot time, since NMBL ships without udev. The Rust
+            # crate shells out via the activation runner (run_capture)
+            # to read blkid -o export output for every block device
+            # the kernel knows about. Mirrors the bash bootloader's
+            # approach (commit 534fe5d).
+            object = "${pkgs.util-linux}/bin/blkid";
+            symlink = "/bin/blkid";
           }
           {
             object = "${kernelModulesManager.modulesClosure}/lib/modules";
