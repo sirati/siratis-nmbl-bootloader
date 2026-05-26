@@ -3,8 +3,14 @@ target = "x86_64-unknown-linux-musl"
 
 [target.x86_64-unknown-linux-musl]
 # Force a fully static binary so the initramfs needs no dynamic loader.
+# `linux_latest` is the rustix optimization cfg — NixOS users run modern
+# kernels and we want rustix to skip the pre-5.x fallback paths. The
+# matching `--check-cfg` line silences the unexpected_cfgs lint on our
+# own crate (rustix declares it via its own build.rs).
 rustflags = [
     "-C", "target-feature=+crt-static",
     "-C", "link-arg=-s",
     "-C", "relocation-model=static",
+    "--cfg", "linux_latest",
+    "--check-cfg", "cfg(linux_latest)",
 ]
