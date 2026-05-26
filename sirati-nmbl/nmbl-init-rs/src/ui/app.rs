@@ -325,6 +325,7 @@ mod tests {
             profile_link: PathBuf::from(format!("/p/system-{number}-link")),
             kernel: PathBuf::from("/p/kernel"),
             initrd: PathBuf::from("/p/initrd"),
+            init_path: PathBuf::from(format!("/p/system-{number}-link/init")),
             kernel_params: params.iter().map(|s| (*s).to_string()).collect(),
             label: String::new(),
         }
