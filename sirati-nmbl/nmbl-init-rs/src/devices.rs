@@ -75,7 +75,10 @@ fn device_ready(device: &Path) -> bool {
 ///   used as-is (lets configs spell out the post-pivot path).
 /// * Anything else (relative, or absolute outside the root such as
 ///   the natural `/boot`) is joined with `system_root`.
-fn resolve_mountpoint(system_root: &Path, entry: &FilesystemEntry) -> PathBuf {
+///
+/// Exposed `pub` so `src/boot.rs` resolves unmount targets via the
+/// exact same logic — any drift would silently miss live mounts.
+pub fn resolve_mountpoint(system_root: &Path, entry: &FilesystemEntry) -> PathBuf {
     if entry.is_root {
         return system_root.to_path_buf();
     }
