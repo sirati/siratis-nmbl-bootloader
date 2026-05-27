@@ -17,7 +17,7 @@ use std::fs::File;
 use std::io::Write as _;
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nix::unistd::execve;
@@ -29,11 +29,15 @@ use nix::unistd::execve;
 /// somewhere to write even when the system filesystem isn't mounted.
 const DEFAULT_PANIC_REPORT_DIR: &str = "/run";
 
-/// Process-wide override for the panic report directory. Populated once
-/// by [`install_panic_hook`] from the runtime config so the panic hook
-/// — which is a `'static + Send + Sync` closure with no captured state
-/// — can still honour the operator's choice.
-static PANIC_REPORT_DIR: OnceLock<PathBuf> = OnceLock::new();
+/// Process-wide override for the panic report directory. Populated by
+/// [`install_panic_hook`] from the runtime config so the panic hook —
+/// which is a `'static + Send + Sync` closure with no captured state —
+/// can still honour the operator's choice. An `RwLock` (rather than a
+/// `OnceLock`) so a second `install_panic_hook` call genuinely replaces
+/// the first value: bootstrap mode installs once against the recovery
+/// default before Phase 0.5, then again with the real config after
+/// `run_bootstrap_phase` returns.
+static PANIC_REPORT_DIR: RwLock<Option<PathBuf>> = RwLock::new(None);
 
 /// Path to the on-disk self for `execve(2)`. The kernel resolves this
 /// to the binary that is currently mapped into the panicking process,
@@ -44,20 +48,28 @@ const SELF_EXE: &str = "/proc/self/exe";
 /// so `ps` output stays consistent across the re-exec.
 const ARGV0: &str = "nmbl-init";
 
-/// Install the process-wide panic hook. Must run once at startup,
+/// Install the process-wide panic hook. Must run early in startup,
 /// before any other work, so a bug in early phases (config load,
 /// mount, …) is still caught by the recovery path.
 ///
 /// `report_dir` is the directory where the structured panic report
-/// will be written. This is recorded in a process-wide `OnceLock` so
+/// will be written. This is recorded in a process-wide `RwLock` so
 /// the `'static` panic-hook closure can pick it up without capturing
-/// non-`'static` config state. Subsequent calls to `install_panic_hook`
-/// do not change the directory (the first value wins) — `main` is the
-/// only caller, so this is just defensive.
+/// non-`'static` config state.
+///
+/// **Idempotent / replace semantics.** Each call replaces the stored
+/// directory. Bootstrap mode relies on this: `main` installs once with
+/// the recovery default before `run_bootstrap_phase` (so an early panic
+/// still produces a report), then re-installs after Phase 0.5 returns
+/// the operator's real `Config`, so the remainder of the boot honours
+/// `general.panic_report_dir` from `/boot/.../config.toml`. A poisoned
+/// lock is treated as a no-op — the previous directory keeps applying,
+/// which is the safer behaviour for a hook that may run from the same
+/// thread that poisoned the lock.
 pub fn install_panic_hook(report_dir: &Path) {
-    // Ignore the result: a second install with a different dir is a
-    // programmer error, not a runtime concern. The first value wins.
-    let _ = PANIC_REPORT_DIR.set(report_dir.to_path_buf());
+    if let Ok(mut w) = PANIC_REPORT_DIR.write() {
+        *w = Some(report_dir.to_path_buf());
+    }
     std::panic::set_hook(Box::new(|info: &PanicHookInfo<'_>| {
         let report = build_report(info);
         let pid = std::process::id();
@@ -126,13 +138,14 @@ fn report_path_in(dir: &Path, pid: u32) -> PathBuf {
 }
 
 /// Per-PID report path. Reads the configured directory from the
-/// [`PANIC_REPORT_DIR`] `OnceLock`, falling back to
+/// [`PANIC_REPORT_DIR`] `RwLock`, falling back to
 /// [`DEFAULT_PANIC_REPORT_DIR`] when the hook hasn't been installed
-/// yet.
+/// yet or the lock is poisoned.
 fn report_path_for(pid: u32) -> PathBuf {
     let dir = PANIC_REPORT_DIR
-        .get()
-        .cloned()
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
         .unwrap_or_else(|| PathBuf::from(DEFAULT_PANIC_REPORT_DIR));
     report_path_in(&dir, pid)
 }
@@ -201,6 +214,32 @@ mod tests {
         let dir = PathBuf::from("/var/run/nmbl");
         let p = report_path_in(&dir, 1);
         assert_eq!(p, PathBuf::from("/var/run/nmbl/nmbl-panic-1.txt"));
+    }
+
+    #[test]
+    fn install_panic_hook_replaces_stored_dir() {
+        // Bootstrap mode installs twice: first with the recovery default
+        // before run_bootstrap_phase, then with the operator's real
+        // panic_report_dir after Phase 0.5. The second call must
+        // overwrite the first — `report_path_for` must see the latest
+        // value, not the first one.
+        //
+        // Touches global state (PANIC_REPORT_DIR and the panic hook), so
+        // it cannot run in parallel with other tests that also poke
+        // those; cargo test serialises by module via `--test-threads`
+        // when needed. We restore the original hook on exit.
+        let prev_hook = std::panic::take_hook();
+        install_panic_hook(Path::new("/tmp/first"));
+        assert_eq!(
+            report_path_for(7),
+            PathBuf::from("/tmp/first/nmbl-panic-7.txt"),
+        );
+        install_panic_hook(Path::new("/tmp/second"));
+        assert_eq!(
+            report_path_for(7),
+            PathBuf::from("/tmp/second/nmbl-panic-7.txt"),
+        );
+        std::panic::set_hook(prev_hook);
     }
 
     #[test]

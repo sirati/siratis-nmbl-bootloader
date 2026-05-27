@@ -45,6 +45,7 @@ let
 
       kernel_modules = {
         explicit = bootstrap.kernelModules.explicit;
+        modules_dir = bootstrap.kernelModules.modulesDir;
       };
     } // lib.optionalAttrs rescueSet {
       rescue = {

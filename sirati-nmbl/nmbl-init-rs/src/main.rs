@@ -145,16 +145,20 @@ fn run_phases(config: &Config) -> Result<Vec<KeyInjection>> {
 /// mounted we intentionally leave it mounted on the error path so the
 /// operator's shell still sees it under `bootstrap.boot_fs.mountpoint`.
 fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
-    nmbl_info!("phase 0.5: loading bootstrap config {}", bootstrap_path.display());
+    nmbl_info!(
+        "phase 0.5: loading bootstrap config {}",
+        bootstrap_path.display()
+    );
     let bootstrap = BootstrapConfig::load(bootstrap_path)?;
     let section = &bootstrap.bootstrap;
 
     nmbl_info!(
-        "phase 0.5: loading {} bootstrap kernel modules",
-        section.kernel_modules.explicit.len()
+        "phase 0.5: loading {} bootstrap kernel modules from {}",
+        section.kernel_modules.explicit.len(),
+        section.kernel_modules.modules_dir.display(),
     );
     load_modules(
-        Path::new("/lib/modules"),
+        &section.kernel_modules.modules_dir,
         &section.kernel_modules.explicit,
         &[],
     )
@@ -197,7 +201,10 @@ fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
     // boot_fs is mounted; from here on, any failure must NOT unmount
     // it — the operator's emergency shell needs to see it.
     let full_path = resolve_full_config_path(&boot_fs.mountpoint, &section.config_path);
-    nmbl_info!("phase 0.5: loading full config from {}", full_path.display());
+    nmbl_info!(
+        "phase 0.5: loading full config from {}",
+        full_path.display()
+    );
     let config = Config::load(&full_path).map_err(|source| NmblError::Bootstrap {
         stage: "read-config",
         source: Box::new(source),
@@ -286,8 +293,15 @@ fn main() -> ExitCode {
     // inside the initramfs by the new Nix path; its absence means the
     // image was built with the legacy single-tier flow and the real
     // config lives at `args.config_path` (default `/etc/nmbl/config.toml`).
+    //
+    // `try_exists()` (not `exists()`) so an unreadable bootstrap.toml
+    // (broken symlink, permission denied, …) routes into the bootstrap
+    // failure path instead of silently being mistaken for legacy mode
+    // — which would then resurface as a misleading missing
+    // `/etc/nmbl/config.toml` error.
     let bootstrap_path = Path::new(BOOTSTRAP_CONFIG_PATH);
-    let bootstrap_mode = bootstrap_path.exists();
+    let bootstrap_probe = bootstrap_path.try_exists();
+    let bootstrap_mode = matches!(bootstrap_probe, Ok(true));
 
     // Config load is the chicken-and-egg moment: if it fails we have
     // no `shell` path, no verbosity, no nothing. In bootstrap mode the
@@ -307,13 +321,34 @@ fn main() -> ExitCode {
     // Install the panic hook now that we know where to write reports.
     // A panic during the brief window before this call would still
     // unwind through the default Rust hook, abort PID 1, and let the
-    // kernel panic — the documented worst case.
+    // kernel panic — the documented worst case. In bootstrap mode the
+    // configured `panic_report_dir` from the operator's `config.toml`
+    // is not yet reachable, so we install with the recovery default
+    // and re-install once `run_bootstrap_phase` returns the real config
+    // (`install_panic_hook` is idempotent: each call replaces the
+    // previously stored directory).
     install_panic_hook(&config.general.panic_report_dir);
 
     log::init(config.general.verbosity);
     nmbl_info!("nmbl-init starting");
 
     if let Some(err) = load_err {
+        match drop_to_emergency(&config, err) {}
+    }
+
+    // Probe error reported by `try_exists` — neither "exists" nor "does
+    // not exist". Route into the bootstrap failure path with a
+    // descriptive stage so the emergency-shell banner explains what was
+    // attempted instead of resurfacing the legacy-mode "no
+    // /etc/nmbl/config.toml" error.
+    if let Err(probe_err) = bootstrap_probe {
+        let err = NmblError::Bootstrap {
+            stage: "probe",
+            source: Box::new(NmblError::Io {
+                source: probe_err,
+                context: format!("probing {}", bootstrap_path.display()),
+            }),
+        };
         match drop_to_emergency(&config, err) {}
     }
 
@@ -327,7 +362,18 @@ fn main() -> ExitCode {
 
     if bootstrap_mode {
         match run_bootstrap_phase(bootstrap_path) {
-            Ok(loaded) => config = loaded,
+            Ok(loaded) => {
+                config = loaded;
+                // Re-install the panic hook against the operator's
+                // configured directory and re-init the logger at the
+                // operator's verbosity. The early init used the recovery
+                // defaults because the real config was not yet
+                // reachable, but a panic or log line during the
+                // remaining phases must honour what the operator set in
+                // /boot's config.toml.
+                install_panic_hook(&config.general.panic_report_dir);
+                log::init(config.general.verbosity);
+            }
             // boot_fs may have been mounted before the failure — the
             // emergency shell wants to see it, so we do NOT unmount on
             // this path.
