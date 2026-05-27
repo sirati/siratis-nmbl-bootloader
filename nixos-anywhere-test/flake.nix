@@ -581,6 +581,12 @@
             mkdir -p "$RUNDIR"
             SER_SOCK="$RUNDIR/ser0.sock"
             WORK_SOCK_LINK="$WORK_DIR/ser0.sock"
+            # QEMU monitor (HMP) socket follows the same path-length
+            # rule as the serial socket — sun_path is 108 bytes — so
+            # park it next to ser0.sock and symlink into WORK_DIR for
+            # operator convenience.
+            MON_SOCK="$RUNDIR/qemu-monitor.sock"
+            WORK_MON_LINK="$WORK_DIR/qemu-monitor.sock"
 
             stop_one() {
               local pidfile="$1"
@@ -603,7 +609,7 @@
             if [[ "$CMD" == "exit" ]]; then
               stop_one "$NOVNC_PIDFILE"
               stop_one "$QEMU_PIDFILE"
-              rm -f "$SER_SOCK" "$WORK_SOCK_LINK"
+              rm -f "$SER_SOCK" "$WORK_SOCK_LINK" "$MON_SOCK" "$WORK_MON_LINK"
               echo "All stopped."
               exit 0
             fi
@@ -614,8 +620,11 @@
               echo "Use \`$0 exit\` to stop it first." >&2
               exit 1
             fi
-            rm -f "$QEMU_PIDFILE" "$NOVNC_PIDFILE" "$SER_SOCK" "$WORK_SOCK_LINK" "$SER_LOG"
+            rm -f "$QEMU_PIDFILE" "$NOVNC_PIDFILE" \
+                  "$SER_SOCK" "$WORK_SOCK_LINK" "$SER_LOG" \
+                  "$MON_SOCK" "$WORK_MON_LINK"
             ln -sfn "$SER_SOCK" "$WORK_SOCK_LINK"
+            ln -sfn "$MON_SOCK" "$WORK_MON_LINK"
 
             cleanup() {
               stop_one "$NOVNC_PIDFILE" || true
@@ -649,7 +658,7 @@
               -display "vnc=:$VNC_DISPLAY" \
               -chardev "socket,id=ser0,path=$SER_SOCK,server=on,wait=off" \
               -serial chardev:ser0 \
-              -monitor none \
+              -monitor "unix:$MON_SOCK,server=on,wait=off" \
               -nodefaults \
               -daemonize \
               -pidfile "$QEMU_PIDFILE"
@@ -659,6 +668,9 @@
             echo "serial   : $SER_SOCK"
             echo "           (also symlinked at $WORK_SOCK_LINK)"
             echo "           attach: socat - UNIX-CONNECT:$SER_SOCK"
+            echo "monitor  : $MON_SOCK"
+            echo "           (also symlinked at $WORK_MON_LINK)"
+            echo "           sendkey example: echo sendkey a | socat - UNIX-CONNECT:$MON_SOCK"
             echo "vnc      : localhost:$VNC_PORT"
 
             # Tee the serial socket into serial.log in the background so

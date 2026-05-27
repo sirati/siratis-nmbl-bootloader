@@ -39,6 +39,7 @@
 pub mod app;
 pub mod console;
 pub mod emergency;
+pub mod key_echo;
 pub mod reporter;
 #[cfg(feature = "network-rescue")]
 pub mod rescue;
@@ -57,8 +58,9 @@ use crate::generations::Generation;
 use crate::ui::console::Console;
 use crate::ui::timeout::TimeoutOutcome;
 use crate::ui::view::{
-    EditScreenData, EmergencyScreenData, ListScreenData, PassphraseScreenData, render_boot_status,
-    render_edit, render_emergency, render_list, render_passphrase,
+    EditScreenData, EmergencyScreenData, KeyEchoScreenData, ListScreenData, PassphraseScreenData,
+    render_boot_status, render_edit, render_emergency, render_key_echo, render_list,
+    render_passphrase,
 };
 
 #[cfg(feature = "image-splash")]
@@ -317,6 +319,18 @@ pub(crate) fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_
             render_emergency(frame, &data);
         }
         Screen::BootStatus(data) => render_boot_status(frame, data),
+        Screen::KeyEcho { events, byte_log } => {
+            // VecDeque is not necessarily contiguous, so flatten through
+            // make_contiguous-free iteration: collect via a slice pair.
+            // Cheap because we only ever store ≤20 entries per panel.
+            let events_vec: Vec<String> = events.iter().cloned().collect();
+            let bytes_vec: Vec<String> = byte_log.iter().cloned().collect();
+            let data = KeyEchoScreenData {
+                events: &events_vec,
+                byte_log: &bytes_vec,
+            };
+            render_key_echo(frame, &data);
+        }
     }
 }
 
