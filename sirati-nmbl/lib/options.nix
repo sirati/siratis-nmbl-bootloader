@@ -232,6 +232,36 @@ in
         Include modules needed for:
         - Your filesystem (ext4, btrfs, xfs, etc.)
         - Your storage controller (ahci, nvme, virtio_blk, etc.)
+
+        Loaded in phase 2b, after the boot console is up so the operator
+        sees per-module progress. For graphics drivers that must be in
+        place BEFORE the splash console attaches (e.g. on
+        `bootMode = "qemu_kernel_invoke"` where there is no kmod
+        auto-load), use `boot.nmbl.earlyKernelModules` instead.
+      '';
+    };
+
+    earlyKernelModules = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [
+        "virtio_pci"
+        "virtio_gpu"
+        "simpledrm"
+      ];
+      description = lib.mdDoc ''
+        Kernel modules loaded BEFORE the NMBL boot console is brought up.
+
+        Reserved for graphics drivers that must populate
+        `/dev/dri/card*` so the splash backend can attach. NMBL ships
+        without udev / kmod auto-load — anything the splash needs to
+        find at `open_console` time has to be listed here, otherwise
+        the splash falls back to the tty console.
+
+        Loaded in phase 2a, immediately after pseudo-filesystem mount
+        and before the boot console open. Storage / filesystem drivers
+        belong in `boot.nmbl.kernelModules` (phase 2b) so the operator
+        sees their progress on the live console.
       '';
     };
 
@@ -389,6 +419,29 @@ in
         plus filesystem-driver modules derived from
         `config.fileSystems.*.fsType` (NMBL has no udev to auto-load
         them on mount(2)); set directly to override.
+      '';
+    };
+
+    earlyExplicitKernelModules = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = lib.unique (
+        lib.filter (m: !(lib.elem m cfg.blacklistedKernelModules))
+          cfg.earlyKernelModules
+      );
+      defaultText = lib.literalMD ''
+        `boot.nmbl.earlyKernelModules` with
+        `boot.nmbl.blacklistedKernelModules` removed.
+      '';
+      description = lib.mdDoc ''
+        Kernel modules the NMBL /init will load BEFORE bringing up the
+        boot console. Computed by default from
+        `boot.nmbl.earlyKernelModules` with the blacklist applied; set
+        directly to override.
+
+        Surfaced to the runtime TOML config as
+        `kernel_modules.early`; the Rust side calls
+        `modules::load_modules(_, ModuleSet::Early)` in phase 2a,
+        immediately before `open_console`.
       '';
     };
 
