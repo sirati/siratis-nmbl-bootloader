@@ -16,7 +16,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use drm::Device as BasicDevice;
 use drm::buffer::{Buffer, DrmFourcc};
@@ -26,7 +26,7 @@ use drm::control::{
 };
 
 use crate::error::{NmblError, Result};
-use crate::nmbl_warn;
+use crate::{nmbl_info, nmbl_warn};
 use crate::splash::types::FramebufferDims;
 
 /// Thin newtype wrapper around an `OwnedFd` so we can implement the
@@ -80,21 +80,56 @@ pub struct SplashDrm {
 ///   falls back to the tty UI without surfacing this as an error.
 /// - `Err(_)`: device exists but bring-up failed.
 pub fn open_card(path: &Path) -> Result<Option<SplashDrm>> {
-    let file = match OpenOptions::new()
+    match try_open(path)? {
+        Some(card) => bring_up(card).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Open the configured card or, failing that, walk `/dev/dri/card0..card7`
+/// for the first one that brings up. Boards that hand a virtio-gpu /
+/// radeon / amdgpu framebuffer cause simpledrm to deregister
+/// `/dev/dri/card0`, so the configured default can vanish at
+/// module-load time. The configured `path` is tried first to honour
+/// operator overrides; the walk is a safety net for default deployments.
+pub fn open_card_with_fallback(path: &Path) -> Result<Option<SplashDrm>> {
+    if let Some(card) = try_open(path)? {
+        return bring_up(card).map(Some);
+    }
+    nmbl_warn!(
+        "splash::drm: configured path {} unavailable; scanning /dev/dri/card*",
+        path.display(),
+    );
+    for minor in 0u8..=7 {
+        let candidate = PathBuf::from(format!("/dev/dri/card{minor}"));
+        if candidate == path {
+            continue;
+        }
+        if let Some(card) = try_open(&candidate)? {
+            nmbl_info!("splash::drm: using {}", candidate.display());
+            return bring_up(card).map(Some);
+        }
+    }
+    nmbl_warn!("splash::drm: no DRM card opened from /dev/dri/card0..card7");
+    Ok(None)
+}
+
+/// Try to open one DRM device. `Ok(None)` for missing / unauthorised
+/// nodes, `Ok(Some(card))` for a usable raw card, `Err(_)` for genuine
+/// open failures (e.g. EIO).
+fn try_open(path: &Path) -> Result<Option<Card>> {
+    match OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(libc::O_CLOEXEC)
         .open(path)
     {
-        Ok(f) => f,
+        Ok(f) => Ok(Some(Card(OwnedFd::from(f)))),
         Err(e) => match e.kind() {
-            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => return Ok(None),
-            _ => return Err(NmblError::Tui { source: e }),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => Ok(None),
+            _ => Err(NmblError::Tui { source: e }),
         },
-    };
-    let card = Card(OwnedFd::from(file));
-
-    bring_up(card).map(Some)
+    }
 }
 
 /// Wrap an `io::Error` from a `drm` crate call into the project's
