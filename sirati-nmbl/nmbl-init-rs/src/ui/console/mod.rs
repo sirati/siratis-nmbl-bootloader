@@ -43,8 +43,13 @@ pub enum ConsoleKind {
 pub trait Console {
     /// Render one frame from the current [`App`] state.
     fn render(&mut self, app: &App<'_>) -> Result<()>;
-    /// Poll for one key event. Returns `Ok(None)` on timeout so the
-    /// caller can drive ticking countdowns at the same cadence.
+    /// Poll for one key event. Returns `Ok(None)` at or before `timeout`.
+    ///
+    /// Backends may return early — in particular, both current backends
+    /// cap the effective wait at [`crate::ui::POLL_SLICE`] (~100ms) so
+    /// callers can drive ticking countdowns and spinner animations with
+    /// consistent cadence regardless of backend. Callers that want a
+    /// longer effective block must loop.
     fn poll_key(&mut self, timeout: Duration) -> Result<Option<KeyEvent>>;
     /// Backend grid size in (cols, rows). Useful for centring modals
     /// without a redundant `Terminal::size()` round-trip.
@@ -61,38 +66,81 @@ pub mod splash;
 #[cfg(feature = "image-splash")]
 pub use self::splash::SplashConsole;
 
-/// Open the appropriate backend for the current config.
+/// Outcome of the backend-selection decision. Single source of truth for
+/// "which path will `open_console` take" — pinned by tests so a future
+/// edit to the decision tree gets exercised without needing real
+/// hardware.
 ///
-/// See module docs for the decision tree.
-pub fn open_console(config: &Config, panic_recovery: bool) -> Result<Box<dyn Console>> {
+/// Note this does NOT promise a splash bring-up succeeded; it only says
+/// `open_console` *will try* splash first, with a tty fall-through if
+/// splash fails. The two-stage shape keeps the decision pure and
+/// hardware-free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackendChoice {
+    /// Skip splash entirely and bring up [`TtyConsole`].
+    Tty,
+    /// Attempt [`SplashConsole`]; on `Ok(None)` or `Err(_)` fall back
+    /// to [`TtyConsole`]. Only constructible when the `image-splash`
+    /// feature is compiled in — in no-feature builds the splash code
+    /// path doesn't exist, so the variant would be dead code.
+    #[cfg(feature = "image-splash")]
+    SplashOrTty,
+}
+
+/// Pure decision helper: which backend will [`open_console`] try?
+///
+/// Mirrors the rules in the module docs without touching hardware, so
+/// tests can pin the same logic `open_console` runs in production.
+pub(super) fn decide_backend(config: &Config, panic_recovery: bool) -> BackendChoice {
     if panic_recovery {
         // Rule 1: panic re-exec → never re-enter splash.
-        let tty = TtyConsole::open()?;
-        return Ok(Box::new(tty));
+        return BackendChoice::Tty;
     }
-
     #[cfg(feature = "image-splash")]
     if config.splash.enable {
-        match SplashConsole::open(config) {
-            Ok(Some(s)) => return Ok(Box::new(s)),
+        return BackendChoice::SplashOrTty;
+    }
+    // Suppress unused-config warning when image-splash isn't compiled in.
+    #[cfg(not(feature = "image-splash"))]
+    let _ = config;
+    BackendChoice::Tty
+}
+
+/// Open the appropriate backend for the current config.
+///
+/// See module docs for the decision tree; [`decide_backend`] holds the
+/// pure decision logic and is the helper tests pin.
+pub fn open_console(config: &Config, panic_recovery: bool) -> Result<Box<dyn Console>> {
+    match decide_backend(config, panic_recovery) {
+        #[cfg(feature = "image-splash")]
+        BackendChoice::SplashOrTty => match SplashConsole::open(config) {
+            Ok(Some(s)) => Ok(Box::new(s)),
             Ok(None) => {
                 crate::nmbl_warn!(
                     "splash backend unavailable (no DRM device, no font, etc.); \
                      falling back to tty console"
                 );
+                open_tty()
             }
             Err(e) => {
                 crate::nmbl_warn!(
                     "splash backend bring-up failed: {e}; falling back to tty console"
                 );
+                open_tty()
             }
+        },
+        BackendChoice::Tty => {
+            // Suppress unused-config warning when image-splash isn't
+            // compiled in — `decide_backend` reads it but the splash
+            // arm above is the only consumer of the actual value.
+            #[cfg(not(feature = "image-splash"))]
+            let _ = config;
+            open_tty()
         }
     }
+}
 
-    // Suppress unused-config warning when image-splash isn't compiled in.
-    #[cfg(not(feature = "image-splash"))]
-    let _ = config;
-
+fn open_tty() -> Result<Box<dyn Console>> {
     let tty = TtyConsole::open()?;
     Ok(Box::new(tty))
 }
@@ -107,57 +155,48 @@ pub fn open_console(config: &Config, panic_recovery: bool) -> Result<Box<dyn Con
 mod tests {
     use super::*;
 
-    /// Building a real [`TtyConsole`] in a test harness requires
-    /// `/dev/console`, which CI typically doesn't have. The decision
-    /// tree itself is what we want to pin here, so we lift it into a
-    /// pure helper that returns a `ConsoleKind` discriminant without
-    /// touching any hardware.
-    fn decide_kind(config: &Config, panic_recovery: bool) -> ConsoleKind {
-        if panic_recovery {
-            return ConsoleKind::Tty;
-        }
-        #[cfg(feature = "image-splash")]
-        if config.splash.enable {
-            return ConsoleKind::Splash;
-        }
-        // Reference the config so the no-feature build still sees it
-        // used (mirrors `open_console`).
-        let _ = config;
-        ConsoleKind::Tty
-    }
+    // Building a real [`TtyConsole`] in a test harness requires
+    // `/dev/console`, which CI typically doesn't have. We pin the
+    // pure `decide_backend` helper instead — `open_console` calls
+    // the exact same function, so the production path is exercised
+    // without touching any hardware.
 
     #[test]
-    fn open_console_panic_recovery_returns_tty() {
+    fn open_console_panic_recovery_picks_tty() {
         let config = Config::recovery_default();
         // panic_recovery wins regardless of splash.enable.
-        assert_eq!(decide_kind(&config, true), ConsoleKind::Tty);
+        assert_eq!(decide_backend(&config, true), BackendChoice::Tty);
 
         #[cfg(feature = "image-splash")]
         {
             let mut config = Config::recovery_default();
             config.splash.enable = true;
             assert_eq!(
-                decide_kind(&config, true),
-                ConsoleKind::Tty,
+                decide_backend(&config, true),
+                BackendChoice::Tty,
                 "panic_recovery must veto splash"
             );
         }
     }
 
     #[test]
-    fn open_console_splash_disabled_returns_tty() {
+    fn open_console_splash_disabled_picks_tty() {
         let config = Config::recovery_default();
         // recovery_default has splash.enable=false (and the field is
         // gated, so on no-feature builds the disabled-state is the
         // only state).
-        assert_eq!(decide_kind(&config, false), ConsoleKind::Tty);
+        assert_eq!(decide_backend(&config, false), BackendChoice::Tty);
     }
 
     #[cfg(feature = "image-splash")]
     #[test]
-    fn open_console_splash_enabled_prefers_splash() {
+    fn open_console_splash_enabled_picks_splash_or_tty() {
         let mut config = Config::recovery_default();
         config.splash.enable = true;
-        assert_eq!(decide_kind(&config, false), ConsoleKind::Splash);
+        assert_eq!(
+            decide_backend(&config, false),
+            BackendChoice::SplashOrTty,
+            "splash.enable=true must opt into the splash path",
+        );
     }
 }
