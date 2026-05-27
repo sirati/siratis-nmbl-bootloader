@@ -7,6 +7,7 @@
 //! (blacklist wins over explicit).
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use crate::config::Config;
 use crate::error::Result;
@@ -17,18 +18,25 @@ use crate::{nmbl_info, nmbl_verbose, nmbl_warn};
 /// names (top-level or transitive) are skipped with a log line; a
 /// blacklisted dep is a config inconsistency and gets a warning.
 pub fn load_explicit_modules(config: &Config) -> Result<()> {
+    load_modules(
+        &config.kernel_modules.modules_dir,
+        &config.kernel_modules.explicit,
+        &config.kernel_modules.blacklist,
+    )
+}
+
+/// Lower-level loader used both by [`load_explicit_modules`] (full
+/// config) and by the bootstrap stage (which only has a tiny explicit
+/// list and no blacklist). Pulled out so the bootstrap path does not
+/// need to fabricate a synthetic [`Config`].
+pub fn load_modules(modules_dir: &Path, explicit: &[String], blacklist: &[String]) -> Result<()> {
     let release = crate::sys::uname::kernel_release()?;
-    let entries = module::load_modules_dep(&config.kernel_modules.modules_dir, &release)?;
+    let entries = module::load_modules_dep(modules_dir, &release)?;
     let by_name: HashMap<String, &ModuleEntry> = module::index_by_name(&entries);
-    let blacklist: HashSet<&str> = config
-        .kernel_modules
-        .blacklist
-        .iter()
-        .map(String::as_str)
-        .collect();
+    let blacklist: HashSet<&str> = blacklist.iter().map(String::as_str).collect();
 
     let mut loaded: usize = 0;
-    for name in &config.kernel_modules.explicit {
+    for name in explicit {
         if blacklist.contains(name.as_str()) {
             nmbl_verbose!("skipping blacklisted module {}", name);
             continue;
