@@ -437,7 +437,10 @@ in
 
     bootstrap = {
       configPath = lib.mkOption {
-        type = lib.types.path;
+        # `types.str`, not `types.path`: this is a target-filesystem
+        # path interpreted by the NMBL runtime, not a build-host path
+        # Nix should resolve to the store.
+        type = lib.types.str;
         default = "/nmbl/config.toml";
         description = lib.mdDoc ''
           Path to the full runtime `config.toml`, relative to
@@ -477,7 +480,10 @@ in
         };
 
         mountpoint = lib.mkOption {
-          type = lib.types.path;
+          # `types.str`, not `types.path`: this is a target-filesystem
+          # path interpreted by the NMBL runtime, not a build-host path
+          # Nix should resolve to the store.
+          type = lib.types.str;
           default = "/mnt/boot";
           description = lib.mdDoc ''
             Mountpoint inside the NMBL initramfs where the boot
