@@ -38,6 +38,8 @@
 
 pub mod app;
 pub mod console;
+pub mod console_picker;
+pub mod console_relay;
 pub mod emergency;
 pub mod key_echo;
 #[cfg(feature = "image-splash")]
@@ -719,6 +721,12 @@ mod tests {
             _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
         ) -> Result<()> {
             self.renders = self.renders.saturating_add(1);
+            Ok(())
+        }
+        fn suspend(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
             Ok(())
         }
     }

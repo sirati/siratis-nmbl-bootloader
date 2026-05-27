@@ -192,6 +192,12 @@ mod tests {
         ) -> Result<()> {
             Ok(())
         }
+        fn suspend(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]

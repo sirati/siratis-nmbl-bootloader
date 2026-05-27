@@ -750,6 +750,27 @@ in
       };
     };
 
+    emergencyShell = {
+      extraConsoles = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "/dev/ttyS0" "/dev/tty1" ];
+        description = lib.mdDoc ''
+          Additional `/dev/<tty>` devices the operator may multiplex
+          the emergency shell onto via the in-TUI picker dialog.
+
+          Each entry MUST be a /dev path the operator considers
+          acceptable to expose a root shell on. Untrusted serial
+          access (IPMI SOL, server-room serial concentrators) becomes
+          a privilege exposure when added here.
+
+          Default: empty — only `/dev/console` (kernel-elected primary
+          interactive console) gets the shell. The picker still lets
+          the operator narrow the selection at runtime.
+        '';
+      };
+    };
+
     paths = {
       nixProfilesDir = lib.mkOption {
         type = lib.types.path;
