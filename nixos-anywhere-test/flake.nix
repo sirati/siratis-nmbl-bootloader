@@ -382,7 +382,10 @@
             ${
               if displayMode == "vnc-demo" then
                 ''
-                  STAGE3_DISPLAY=(-display vnc=:1 -vga std)
+                  STAGE3_DISPLAY=(
+                    -device virtio-vga,xres=1920,yres=1080
+                    -display vnc=:1
+                  )
                 ''
               else
                 ''
