@@ -644,12 +644,12 @@
               -smp "$CORES" \
               -kernel "$KERNEL" \
               -initrd "$INITRD" \
-              -append "console=tty0 console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 loglevel=7" \
+              -append "console=tty0 console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 loglevel=7 nmbl.key_echo=1" \
               -device "virtio-vga,xres=1920,yres=1080" \
               -display "vnc=:$VNC_DISPLAY" \
               -chardev "socket,id=ser0,path=$SER_SOCK,server=on,wait=off" \
               -serial chardev:ser0 \
-              -monitor none \
+              -monitor "unix:$WORK_DIR/qemu-monitor.sock,server=on,wait=off" \
               -nodefaults \
               -daemonize \
               -pidfile "$QEMU_PIDFILE"

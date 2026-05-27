@@ -100,6 +100,8 @@ impl SplashInput {
             return Ok(None);
         }
 
+        log_raw_bytes(buf.get(..n).unwrap_or(&[]));
+
         // Bare Esc disambiguation: if the first byte is 0x1b and that
         // was the only byte, give the kernel ~10 ms to deliver the
         // rest of a CSI; if nothing arrives, it's a real Esc.
@@ -107,14 +109,64 @@ impl SplashInput {
             let tail = buf.get_mut(1..).unwrap_or(&mut []);
             let extra = poll_read(self.fd.as_fd(), tail, ESC_FOLLOWUP_MS)?;
             if extra == 0 {
-                return Ok(Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+                let ev = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+                log_parsed_event(Some(&ev));
+                return Ok(Some(ev));
             }
             let total = n.saturating_add(extra);
             let slice = buf.get(..total).unwrap_or(&[]);
-            return Ok(parse_event(slice).0);
+            // The follow-up read may have grabbed more bytes; log the
+            // continuation so the byte panel sees the full CSI.
+            if extra > 0 {
+                log_raw_bytes(buf.get(n..total).unwrap_or(&[]));
+            }
+            let parsed = parse_event(slice).0;
+            log_parsed_event(parsed.as_ref());
+            return Ok(parsed);
         }
 
-        Ok(parse_event(buf.get(..n).unwrap_or(&[])).0)
+        let parsed = parse_event(buf.get(..n).unwrap_or(&[])).0;
+        log_parsed_event(parsed.as_ref());
+        Ok(parsed)
+    }
+}
+
+/// Emit a `nmbl_warn!` listing the bytes that just arrived from the VT
+/// keyboard layer in hex, joined with single spaces (e.g. `1b 5b 41`).
+/// Routed at `nmbl_warn!` rather than `nmbl_info!` so the line appears
+/// even when the operator's config left verbosity at `Quiet` — the
+/// whole point of this trace is to diagnose situations where the
+/// operator can't see what they're doing.
+fn log_raw_bytes(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let mut hex = String::with_capacity(bytes.len().saturating_mul(3));
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            hex.push(' ');
+        }
+        // Two-digit lowercase hex via `format!` — clippy's
+        // indexing_slicing lint is denied at crate level, so a manual
+        // 16-byte LUT lookup would need an explicit annotation; the
+        // ergonomic cost of the per-byte allocation here is irrelevant
+        // because this fires at human-keypress cadence at most.
+        hex.push_str(&format!("{b:02x}"));
+    }
+    nmbl_warn!("SplashInput raw bytes: {hex}");
+}
+
+/// Emit a `nmbl_warn!` describing the parsed `KeyEvent` (or the fact
+/// that no event was produced — i.e. the parser dropped the bytes).
+/// Same routing rationale as [`log_raw_bytes`].
+fn log_parsed_event(ev: Option<&KeyEvent>) {
+    match ev {
+        Some(k) => nmbl_warn!(
+            "SplashInput parsed: code={:?} mods={:?}",
+            k.code,
+            k.modifiers
+        ),
+        None => nmbl_warn!("SplashInput parsed: <no event> (parser dropped bytes)"),
     }
 }
 

@@ -314,6 +314,66 @@ pub fn render_boot_status(frame: &mut Frame<'_>, data: &BootStatusData<'_>) {
     frame.render_widget(status_para, status);
 }
 
+/// State needed to render the [`Screen::KeyEcho`] diagnostic view.
+///
+/// Both ring buffers are caller-owned (`App` holds the
+/// [`std::collections::VecDeque`]s); we only borrow slices to avoid
+/// cloning every frame. Most recent entries are at the back of each
+/// slice and end up at the bottom of their panel after rendering.
+pub struct KeyEchoScreenData<'a> {
+    pub events: &'a [String],
+    pub byte_log: &'a [String],
+}
+
+/// Render the key-echo diagnostic screen: header, two side-by-side
+/// ring-buffer panels (parsed events on the left, raw bytes on the
+/// right), and a single status hint at the bottom.
+pub fn render_key_echo(frame: &mut Frame<'_>, data: &KeyEchoScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .areas::<2>(body);
+
+    let events_block = Block::bordered().title("KeyEvents");
+    let bytes_block = Block::bordered().title("Raw bytes");
+    let events_inner_rows = events_block.inner(left).height as usize;
+    let bytes_inner_rows = bytes_block.inner(right).height as usize;
+
+    let events_start = data.events.len().saturating_sub(events_inner_rows);
+    let events_visible: Vec<Line<'_>> = data
+        .events
+        .get(events_start..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| Line::raw(s.clone()))
+        .collect();
+    let events_para = Paragraph::new(Text::from(events_visible))
+        .block(events_block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(events_para, left);
+
+    let bytes_start = data.byte_log.len().saturating_sub(bytes_inner_rows);
+    let bytes_visible: Vec<Line<'_>> = data
+        .byte_log
+        .get(bytes_start..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| Line::raw(s.clone()))
+        .collect();
+    let bytes_para = Paragraph::new(Text::from(bytes_visible))
+        .block(bytes_block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(bytes_para, right);
+
+    render_footer(
+        frame,
+        footer,
+        "key-echo test - Ctrl+C to exit (would be quit if not test)",
+    );
+}
+
 /// Render the passphrase modal over the body area.
 pub fn render_passphrase(frame: &mut Frame<'_>, data: &PassphraseScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
