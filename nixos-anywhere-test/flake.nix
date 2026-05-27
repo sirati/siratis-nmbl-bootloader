@@ -383,7 +383,7 @@
               if displayMode == "vnc-demo" then
                 ''
                   STAGE3_DISPLAY=(
-                    -device virtio-vga,xres=1920,yres=1080
+                    -device "virtio-vga,xres=1920,yres=1080"
                     -display vnc=:1
                   )
                 ''
