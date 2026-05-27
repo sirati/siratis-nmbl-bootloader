@@ -65,7 +65,7 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 fn render_header(frame: &mut Frame<'_>, area: Rect, countdown: Option<u64>) {
     let mut spans = vec![
         Span::styled("sirati's NMBL ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("— no more boot loader"),
+        Span::raw("— bootloader"),
     ];
     if let Some(secs) = countdown {
         spans.push(Span::raw("   "));
