@@ -21,6 +21,7 @@
   legacyBootMode,
   configLocation,
   nmblConfigToml,
+  nmblRescueSquashfs,
 }:
 
 let
@@ -105,6 +106,28 @@ pkgs.writeScript "install-nmbl-bootloader" ''
       echo "Staging external NMBL config to ${escapedDest}..."
       install -D -m 0644 ${nmblConfigToml} ${escapedDest}
       echo "✓ External config installed: ${escapedDest}"
+    ''
+  )}
+
+  ${lib.optionalString (cfg.rescue.mode == "external") (
+    let
+      # `cfg.rescue.sfsPath` is interpreted relative to the boot mount
+      # by the Rust /init; strip a leading slash so the host-side
+      # install path joins cleanly under `/boot/`.
+      rescuePath =
+        if lib.hasPrefix "/" cfg.rescue.sfsPath
+        then lib.removePrefix "/" cfg.rescue.sfsPath
+        else cfg.rescue.sfsPath;
+      escapedDest = lib.escapeShellArg "/boot/${rescuePath}";
+    in ''
+      # External-rescue mode: stage the squashfs blob on /boot at the
+      # path the Rust disk-rescue path reads from. The initramfs itself
+      # carries no busybox / activation tools in this mode — they all
+      # live in the squashfs and are loop-mounted on the emergency
+      # path.
+      echo "Staging NMBL rescue squashfs to ${escapedDest}..."
+      install -D -m 0644 ${nmblRescueSquashfs} ${escapedDest}
+      echo "✓ Rescue squashfs installed: ${escapedDest}"
     ''
   )}
 
