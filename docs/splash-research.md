@@ -1,14 +1,18 @@
 # NMBL boot-splash add-on — feasibility & design
 
+> **Status (2026-05-27): implemented behind the `image-splash` Cargo
+> feature; see `sirati-nmbl/nmbl-init-rs/src/splash/`. This file
+> remains as the design archive.**
+
 Consolidated findings from two rounds of research on adding an
 optional graphical boot splash (PNG background + rasterized text)
 to the NMBL Rust `/init`. The default tty-on-`/dev/console` UI is
 unaffected; the splash lives behind a Cargo feature gate.
 
-**Current verdict: GO**, given the constraints below. Not yet
-implemented — this file documents the design so we can pick it up
-when scheduled. Confidence: HIGH for the per-component viability,
-MEDIUM for the integration LOC estimate (no working prototype yet).
+**Current verdict: GO**, given the constraints below. Confidence:
+HIGH for the per-component viability, MEDIUM for the integration LOC
+estimate at the time of writing (the actual implementation came in
+under those estimates).
 
 ## Constraints that drive the design
 
