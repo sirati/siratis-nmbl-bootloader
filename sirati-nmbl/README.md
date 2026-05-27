@@ -266,7 +266,7 @@ single-tier path when it is absent.
 - **`external`** — `nmbl-rescue.sfs` is built at install time from
   `boot.nmbl.rescue.squashfsContents` (default:
   `busybox-sandbox-shell`, `cryptsetup`, `lvm2`, `mdadm`) via
-  `pkgs.squashfs-tools-ng` with zstd-19 compression. The blob is
+  `pkgs.squashfsTools` (`mksquashfs`) with zstd-19 compression. The blob is
   staged on the boot partition. The Rust /init loop-mounts it on
   demand via `LOOP_CTL_GET_FREE` + `LOOP_CONFIGURE`, then
   `switch_root`s into it (chdir → `mount --move . /` → chroot . →
