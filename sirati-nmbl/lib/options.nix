@@ -14,6 +14,15 @@ let
   fsDerivedKernelModules = import ./modules/fs-modules.nix {
     inherit lib config;
   };
+
+  cosmicGreeterBackgroundPng = pkgs.runCommand "cosmic-greeter-background.png"
+    { nativeBuildInputs = [ pkgs.imagemagick ]; }
+    ''
+      magick ${pkgs.fetchurl {
+        url = "https://raw.githubusercontent.com/pop-os/cosmic-greeter/master/res/background.jpg";
+        sha256 = "sha256-/gcRiJ7lMUdtMRol5Rfo+sTGB0sM7VLcsLf+LL6p3u4=";
+      }} -strip -define png:color-type=6 "$out"
+    '';
 in
 {
   imports = [
@@ -433,11 +442,13 @@ in
 
       backgroundImage = lib.mkOption {
         type = lib.types.path;
-        default = ../assets/splash-default.png;
-        defaultText = lib.literalExpression "sirati-nmbl/assets/splash-default.png";
+        default = cosmicGreeterBackgroundPng;
+        defaultText = lib.literalExpression "cosmic-greeter background.jpg converted to PNG";
         description = lib.mdDoc ''
           PNG to use as the splash background. Must be a real PNG, RGBA8.
-          Embedded into the initramfs at `/etc/splash/image.png`.
+          Embedded into the initramfs at `/etc/splash/image.png`. The
+          default is the cosmic-greeter project's background.jpg, fetched
+          at Nix build time and converted to PNG via imagemagick.
         '';
       };
 
