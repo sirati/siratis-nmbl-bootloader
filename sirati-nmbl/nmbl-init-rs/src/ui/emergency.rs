@@ -236,6 +236,12 @@ mod tests {
         fn kind(&self) -> ConsoleKind {
             ConsoleKind::Tty
         }
+        fn draw_with(
+            &mut self,
+            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -328,6 +334,14 @@ mod tests {
             }
             fn kind(&self) -> ConsoleKind {
                 ConsoleKind::Tty
+            }
+            fn draw_with(
+                &mut self,
+                _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+            ) -> Result<()> {
+                Err(NmblError::Tui {
+                    source: std::io::Error::other("backend dead"),
+                })
             }
         }
 

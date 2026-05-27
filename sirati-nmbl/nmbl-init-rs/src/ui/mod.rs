@@ -61,20 +61,6 @@ use crate::ui::view::{
     render_edit, render_emergency, render_list, render_passphrase,
 };
 
-#[cfg(feature = "network-rescue")]
-use std::os::fd::AsFd;
-#[cfg(feature = "network-rescue")]
-use std::path::Path;
-#[cfg(feature = "network-rescue")]
-use ratatui::Terminal as RatatuiTerminal;
-#[cfg(feature = "network-rescue")]
-use ratatui::backend::CrosstermBackend as RatatuiCrosstermBackend;
-#[cfg(feature = "network-rescue")]
-use crate::sys::tty::{RawModeGuard, open_console as sys_open_console};
-
-#[cfg(feature = "network-rescue")]
-const RESCUE_CONSOLE_PATH: &str = "/dev/console";
-
 #[cfg(feature = "image-splash")]
 use alacritty_terminal::term::cell::Flags;
 #[cfg(feature = "image-splash")]
@@ -228,15 +214,32 @@ pub(crate) fn render_splash_frame(
     cell_dims: CellDims,
     app: &App<'_>,
 ) -> Result<()> {
+    render_splash_frame_with(drm, bg_scaled, cache, cell_dims, &mut |f| {
+        render_current_screen(f, app);
+    })
+}
+
+/// Generic counterpart to [`render_splash_frame`] that takes a render
+/// closure instead of an `App`. Used by [`Console::draw_with`] on the
+/// splash backend to paint dynamic widgets (network-rescue gauges,
+/// cursor-tracking editors) that don't fit the App+Screen state
+/// machine — the same compositor / cell-walk / blit pipeline is reused
+/// so no parallel splash bring-up is performed.
+#[cfg(feature = "image-splash")]
+pub(crate) fn render_splash_frame_with(
+    drm: &mut drm::SplashDrm,
+    bg_scaled: &[u8],
+    cache: &glyph_cache::GlyphCache,
+    cell_dims: CellDims,
+    body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+) -> Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     {
         let backend = CrosstermBackend::new(&mut buf);
         let viewport = Viewport::Fixed(Rect::new(0, 0, cell_dims.cols, cell_dims.rows));
         let mut terminal =
             Terminal::with_options(backend, TerminalOptions { viewport }).map_err(tui_err)?;
-        terminal
-            .draw(|f| render_current_screen(f, app))
-            .map_err(tui_err)?;
+        terminal.draw(|f| body(f)).map_err(tui_err)?;
     }
 
     let mut term_pipe = SplashTerminal::new(cell_dims);
@@ -548,32 +551,6 @@ fn tui_err(source: std::io::Error) -> NmblError {
     NmblError::Tui { source }
 }
 
-/// Compatibility helper for the `network-rescue` UI (`src/ui/rescue.rs`).
-///
-/// Opens `/dev/console`, enters raw mode via the legacy [`RawModeGuard`],
-/// builds a ratatui terminal over stdout, and hands it to `body`. The
-/// raw-mode guard is dropped on return so the operator's terminal is
-/// restored even when `body` returns an error.
-///
-/// The main boot flow (`run_selector`, `tui_passphrase_prompt`,
-/// emergency screen) uses the live [`Console`] handed down from
-/// `main.rs` instead of opening a parallel session here. This helper
-/// exists only so the network-rescue screens, which predate the Console
-/// trait, keep compiling without a parallel refactor — see
-/// `src/ui/rescue.rs`.
-#[cfg(feature = "network-rescue")]
-pub(crate) fn with_console_terminal<R>(
-    body: impl FnOnce(
-        &mut RatatuiTerminal<RatatuiCrosstermBackend<std::io::Stdout>>,
-    ) -> Result<R>,
-) -> Result<R> {
-    let console_fd = sys_open_console(Path::new(RESCUE_CONSOLE_PATH))?;
-    let _raw = RawModeGuard::new(console_fd.as_fd())?;
-    let backend = RatatuiCrosstermBackend::new(std::io::stdout());
-    let mut terminal = RatatuiTerminal::new(backend).map_err(tui_err)?;
-    body(&mut terminal)
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -673,6 +650,13 @@ mod tests {
         }
         fn kind(&self) -> ConsoleKind {
             ConsoleKind::Tty
+        }
+        fn draw_with(
+            &mut self,
+            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> Result<()> {
+            self.renders = self.renders.saturating_add(1);
+            Ok(())
         }
     }
 
