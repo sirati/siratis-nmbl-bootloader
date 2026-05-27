@@ -15,4 +15,5 @@ pub mod shell;
 #[cfg(feature = "image-splash")]
 pub mod splash;
 pub mod sys;
+pub mod terminal;
 pub mod ui;
