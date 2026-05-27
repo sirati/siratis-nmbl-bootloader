@@ -58,6 +58,9 @@ pub trait Console {
     fn kind(&self) -> ConsoleKind;
 }
 
+pub mod noop;
+pub use self::noop::NoopConsole;
+
 pub mod tty;
 pub use self::tty::TtyConsole;
 

@@ -20,11 +20,11 @@ use nmbl_init::config::Config;
 use nmbl_init::devices::mount_system_filesystems;
 use nmbl_init::error::{NmblError, Result};
 use nmbl_init::generations::scan_generations;
-use nmbl_init::modules::load_explicit_modules;
+use nmbl_init::modules::{load_early_modules, load_explicit_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
 use nmbl_init::panic::install_panic_hook;
 use nmbl_init::shell::drop_to_emergency;
-use nmbl_init::ui::console::{Console, open_console};
+use nmbl_init::ui::console::{Console, NoopConsole, open_console};
 use nmbl_init::ui::{BootReporter, Decision, TuiPasswordSupplier, run_selector};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
 
@@ -116,28 +116,41 @@ fn recover_from_panic(args: Args, report_path: PathBuf) -> std::convert::Infalli
     drop_to_emergency(None, &config, NmblError::Panicked { report_path })
 }
 
-/// Execute the normal boot phases in order. Each phase that errors
-/// short-circuits to the caller, which routes through the emergency
-/// shell.
-///
-/// `console` is the live boot console (splash framebuffer or raw-mode
-/// tty) brought up by the caller before phase 1. We construct a
-/// short-lived [`BootReporter`] around it so every phase pushes its
-/// current "what am I doing" string through the reporter and the
-/// operator sees progress instead of a frozen logo. The reporter is
-/// dropped on return so the caller can reuse the underlying console
-/// for the generation selector.
-fn run_phases(config: &Config, console: &mut dyn Console) -> Result<()> {
-    let mut reporter = BootReporter::new(console, "phase 1: mount pseudo-filesystems");
-    // Paint the first frame so the operator sees a populated screen
-    // before any work happens — otherwise a fast phase 1 would race the
-    // first kmsg push and the log panel would be empty for one frame.
-    let _ = reporter.refresh_log();
+/// Execute the pre-console phases (1 and 2a). These run against a
+/// [`NoopConsole`] sentinel because the real console can't be opened
+/// yet: phase 2a is what brings up the DRM card the splash backend
+/// needs. `nmbl_info!` lines still reach the kernel ring, so the log
+/// snapshot the live reporter pulls a few hundred ms later replays the
+/// pre-console narration on the boot-status screen.
+fn run_phases_pre_console(config: &Config) -> Result<()> {
+    let mut noop = NoopConsole::new();
+    let mut reporter = BootReporter::new(&mut noop, "phase 1: mount pseudo-filesystems");
 
     nmbl_info!("phase 1: mount pseudo-filesystems");
     mount_pseudo_filesystems(&mut reporter)?;
 
-    nmbl_info!("phase 2: load explicit kernel modules");
+    nmbl_info!("phase 2a: load early kernel modules");
+    load_early_modules(config, &mut reporter)?;
+
+    Ok(())
+}
+
+/// Execute the post-console phases (2b, 3, 3b). The caller has already
+/// opened the live console; we wrap it in a [`BootReporter`] so every
+/// phase pushes its current "what am I doing" string through the
+/// reporter and the operator sees progress on the splash framebuffer
+/// or raw-mode tty. The reporter is dropped on return so the caller
+/// can reuse the underlying console for the generation selector.
+fn run_phases_post_console(config: &Config, console: &mut dyn Console) -> Result<()> {
+    let mut reporter = BootReporter::new(console, "phase 2b: loading kernel modules");
+    // Paint the first frame so the operator sees a populated screen
+    // before any work happens — otherwise a fast phase 2b would race
+    // the first kmsg push and the log panel would be empty for one
+    // frame. The pre-console phases already populated the log ring,
+    // so the snapshot we pull here already shows phase 1 + 2a output.
+    let _ = reporter.refresh_log();
+
+    nmbl_info!("phase 2b: load explicit kernel modules");
     load_explicit_modules(config, &mut reporter)?;
 
     // The splash backend opens /dev/tty1 and calls VT_ACTIVATE itself
@@ -265,12 +278,27 @@ fn main() -> ExitCode {
         match drop_to_emergency(None, &config, err) {}
     }
 
-    // Bring the boot console up BEFORE phase 1 so the operator sees a
-    // populated BootStatus screen during the first mount, the module
-    // loads, storage activations, and the generation scan. The same
-    // backend is reused all the way through the boot-menu selector and
-    // the emergency screen on phase failure — `drop_to_emergency` takes
-    // the live console handle when one exists.
+    // Phase 1 + 2a run BEFORE the real console is opened. The splash
+    // backend needs a DRM card to attach to and phase 2a is what
+    // brings up the graphics-driver modules (virtio_gpu / simpledrm /
+    // i915 / …) that materialise `/dev/dri/card*`. We use a
+    // `NoopConsole` sentinel inside `run_phases_pre_console` so the
+    // reporter wiring stays uniform across phases; `nmbl_info!` lines
+    // still reach the kernel ring and replay onto the live console as
+    // soon as it comes up.
+    if let Err(err) = run_phases_pre_console(&config) {
+        nmbl_warn!("pre-console phases failed: {err}");
+        // No live console yet — drop_to_emergency will open a tty
+        // console itself (panic_recovery=true so it skips splash).
+        match drop_to_emergency(None, &config, err) {}
+    }
+
+    // Bring the boot console up AFTER phase 2a so the splash backend
+    // can attach to the DRM card the early modules just brought up.
+    // The same backend is reused all the way through the boot-menu
+    // selector and the emergency screen on phase failure —
+    // `drop_to_emergency` takes the live console handle when one
+    // exists.
     //
     // If we cannot bring up ANY console at all, log it and route the
     // bring-up error through the emergency shell; `drop_to_emergency`
@@ -286,7 +314,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let outcome = run_phases(&config, &mut *console)
+    let outcome = run_phases_post_console(&config, &mut *console)
         .and_then(|()| select_and_act(&config, &mut *console));
 
     match outcome {

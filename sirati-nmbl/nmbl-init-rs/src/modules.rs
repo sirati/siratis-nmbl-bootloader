@@ -1,10 +1,18 @@
 //! Explicit kernel-module loader.
 //!
 //! Replaces the `for module in $explicit_modules; do modprobe ...` loop
-//! in `scripts/mount-and-kernel.sh.nix`. Loads every module listed in
-//! `config.kernel_modules.explicit`, plus each module's transitive
-//! dependencies, via `sys::module`. Blacklisted names are skipped
-//! (blacklist wins over explicit).
+//! in `scripts/mount-and-kernel.sh.nix`. Loads every module named in the
+//! selected list, plus each module's transitive dependencies, via
+//! `sys::module`. Blacklisted names are skipped (blacklist wins).
+//!
+//! The loader is split across two phases. Graphics drivers
+//! (`virtio_gpu`, `simpledrm`, `i915`, …) must be available BEFORE
+//! `open_console` so the splash backend can attach to
+//! `/dev/dri/card*` — those go into [`ModuleSet::Early`] and are
+//! loaded in phase 2a, before the console is brought up. Storage /
+//! filesystem / activation drivers go into [`ModuleSet::Explicit`] and
+//! load in phase 2b, after the console is up so per-module progress
+//! is visible to the operator.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,18 +22,90 @@ use crate::sys::module::{self, LoadOutcome, ModuleEntry};
 use crate::ui::BootReporter;
 use crate::{nmbl_info, nmbl_verbose, nmbl_warn};
 
-/// Load every explicit module + its transitive deps. Blacklisted module
-/// names (top-level or transitive) are skipped with a log line; a
-/// blacklisted dep is a config inconsistency and gets a warning.
+/// Which subset of `config.kernel_modules` a single load pass walks.
 ///
-/// `reporter` carries the live boot console; we surface the current
-/// module name as the boot-status phase label so a long modprobe chain
-/// shows progress to the operator.
-pub fn load_explicit_modules(
+/// The orchestrator runs phase 2a with [`ModuleSet::Early`] before
+/// `open_console`, and phase 2b with [`ModuleSet::Explicit`] after.
+/// The blacklist is shared between both passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModuleSet {
+    /// Pre-console drivers — graphics stack so the splash backend can
+    /// attach to `/dev/dri/card*`. Reads `config.kernel_modules.early`.
+    Early,
+    /// Post-console drivers — storage, filesystem, activation. Reads
+    /// `config.kernel_modules.explicit`.
+    Explicit,
+}
+
+impl ModuleSet {
+    /// Borrow the matching list out of the config.
+    fn module_list(self, config: &Config) -> &[String] {
+        match self {
+            ModuleSet::Early => &config.kernel_modules.early,
+            ModuleSet::Explicit => &config.kernel_modules.explicit,
+        }
+    }
+
+    /// Human-readable label for log messages and the boot-status phase
+    /// string. Matches the run_phases narration.
+    fn phase_label(self) -> &'static str {
+        match self {
+            ModuleSet::Early => "phase 2a: loading early kernel modules",
+            ModuleSet::Explicit => "phase 2b: loading kernel modules",
+        }
+    }
+
+    /// Phase prefix for the per-module spinner label, e.g. `"phase 2a"`.
+    fn modprobe_prefix(self) -> &'static str {
+        match self {
+            ModuleSet::Early => "phase 2a",
+            ModuleSet::Explicit => "phase 2b",
+        }
+    }
+}
+
+/// Load the [`ModuleSet::Early`] subset — graphics drivers, etc. Called
+/// in phase 2a before `open_console` so the splash backend has a DRM
+/// card to attach to.
+///
+/// The pre-console reporter wraps a [`crate::ui::console::NoopConsole`];
+/// status pushes do nothing visible, but the underlying log-ring is
+/// still populated for the post-console reporter to surface.
+pub fn load_early_modules(config: &Config, reporter: &mut BootReporter<'_>) -> Result<()> {
+    load_modules(config, reporter, ModuleSet::Early)
+}
+
+/// Load the [`ModuleSet::Explicit`] subset — storage, filesystem,
+/// activation drivers. Called in phase 2b after `open_console` so the
+/// operator sees per-module progress on the live boot console.
+pub fn load_explicit_modules(config: &Config, reporter: &mut BootReporter<'_>) -> Result<()> {
+    load_modules(config, reporter, ModuleSet::Explicit)
+}
+
+/// Walk the chosen [`ModuleSet`] list, loading each entry + its
+/// transitive deps via `sys::module`. Blacklisted module names
+/// (top-level or transitive) are skipped with a log line; a blacklisted
+/// dep is a config inconsistency and gets a warning.
+///
+/// `reporter` carries either the live boot console (phase 2b) or the
+/// pre-console `NoopConsole` (phase 2a); the call sequence is identical
+/// in both phases — only the visible side-effect differs.
+pub fn load_modules(
     config: &Config,
     reporter: &mut BootReporter<'_>,
+    which: ModuleSet,
 ) -> Result<()> {
-    let _ = reporter.set_phase("phase 2: loading kernel modules");
+    let _ = reporter.set_phase(which.phase_label());
+    let module_list = which.module_list(config);
+    // Cheap fast path: skip the modules.dep parse when the list is empty.
+    // This also matters in phase 2a, where the early list is often empty
+    // on platforms with built-in graphics drivers (KVM with simpledrm-only,
+    // bare-metal with i915 built into the kernel, etc.).
+    if module_list.is_empty() {
+        nmbl_verbose!("no modules requested for {:?}; skipping", which);
+        return Ok(());
+    }
+
     let release = crate::sys::uname::kernel_release()?;
     let entries = module::load_modules_dep(&config.kernel_modules.modules_dir, &release)?;
     let by_name: HashMap<String, &ModuleEntry> = module::index_by_name(&entries);
@@ -36,9 +116,10 @@ pub fn load_explicit_modules(
         .map(String::as_str)
         .collect();
 
+    let prefix = which.modprobe_prefix();
     let mut loaded: usize = 0;
-    for name in &config.kernel_modules.explicit {
-        let _ = reporter.set_phase(format!("phase 2: modprobe {name}"));
+    for name in module_list {
+        let _ = reporter.set_phase(format!("{prefix}: modprobe {name}"));
         if blacklist.contains(name.as_str()) {
             nmbl_verbose!("skipping blacklisted module {}", name);
             continue;
@@ -83,7 +164,7 @@ pub fn load_explicit_modules(
         }
     }
 
-    nmbl_info!("loaded {} explicit modules", loaded);
+    nmbl_info!("loaded {} modules ({:?})", loaded, which);
     Ok(())
 }
 
@@ -157,6 +238,72 @@ mod tests {
         let (to_load, skipped) = filter_blacklisted(order, &blacklist);
         assert!(to_load.is_empty());
         assert_eq!(skipped.len(), 2);
+    }
+
+    #[test]
+    fn module_set_early_reads_early_list() {
+        let mut config = Config::recovery_default();
+        config.kernel_modules.early = vec!["fake_a".to_owned()];
+        config.kernel_modules.explicit = vec!["fake_b".to_owned()];
+        let early_list = ModuleSet::Early.module_list(&config);
+        assert_eq!(early_list, &["fake_a".to_owned()]);
+    }
+
+    #[test]
+    fn module_set_explicit_reads_explicit_list() {
+        let mut config = Config::recovery_default();
+        config.kernel_modules.early = vec!["fake_a".to_owned()];
+        config.kernel_modules.explicit = vec!["fake_b".to_owned()];
+        let explicit_list = ModuleSet::Explicit.module_list(&config);
+        assert_eq!(explicit_list, &["fake_b".to_owned()]);
+    }
+
+    #[test]
+    fn module_set_early_and_explicit_are_disjoint_in_picker() {
+        // Synthetic config — confirm `load_early_modules` selects the
+        // early list and `load_explicit_modules` selects the explicit
+        // list, and the two lists do not bleed into each other through
+        // the dispatcher. Mirrors the production split: phase 2a loads
+        // virtio_gpu/virtio_pci; phase 2b loads ext4/nvme.
+        let mut config = Config::recovery_default();
+        config.kernel_modules.early =
+            vec!["virtio_pci".to_owned(), "virtio_gpu".to_owned()];
+        config.kernel_modules.explicit = vec!["ext4".to_owned(), "nvme".to_owned()];
+
+        let early = ModuleSet::Early.module_list(&config);
+        let explicit = ModuleSet::Explicit.module_list(&config);
+
+        assert_eq!(early, &["virtio_pci".to_owned(), "virtio_gpu".to_owned()]);
+        assert_eq!(explicit, &["ext4".to_owned(), "nvme".to_owned()]);
+
+        // Each list contains exactly the modules the operator asked
+        // for in that phase; nothing crosses the divide.
+        for early_name in early {
+            assert!(
+                !explicit.iter().any(|m| m == early_name),
+                "early module {early_name} must not leak into explicit list",
+            );
+        }
+        for explicit_name in explicit {
+            assert!(
+                !early.iter().any(|m| m == explicit_name),
+                "explicit module {explicit_name} must not leak into early list",
+            );
+        }
+    }
+
+    #[test]
+    fn module_set_labels_are_distinct() {
+        // Phase labels surface to the operator via the boot-status
+        // screen; mixing them would confuse "what is the boot doing".
+        assert_ne!(
+            ModuleSet::Early.phase_label(),
+            ModuleSet::Explicit.phase_label(),
+        );
+        assert!(ModuleSet::Early.phase_label().contains("2a"));
+        assert!(ModuleSet::Explicit.phase_label().contains("2b"));
+        assert_eq!(ModuleSet::Early.modprobe_prefix(), "phase 2a");
+        assert_eq!(ModuleSet::Explicit.modprobe_prefix(), "phase 2b");
     }
 
     /// Mirror of the `match module::load_module(entry)?` arm used by

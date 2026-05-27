@@ -229,6 +229,9 @@ in
         { lib, ... }:
         {
           boot.nmbl.splash.enable = true;
+          # Graphics drivers must be loaded BEFORE `open_console` so
+          # the splash backend has a DRM card to attach to.
+          boot.nmbl.earlyKernelModules = [ "virtio_pci" "virtio_gpu" ];
           # mkForce because mkInstall hard-codes serialConsole = "ttyS0,115200".
           # The splash path is gated by `if config.general.serial_console`, so
           # serial-on would short-circuit straight to line-mode menu and we'd
@@ -304,8 +307,11 @@ in
             # NMBL itself must insmod the virtio_gpu stack in
             # qemu_kernel_invoke mode (no kmod auto-load), otherwise
             # /dev/dri/card0 never materialises and the splash DRM
-            # bring-up falls back to "console unavailable".
-            kernelModules = [ "virtio_pci" "virtio_gpu" ];
+            # bring-up falls back to "console unavailable". These
+            # belong in `earlyKernelModules` so they load in phase 2a,
+            # before `open_console` reaches for the DRM card.
+            earlyKernelModules = [ "virtio_pci" "virtio_gpu" ];
+            kernelModules = [ ];
             mountPrefix = "/mnt";
             kernelParams = [
               "console=ttyS0,115200"
@@ -375,6 +381,10 @@ in
         { lib, ... }:
         {
           boot.nmbl.splash.enable = true;
+          # Graphics drivers must be loaded BEFORE `open_console` so
+          # the splash backend has a DRM card to attach to before the
+          # LUKS passphrase prompt comes up.
+          boot.nmbl.earlyKernelModules = [ "virtio_pci" "virtio_gpu" ];
           boot.nmbl.serialConsole = lib.mkForce null;
           boot.nmbl.timeoutSeconds = lib.mkForce 600;
           boot.nmbl.kernelParams = lib.mkForce [
