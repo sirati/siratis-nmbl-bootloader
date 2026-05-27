@@ -93,6 +93,16 @@ let
           # virtio device path. vda1 is the FAT32 ESP under the hybrid
           # partition layout used by vm-config.nix.
           boot.nmbl.bootstrap.bootFs.device = "/dev/vda1";
+          # The default bootstrap kernel module list targets SATA/NVMe.
+          # VMs use VirtIO block devices, so replace it with the VirtIO
+          # drivers plus the FAT32 stack needed to read the boot partition.
+          boot.nmbl.bootstrap.kernelModules.explicit = [
+            "virtio_pci"
+            "virtio_blk"
+            "vfat"
+            "nls_cp437"
+            "nls_iso8859_1"
+          ];
         })
       ];
     };
@@ -119,9 +129,23 @@ let
       extraModules = [
         ({ pkgs, ... }: {
           boot.nmbl.rescue.mode = "external";
-          # strace is the F.4 smoke-test target; busybox provides /bin/sh
-          # which the Rust loader requires inside the squashfs tree.
-          boot.nmbl.rescue.squashfsContents = [ pkgs.busybox pkgs.strace ];
+          # Static busybox provides /bin/sh without needing glibc in the
+          # squashfs chroot. pkgsStatic.strace is the F.4 smoke-test target;
+          # both must be statically linked since /nix/store is absent after
+          # switch_root into the squashfs.
+          boot.nmbl.rescue.squashfsContents = [ pkgs.busybox-sandbox-shell pkgs.pkgsStatic.strace ];
+          # External rescue requires bootstrap mode so that Phase 0.5
+          # mounts /boot and sets runtime_boot_mountpoint, which
+          # rescue::locate_sfs needs to find nmbl-rescue.sfs.
+          boot.nmbl.configLocation = "external";
+          boot.nmbl.bootstrap.bootFs.device = "/dev/vda1";
+          boot.nmbl.bootstrap.kernelModules.explicit = [
+            "virtio_pci"
+            "virtio_blk"
+            "vfat"
+            "nls_cp437"
+            "nls_iso8859_1"
+          ];
         })
       ];
     };
@@ -149,9 +173,20 @@ let
       extraModules = [
         ({ pkgs, ... }: {
           boot.nmbl.rescue.mode = "external";
-          boot.nmbl.rescue.squashfsContents = [ pkgs.busybox pkgs.strace ];
+          boot.nmbl.rescue.squashfsContents = [ pkgs.busybox-sandbox-shell pkgs.pkgsStatic.strace ];
           boot.nmbl.rescue.network = true;
           boot.nmbl.rescue.defaultUrl = "";
+          # External rescue requires bootstrap mode so that Phase 0.5
+          # mounts /boot and sets runtime_boot_mountpoint.
+          boot.nmbl.configLocation = "external";
+          boot.nmbl.bootstrap.bootFs.device = "/dev/vda1";
+          boot.nmbl.bootstrap.kernelModules.explicit = [
+            "virtio_pci"
+            "virtio_blk"
+            "vfat"
+            "nls_cp437"
+            "nls_iso8859_1"
+          ];
         })
       ];
     };
