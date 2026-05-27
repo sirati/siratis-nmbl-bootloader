@@ -39,25 +39,22 @@
 //!   `"dhcp-nak"` stage so the operator can diagnose policy
 //!   rejections instead of waiting for a timeout.
 
-#![allow(dead_code)]
-
 use std::mem;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use dhcproto::v4::{
-    DhcpOption, Flags, Message, MessageType, Opcode, OptionCode, CLIENT_PORT, SERVER_PORT,
+    CLIENT_PORT, DhcpOption, Flags, Message, MessageType, Opcode, OptionCode, SERVER_PORT,
 };
 use dhcproto::{Decodable, Decoder, Encodable};
+use nix::sys::socket::setsockopt;
 use nix::sys::socket::sockopt::ReceiveTimeout;
-use nix::sys::socket::{
-    setsockopt, socket, AddressFamily, MsgFlags, SockFlag, SockType, SockaddrStorage,
-};
 use nix::sys::time::TimeVal;
 
 use crate::error::{NmblError, Result};
 use crate::net::iface::Interface;
+use crate::nmbl_warn;
 
 /// Cap on DISCOVER/REQUEST retries (per phase) before we give up. The
 /// total elapsed time is still bounded by the `timeout` parameter so
@@ -192,14 +189,15 @@ fn open_packet_socket(iface: &Interface) -> Result<OwnedFd> {
 
 /// Build a `sockaddr_ll` for `bind`-ing an AF_PACKET socket to a
 /// specific ifindex. We only ever bind (and send), so `sll_addr` is
-/// the L2 broadcast address.
-fn make_sockaddr_ll(ifindex: u32, protocol_be: u16) -> libc::sockaddr_ll {
+/// the L2 broadcast address. `protocol_host` is the EtherType in
+/// host byte order — the function does the `to_be()` swap.
+fn make_sockaddr_ll(ifindex: u32, protocol_host: u16) -> libc::sockaddr_ll {
     // SAFETY: `libc::sockaddr_ll` is a POD made of integers and a
     // fixed-size byte array. The all-zero bit pattern is a valid
     // value (sll_addr empty, sll_halen 0).
     let mut sll: libc::sockaddr_ll = unsafe { mem::zeroed() };
     sll.sll_family = libc::AF_PACKET as u16;
-    sll.sll_protocol = protocol_be.to_be();
+    sll.sll_protocol = protocol_host.to_be();
     sll.sll_ifindex = ifindex as i32;
     sll.sll_halen = 6;
     // L2 broadcast for the destination.
@@ -667,7 +665,8 @@ fn strip_ip_udp(frame: &[u8]) -> Option<&[u8]> {
 /// Pull the two fields we need from an OFFER. `server_id` (option 54)
 /// is mandatory per RFC 2131; a missing value here means the server
 /// is non-compliant. We fall back to `siaddr` only if option 54 was
-/// absent.
+/// absent — and warn loudly so the operator can chase the broken
+/// server instead of silently relying on the fallback.
 fn parsed_to_offer(msg: &Message) -> Offer {
     let server_id = msg
         .opts()
@@ -676,7 +675,13 @@ fn parsed_to_offer(msg: &Message) -> Offer {
             DhcpOption::ServerIdentifier(ip) => Some(*ip),
             _ => None,
         })
-        .unwrap_or_else(|| msg.siaddr());
+        .unwrap_or_else(|| {
+            let siaddr = msg.siaddr();
+            nmbl_warn!(
+                "dhcp: OFFER missing option 54 (Server Identifier); falling back to siaddr {siaddr}"
+            );
+            siaddr
+        });
     Offer {
         yiaddr: msg.yiaddr(),
         server_id,
@@ -761,27 +766,6 @@ fn random_xid() -> Result<u32> {
         }),
     })?;
     Ok(u32::from_ne_bytes(buf))
-}
-
-// ---------------------------------------------------------------------------
-// Unused helper kept for symmetry: re-exports nix's typed socket() so
-// callers picking up the module without root can still link.
-// ---------------------------------------------------------------------------
-
-/// Compile-time guard that `AddressFamily`, `SockType`, `SockFlag`,
-/// `MsgFlags`, `SockaddrStorage`, and `socket` (which we don't use
-/// in the hot path because we need `AF_PACKET` + raw protocol) are
-/// kept referenced. Without this the import block would be dead.
-#[allow(dead_code)]
-fn _nix_imports_keepalive() {
-    let _ = (
-        AddressFamily::Inet,
-        SockType::Datagram,
-        SockFlag::SOCK_CLOEXEC,
-        MsgFlags::empty(),
-        |_: &SockaddrStorage| (),
-        socket::<nix::sys::socket::SockProtocol>,
-    );
 }
 
 // ---------------------------------------------------------------------------
