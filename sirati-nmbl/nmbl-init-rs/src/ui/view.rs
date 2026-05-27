@@ -374,6 +374,96 @@ pub fn render_key_echo(frame: &mut Frame<'_>, data: &KeyEchoScreenData<'_>) {
     );
 }
 
+/// State needed to render the pretty-shell screen.
+///
+/// Owned by the [`crate::ui::pretty_shell::PtyShellState`] driver; the
+/// renderer is a pure consumer of the snapshot. The grid is supplied
+/// pre-flattened as `rows_text` so this file can stay independent of
+/// `alacritty_terminal` (which is only compiled in when `image-splash`
+/// is on, but this struct is unconditionally visible here so the
+/// `view` module's tests don't fragment over feature flags).
+pub struct PtyShellScreenData<'a> {
+    /// Grid width in cells. Used to clamp / pad the rendered rows.
+    pub cols: u16,
+    /// Grid height in cells. Used for layout decisions only — the
+    /// actual rendered height comes from `rows_text.len()`.
+    pub rows: u16,
+    /// One pre-built `String` per grid row, in row-major order. The
+    /// renderer trusts the caller to have produced exactly `rows` of
+    /// `cols` chars each; degraded inputs (short rows, missing rows)
+    /// just render shorter lines without panicking.
+    pub rows_text: &'a [String],
+    /// `Grid::display_offset` — rows above the live tail currently
+    /// visible. Zero means the live grid is shown.
+    pub scroll_offset: usize,
+}
+
+/// Render the pretty-shell screen: header, bordered "Shell" box
+/// containing the alacritty grid snapshot, and a footer showing the
+/// scroll hint.
+///
+/// The bottom-right of the bordered box hosts the dim scroll hint
+/// (`Ctrl+Shift+Up/Dn scroll`); the bottom-left shows a scrollback
+/// indicator when `scroll_offset > 0`. ASCII glyphs only — the splash
+/// glyph cache rasterises ASCII printable plus a box-drawing subset
+/// (see `src/splash/glyph_cache.rs`), so Unicode arrows (U+2191 /
+/// U+2193) would render as blank cells on the framebuffer backend.
+pub fn render_pty_shell(frame: &mut Frame<'_>, data: &PtyShellScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    let block = Block::bordered().title("Pretty Shell");
+    let inner = block.inner(body);
+    frame.render_widget(block, body);
+
+    // Inner area drives the visible rows. We always paint from the
+    // first cell of each grid row at the inner top-left; rows that
+    // overflow the inner area are clipped by ratatui.
+    let row_count = (inner.height as usize).min(data.rows_text.len());
+    let col_count = inner.width as usize;
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(row_count);
+    for row in data.rows_text.iter().take(row_count) {
+        // Clamp to inner width so a stray wide row doesn't bleed into
+        // the right border. `chars().take(n)` is char-correct.
+        let truncated: String = row.chars().take(col_count).collect();
+        lines.push(Line::raw(truncated));
+    }
+    let para = Paragraph::new(Text::from(lines));
+    frame.render_widget(para, inner);
+
+    // Bottom-of-box hint. We paint two overlay rows on the last row of
+    // the bordered area: the scrollback indicator on the left, the
+    // scroll-hint on the right. Both use dim styling.
+    if inner.height > 0 {
+        let hint_row = inner.y.saturating_add(inner.height.saturating_sub(1));
+        let hint_rect = Rect::new(inner.x, hint_row, inner.width, 1);
+        // Left side: scroll indicator (only when scrolled).
+        if data.scroll_offset > 0 {
+            let indicator = format!("[scrolled {} lines]", data.scroll_offset);
+            let left = Paragraph::new(Span::styled(
+                indicator,
+                Style::default().add_modifier(Modifier::DIM),
+            ))
+            .alignment(Alignment::Left);
+            frame.render_widget(left, hint_rect);
+        }
+        // Right side: scroll hint.
+        let right_hint = "Ctrl+Shift+Up/Dn scroll  Ctrl+Shift+Q exit";
+        let right = Paragraph::new(Span::styled(
+            right_hint,
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+        .alignment(Alignment::Right);
+        frame.render_widget(right, hint_rect);
+    }
+
+    render_footer(
+        frame,
+        footer,
+        "exit shell or Ctrl+Shift+Q to return to emergency",
+    );
+}
+
 /// Render the passphrase modal over the body area.
 pub fn render_passphrase(frame: &mut Frame<'_>, data: &PassphraseScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
