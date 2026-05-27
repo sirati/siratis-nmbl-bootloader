@@ -524,7 +524,7 @@ fn main() -> ExitCode {
             source: std::io::Error::other("key-echo diagnostic mode terminated"),
             context: "key-echo".to_string(),
         };
-        match drop_to_emergency(Some(&mut *console), &config, err) {}
+        match drop_to_emergency(Some(console), &config, err) {}
     }
 
     let outcome = run_phases_post_console(&config, &mut *console)
@@ -536,7 +536,10 @@ fn main() -> ExitCode {
             // Hand the live boot console down to the emergency screen so
             // the operator keeps the same backend (splash or tty) they
             // saw during phase progress — no DRM/tty re-grab, no flicker.
-            match drop_to_emergency(Some(&mut *console), &config, err) {}
+            // Ownership transfer so the rescue dispatcher can drop the
+            // backend before `execve`, restoring VT text mode and
+            // termios.
+            match drop_to_emergency(Some(console), &config, err) {}
         }
     }
 }
