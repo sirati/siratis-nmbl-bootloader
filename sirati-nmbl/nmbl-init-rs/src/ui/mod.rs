@@ -39,6 +39,7 @@
 //! emergency shell.
 
 pub mod app;
+pub mod emergency;
 pub mod timeout;
 pub mod view;
 
@@ -58,8 +59,8 @@ use crate::error::{NmblError, Result};
 use crate::generations::Generation;
 use crate::sys::tty::{RawModeGuard, open_console};
 use crate::ui::view::{
-    EditScreenData, ListScreenData, PassphraseScreenData, render_edit, render_list,
-    render_passphrase,
+    EditScreenData, EmergencyScreenData, ListScreenData, PassphraseScreenData, render_edit,
+    render_emergency, render_list, render_passphrase,
 };
 
 /// Default console path used by the activation-phase passphrase modal
@@ -89,7 +90,8 @@ use crate::splash::types::CellDims;
 #[cfg(feature = "image-splash")]
 use crate::ui::timeout::TimeoutOutcome;
 
-pub use app::{App, Decision, Screen};
+pub use app::{App, Decision, EmergencyChoice, EmergencyItem, Screen};
+pub use emergency::run_emergency_screen;
 
 /// Slice we wait on input per iteration. Shared by the event loop and
 /// the countdown ticker so they have the same responsiveness profile
@@ -137,20 +139,53 @@ pub fn run_selector(config: &Config, generations: &[Generation]) -> Result<Decis
     select_generation_serial(config, generations)
 }
 
-/// Run the graphical boot selector backed by DRM + alacritty + SplashInput.
+/// Live splash-console handles. Holds everything `render_splash_frame`
+/// needs plus the input source; lets a caller paint a frame and poll
+/// for keys without owning the bring-up details.
 ///
-/// Returns `Ok(Some(decision))` on a clean operator choice, `Ok(None)`
-/// when the splash backend is unavailable (no DRM device, no font, etc.),
+/// Constructed via [`open_splash_console`]; the rest of the splash
+/// orchestration (`run_splash_selector`, `run_emergency_screen`) calls
+/// `render` and `poll` against this handle so the bring-up boilerplate
+/// is centralised.
+#[cfg(feature = "image-splash")]
+pub(crate) struct SplashConsole {
+    drm: drm::SplashDrm,
+    bg_scaled: Vec<u8>,
+    cache: glyph_cache::GlyphCache,
+    cell_dims: CellDims,
+    input: input::SplashInput,
+}
+
+#[cfg(feature = "image-splash")]
+impl SplashConsole {
+    /// Paint one frame of `app` to the splash framebuffer.
+    pub(crate) fn render(&mut self, app: &App<'_>) -> Result<()> {
+        render_splash_frame(
+            &mut self.drm,
+            &self.bg_scaled,
+            &self.cache,
+            self.cell_dims,
+            app,
+        )
+    }
+
+    /// Poll the splash input source for a key event.
+    pub(crate) fn poll(&mut self, timeout: Duration) -> Result<Option<crossterm::event::KeyEvent>> {
+        self.input.poll(timeout)
+    }
+}
+
+/// Bring up the splash backend so callers can render the TUI over it.
+///
+/// Returns `Ok(Some(console))` on a clean bring-up, `Ok(None)` when
+/// the splash backend is unavailable (no DRM device, no font, etc.),
 /// and `Err(_)` when bring-up failed mid-flight.
 #[cfg(feature = "image-splash")]
-fn run_splash_selector(
-    config: &Config,
-    generations: &[Generation],
-) -> Result<Option<Decision>> {
+pub(crate) fn open_splash_console(config: &Config) -> Result<Option<SplashConsole>> {
     // 1. Open the DRM card. Missing / inaccessible nodes map to
     //    `Ok(None)` inside `open_card_with_fallback`, so this
     //    propagates only real bring-up errors.
-    let mut drm = match drm::open_card_with_fallback(&config.splash.dri_path)? {
+    let drm = match drm::open_card_with_fallback(&config.splash.dri_path)? {
         Some(d) => d,
         None => return Ok(None),
     };
@@ -181,7 +216,30 @@ fn run_splash_selector(
     };
 
     // 4. Open /dev/tty1 for raw-mode keyboard input.
-    let mut input = input::SplashInput::open(Path::new(INPUT_TTY_PATH))?;
+    let input = input::SplashInput::open(Path::new(INPUT_TTY_PATH))?;
+
+    Ok(Some(SplashConsole {
+        drm,
+        bg_scaled,
+        cache,
+        cell_dims,
+        input,
+    }))
+}
+
+/// Run the graphical boot selector backed by DRM + alacritty + SplashInput.
+///
+/// Returns `Ok(Some(decision))` on a clean operator choice, `Ok(None)`
+/// when the splash backend is unavailable (no DRM device, no font, etc.),
+/// and `Err(_)` when bring-up failed mid-flight.
+#[cfg(feature = "image-splash")]
+fn run_splash_selector(
+    config: &Config,
+    generations: &[Generation],
+) -> Result<Option<Decision>> {
+    let Some(mut console) = open_splash_console(config)? else {
+        return Ok(None);
+    };
 
     // 5. Build the App. The headless terminal pipeline is built fresh
     //    per frame inside render_frame to bound SGR state to one frame.
@@ -192,10 +250,16 @@ fn run_splash_selector(
     let countdown = Duration::from_secs(u64::from(config.general.timeout_secs));
     let countdown_outcome = run_splash_countdown(
         countdown,
-        &mut input,
+        &mut console.input,
         &mut |secs| {
             app.countdown_remaining_secs = Some(secs);
-            let _ = render_splash_frame(&mut drm, &bg_scaled, &cache, cell_dims, &app);
+            let _ = render_splash_frame(
+                &mut console.drm,
+                &console.bg_scaled,
+                &console.cache,
+                console.cell_dims,
+                &app,
+            );
         },
     )?;
     app.countdown_remaining_secs = None;
@@ -211,10 +275,10 @@ fn run_splash_selector(
     let mut dirty = true;
     loop {
         if dirty {
-            render_splash_frame(&mut drm, &bg_scaled, &cache, cell_dims, &app)?;
+            console.render(&app)?;
             dirty = false;
         }
-        if let Some(key) = input.poll(POLL_SLICE)? {
+        if let Some(key) = console.poll(POLL_SLICE)? {
             // Intercept Ctrl+P from the list screen to demo the
             // passphrase dialog. Plain `p` is already a list-view
             // hotkey (toggles show_kernel_params) and a literal in
@@ -224,8 +288,13 @@ fn run_splash_selector(
                 && key.code == KeyCode::Char('p')
                 && key.modifiers == KeyModifiers::CONTROL
             {
-                let outcome =
-                    passphrase_demo::run(&mut drm, &bg_scaled, &cache, cell_dims, &mut input)?;
+                let outcome = passphrase_demo::run(
+                    &mut console.drm,
+                    &console.bg_scaled,
+                    &console.cache,
+                    console.cell_dims,
+                    &mut console.input,
+                )?;
                 crate::nmbl_info!("passphrase demo returned: {outcome:?}");
                 dirty = true;
                 continue;
@@ -372,6 +441,20 @@ pub(crate) fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_
                 buffer_len: buffer.len(),
             };
             render_passphrase(frame, &data);
+        }
+        Screen::Emergency {
+            message,
+            items,
+            selected,
+            ..
+        } => {
+            let data = EmergencyScreenData {
+                message,
+                items,
+                selected_index: *selected,
+                countdown_remaining_secs: app.countdown_remaining_secs,
+            };
+            render_emergency(frame, &data);
         }
     }
 }

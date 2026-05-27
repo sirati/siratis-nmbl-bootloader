@@ -3,14 +3,21 @@
 //! This module is one of the few crate sites permitted to replace the
 //! current process via `execve(2)` (see also `src/panic.rs` and
 //! `src/sys/activation.rs`). When any top-level phase returns `Err`,
-//! `main` routes the error through [`drop_to_emergency`], which prints
-//! an operator-facing banner including the full error chain and a
-//! variant-specific hint, then `execve`s the configured shell binary.
+//! `main` routes the error through [`drop_to_emergency`], which:
 //!
-//! On success the function does not return — the new shell process
-//! inherits PID 1. The signature uses [`std::convert::Infallible`] to
-//! document that contract at the type level: a caller that does
-//! `let _: Infallible = drop_to_emergency(...);` will never proceed.
+//! 1. Runs the [`crate::ui::run_emergency_screen`] TUI over the splash
+//!    backend (or a tty/serial fallback) to ask the operator whether
+//!    they want to reboot or get a shell.
+//! 2. On [`EmergencyChoice::Reboot`] calls `reboot(RB_AUTOBOOT)`.
+//! 3. On [`EmergencyChoice::Shell`] prints the operator-facing banner
+//!    including the full error chain and then `execve(2)`s the
+//!    configured shell binary.
+//!
+//! On success the function does not return — either `reboot` reboots
+//! the machine or the new shell process inherits PID 1. The signature
+//! uses [`std::convert::Infallible`] to document that contract at the
+//! type level: a caller that does `let _: Infallible = drop_to_emergency(...);`
+//! will never proceed.
 //!
 //! Failure modes are themselves "no-return": if the `execve(2)` fails
 //! (shell binary missing, ENOEXEC, EACCES, …) we print one last
@@ -26,12 +33,34 @@ use nix::unistd::execve;
 
 use crate::config::Config;
 use crate::error::{NmblError, format_chain};
+use crate::ui::{EmergencyChoice, run_emergency_screen};
 
 /// Print the operator-facing emergency banner and `execve(2)` the
 /// configured shell. Does not return on success; on `execve` failure
 /// halts the system rather than returning to the caller.
 pub fn drop_to_emergency(config: &Config, err: NmblError) -> Infallible {
-    print_banner(config, &err);
+    // Ask the operator what to do via the TUI. The TUI runs over the
+    // splash backend when available and falls back to a tty / serial
+    // prompt otherwise; on a 30s no-input timeout it returns Reboot.
+    let choice = run_emergency_screen(config, &err);
+
+    match choice {
+        EmergencyChoice::Reboot => {
+            eprintln!("[nmbl] operator (or timeout) chose reboot");
+            let _ = reboot(RebootMode::RB_AUTOBOOT);
+            // reboot() returned Err — fall through to the same halt
+            // path execve uses, so we still preserve Infallible.
+            halt_with("reboot(RB_AUTOBOOT) returned; halting");
+        }
+        EmergencyChoice::Shell => exec_shell(config, &err),
+    }
+}
+
+/// Execute the chosen-shell path: print the banner with the error
+/// chain so the operator has context, then `execve`. Does not return
+/// on success; on `execve` failure halts the system.
+fn exec_shell(config: &Config, err: &NmblError) -> Infallible {
+    print_banner(config, err);
 
     let shell_path = config.paths.shell.as_path();
     let argv0_bytes: Vec<u8> = shell_path
