@@ -730,6 +730,7 @@ dependencies = [
  "crossterm",
  "dhcproto",
  "flate2",
+ "getrandom 0.3.4",
  "libc",
  "lzma-rs",
  "nix",
