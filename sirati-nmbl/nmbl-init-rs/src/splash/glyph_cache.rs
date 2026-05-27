@@ -53,6 +53,9 @@ const BOX_DRAWING: &[char] = &[
 pub struct GlyphCache {
     cell_w: u32,
     cell_h: u32,
+    /// Ascent in pixels at the font size used to populate the cache.
+    /// Stored so callers can place the baseline at `cell_y + ascent`.
+    ascent: f32,
     glyphs: HashMap<(char, bool), GlyphBitmap>,
 }
 
@@ -75,15 +78,24 @@ fn fontdue_err(stage: &str, e: &str) -> NmblError {
 }
 
 /// Rasterize one glyph at `px` and return its bitmap. Returns
-/// `(width, height, coverage)` exactly as fontdue produced them, with
-/// no padding to the cell box (the compositor positions the glyph
-/// inside the cell).
-fn rasterize_regular(font: &Font, c: char, px: f32) -> GlyphBitmap {
+/// `(width, height, coverage)` exactly as fontdue produced them plus
+/// the per-glyph pixel offsets relative to the cell's top-left.
+///
+/// `ascent` is the font's horizontal ascent in pixels at `px`; the
+/// vertical offset is derived so the bitmap sits relative to the
+/// baseline at `cell_y + ascent`. fontdue's `Metrics::ymin` is the
+/// distance from the baseline to the bottom of the bitmap (positive
+/// upward in font coordinates), so the bitmap's top edge in screen
+/// pixels is `baseline_y - (ymin + height)`.
+fn rasterize_regular(font: &Font, c: char, px: f32, ascent: f32) -> GlyphBitmap {
     let (metrics, coverage) = font.rasterize(c, px);
+    let baseline_top = ascent.round() as i32 - metrics.ymin - metrics.height as i32;
     GlyphBitmap {
         width: metrics.width as u32,
         height: metrics.height as u32,
         coverage,
+        offset_x: metrics.xmin,
+        offset_y: baseline_top,
     }
 }
 
@@ -100,6 +112,8 @@ fn synthesize_bold(regular: &GlyphBitmap) -> GlyphBitmap {
             width: regular.width,
             height: regular.height,
             coverage: Vec::new(),
+            offset_x: regular.offset_x,
+            offset_y: regular.offset_y,
         };
     }
 
@@ -129,6 +143,8 @@ fn synthesize_bold(regular: &GlyphBitmap) -> GlyphBitmap {
         width: dst_w as u32,
         height: src_h as u32,
         coverage,
+        offset_x: regular.offset_x,
+        offset_y: regular.offset_y,
     }
 }
 
@@ -159,6 +175,7 @@ pub fn load(font_path: &Path, px: f32) -> Result<GlyphCache> {
         .horizontal_line_metrics(px)
         .ok_or_else(|| fontdue_err("horizontal_line_metrics", "missing"))?;
     let cell_h = round_half_up(line.ascent - line.descent + line.line_gap);
+    let ascent = line.ascent;
 
     if cell_w == 0 || cell_h == 0 {
         return Err(NmblError::Tui {
@@ -173,7 +190,7 @@ pub fn load(font_path: &Path, px: f32) -> Result<GlyphCache> {
     // ASCII printable 0x20..=0x7E.
     for code in 0x20u8..=0x7E {
         let c = code as char;
-        let regular = rasterize_regular(&font, c, px);
+        let regular = rasterize_regular(&font, c, px, ascent);
         let bold = synthesize_bold(&regular);
         glyphs.insert((c, false), regular);
         glyphs.insert((c, true), bold);
@@ -181,7 +198,7 @@ pub fn load(font_path: &Path, px: f32) -> Result<GlyphCache> {
 
     // Box-drawing subset.
     for &c in BOX_DRAWING {
-        let regular = rasterize_regular(&font, c, px);
+        let regular = rasterize_regular(&font, c, px, ascent);
         let bold = synthesize_bold(&regular);
         glyphs.insert((c, false), regular);
         glyphs.insert((c, true), bold);
@@ -190,6 +207,7 @@ pub fn load(font_path: &Path, px: f32) -> Result<GlyphCache> {
     Ok(GlyphCache {
         cell_w,
         cell_h,
+        ascent,
         glyphs,
     })
 }
@@ -203,6 +221,13 @@ impl GlyphCache {
             w: self.cell_w,
             h: self.cell_h,
         }
+    }
+
+    /// Pixel ascent at the loaded font size. Callers place the baseline
+    /// at `cell_y + ascent`. Returned as a raw `f32` because callers
+    /// already work in pixel coordinates and may round however suits.
+    pub fn ascent(&self) -> f32 {
+        self.ascent
     }
 
     /// Look up a pre-rasterized glyph. Falls back to the regular
