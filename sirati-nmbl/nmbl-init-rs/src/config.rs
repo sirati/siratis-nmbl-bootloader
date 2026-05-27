@@ -304,11 +304,27 @@ pub struct BootstrapBootFs {
     pub mountpoint: PathBuf,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapKernelModules {
     #[serde(default)]
     pub explicit: Vec<String>,
+
+    /// Mirrors [`KernelModules::modules_dir`]; defaults to
+    /// `/lib/modules` so the bootstrap stage and the full-config stage
+    /// agree on where to find `modules.dep` unless the operator overrides
+    /// both.
+    #[serde(default = "default_modules_dir")]
+    pub modules_dir: PathBuf,
+}
+
+impl Default for BootstrapKernelModules {
+    fn default() -> Self {
+        Self {
+            explicit: Vec::new(),
+            modules_dir: default_modules_dir(),
+        }
+    }
 }
 
 /// Optional network-rescue defaults. Tolerated even when network rescue
@@ -523,8 +539,34 @@ mountpoint = "/mnt/boot"
         );
         assert_eq!(cfg.bootstrap.boot_fs.options, "");
         assert!(cfg.bootstrap.kernel_modules.explicit.is_empty());
+        // Default mirrors `KernelModules::modules_dir` so the bootstrap
+        // and full-config stages agree on where `modules.dep` lives.
+        assert_eq!(
+            cfg.bootstrap.kernel_modules.modules_dir,
+            PathBuf::from("/lib/modules"),
+        );
         assert_eq!(cfg.bootstrap.rescue.default_url, "");
         assert_eq!(cfg.bootstrap.rescue.default_sha256, "");
+    }
+
+    #[test]
+    fn bootstrap_kernel_modules_dir_override_parses() {
+        let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+
+[bootstrap.kernel_modules]
+explicit    = ["vfat"]
+modules_dir = "/run/custom/modules"
+"#;
+        let cfg: BootstrapConfig = toml::from_str(toml).expect("override schema must parse");
+        assert_eq!(
+            cfg.bootstrap.kernel_modules.modules_dir,
+            PathBuf::from("/run/custom/modules"),
+        );
+        assert_eq!(cfg.bootstrap.kernel_modules.explicit, vec!["vfat"]);
     }
 
     #[test]
