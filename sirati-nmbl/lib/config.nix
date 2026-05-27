@@ -96,6 +96,21 @@ let
     inherit pkgs lib config nmblInit;
   };
 
+  # Render the embedded bootstrap TOML used in external-config mode.
+  # The bootstrap file points at /boot's device + fs + the relative path
+  # to the full config.toml on the boot partition. Helper owned by B.2.
+  nmblBootstrapToml = import ./bootstrap-toml.nix {
+    inherit pkgs lib config;
+  };
+
+  # Where the runtime config TOML lives at boot. In embedded mode it
+  # ships inside the initramfs; in external mode the initramfs only
+  # carries the bootstrap TOML and the full config is staged onto the
+  # boot partition by install-bootloader.nix. Default mirrors the Rust
+  # bootstrap default (`/nmbl/config.toml`) so the field is defensible
+  # if B.2's option tree hasn't been merged yet.
+  configLocation = cfg.configLocation or "embedded";
+
   # Determine legacy boot mode string for compatibility
   legacyBootMode =
     if bootstrapper.partition_table == "gpt" && bootstrapper.bootMode == "bios" then
@@ -142,7 +157,10 @@ in
     #
     # Contents are deliberately small:
     #   - /init                       : the static-musl Rust binary (PID 1)
-    #   - /etc/nmbl/config.toml       : runtime config it reads at startup
+    #   - /etc/nmbl/config.toml       : runtime config (embedded mode only)
+    #   - /etc/nmbl/bootstrap.toml    : minimal bootstrap config used to
+    #                                   locate the full config on /boot
+    #                                   (external mode only)
     #   - /bin/sh                     : busybox, used ONLY for the emergency
     #                                   shell on failure (never by /init itself)
     #   - /bin/blkid                  : util-linux's blkid, called by the
@@ -156,15 +174,32 @@ in
     # ./modules/activation.nix only when fileSystems require it.
     system.build.nmblInitramfs =
       let
+        # External-config mode embeds ONLY bootstrap.toml; the full
+        # config.toml is staged onto /boot by install-bootloader.nix.
+        # That separation is the whole point of external mode: edits to
+        # the runtime config no longer require an initramfs rebuild.
+        configContents =
+          if configLocation == "external" then
+            [
+              {
+                object = nmblBootstrapToml;
+                symlink = "/etc/nmbl/bootstrap.toml";
+              }
+            ]
+          else
+            [
+              {
+                object = nmblConfigToml;
+                symlink = "/etc/nmbl/config.toml";
+              }
+            ];
+
         baseContents = [
           {
             object = "${nmblInit}/bin/nmbl-init";
             symlink = "/init";
           }
-          {
-            object = nmblConfigToml;
-            symlink = "/etc/nmbl/config.toml";
-          }
+        ] ++ configContents ++ [
           {
             object = "${pkgs.busybox}/bin/busybox";
             symlink = "/bin/sh";
@@ -288,6 +323,8 @@ in
         cfg
         bootstrapper
         legacyBootMode
+        configLocation
+        nmblConfigToml
         ;
     };
 
