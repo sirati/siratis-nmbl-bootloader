@@ -5,5 +5,7 @@ pub mod kexec;
 pub mod loopdev;
 pub mod module;
 pub mod mount;
+#[cfg(feature = "image-splash")]
+pub mod pty;
 pub mod tty;
 pub mod uname;
