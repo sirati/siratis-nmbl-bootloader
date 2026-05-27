@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 
 use nix::mount::MsFlags;
 use nix::sys::reboot::{RebootMode, reboot};
-use nix::unistd::{chdir, chroot, execve};
+use nix::unistd::{chdir, chroot, dup2, execve};
 use serde::Deserialize;
 
 use crate::config::Config;
@@ -39,6 +39,11 @@ use crate::ui::console::Console;
 /// Shell binary expected inside the rescue squashfs. The squashfs ships
 /// busybox under `/bin/sh`, so this path is the post-switch-root one.
 const RESCUE_SHELL: &str = "/bin/sh";
+
+/// VT the splash UI activates (see `splash::INPUT_TTY_PATH`). The rescue
+/// shell is wired to the same VT so the operator sees the prompt on
+/// whatever display the splash was already painting (framebuffer / VNC).
+const RESCUE_TTY_PATH: &str = "/dev/tty1";
 
 /// Default basename of the rescue squashfs on the boot partition. Used
 /// when `[rescue].sfs_path` is absent from the operator's runtime
@@ -192,6 +197,60 @@ fn dispatch_external(
     })
 }
 
+/// Open `RESCUE_TTY_PATH` and redirect fds 0/1/2 onto it via `dup2(2)`,
+/// so the upcoming `execve(2)` lands a shell whose stdin/stdout/stderr
+/// reach the operator's screen (framebuffer / VNC) and keyboard rather
+/// than wherever `/dev/console` happens to point.
+///
+/// Why this matters: the kernel cmdline routinely sets multiple
+/// `console=` tokens (e.g. `console=tty0 console=ttyS0,115200`); the
+/// last entry wins for `/dev/console`. nmbl-init inherits fds 0/1/2
+/// pointing at the kernel's `/dev/console`, so without this redirect
+/// the rescue shell prints to serial — invisible to a VNC operator
+/// even though the busybox process is alive.
+///
+/// We target `/dev/tty1` because the splash code activates VT 1 via
+/// `VT_ACTIVATE` (see `splash::input`). After the boot console's `Drop`
+/// runs, VT 1 is foreground and in `KD_TEXT`, so writes to `/dev/tty1`
+/// land on the framebuffer the operator is watching.
+///
+/// Errors carry `Rescue { stage: "shell-tty-…" }` so the emergency
+/// banner names the failed step. Best-effort: on any error we surface
+/// it to the caller, which currently chooses to abort the exec rather
+/// than fall through to a deaf shell.
+fn redirect_stdio_to_rescue_tty() -> Result<()> {
+    // Read+Write so the same fd serves stdin (read) and stdout/stderr
+    // (write). O_NOCTTY: do not steal the controlling tty here; the
+    // shell can call setsid()/TIOCSCTTY itself if it wants.
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(RESCUE_TTY_PATH)
+        .map_err(|source| NmblError::Rescue {
+            stage: "shell-tty-open",
+            source: Box::new(NmblError::Io {
+                source,
+                context: format!("opening {RESCUE_TTY_PATH} for shell stdio"),
+            }),
+        })?;
+
+    use std::os::unix::io::AsRawFd;
+    let fd = tty.as_raw_fd();
+    for target in [0, 1, 2] {
+        dup2(fd, target).map_err(|source| NmblError::Rescue {
+            stage: "shell-tty-dup2",
+            source: Box::new(NmblError::Io {
+                source: io::Error::from_raw_os_error(source as i32),
+                context: format!("dup2({RESCUE_TTY_PATH}, fd={target})"),
+            }),
+        })?;
+    }
+    // `tty` is dropped here: its original fd is closed but fds 0/1/2
+    // remain valid dup'd references to the same open file description.
+    drop(tty);
+    Ok(())
+}
+
 /// `execve(2)` the operator-configured shell (`cfg.paths.shell`) with
 /// an empty environment. Mirrors the existing
 /// [`crate::shell::drop_to_emergency`] body byte-for-byte so the
@@ -229,6 +288,11 @@ pub fn exec_embedded(config: &Config) -> Result<Infallible> {
 
     let argv: [&CString; 1] = [&argv0_c];
     let env: [&CString; 0] = [];
+
+    // Re-wire fds 0/1/2 onto /dev/tty1 so the busybox shell renders on
+    // the framebuffer / VNC, not on whatever /dev/console points to
+    // (typically the last kernel `console=` token — usually serial).
+    redirect_stdio_to_rescue_tty()?;
 
     // execve only returns on error.
     let exec_err = execve(&path_c, &argv, &env).err();
@@ -298,6 +362,14 @@ pub fn halt_with_banner(cause: &NmblError) -> Result<Infallible> {
 /// path. On success this never returns — the process image is replaced
 /// by the rescue shell.
 pub(crate) fn switch_root_and_exec(new_root: &Path) -> Result<Infallible> {
+    // Step 0: re-wire fds 0/1/2 to /dev/tty1 BEFORE chroot, while the
+    // initramfs devtmpfs is still reachable. After chroot the rescue
+    // squashfs may not ship a populated /dev, and even when it does the
+    // tty1 device node belongs to the kernel's devtmpfs (a global VFS
+    // singleton) which is not visible inside a chrooted view. Dup'd
+    // fds, by contrast, survive chroot/execve untouched.
+    redirect_stdio_to_rescue_tty()?;
+
     // Step 1: cd into the new root (the mounted squashfs).
     chdir(new_root).map_err(|source| NmblError::Rescue {
         stage: "switch-root",
