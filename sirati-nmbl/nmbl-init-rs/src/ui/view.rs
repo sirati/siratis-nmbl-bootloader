@@ -278,8 +278,13 @@ pub fn render_boot_status(frame: &mut Frame<'_>, data: &BootStatusData<'_>) {
     render_header(frame, header, None);
 
     // Log panel. The bordered block subtracts 2 rows of chrome
-    // (top + bottom border), so we keep only the last `inner_rows`
-    // lines from the snapshot to avoid relying on ratatui's clipping.
+    // (top + bottom border). We pre-clip the source line list to
+    // `inner_rows` to bound copy work; ratatui still does the final
+    // visible-row clipping when a long line wraps under
+    // `Wrap { trim: false }`. We intentionally don't pay for a
+    // unicode-width-aware wrap count here — operator log lines are
+    // typically one row each, and the paragraph widget handles the
+    // overflow case correctly.
     let log_block = Block::bordered().title("log");
     let inner = log_block.inner(body);
     let inner_rows = inner.height as usize;

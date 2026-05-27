@@ -24,6 +24,7 @@ use crate::splash::input::SplashInput;
 use crate::splash::png;
 use crate::splash::scale;
 use crate::splash::types::CellDims;
+use crate::ui::POLL_SLICE;
 use crate::ui::app::App;
 use crate::ui::console::{Console, ConsoleKind};
 use crate::ui::render_splash_frame;
@@ -124,7 +125,13 @@ impl Console for SplashConsole {
     }
 
     fn poll_key(&mut self, timeout: Duration) -> Result<Option<KeyEvent>> {
-        self.input.poll(timeout)
+        // Cap the effective wait the same way [`TtyConsole`] does so
+        // backends are uniformly responsive to ticking countdowns and
+        // spinner animations. The caller-supplied timeout is honoured
+        // but never longer than POLL_SLICE per call; the trait doc
+        // pins this contract for both backends.
+        let slice = timeout.min(POLL_SLICE);
+        self.input.poll(slice)
     }
 
     fn size(&self) -> (u16, u16) {
