@@ -44,6 +44,10 @@ pkgs.runCommand "nmbl-rescue.sfs"
     # blob stays small even though the staging tree is large.
     mkdir -p root
     cp -aL ${rescueRoot}/. root/
+    # `cp -aL` preserves source permissions which are read-only in a Nix
+    # buildEnv. Relax them so subsequent operations (mkdir, mksquashfs)
+    # can modify the staging tree.
+    chmod -R u+w root/
 
     # `pivot_root(new_root, put_old)` needs `put_old` to exist inside the
     # squashfs image (the Rust disk-rescue code uses `oldroot`). Create the
