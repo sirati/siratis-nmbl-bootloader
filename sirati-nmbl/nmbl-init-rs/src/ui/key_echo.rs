@@ -52,8 +52,62 @@ pub fn run_key_echo_loop(console: &mut dyn Console) -> Result<()> {
             return Ok(());
         }
         app.push_key_echo_event(describe_key(&key));
+        // The raw bytes that drove this event live inside SplashInput
+        // and are teed to serial via `nmbl_warn!` (see
+        // `splash::input::log_raw_bytes`), but the [`Console`] trait
+        // intentionally has no "what bytes did you just read" accessor
+        // — adding one would burden every backend. As a substitute,
+        // we derive the canonical VT byte sequence for the parsed
+        // `KeyCode` and push that into the byte_log panel. It is the
+        // *expected* byte stream the parser would receive in K_XLATE
+        // mode for this code; mismatches against the
+        // `SplashInput raw bytes:` serial trace are themselves a
+        // diagnostic signal (parser disagreement, modifier loss, …).
+        app.push_key_echo_bytes(synthesise_bytes(&key));
         console.render(&app)?;
     }
+}
+
+/// Build the canonical K_XLATE byte sequence for a `KeyEvent`, formatted
+/// as space-separated lowercase hex (e.g. `"1b 5b 41"` for Up). For
+/// codes the parser doesn't have a 1:1 byte mapping for (function keys,
+/// modifiers, etc.) we return a textual `"<code>"` marker so the panel
+/// still surfaces the event.
+fn synthesise_bytes(key: &KeyEvent) -> String {
+    let bytes: Vec<u8> = match key.code {
+        KeyCode::Up => vec![0x1b, b'[', b'A'],
+        KeyCode::Down => vec![0x1b, b'[', b'B'],
+        KeyCode::Right => vec![0x1b, b'[', b'C'],
+        KeyCode::Left => vec![0x1b, b'[', b'D'],
+        KeyCode::Home => vec![0x1b, b'[', b'H'],
+        KeyCode::End => vec![0x1b, b'[', b'F'],
+        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
+        KeyCode::Enter => vec![0x0d],
+        KeyCode::Tab => vec![0x09],
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Char(c) if c.is_ascii() => {
+            // Ctrl+letter collapses to a C0 control byte; otherwise the
+            // ASCII codepoint is the byte value.
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && c.is_ascii_alphabetic()
+            {
+                let lc = c.to_ascii_lowercase() as u8;
+                vec![lc.wrapping_sub(0x60)]
+            } else {
+                vec![c as u8]
+            }
+        }
+        _ => return format!("<{:?}>", key.code),
+    };
+    let mut s = String::with_capacity(bytes.len().saturating_mul(3));
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// Return `true` for the exit chords: Ctrl+C and Ctrl+\\. Anything
@@ -99,6 +153,25 @@ mod tests {
         assert!(!is_exit_chord(&k));
         let k = KeyEvent::new(KeyCode::Esc, KeyModifiers::CONTROL);
         assert!(!is_exit_chord(&k));
+    }
+
+    #[test]
+    fn synthesise_bytes_known_codes() {
+        let plain_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert_eq!(synthesise_bytes(&plain_a), "61");
+
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(synthesise_bytes(&up), "1b 5b 41");
+
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(synthesise_bytes(&enter), "0d");
+
+        // Ctrl+c -> C0 0x03.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(synthesise_bytes(&ctrl_c), "03");
+
+        let bs = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(synthesise_bytes(&bs), "7f");
     }
 
     #[test]
