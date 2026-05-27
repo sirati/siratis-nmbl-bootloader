@@ -64,6 +64,97 @@ let
         # loader and loader_extra_args are null by default for qemu_kernel_invoke
       };
     };
+
+    # External-config (Option 1) variant: same UEFI+GRUB chain as
+    # test-gpt-uefi-grub, but the runtime config.toml lives on the boot
+    # partition. The initramfs ships only the bootstrap.toml descriptor
+    # emitted by lib/bootstrap-toml.nix; lib/install-bootloader.nix stages
+    # the full config.toml to /boot/nmbl/config.toml at install time.
+    test-external-config = {
+      name = "test-external-config";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "uefi";
+        loader = "grub";
+        loader_extra_args = {
+          timeout = 0;
+          extraConfig = ''
+            serial --unit=0 --speed=115200
+            terminal_input serial
+            terminal_output serial
+          '';
+        };
+      };
+      extraModules = [
+        ({ ... }: {
+          boot.nmbl.configLocation = "external";
+          # make-disk-image.nix does not set GPT partlabels, so override
+          # the default `/dev/disk/by-partlabel/disk-main-ESP` to the raw
+          # virtio device path. vda1 is the FAT32 ESP under the hybrid
+          # partition layout used by vm-config.nix.
+          boot.nmbl.bootstrap.bootFs.device = "/dev/vda1";
+        })
+      ];
+    };
+
+    # External-rescue (Option 2) variant: same UEFI+GRUB chain as
+    # test-gpt-uefi-grub, but rescue tools live in nmbl-rescue.sfs on the
+    # boot partition rather than embedded in the initramfs. F.4's VM test
+    # boots into the rescue shell and runs `strace --version`.
+    test-external-rescue = {
+      name = "test-external-rescue";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "uefi";
+        loader = "grub";
+        loader_extra_args = {
+          timeout = 0;
+          extraConfig = ''
+            serial --unit=0 --speed=115200
+            terminal_input serial
+            terminal_output serial
+          '';
+        };
+      };
+      extraModules = [
+        ({ pkgs, ... }: {
+          boot.nmbl.rescue.mode = "external";
+          # strace is the F.4 smoke-test target; busybox provides /bin/sh
+          # which the Rust loader requires inside the squashfs tree.
+          boot.nmbl.rescue.squashfsContents = [ pkgs.busybox pkgs.strace ];
+        })
+      ];
+    };
+
+    # External-rescue + network variant: extends test-external-rescue
+    # with the network-rescue feature so F.5's VM test can verify the
+    # HTTP fallback prompt comes up. defaultUrl is left empty so the
+    # operator types the URL at the prompt; virtio_net is auto-pulled
+    # by lib/modules/nic-modules.nix from the qemu-guest profile.
+    test-external-rescue-network = {
+      name = "test-external-rescue-network";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "uefi";
+        loader = "grub";
+        loader_extra_args = {
+          timeout = 0;
+          extraConfig = ''
+            serial --unit=0 --speed=115200
+            terminal_input serial
+            terminal_output serial
+          '';
+        };
+      };
+      extraModules = [
+        ({ pkgs, ... }: {
+          boot.nmbl.rescue.mode = "external";
+          boot.nmbl.rescue.squashfsContents = [ pkgs.busybox pkgs.strace ];
+          boot.nmbl.rescue.network = true;
+          boot.nmbl.rescue.defaultUrl = "";
+        })
+      ];
+    };
   } // nixpkgs.lib.optionalAttrs (disko != null) {
     # LUKS-password variant: same UEFI+GRUB chain as test-gpt-uefi-grub,
     # but vda3 is a LUKS container that NMBL unlocks via the TUI passphrase
