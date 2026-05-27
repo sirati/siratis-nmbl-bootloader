@@ -251,7 +251,10 @@ in
     extraInitrdKernelModules = [
       "dm_mod"
       "dm-crypt"
-      "aes"
+      "aesni_intel"
+      "ecb"
+      "xts"
+      "sha256_generic"
     ];
     # Linux 6.6 trips a crypto-API init bug in dm-crypt; use latest.
     nmblKernelPackage = pkgs.linuxPackages_latest.kernel;
