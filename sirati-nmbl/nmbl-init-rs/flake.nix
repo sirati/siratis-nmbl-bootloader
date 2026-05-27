@@ -169,13 +169,15 @@
           };
 
           # Enforce that the only sites that may exec a new process or
-          # invoke std::process::Command are the three allow-listed
-          # files: the emergency-shell exec site, the panic-recovery
-          # re-exec site, and the activation-runner fork/exec helper.
+          # invoke std::process::Command are the allow-listed files:
+          # the emergency-shell exec site, the panic-recovery re-exec
+          # site, the activation-runner fork/exec helper, the rescue
+          # dispatcher's embedded execve, and the disk/network rescue
+          # pivot-into-shell sites.
           nmbl-init-no-exec = pkgs.runCommand "nmbl-init-no-exec" { } ''
             cd ${./.}
             if grep -RIn -E '\bCommand::|\bexecve\(' src/ \
-                 | grep -v -E '^src/(shell\.rs|panic\.rs|sys/activation\.rs)'; then
+                 | grep -v -E '^src/(shell\.rs|panic\.rs|sys/activation\.rs|rescue/(mod|disk|net)\.rs)'; then
               echo "ERROR: Command:: or execve() found outside allowlisted files"
               exit 1
             fi
