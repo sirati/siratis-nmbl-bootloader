@@ -163,7 +163,7 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// the 30s budget).
 pub fn mount_system_filesystems(
     config: &Config,
-    reporter: &mut BootReporter<'_, '_>,
+    reporter: &mut BootReporter<'_>,
 ) -> Result<()> {
     let system_root = config.paths.system_root.as_path();
     ensure_dir(system_root)?;
@@ -189,7 +189,7 @@ pub fn mount_system_filesystems(
             dev,
             DEFAULT_DEVICE_TIMEOUT,
             "phase 3b: waiting for",
-            Some(reporter as &mut dyn ProgressSink),
+            Some(&mut *reporter),
         )?;
 
         let target = resolve_mountpoint(system_root, entry);

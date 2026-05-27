@@ -59,13 +59,11 @@ const PSEUDO_FILESYSTEMS: &[PseudoFs] = &[
 /// `reporter` carries the live boot console; we surface the current
 /// pseudo-fs being mounted as the boot-status phase label so the
 /// operator sees what we're working on.
-pub fn mount_pseudo_filesystems(reporter: &mut BootReporter<'_, '_>) -> Result<()> {
+pub fn mount_pseudo_filesystems(reporter: &mut BootReporter<'_>) -> Result<()> {
     for fs in PSEUDO_FILESYSTEMS {
         let target = Path::new(fs.target);
-        // Best-effort: a render failure here must not abort the mount
-        // chain. The reporter's render path swallows non-critical errors
-        // but we still defensively ignore Err so a broken console can't
-        // brick a real boot.
+        // We swallow render errors here because pseudo-fs mounts are
+        // critical and a flaky DRM ioctl should not abort phase 1.
         let _ = reporter.set_phase(format!("phase 1: mounting {}", fs.target));
         ensure_dir(target)?;
         match mount_fs(None, target, fs.fstype, fs.options) {
