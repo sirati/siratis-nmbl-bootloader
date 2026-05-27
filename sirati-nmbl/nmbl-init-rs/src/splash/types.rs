@@ -13,6 +13,15 @@ pub struct CellDims {
     pub cell_h: u32,
 }
 
+/// Pixel size of a single terminal cell, derived from the font.
+/// Independent of how many cells fit in the framebuffer (that's
+/// [`CellDims`]).
+#[derive(Copy, Clone, Debug)]
+pub struct CellSize {
+    pub w: u32,
+    pub h: u32,
+}
+
 /// 8-bit RGBA color. simpledrm exposes XRGB8888 so the alpha byte is
 /// ignored on flip, but the compositor uses it for src-over math.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]

@@ -23,7 +23,7 @@ use std::path::Path;
 use fontdue::{Font, FontSettings};
 
 use crate::error::{NmblError, Result};
-use crate::splash::types::{CellDims, GlyphBitmap};
+use crate::splash::types::{CellSize, GlyphBitmap};
 
 /// Box-drawing glyphs ratatui renders with the default `Borders` and
 /// `BorderType::Plain`. Kept in one constant so the test set and the
@@ -191,15 +191,13 @@ pub fn load(font_path: &Path, px: f32) -> Result<GlyphCache> {
 }
 
 impl GlyphCache {
-    /// Cell dimensions derived from the loaded font. `cols`/`rows`
-    /// are left at zero; the compositor divides the framebuffer
-    /// dimensions by `cell_w`/`cell_h` to fill them in.
-    pub fn cell_dims(&self) -> CellDims {
-        CellDims {
-            cols: 0,
-            rows: 0,
-            cell_w: self.cell_w,
-            cell_h: self.cell_h,
+    /// Pixel size of one terminal cell. The compositor divides the
+    /// framebuffer dimensions by these values to derive a full
+    /// [`crate::splash::types::CellDims`] at integration time.
+    pub fn cell_size(&self) -> CellSize {
+        CellSize {
+            w: self.cell_w,
+            h: self.cell_h,
         }
     }
 
@@ -244,11 +242,9 @@ mod tests {
             Err(e) => panic!("load() failed: {e}"),
         };
 
-        let dims = cache.cell_dims();
-        assert!(dims.cell_w > 0, "cell_w must be positive");
-        assert!(dims.cell_h > 0, "cell_h must be positive");
-        assert_eq!(dims.cols, 0);
-        assert_eq!(dims.rows, 0);
+        let size = cache.cell_size();
+        assert!(size.w > 0, "cell width must be positive");
+        assert!(size.h > 0, "cell height must be positive");
 
         assert!(
             matches!(cache.get('A', false), Some(g) if g.width > 0 && g.height > 0),
