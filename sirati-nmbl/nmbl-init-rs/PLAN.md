@@ -669,7 +669,7 @@ falls through to the legacy single-tier path when it is absent.
   in the initramfs. Legacy v1 behaviour preserved.
 - **`external`** — `nmbl-rescue.sfs` is built at install time from
   `boot.nmbl.rescue.squashfsContents` (default: `busybox-sandbox-shell`,
-  `cryptsetup`, `lvm2`, `mdadm`) via `pkgs.squashfs-tools-ng` with
+  `cryptsetup`, `lvm2`, `mdadm`) via `pkgs.squashfsTools` (`mksquashfs`) with
   zstd-19 compression. The blob is staged onto the boot partition.
   `/init` loop-mounts it on demand via `LOOP_CTL_GET_FREE` +
   `LOOP_CONFIGURE`, then `switch_root`s into it (chdir →
@@ -691,7 +691,8 @@ process image is replaced by the rescue shell in the squashfs.
 the rescue squashfs. It bundles the operator-configured NIC
 drivers plus the NIC drivers already declared by
 `hardware-configuration.nix`, and enables the `network-rescue`
-Cargo feature in `nmbl-init`. That feature pulls in:
+Cargo feature in `nmbl-init`. That feature activates the optional
+deps `dep:dhcproto`, `dep:sha2`, and `dep:getrandom`, and pulls in:
 
 - `src/net/iface.rs` — NETLINK enumerate + bring-up + carrier wait.
 - `src/net/dhcp.rs` — one-shot DHCPv4 client (DISCOVER → OFFER →
@@ -711,7 +712,7 @@ Cargo feature in `nmbl-init`. That feature pulls in:
 
 The whole feature is conditionally compiled. With
 `rescue.network = false` (the default) none of `sha2`, `dhcproto`,
-or the network modules ship — store-path dedup keeps the
+`getrandom`, or the network modules ship — store-path dedup keeps the
 binary byte-identical with the embedded-rescue case.
 
 Operator-confirmed SHA-256 substitutes for transport integrity, so
