@@ -8,11 +8,21 @@
 //!   panic hook's `execve` of `/proc/self/exe`). Reads the report,
 //!   loads config best-effort, drops straight to the emergency shell
 //!   with [`NmblError::Panicked`].
+//!
+//! Every no-return syscall — `execve(2)`, `reboot(RB_AUTOBOOT)`,
+//! `reboot(RB_HALT_SYSTEM)`, `reboot(RB_KEXEC)` — funnels through
+//! [`execute_terminal_action`]. Inner layers return a
+//! [`TerminalAction`] value; control unwinds back to `main`, every
+//! stack-allocated `Drop` runs (Console restores KD_TEXT, RawModeGuard
+//! restores termios, glyph caches free, …), and only then does
+//! `execute_terminal_action` fire the syscall.
 
+use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nix::sys::reboot::{RebootMode, reboot};
+use nix::unistd::execve;
 
 use nmbl_init::activation::{KeyInjection, run_all_activations};
 use nmbl_init::boot::kexec_into;
@@ -23,8 +33,11 @@ use nmbl_init::generations::scan_generations;
 use nmbl_init::modules::{load_early_modules, load_explicit_modules, load_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
 use nmbl_init::panic::install_panic_hook;
-use nmbl_init::shell::drop_to_emergency;
+use nmbl_init::shell::{
+    drop_to_emergency, open_console_and_drop_to_emergency, print_banner, print_halt_banner,
+};
 use nmbl_init::sys::{blkid, mount as sys_mount};
+use nmbl_init::terminal::{TerminalAction, redirect_stdio_for_execve};
 use nmbl_init::ui::console::{Console, NoopConsole, open_console};
 use nmbl_init::ui::key_echo::run_key_echo_loop;
 use nmbl_init::ui::{BootReporter, Decision, TuiPasswordSupplier, run_selector};
@@ -124,10 +137,9 @@ fn load_config_lenient(path: &std::path::Path) -> Config {
     }
 }
 
-/// Run the panic-recovery flow. Returns `Infallible` to document the
-/// non-return — [`drop_to_emergency`] either `execve`s the shell or
-/// halts the system.
-fn recover_from_panic(args: Args, report_path: PathBuf) -> std::convert::Infallible {
+/// Run the panic-recovery flow. Returns a [`TerminalAction`] the
+/// dispatcher in `main` performs after the call stack has unwound.
+fn recover_from_panic(args: Args, report_path: PathBuf) -> (TerminalAction, Config) {
     let report = read_panic_report(&report_path);
     let config = load_config_lenient(&args.config_path);
     log::init(nmbl_init::log::Verbosity::Verbose);
@@ -135,7 +147,11 @@ fn recover_from_panic(args: Args, report_path: PathBuf) -> std::convert::Infalli
     nmbl_warn!("panic recovery mode: report at {}", report_path.display());
     nmbl_warn!("panic report follows:\n{report}");
 
-    drop_to_emergency(None, &config, NmblError::Panicked { report_path })
+    let action = open_console_and_drop_to_emergency(
+        &config,
+        NmblError::Panicked { report_path },
+    );
+    (action, config)
 }
 
 /// Phase 1: mount /proc, /sys, /dev. Lives at the top of `main` so the
@@ -293,7 +309,7 @@ fn select_and_act(
     config: &Config,
     console: &mut dyn Console,
     key_injections: &[KeyInjection],
-) -> Result<()> {
+) -> Result<TerminalAction> {
     nmbl_info!("phase 4: scan generations");
     let generations = {
         let mut reporter = BootReporter::new(console, "phase 4: scan generations");
@@ -318,11 +334,7 @@ fn select_and_act(
                     context: "decision dispatch".to_string(),
                 });
             };
-            // kexec_into returns Result<Infallible> — on success it
-            // does not return. Match against the Infallible so a
-            // future signature change becomes a compile error here
-            // rather than a silently-ignored return value.
-            match kexec_into(config, target, cmdline_override.as_deref(), key_injections)? {}
+            kexec_into(config, target, cmdline_override.as_deref(), key_injections)
         }
         Decision::Shell => Err(NmblError::Io {
             source: std::io::Error::other("operator chose emergency shell"),
@@ -330,20 +342,101 @@ fn select_and_act(
         }),
         Decision::Reboot => {
             nmbl_info!("operator chose reboot");
-            let _err = reboot(RebootMode::RB_AUTOBOOT);
-            // reboot only returns on failure.
-            Err(NmblError::Io {
-                source: std::io::Error::other("reboot(RB_AUTOBOOT) returned"),
-                context: "decision dispatch".to_string(),
-            })
+            Ok(TerminalAction::Reboot)
         }
     }
 }
 
+/// Dispatch the final [`TerminalAction`] produced by the inner
+/// layers. Single point of `execve(2)` / `reboot(2)` / `reboot
+/// (RB_KEXEC)` in the entire crate — by the time control reaches
+/// here every `Drop` has run via normal stack unwinding, so the
+/// freshly-execve'd shell or freshly-kexec'd kernel sees a clean VT.
+///
+/// All four variants diverge on success; on failure they fall through
+/// to [`halt_final`] which performs a final `reboot(RB_HALT_SYSTEM)`
+/// (or `libc::_exit` if the kernel refuses).
 #[allow(
-    unreachable_code,
-    reason = "drop_to_emergency / recover_from_panic return Infallible; the empty match consuming an uninhabited type is the canonical idiom"
+    clippy::needless_pass_by_value,
+    reason = "TerminalAction is consumed exactly once at the top of main; \
+              taking by value makes the move explicit"
 )]
+fn execute_terminal_action(action: TerminalAction) -> ! {
+    match action {
+        TerminalAction::Reboot => {
+            eprintln!("[nmbl] operator (or timeout) chose reboot");
+            let _ = reboot(RebootMode::RB_AUTOBOOT);
+            halt_final("reboot(RB_AUTOBOOT) returned; halting")
+        }
+        TerminalAction::HaltWithBanner { cause } => {
+            print_halt_banner(&cause);
+            halt_final("halt-with-banner")
+        }
+        TerminalAction::Execve {
+            path,
+            argv,
+            env,
+            banner,
+        } => {
+            if let Some(b) = banner {
+                print_banner(&b);
+            }
+            // Re-open /dev/console and dup2 it onto 0/1/2 so the
+            // freshly-execve'd shell renders on the operator's primary
+            // console (framebuffer for head, ttyS0 for serial). Every
+            // boot-console `Drop` has already fired by now via normal
+            // stack unwinding, so the fds we just opened are the ones
+            // the shell will inherit. On failure we cannot recover —
+            // an execve into invisibility is worse than halting with a
+            // banner — so we surface the redirect error through
+            // halt_final instead of charging ahead.
+            if let Err(err) = redirect_stdio_for_execve() {
+                eprintln!(
+                    "[nmbl] cannot redirect stdio before execve: {}",
+                    format_chain(&err as &dyn std::error::Error)
+                );
+                halt_final("stdio redirect failed; halting")
+            }
+            let argv_refs: Vec<&CString> = argv.iter().collect();
+            let env_refs: Vec<&CString> = env.iter().collect();
+            let _ = execve(&path, &argv_refs, &env_refs);
+            halt_final("execve returned; halting")
+        }
+        TerminalAction::Kexec => {
+            nmbl_info!("kexec: handing off to new kernel");
+            // sys::kexec::execute returns Result<Infallible>; either
+            // branch surfaces an error we cannot recover from at this
+            // point (the image was already loaded and mounts were
+            // detached), so fall through to halt_final.
+            match nmbl_init::sys::kexec::execute() {
+                Ok(infallible) => match infallible {},
+                Err(err) => {
+                    eprintln!(
+                        "[nmbl] kexec execute returned: {}",
+                        format_chain(&err as &dyn std::error::Error)
+                    );
+                    halt_final("kexec returned; halting")
+                }
+            }
+        }
+    }
+}
+
+/// Print a one-line final-fallback message and halt. Diverges via
+/// `reboot(RB_HALT_SYSTEM)` on success or `libc::_exit(1)` if the
+/// kernel refuses (lacking CAP_SYS_BOOT in a sandbox, not PID 1, …).
+fn halt_final(reason: &str) -> ! {
+    eprintln!("[nmbl] {reason}");
+    let _ = reboot(RebootMode::RB_HALT_SYSTEM);
+    // SAFETY: libc::_exit is async-signal-safe and unconditionally
+    // terminates the process; no crate wraps it (rustix issue #844).
+    unsafe { libc::_exit(1) };
+}
+
+/// The orchestrator. Returns `ExitCode` so the `--validate-config`
+/// path can exit normally; every other path either reaches
+/// [`execute_terminal_action`] (which diverges) or returns
+/// `ExitCode::SUCCESS` after a normal `Ok(())` outcome.
 fn main() -> ExitCode {
     let args = parse_args();
 
@@ -368,7 +461,10 @@ fn main() -> ExitCode {
     if let Some(report_path) = args.errored_report.clone() {
         // Note: the panic hook must NOT be re-installed here — a
         // second panic during recovery should crash, not loop.
-        match recover_from_panic(args, report_path) {}
+        let (action, _config) = recover_from_panic(args, report_path);
+        // _config drops here; action moves into the dispatcher
+        // below by value.
+        execute_terminal_action(action);
     }
 
     // Two-tier vs single-tier branch. The bootstrap.toml file is shipped
@@ -391,7 +487,7 @@ fn main() -> ExitCode {
     // boot filesystem, so seed from `recovery_default` and replace
     // later. In single-tier mode load from `args.config_path` with a
     // recovery-default fallback as before.
-    let (mut config, load_err): (Config, Option<NmblError>) = if bootstrap_mode {
+    let (config, load_err): (Config, Option<NmblError>) = if bootstrap_mode {
         (Config::recovery_default(), None)
     } else {
         match Config::load(&args.config_path) {
@@ -414,18 +510,50 @@ fn main() -> ExitCode {
     log::init(config.general.verbosity);
     nmbl_info!("nmbl-init starting");
 
+    // Compute the TerminalAction from the inner layers and let the
+    // single `execute_terminal_action` site at the bottom of `main`
+    // fire the syscall. Every intermediate stack frame is dropped
+    // before that call, which is what restores VT mode and termios
+    // for the freshly-execve'd shell.
+    let action = match run_inner(config, load_err, bootstrap_probe, bootstrap_path, &args) {
+        Ok(action) => action,
+        Err(boxed) => {
+            // Unrecoverable: render the emergency screen, drop to
+            // shell. drop_to_emergency itself returns a
+            // TerminalAction so this collapses to a single path
+            // back to the dispatcher.
+            let (err, config) = *boxed;
+            open_console_and_drop_to_emergency(&config, err)
+        }
+    };
+
+    // Drop everything left on this stack frame, then fire the
+    // syscall. `execute_terminal_action` diverges so the trailing
+    // ExitCode is unreachable in practice; it only exists to satisfy
+    // the signature of `main`.
+    execute_terminal_action(action);
+}
+
+/// Helper: run the boot phases and return the resulting
+/// [`TerminalAction`]. On phase failure returns
+/// `Err(Box::new((err, config)))` so the caller can hand the live
+/// config to `open_console_and_drop_to_emergency`. The error variant
+/// is boxed because `(NmblError, Config)` is large enough to trip
+/// clippy's `result_large_err` lint on every recoverable return path.
+///
+/// `config` is taken by value because it is mutated in bootstrap
+/// mode (Phase 0.5 replaces it with the real config from `/boot`).
+fn run_inner(
+    mut config: Config,
+    load_err: Option<NmblError>,
+    bootstrap_probe: std::io::Result<bool>,
+    bootstrap_path: &Path,
+    _args: &Args,
+) -> std::result::Result<TerminalAction, Box<(NmblError, Config)>> {
     if let Some(err) = load_err {
-        // No console is open yet at this point — drop_to_emergency will
-        // open a tty console itself (panic_recovery=true so it skips the
-        // splash bring-up).
-        match drop_to_emergency(None, &config, err) {}
+        return Err(Box::new((err, config)));
     }
 
-    // Probe error reported by `try_exists` — neither "exists" nor "does
-    // not exist". Route into the bootstrap failure path with a
-    // descriptive stage so the emergency-shell banner explains what was
-    // attempted instead of resurfacing the legacy-mode "no
-    // /etc/nmbl/config.toml" error.
     if let Err(probe_err) = bootstrap_probe {
         let err = NmblError::Bootstrap {
             stage: "probe",
@@ -434,8 +562,9 @@ fn main() -> ExitCode {
                 context: format!("probing {}", bootstrap_path.display()),
             }),
         };
-        match drop_to_emergency(None, &config, err) {}
+        return Err(Box::new((err, config)));
     }
+    let bootstrap_mode = bootstrap_path.try_exists().unwrap_or(false);
 
     // Phase 1 lives at the top of `main` so Phase 0.5 (when active) and
     // Phase 2a both see /proc, /sys, /dev already mounted. The reporter
@@ -446,9 +575,7 @@ fn main() -> ExitCode {
     {
         let mut reporter = BootReporter::new(&mut noop, "phase 1: mount pseudo-filesystems");
         if let Err(err) = run_phase_1(&mut reporter) {
-            // No live console yet — drop_to_emergency will open a tty
-            // console itself (panic_recovery=true so it skips splash).
-            match drop_to_emergency(None, &config, err) {}
+            return Err(Box::new((err, config)));
         }
     }
 
@@ -469,7 +596,7 @@ fn main() -> ExitCode {
             // boot_fs may have been mounted before the failure — the
             // emergency shell wants to see it, so we do NOT unmount on
             // this path.
-            Err(err) => match drop_to_emergency(None, &config, err) {},
+            Err(err) => return Err(Box::new((err, config))),
         }
     }
 
@@ -481,28 +608,19 @@ fn main() -> ExitCode {
         let mut reporter = BootReporter::new(&mut noop, "phase 2a: load early kernel modules");
         if let Err(err) = run_phase_2a(&config, &mut reporter) {
             nmbl_warn!("phase 2a (early modules) failed: {err}");
-            match drop_to_emergency(None, &config, err) {}
+            return Err(Box::new((err, config)));
         }
     }
 
     // Bring the boot console up AFTER phase 2a so the splash backend
     // can attach to the DRM card the early modules just brought up.
     // The same backend is reused all the way through the boot-menu
-    // selector and the emergency screen on phase failure —
-    // `drop_to_emergency` takes the live console handle when one
-    // exists.
-    //
-    // If we cannot bring up ANY console at all, log it and route the
-    // bring-up error through the emergency shell; `drop_to_emergency`
-    // will open a fresh tty console itself (forced past splash via
-    // panic_recovery=true), so the operator still gets a screen.
+    // selector and the emergency screen on phase failure.
     let mut console: Box<dyn Console> = match open_console(&config, false) {
         Ok(c) => c,
         Err(err) => {
             nmbl_warn!("boot console bring-up failed: {err}");
-            // No console available; drop_to_emergency opens a tty
-            // console itself (panic_recovery=true so it skips splash).
-            match drop_to_emergency(None, &config, err) {}
+            return Err(Box::new((err, config)));
         }
     };
 
@@ -524,22 +642,28 @@ fn main() -> ExitCode {
             source: std::io::Error::other("key-echo diagnostic mode terminated"),
             context: "key-echo".to_string(),
         };
-        match drop_to_emergency(Some(console), &config, err) {}
+        // Hand the live console down to drop_to_emergency so the
+        // emergency UI paints through the same backend.
+        return Ok(drop_to_emergency(console, &config, err));
     }
 
-    let outcome = run_phases_post_console(&config, &mut *console)
-        .and_then(|injections| select_and_act(&config, &mut *console, &injections));
-
-    match outcome {
-        Ok(()) => ExitCode::from(0),
+    match run_phases_post_console(&config, &mut *console)
+        .and_then(|injections| select_and_act(&config, &mut *console, &injections))
+    {
+        Ok(action) => {
+            // `console` falls out of scope on this return, running
+            // SplashConsole/TtyConsole Drop (KD_TEXT restore, termios
+            // reset) before the no-return syscall fires in main.
+            let _ = console;
+            Ok(action)
+        }
         Err(err) => {
-            // Hand the live boot console down to the emergency screen so
-            // the operator keeps the same backend (splash or tty) they
-            // saw during phase progress — no DRM/tty re-grab, no flicker.
-            // Ownership transfer so the rescue dispatcher can drop the
-            // backend before `execve`, restoring VT text mode and
-            // termios.
-            match drop_to_emergency(Some(console), &config, err) {}
+            // Hand the live boot console down to the emergency screen
+            // so the operator keeps the same backend (splash or tty)
+            // they saw during phase progress — no DRM/tty re-grab, no
+            // flicker. drop_to_emergency itself drops the console
+            // before returning, by way of normal scope exit.
+            Ok(drop_to_emergency(console, &config, err))
         }
     }
 }
