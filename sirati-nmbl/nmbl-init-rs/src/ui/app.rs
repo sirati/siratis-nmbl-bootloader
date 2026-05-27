@@ -2,11 +2,13 @@
 //! and mutates [`App`]; the surrounding `ui::mod` is responsible for
 //! actually polling input and rendering frames via [`crate::ui::view`].
 //!
-//! The state machine has four screens:
+//! The state machine has five screens:
 //! - [`Screen::List`]    — generation picker, default landing page.
 //! - [`Screen::Editing`] — single-line kernel-cmdline editor.
 //! - [`Screen::Passphrase`] — modal LUKS prompt driven by activation.rs.
 //! - [`Screen::Emergency`] — boot-failed picker between Reboot and Shell.
+//! - [`Screen::BootStatus`] — non-interactive progress + log view shown
+//!   during early boot phases (before the selector / activation).
 //!
 //! When the user makes a final decision the `decision` field is set
 //! and [`App::on_key`] returns `true`, signalling the run loop to exit.
@@ -54,8 +56,25 @@ pub struct EmergencyItem {
     pub choice: EmergencyChoice,
 }
 
+/// Per-frame snapshot shown by [`Screen::BootStatus`].
+///
+/// Owned by the App so callers can mutate fields between frames via the
+/// `set_*` / `tick_*` helpers on [`App`]; the renderer is purely a
+/// consumer of this struct.
+pub struct BootStatusData<'a> {
+    /// Current phase label, e.g. "phase 3: storage activations" or
+    /// "waiting for /dev/disk/by-uuid/X (12s/30s)".
+    pub phase: std::borrow::Cow<'a, str>,
+    /// Snapshot of the recent log lines (already gathered by caller).
+    /// Most recent last; the renderer clips to the visible panel.
+    pub log_lines: Vec<String>,
+    /// Spinner phase. Caller increments via [`App::tick_boot_spinner`];
+    /// renderer maps to a glyph by `spinner_frame % SPINNER_FRAMES`.
+    pub spinner_frame: u8,
+}
+
 /// Which screen the App is currently presenting.
-pub enum Screen {
+pub enum Screen<'a> {
     List,
     Editing {
         /// Index into the generations slice.
@@ -83,17 +102,37 @@ pub enum Screen {
         /// Final choice the operator committed to; `None` until Enter.
         chosen: Option<EmergencyChoice>,
     },
+    /// Non-interactive progress view shown during early boot. The
+    /// caller drives the phase label, log snapshot, and spinner tick;
+    /// key events are absorbed but never produce a [`Decision`].
+    BootStatus(BootStatusData<'a>),
 }
 
 /// Top-level TUI app state.
 pub struct App<'a> {
     pub generations: &'a [Generation],
     pub selected_index: usize,
-    pub screen: Screen,
+    pub screen: Screen<'a>,
     pub show_kernel_params: bool,
     pub countdown_remaining_secs: Option<u64>,
     pub decision: Option<Decision>,
 }
+
+/// Number of frames in the boot-status spinner cycle.
+///
+/// We deliberately use the 4-frame ASCII rotor `|/-\` rather than the
+/// 10-frame braille systemd uses. The splash glyph cache (see
+/// `src/splash/glyph_cache.rs`) only rasterises ASCII printable plus
+/// the box-drawing subset ratatui uses for borders; Unicode braille
+/// (U+2800 block) is not in the cache, so `cache.get(c, _)` would
+/// return `None` and the splash compositor would draw nothing. On a
+/// crossterm terminal the braille would render fine, but the boot
+/// screen needs to look identical on both backends — pick ASCII for
+/// guaranteed coverage.
+pub const SPINNER_FRAMES: u8 = 4;
+
+/// The ASCII spinner glyph sequence. Indexed by `spinner_frame % SPINNER_FRAMES`.
+pub const SPINNER_GLYPHS: [char; SPINNER_FRAMES as usize] = ['|', '/', '-', '\\'];
 
 impl<'a> App<'a> {
     pub fn new(generations: &'a [Generation]) -> Self {
@@ -104,6 +143,60 @@ impl<'a> App<'a> {
             show_kernel_params: false,
             countdown_remaining_secs: None,
             decision: None,
+        }
+    }
+
+    /// Construct an App parked on the [`Screen::BootStatus`] view with
+    /// the given phase label, an empty log buffer, and spinner_frame=0.
+    ///
+    /// `generations` is empty because the boot-status screen runs
+    /// before the selector has anything to show. A future caller can
+    /// transition out of the boot-status screen by replacing
+    /// `self.screen` directly.
+    pub fn boot_status(phase: impl Into<std::borrow::Cow<'a, str>>) -> App<'a> {
+        App {
+            generations: &[],
+            selected_index: 0,
+            screen: Screen::BootStatus(BootStatusData {
+                phase: phase.into(),
+                log_lines: Vec::new(),
+                spinner_frame: 0,
+            }),
+            show_kernel_params: false,
+            countdown_remaining_secs: None,
+            decision: None,
+        }
+    }
+
+    /// Replace the phase label of the boot-status screen. No-op when
+    /// the App is on any other screen so a stray phase update from a
+    /// late-firing supervisor task can't crash production.
+    pub fn set_boot_phase(&mut self, phase: impl Into<std::borrow::Cow<'a, str>>) {
+        if let Screen::BootStatus(data) = &mut self.screen {
+            data.phase = phase.into();
+        } else {
+            debug_assert!(false, "set_boot_phase called on non-BootStatus screen");
+        }
+    }
+
+    /// Replace the log-line snapshot. The caller (typically holding a
+    /// log-ring snapshot via `crate::log::snapshot`) is responsible for
+    /// ordering: most recent last.
+    pub fn set_boot_log_lines(&mut self, lines: Vec<String>) {
+        if let Screen::BootStatus(data) = &mut self.screen {
+            data.log_lines = lines;
+        } else {
+            debug_assert!(false, "set_boot_log_lines called on non-BootStatus screen");
+        }
+    }
+
+    /// Advance the spinner one frame. Wraps modulo [`SPINNER_FRAMES`]
+    /// so callers can tick on any interval without checking the count.
+    pub fn tick_boot_spinner(&mut self) {
+        if let Screen::BootStatus(data) = &mut self.screen {
+            data.spinner_frame = data.spinner_frame.wrapping_add(1) % SPINNER_FRAMES;
+        } else {
+            debug_assert!(false, "tick_boot_spinner called on non-BootStatus screen");
         }
     }
 
@@ -135,6 +228,10 @@ impl<'a> App<'a> {
                 Self::handle_passphrase_key(key.code, &mut self.screen, &mut self.decision)
             }
             Screen::Emergency { .. } => Self::handle_emergency_key(key.code, &mut self.screen),
+            // BootStatus absorbs keypresses without producing a Decision.
+            // The boot-status screen is non-interactive: it shows progress
+            // until the caller flips the App to a different screen.
+            Screen::BootStatus(_) => false,
         }
     }
 
@@ -784,6 +881,89 @@ mod tests {
         let mut app = emergency_app();
         assert!(app.on_key(press(KeyCode::Char('s'))));
         assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::Shell));
+    }
+
+    #[test]
+    fn boot_status_constructor_parks_app_on_boot_screen() {
+        let app = App::boot_status("phase 0: kernel handoff");
+        assert!(app.decision.is_none());
+        match &app.screen {
+            Screen::BootStatus(data) => {
+                assert_eq!(&*data.phase, "phase 0: kernel handoff");
+                assert!(data.log_lines.is_empty());
+                assert_eq!(data.spinner_frame, 0);
+            }
+            _ => panic!("expected BootStatus screen"),
+        }
+    }
+
+    #[test]
+    fn boot_status_setters_mutate_in_place() {
+        let mut app = App::boot_status("initial");
+        app.set_boot_phase("phase 2");
+        app.set_boot_log_lines(vec!["one".into(), "two".into()]);
+        match &app.screen {
+            Screen::BootStatus(data) => {
+                assert_eq!(&*data.phase, "phase 2");
+                assert_eq!(data.log_lines, vec!["one", "two"]);
+            }
+            _ => panic!("expected BootStatus screen"),
+        }
+    }
+
+    #[test]
+    fn boot_status_spinner_tick_wraps_modulo_frame_count() {
+        let mut app = App::boot_status("waiting");
+        for _ in 0..SPINNER_FRAMES {
+            app.tick_boot_spinner();
+        }
+        // SPINNER_FRAMES ticks must wrap back to 0.
+        match &app.screen {
+            Screen::BootStatus(data) => assert_eq!(data.spinner_frame, 0),
+            _ => panic!("expected BootStatus screen"),
+        }
+        // One more tick lands on frame 1.
+        app.tick_boot_spinner();
+        match &app.screen {
+            Screen::BootStatus(data) => assert_eq!(data.spinner_frame, 1),
+            _ => panic!("expected BootStatus screen"),
+        }
+    }
+
+    #[test]
+    fn boot_status_on_key_does_not_produce_decision() {
+        let mut app = App::boot_status("phase X");
+        // Any keypress is absorbed; no decision is emitted.
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('s'),
+            KeyCode::Char('q'),
+        ] {
+            assert!(!app.on_key(press(code)), "{code:?} must not exit");
+            assert!(app.decision.is_none(), "{code:?} must not set decision");
+        }
+    }
+
+    #[test]
+    fn boot_status_setters_are_noop_on_other_screens_in_release() {
+        // In release builds the setters are no-ops on non-BootStatus
+        // screens — debug_assert is stripped. We can't toggle the cfg
+        // mid-test, but we can drive the same path via a small helper
+        // that checks `let-else` branches don't panic when the
+        // assertion is *expected* to fire only in debug builds. To
+        // keep this test universally runnable, we run it only outside
+        // debug_assertions.
+        if cfg!(debug_assertions) {
+            return;
+        }
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens); // Screen::List
+        app.set_boot_phase("ignored");
+        app.set_boot_log_lines(vec!["ignored".into()]);
+        app.tick_boot_spinner();
+        // Screen must still be List, untouched.
+        assert!(matches!(app.screen, Screen::List));
     }
 
     #[test]
