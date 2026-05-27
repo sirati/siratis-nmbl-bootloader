@@ -77,7 +77,11 @@ pub fn run_all_activations(
 }
 
 /// `None` for every kind except `LuksPassword`, where we prompt and
-/// append a newline so cryptsetup sees interactive-prompt termination.
+/// return the raw passphrase bytes. We do NOT append a newline: the
+/// cryptsetup argv uses `--key-file=-`, which reads stdin verbatim as
+/// binary key data (no stripping). Appending `\n` would turn a 4-byte
+/// passphrase "test" into the 5-byte key "test\n", which doesn't match
+/// the stored LUKS header digest.
 fn collect_stdin(
     activation: &Activation,
     supplier: Option<&mut dyn PasswordSupplier>,
@@ -107,9 +111,8 @@ fn collect_stdin(
         .as_deref()
         .unwrap_or("Enter passphrase");
     let secret = supplier.prompt(label)?;
-    let mut buf = Zeroizing::new(Vec::with_capacity(secret.len().saturating_add(1)));
+    let mut buf = Zeroizing::new(Vec::with_capacity(secret.len()));
     buf.extend_from_slice(secret.as_bytes());
-    buf.push(b'\n');
     Ok(Some(buf))
 }
 
