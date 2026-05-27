@@ -85,6 +85,13 @@ let
     else
       [ ];
 
+  # loop + squashfs are required for the external-rescue disk path: NMBL
+  # calls LOOP_CTL_GET_FREE on /dev/loop-control (needs the loop driver)
+  # and then mounts the .sfs as squashfs. Both modules must be in the
+  # initramfs so they can be insmod'd on demand before allocate_loop_device.
+  rescueDiskModules =
+    if cfg.rescue.mode == "external" then [ "loop" "squashfs" ] else [ ];
+
   # Import kernel modules management module
   kernelModulesManager = import ./modules/kernel-modules.nix {
     inherit
@@ -93,7 +100,7 @@ let
       config
       cfg
       ;
-    extraExplicitModules = rescueNicModules;
+    extraExplicitModules = lib.unique (rescueNicModules ++ rescueDiskModules);
   };
 
   # Import assertions module
