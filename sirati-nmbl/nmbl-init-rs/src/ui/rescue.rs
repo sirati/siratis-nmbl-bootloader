@@ -26,7 +26,7 @@
 use std::io::Write;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -397,6 +397,96 @@ pub(crate) fn render_progress(frame: &mut Frame<'_>, status: DownloadStatus, spi
 // Screen: confirm_hash
 // ---------------------------------------------------------------------------
 
+/// Mutable state threaded through [`handle_hash_key`]. Split out so
+/// the key-handler can be unit-tested without a live terminal.
+#[derive(Debug, Clone)]
+pub(crate) struct HashConfirmState {
+    pub(crate) expected: String,
+    pub(crate) cursor: usize,
+}
+
+impl HashConfirmState {
+    pub(crate) fn new(prefill: &str, cursor_seed: usize) -> Self {
+        let expected = prefill.to_string();
+        let cursor = cursor_seed.min(expected.len());
+        Self { expected, cursor }
+    }
+}
+
+/// Pure input-handler for [`confirm_hash`]. Returns `Some(outcome)`
+/// when the operator has committed (Y/N/Enter/Esc/A) and `None` when
+/// the loop should re-render and read the next event. Editing keys
+/// mutate `state` in place.
+///
+/// Factored out of [`confirm_hash`] so the "Y on mismatch returns
+/// Mismatch" contract has a unit test without spinning up a backend.
+pub(crate) fn handle_hash_key(
+    key: KeyEvent,
+    state: &mut HashConfirmState,
+    computed_hex: &str,
+) -> Option<HashConfirmation> {
+    if key.kind != KeyEventKind::Press {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            if computed_hex.eq_ignore_ascii_case(state.expected.as_str()) {
+                Some(HashConfirmation::Confirmed)
+            } else {
+                // Operator pressed y but the panes disagree: treat as
+                // mismatch so the orchestrator restarts the download
+                // rather than pivoting into a tampered blob.
+                Some(HashConfirmation::Mismatch)
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => Some(HashConfirmation::Mismatch),
+        KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Esc => Some(HashConfirmation::Aborted),
+        KeyCode::Enter => {
+            let outcome = if computed_hex.eq_ignore_ascii_case(state.expected.as_str()) {
+                HashConfirmation::Confirmed
+            } else {
+                HashConfirmation::Mismatch
+            };
+            Some(outcome)
+        }
+        KeyCode::Char(c) => {
+            let insert_at = clamp_to_char_boundary(&state.expected, state.cursor);
+            state.expected.insert(insert_at, c);
+            state.cursor = insert_at.saturating_add(c.len_utf8());
+            None
+        }
+        KeyCode::Backspace => {
+            let current = clamp_to_char_boundary(&state.expected, state.cursor);
+            if let Some(prev) = prev_char_boundary(&state.expected, current) {
+                state.expected.replace_range(prev..current, "");
+                state.cursor = prev;
+            }
+            None
+        }
+        KeyCode::Left => {
+            let current = clamp_to_char_boundary(&state.expected, state.cursor);
+            state.cursor = prev_char_boundary(&state.expected, current).unwrap_or(0);
+            None
+        }
+        KeyCode::Right => {
+            let current = clamp_to_char_boundary(&state.expected, state.cursor);
+            state.cursor =
+                next_char_boundary(&state.expected, current).unwrap_or(state.expected.len());
+            None
+        }
+        KeyCode::Home => {
+            state.cursor = 0;
+            None
+        }
+        KeyCode::End => {
+            state.cursor = state.expected.len();
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Two-pane hash confirm screen. Returns the chosen outcome and the
 /// final cursor offset on the (editable) expected pane.
 fn confirm_hash<W: Write>(
@@ -405,66 +495,16 @@ fn confirm_hash<W: Write>(
     prefill_expected: &str,
     cursor_seed: usize,
 ) -> Result<(HashConfirmation, usize)> {
-    let mut expected = prefill_expected.to_string();
-    let mut cursor = cursor_seed.min(expected.len());
+    let mut state = HashConfirmState::new(prefill_expected, cursor_seed);
 
     loop {
         terminal
-            .draw(|f| render_confirm_hash(f, computed_hex, &expected, cursor))
+            .draw(|f| render_confirm_hash(f, computed_hex, &state.expected, state.cursor))
             .map_err(tui_err)?;
         let evt = read_key_event()?;
         let Event::Key(key) = evt else { continue };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if computed_hex.eq_ignore_ascii_case(expected.as_str()) {
-                    return Ok((HashConfirmation::Confirmed, cursor));
-                }
-                // Operator pressed y but the panes disagree: treat as
-                // mismatch so the orchestrator restarts the download
-                // rather than pivoting into a tampered blob.
-                return Ok((HashConfirmation::Mismatch, cursor));
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                return Ok((HashConfirmation::Mismatch, cursor));
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Esc => {
-                return Ok((HashConfirmation::Aborted, cursor));
-            }
-            KeyCode::Enter => {
-                let outcome = if computed_hex.eq_ignore_ascii_case(expected.as_str()) {
-                    HashConfirmation::Confirmed
-                } else {
-                    HashConfirmation::Mismatch
-                };
-                return Ok((outcome, cursor));
-            }
-            KeyCode::Char(c) => {
-                let insert_at = clamp_to_char_boundary(&expected, cursor);
-                expected.insert(insert_at, c);
-                cursor = insert_at.saturating_add(c.len_utf8());
-            }
-            KeyCode::Backspace => {
-                let current = clamp_to_char_boundary(&expected, cursor);
-                if let Some(prev) = prev_char_boundary(&expected, current) {
-                    expected.replace_range(prev..current, "");
-                    cursor = prev;
-                }
-            }
-            KeyCode::Left => {
-                let current = clamp_to_char_boundary(&expected, cursor);
-                cursor = prev_char_boundary(&expected, current).unwrap_or(0);
-            }
-            KeyCode::Right => {
-                let current = clamp_to_char_boundary(&expected, cursor);
-                cursor = next_char_boundary(&expected, current).unwrap_or(expected.len());
-            }
-            KeyCode::Home => cursor = 0,
-            KeyCode::End => cursor = expected.len(),
-            _ => {}
+        if let Some(outcome) = handle_hash_key(key, &mut state, computed_hex) {
+            return Ok((outcome, state.cursor));
         }
     }
 }
@@ -822,6 +862,43 @@ mod tests {
             text.contains("No expected hash pre-filled"),
             "missing no-prefill banner in:\n{text}",
         );
+    }
+
+    /// Pressing Y when the panes disagree must return `Mismatch`, not
+    /// `Confirmed`. Pinning this so a future refactor can't regress
+    /// the orchestrator into pivoting onto a tampered blob.
+    #[test]
+    fn handle_hash_key_y_on_mismatch_returns_mismatch() {
+        let computed = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let expected = "deadbeef"; // Intentionally disagrees with `computed`.
+        let mut state = HashConfirmState::new(expected, expected.len());
+        let key = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let outcome = handle_hash_key(key, &mut state, computed);
+        assert_eq!(outcome, Some(HashConfirmation::Mismatch));
+        // The expected buffer must be untouched so the operator can
+        // edit-and-retry rather than re-typing from scratch.
+        assert_eq!(state.expected, expected);
+    }
+
+    #[test]
+    fn handle_hash_key_y_on_match_returns_confirmed() {
+        let h = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let mut state = HashConfirmState::new(h, h.len());
+        let key = KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE);
+        let outcome = handle_hash_key(key, &mut state, h);
+        assert_eq!(outcome, Some(HashConfirmation::Confirmed));
+    }
+
+    #[test]
+    fn handle_hash_key_release_event_is_ignored() {
+        let h = "abcd";
+        let mut state = HashConfirmState::new(h, h.len());
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert!(handle_hash_key(release, &mut state, h).is_none());
     }
 
     #[test]
