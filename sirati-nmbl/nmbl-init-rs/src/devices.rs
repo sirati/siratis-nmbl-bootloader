@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{FileType, stat};
 
+use nix::errno::Errno;
+
 use crate::config::{Config, FilesystemEntry};
 use crate::error::{NmblError, Result};
 use crate::nmbl_info;
@@ -114,6 +116,12 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// (`is_root=true`) is mounted at `system_root` itself regardless of
 /// its `mountpoint` field; other entries land beneath it per
 /// [`resolve_mountpoint`].
+///
+/// When Phase 0.5 (bootstrap) already mounted the boot partition at
+/// `config.runtime_boot_mountpoint`, a second `mount(2)` of the same
+/// block device to a different path returns `EBUSY`. In that case we
+/// bind-mount from the bootstrap mountpoint so the system root sees the
+/// boot partition at its expected location without remounting the device.
 pub fn mount_system_filesystems(config: &Config) -> Result<()> {
     let system_root = config.paths.system_root.as_path();
     ensure_dir(system_root)?;
@@ -132,7 +140,41 @@ pub fn mount_system_filesystems(config: &Config) -> Result<()> {
         let target = resolve_mountpoint(system_root, entry);
         ensure_dir(&target)?;
 
-        crate::sys::mount::mount_fs(Some(dev), &target, &entry.fstype, &entry.options)?;
+        match crate::sys::mount::mount_fs(Some(dev), &target, &entry.fstype, &entry.options) {
+            Ok(()) => {}
+            Err(NmblError::Mount {
+                source: Errno::EBUSY,
+                ..
+            }) => {
+                // The device is already mounted — most likely the boot
+                // partition that Phase 0.5 mounted at
+                // `runtime_boot_mountpoint`. Bind-mount from there so the
+                // system root still gets the directory at the expected path.
+                if let Some(bootstrap_mp) = &config.runtime_boot_mountpoint {
+                    nmbl_info!(
+                        "device {} already mounted (EBUSY); bind-mounting {} -> {}",
+                        dev.display(),
+                        bootstrap_mp.display(),
+                        target.display(),
+                    );
+                    crate::sys::mount::mount_fs(
+                        Some(bootstrap_mp.as_path()),
+                        &target,
+                        &entry.fstype,
+                        "bind",
+                    )?;
+                } else {
+                    // No bootstrap mountpoint to fall back to — propagate.
+                    return Err(NmblError::Mount {
+                        src: Some(dev.to_path_buf()),
+                        dst: target,
+                        fstype: entry.fstype.clone(),
+                        source: Errno::EBUSY,
+                    });
+                }
+            }
+            Err(e) => return Err(e),
+        }
     }
 
     nmbl_info!("system filesystems mounted under {}", system_root.display());
