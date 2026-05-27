@@ -40,6 +40,8 @@ pub mod app;
 pub mod console;
 pub mod emergency;
 pub mod key_echo;
+#[cfg(feature = "image-splash")]
+pub mod pretty_shell;
 pub mod reporter;
 #[cfg(feature = "network-rescue")]
 pub mod rescue;

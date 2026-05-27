@@ -86,8 +86,35 @@ pub fn drop_to_emergency(
         },
     };
 
-    let choice = run_emergency_screen(&mut *console, &err);
-    handle_choice(choice, console, config, &err)
+    // Pretty Shell is re-entrant: when the operator exits the
+    // emulated shell we drop back to the emergency picker so they can
+    // choose again. The loop terminates on any "no-return" choice
+    // (Reboot, Shell) because `handle_choice` returns `Infallible`.
+    //
+    // Without the `image-splash` feature the loop has no `continue`
+    // branch — every iteration diverges via `handle_choice` — so
+    // clippy's `never_loop` lint fires. Suppress it here: the loop
+    // shape is intentional and matches the feature-on path so the
+    // diff between builds stays minimal.
+    #[cfg_attr(not(feature = "image-splash"), allow(clippy::never_loop))]
+    loop {
+        let choice = run_emergency_screen(&mut *console, &err);
+        #[cfg(feature = "image-splash")]
+        if matches!(choice, crate::ui::EmergencyChoice::PrettyShell) {
+            if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(&mut *console, config) {
+                nmbl_warn!(
+                    "pretty-shell session failed: {}",
+                    format_chain(&e as &dyn std::error::Error)
+                );
+            }
+            // Re-display the emergency menu.
+            continue;
+        }
+        // All remaining choices diverge inside `handle_choice` (it
+        // returns `Infallible`). The empty match consumes the
+        // uninhabited type without re-entering the loop.
+        match handle_choice(choice, console, config, &err) {}
+    }
 }
 
 /// Act on the operator's emergency-screen choice. `console` is the
@@ -114,6 +141,14 @@ fn handle_choice(
             halt_with("reboot(RB_AUTOBOOT) returned; halting");
         }
         EmergencyChoice::Shell => exec_shell(console, config, err),
+        // The PrettyShell branch is intercepted by the outer loop in
+        // `drop_to_emergency` before it ever reaches here — that path
+        // is non-diverging and re-enters the picker. Pinning it as
+        // `unreachable!()` would violate the `panic`/`unreachable` lint
+        // bans; instead we fall through to the regular shell exec,
+        // which is the safest "we got into a bad state" default.
+        #[cfg(feature = "image-splash")]
+        EmergencyChoice::PrettyShell => exec_shell(console, config, err),
     }
 }
 
