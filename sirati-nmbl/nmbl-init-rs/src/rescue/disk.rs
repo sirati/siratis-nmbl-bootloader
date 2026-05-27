@@ -24,18 +24,14 @@
 //! `stage` string the emergency-shell banner surfaces verbatim.
 
 use std::convert::Infallible;
-use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use nix::mount::MsFlags;
-use nix::unistd::{chdir, chroot, execve};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno as RustixErrno;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
-use crate::modules::load_modules;
 use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
 use crate::sys::mount::mount_fs;
 
@@ -43,10 +39,6 @@ use crate::sys::mount::mount_fs;
 /// Lives at the initramfs root because `/rescue` is unlikely to collide
 /// with anything the initramfs created.
 const RESCUE_MOUNT: &str = "/rescue";
-
-/// Shell binary expected inside the rescue squashfs. The squashfs ships
-/// busybox under `/bin/sh`, so this path is the post-pivot one.
-const RESCUE_SHELL: &str = "/bin/sh";
 
 /// Mount the rescue squashfs from the boot partition, switch root into
 /// it via the switch_root dance (MS_MOVE + chroot), and `execve` its
@@ -76,17 +68,10 @@ pub fn try_disk_rescue(config: &Config, cause: &NmblError) -> Result<Infallible>
         });
     }
 
-    // The loop and squashfs drivers may not be loaded yet (they are not
-    // in the normal boot path). Load them now so that /dev/loop-control
-    // exists and the squashfs filesystem type is registered before we
-    // call allocate_loop_device / mount_fs. Errors are non-fatal here:
-    // if the modules are already built into the kernel or were loaded
-    // earlier the insmod calls return EEXIST/ENODEV and we proceed.
-    let _ = load_modules(
-        &config.kernel_modules.modules_dir,
-        &["loop".to_string(), "squashfs".to_string()],
-        &[],
-    );
+    // loop + squashfs are loaded during Phase 0.5 from the Nix-side
+    // initramfs module list (see `extraExplicitModules` /
+    // `rescueDiskModules` in lib/config.nix); no on-demand insmod is
+    // needed here.
 
     let index = allocate_loop_device().map_err(|source| NmblError::Rescue {
         stage: "loop-alloc",
@@ -126,106 +111,10 @@ pub fn try_disk_rescue(config: &Config, cause: &NmblError) -> Result<Infallible>
         }
     })?;
 
-    // `switch_root` dance: chdir into the squashfs, move its mount to `/`,
-    // chroot into the new root. This avoids `pivot_root(2)` which rejects
-    // the initramfs rootfs pseudo-filesystem as the outgoing root.
-    //
-    // Step 1: cd into the new root (the mounted squashfs).
-    chdir(rescue_dir).map_err(|source| NmblError::Rescue {
-        stage: "switch-root",
-        source: Box::new(NmblError::Io {
-            source: io::Error::from_raw_os_error(source as i32),
-            context: format!("chdir({})", rescue_dir.display()),
-        }),
-    })?;
-
-    // Step 2: Move the squashfs mount from /rescue to /, making it the new /.
-    // MS_MOVE reassigns the mount point atomically; the old initramfs rootfs
-    // is simply detached — it is no longer reachable via any path.
-    nix::mount::mount(
-        Some("."),
-        "/",
-        Option::<&str>::None,
-        MsFlags::MS_MOVE,
-        Option::<&str>::None,
-    )
-    .map_err(|source| NmblError::Rescue {
-        stage: "switch-root",
-        source: Box::new(NmblError::Io {
-            source: io::Error::from_raw_os_error(source as i32),
-            context: "mount --move . /".to_string(),
-        }),
-    })?;
-
-    // Step 3: chroot into the new `/` (the squashfs).
-    chroot(".").map_err(|source| NmblError::Rescue {
-        stage: "switch-root",
-        source: Box::new(NmblError::Io {
-            source: io::Error::from_raw_os_error(source as i32),
-            context: "chroot(.)".to_string(),
-        }),
-    })?;
-
-    // Step 4: Update the cwd to the new root.
-    chdir("/").map_err(|source| NmblError::Rescue {
-        stage: "switch-root",
-        source: Box::new(NmblError::Io {
-            source: io::Error::from_raw_os_error(source as i32),
-            context: "chdir(/) after chroot".to_string(),
-        }),
-    })?;
-
-    let path_c = CString::new(RESCUE_SHELL).map_err(|_| NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "rescue shell path contains interior NUL".to_string(),
-            context: format!("preparing execve of {RESCUE_SHELL}"),
-        }),
-    })?;
-    let argv0_c = CString::new("sh").map_err(|_| NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "rescue argv0 contains interior NUL".to_string(),
-            context: format!("preparing execve of {RESCUE_SHELL}"),
-        }),
-    })?;
-    let term_c = CString::new("TERM=linux").map_err(|_| NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "TERM environment string contains interior NUL".to_string(),
-            context: format!("preparing execve of {RESCUE_SHELL}"),
-        }),
-    })?;
-    let path_env_c =
-        CString::new("PATH=/bin:/sbin:/usr/bin:/usr/sbin").map_err(|_| NmblError::Rescue {
-            stage: "exec-shell",
-            source: Box::new(NmblError::ConfigInvalid {
-                reason: "PATH environment string contains interior NUL".to_string(),
-                context: format!("preparing execve of {RESCUE_SHELL}"),
-            }),
-        })?;
-
-    let argv: [&CString; 1] = [&argv0_c];
-    let env: [&CString; 2] = [&term_c, &path_env_c];
-
-    // execve only returns on error.
-    let exec_err = execve(&path_c, &argv, &env).err();
-    if let Some(source) = exec_err {
-        return Err(NmblError::Rescue {
-            stage: "exec-shell",
-            source: Box::new(NmblError::Shell { source }),
-        });
-    }
-    // execve returned Ok without replacing the process image. The
-    // kernel docs say this cannot happen; the type system demands a
-    // value, so surface it as an exec failure.
-    Err(NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "execve returned Ok without replacing the process image".to_string(),
-            context: format!("execve {RESCUE_SHELL}"),
-        }),
-    })
+    // Hand off to the shared `switch_root` dance: chdir + MS_MOVE +
+    // chroot + execve("/bin/sh"). Avoids `pivot_root(2)`'s EINVAL on
+    // the initramfs rootfs pseudo-filesystem.
+    super::switch_root_and_exec(rescue_dir)
 }
 
 /// Create `path` (and parents) on the rescue mountpoint side. Mirrors

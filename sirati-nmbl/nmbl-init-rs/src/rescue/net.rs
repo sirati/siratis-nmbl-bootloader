@@ -17,7 +17,8 @@
 //!    through `sha2::Sha256` and `rustix::io::write` in one pass.
 //! 6. Show the computed hash to the operator and let them confirm
 //!    against the pre-filled expected value.
-//! 7. Loop-mount the memfd at `/rescue`, `pivot_root` into it, and
+//! 7. Loop-mount the memfd at `/rescue`, `switch_root` into it via
+//!    the shared [`super::switch_root_and_exec`] helper, and
 //!    `execve("/bin/sh", …)`.
 //!
 //! [`RescueUi`] is a trait so the TUI (E.2) can later plug in a
@@ -30,7 +31,6 @@
 
 use std::cell::Cell;
 use std::convert::Infallible;
-use std::ffi::CString;
 use std::io::{self, Write as _};
 use std::mem;
 use std::net::Ipv4Addr;
@@ -39,7 +39,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
-use nix::unistd::{chdir, execve, pivot_root};
 use rustix::fs::MemfdFlags;
 use rustix::io::Errno as RustixErrno;
 use sha2::{Digest, Sha256};
@@ -53,16 +52,11 @@ use crate::nmbl_warn;
 use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
 use crate::sys::mount::mount_fs;
 
-/// Mountpoint where the downloaded squashfs is staged before
-/// `pivot_root`. Mirrors `rescue::disk::RESCUE_MOUNT` so the operator
+/// Mountpoint where the downloaded squashfs is staged before the
+/// `switch_root`. Mirrors `rescue::disk::RESCUE_MOUNT` so the operator
 /// experience is identical whether the rescue blob came from disk
 /// or from the network.
 const RESCUE_MOUNT: &str = "/rescue";
-/// Subdirectory inside the rescue squashfs's root that receives the
-/// old initramfs after `pivot_root`. Matches the disk-rescue path.
-const OLDROOT_NAME: &str = "oldroot";
-/// Shell binary expected inside the rescue squashfs.
-const RESCUE_SHELL: &str = "/bin/sh";
 /// Per-NIC link-up wait. 10s rides out PHY autonegotiation on
 /// gigabit copper without burning the operator's patience.
 const LINK_WAIT: Duration = Duration::from_secs(10);
@@ -243,9 +237,8 @@ fn run_network_attempt<R: RescueUi>(
     }
 
     // From here on we are committed to the rescue shell — any error
-    // is fatal because we've already pivoted (or are about to).
-    mount_and_pivot(&memfd).map_err(NetAttemptOutcome::Fatal)?;
-    exec_rescue_shell().map_err(NetAttemptOutcome::Fatal)
+    // is fatal because we've already switched root (or are about to).
+    mount_and_switch_root(&memfd).map_err(NetAttemptOutcome::Fatal)
 }
 
 // ---------------------------------------------------------------------------
@@ -598,16 +591,13 @@ fn write_all_to_fd<F: rustix::fd::AsFd>(fd: F, mut buf: &[u8]) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Loop-mount + pivot + exec
+// Loop-mount + switch-root + exec
 // ---------------------------------------------------------------------------
 
-/// Loop-mount the memfd at `/rescue` and `pivot_root` into it.
-///
-/// TODO: extract into a shared helper with [`super::disk::try_disk_rescue`];
-/// the bodies are similar enough that a single helper taking the
-/// backing fd would be cleaner. Left duplicated for E.1 to avoid
-/// destabilising the disk path mid-merge.
-fn mount_and_pivot(backing: &rustix::fd::OwnedFd) -> Result<()> {
+/// Loop-mount the memfd at `/rescue`, then hand off to the shared
+/// [`super::switch_root_and_exec`] helper. On success the process
+/// image is replaced by the rescue shell so this never returns.
+fn mount_and_switch_root(backing: &rustix::fd::OwnedFd) -> Result<Infallible> {
     let index = allocate_loop_device().map_err(|source| NmblError::Rescue {
         stage: "loop-alloc",
         source: Box::new(source),
@@ -637,84 +627,7 @@ fn mount_and_pivot(backing: &rustix::fd::OwnedFd) -> Result<()> {
         }
     })?;
 
-    let oldroot = rescue_dir.join(OLDROOT_NAME);
-    ensure_dir(&oldroot).map_err(|source| NmblError::Rescue {
-        stage: "pivot-root",
-        source: Box::new(source),
-    })?;
-    pivot_root(rescue_dir, &oldroot).map_err(|source| NmblError::Rescue {
-        stage: "pivot-root",
-        source: Box::new(NmblError::Io {
-            source: io::Error::from_raw_os_error(source as i32),
-            context: format!(
-                "pivot_root({} -> {})",
-                rescue_dir.display(),
-                oldroot.display(),
-            ),
-        }),
-    })?;
-    chdir("/").map_err(|source| NmblError::Rescue {
-        stage: "pivot-root",
-        source: Box::new(NmblError::Io {
-            source: io::Error::from_raw_os_error(source as i32),
-            context: "chdir(/) after pivot_root".to_string(),
-        }),
-    })?;
-    Ok(())
-}
-
-/// `execve("/bin/sh", ...)` inside the freshly pivoted rescue root.
-/// Mirrors the env (`TERM=linux`, minimal `PATH`) the disk-rescue
-/// path sets so muscle-memory carries over.
-///
-/// TODO: extract into a shared helper with [`super::disk::try_disk_rescue`].
-fn exec_rescue_shell() -> Result<Infallible> {
-    let path_c = CString::new(RESCUE_SHELL).map_err(|_| NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "rescue shell path contains interior NUL".to_string(),
-            context: format!("preparing execve of {RESCUE_SHELL}"),
-        }),
-    })?;
-    let argv0_c = CString::new("sh").map_err(|_| NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "rescue argv0 contains interior NUL".to_string(),
-            context: format!("preparing execve of {RESCUE_SHELL}"),
-        }),
-    })?;
-    let term_c = CString::new("TERM=linux").map_err(|_| NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "TERM environment string contains interior NUL".to_string(),
-            context: format!("preparing execve of {RESCUE_SHELL}"),
-        }),
-    })?;
-    let path_env_c =
-        CString::new("PATH=/bin:/sbin:/usr/bin:/usr/sbin").map_err(|_| NmblError::Rescue {
-            stage: "exec-shell",
-            source: Box::new(NmblError::ConfigInvalid {
-                reason: "PATH environment string contains interior NUL".to_string(),
-                context: format!("preparing execve of {RESCUE_SHELL}"),
-            }),
-        })?;
-    let argv: [&CString; 1] = [&argv0_c];
-    let env: [&CString; 2] = [&term_c, &path_env_c];
-
-    let exec_err = execve(&path_c, &argv, &env).err();
-    if let Some(source) = exec_err {
-        return Err(NmblError::Rescue {
-            stage: "exec-shell",
-            source: Box::new(NmblError::Shell { source }),
-        });
-    }
-    Err(NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "execve returned Ok without replacing the process image".to_string(),
-            context: format!("execve {RESCUE_SHELL}"),
-        }),
-    })
+    super::switch_root_and_exec(rescue_dir)
 }
 
 // ---------------------------------------------------------------------------
