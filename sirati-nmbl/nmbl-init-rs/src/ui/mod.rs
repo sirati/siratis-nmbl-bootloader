@@ -39,6 +39,8 @@
 //! emergency shell.
 
 pub mod app;
+#[cfg(feature = "network-rescue")]
+pub mod rescue;
 pub mod timeout;
 pub mod view;
 
@@ -81,34 +83,48 @@ pub fn run_selector(config: &Config, generations: &[Generation]) -> Result<Decis
         return select_generation_serial(config, generations);
     }
 
+    with_console_terminal(|terminal| {
+        let mut app = App::new(generations);
+        app.show_kernel_params = config.tui.show_kernel_params;
+
+        let countdown = Duration::from_secs(u64::from(config.general.timeout_secs));
+        let countdown_outcome = run_countdown_and_render(terminal, &mut app, countdown)?;
+
+        match countdown_outcome {
+            TimeoutOutcome::Expired if app.decision.is_none() => {
+                // Auto-boot the default (index 0). The countdown reached
+                // zero without input — this is the documented happy path.
+                Ok(Decision::Boot {
+                    generation_index: 0,
+                    cmdline_override: None,
+                })
+            }
+            _ => {
+                run_event_loop(terminal, &mut app)?;
+                app.decision.ok_or_else(|| NmblError::Tui {
+                    source: std::io::Error::other("TUI exited without a decision"),
+                })
+            }
+        }
+    })
+}
+
+/// Open `/dev/console`, enter raw mode, build a ratatui terminal over
+/// stdout, and hand it to `body`. The raw-mode guard is dropped on
+/// return so the operator's post-handover terminal is restored even
+/// if `body` returns an error.
+///
+/// Shared between [`run_selector`], [`tui_passphrase_prompt`], and
+/// [`crate::ui::rescue`] so the early-userspace console lifecycle
+/// lives in exactly one place.
+pub(crate) fn with_console_terminal<R>(
+    body: impl FnOnce(&mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<R>,
+) -> Result<R> {
     let console = open_console(Path::new(CONSOLE_PATH))?;
     let _raw = RawModeGuard::new(console.as_fd())?;
-
     let backend = CrosstermBackend::new(std::io::stdout());
     let mut terminal = Terminal::new(backend).map_err(tui_err)?;
-
-    let mut app = App::new(generations);
-    app.show_kernel_params = config.tui.show_kernel_params;
-
-    let countdown = Duration::from_secs(u64::from(config.general.timeout_secs));
-    let countdown_outcome = run_countdown_and_render(&mut terminal, &mut app, countdown)?;
-
-    match countdown_outcome {
-        TimeoutOutcome::Expired if app.decision.is_none() => {
-            // Auto-boot the default (index 0). The countdown reached
-            // zero without input — this is the documented happy path.
-            Ok(Decision::Boot {
-                generation_index: 0,
-                cmdline_override: None,
-            })
-        }
-        _ => {
-            run_event_loop(&mut terminal, &mut app)?;
-            app.decision.ok_or_else(|| NmblError::Tui {
-                source: std::io::Error::other("TUI exited without a decision"),
-            })
-        }
-    }
+    body(&mut terminal)
 }
 
 /// Run the countdown phase, redrawing the list screen on each tick
@@ -374,53 +390,51 @@ fn serial_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
 /// until the operator submits or cancels. Esc returns an error so the
 /// caller can drop to the emergency shell.
 fn tui_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
-    let console = open_console(Path::new(CONSOLE_PATH))?;
-    let _raw = RawModeGuard::new(console.as_fd())?;
+    with_console_terminal(|terminal| {
+        // No generations to render — pass an empty slice. The App is
+        // only used here for its Passphrase screen state.
+        let empty: [Generation; 0] = [];
+        let mut app = App::new(&empty);
+        app.screen = Screen::Passphrase {
+            prompt_label: label.to_string(),
+            buffer: Zeroizing::new(String::new()),
+        };
 
-    let backend = CrosstermBackend::new(std::io::stdout());
-    let mut terminal = Terminal::new(backend).map_err(tui_err)?;
+        let mut dirty = true;
+        loop {
+            if dirty {
+                terminal
+                    .draw(|f| render_current_screen(f, &app))
+                    .map_err(tui_err)?;
+                dirty = false;
+            }
 
-    // No generations to render — pass an empty slice. The App is
-    // only used here for its Passphrase screen state.
-    let empty: [Generation; 0] = [];
-    let mut app = App::new(&empty);
-    app.screen = Screen::Passphrase {
-        prompt_label: label.to_string(),
-        buffer: Zeroizing::new(String::new()),
-    };
-
-    let mut dirty = true;
-    loop {
-        if dirty {
-            terminal
-                .draw(|f| render_current_screen(f, &app))
-                .map_err(tui_err)?;
-            dirty = false;
-        }
-
-        if event::poll(POLL_SLICE).map_err(tui_err)? {
-            let evt = event::read().map_err(tui_err)?;
-            if let Event::Key(key) = evt {
-                let exited = app.on_key(key);
-                // Esc on the passphrase screen sets a Shell decision.
-                if matches!(app.decision, Some(Decision::Shell)) {
-                    return Err(NmblError::Tui {
-                        source: std::io::Error::other("operator cancelled passphrase entry"),
-                    });
-                }
-                if exited {
-                    // Enter was pressed — extract the buffer and return.
-                    if let Screen::Passphrase { buffer, .. } = app.screen {
-                        return Ok(buffer);
+            if event::poll(POLL_SLICE).map_err(tui_err)? {
+                let evt = event::read().map_err(tui_err)?;
+                if let Event::Key(key) = evt {
+                    let exited = app.on_key(key);
+                    // Esc on the passphrase screen sets a Shell decision.
+                    if matches!(app.decision, Some(Decision::Shell)) {
+                        return Err(NmblError::Tui {
+                            source: std::io::Error::other("operator cancelled passphrase entry"),
+                        });
                     }
-                    return Err(NmblError::Tui {
-                        source: std::io::Error::other("passphrase screen exited without a buffer"),
-                    });
+                    if exited {
+                        // Enter was pressed — extract the buffer and return.
+                        if let Screen::Passphrase { buffer, .. } = app.screen {
+                            return Ok(buffer);
+                        }
+                        return Err(NmblError::Tui {
+                            source: std::io::Error::other(
+                                "passphrase screen exited without a buffer",
+                            ),
+                        });
+                    }
+                    dirty = true;
                 }
-                dirty = true;
             }
         }
-    }
+    })
 }
 
 fn tui_err(source: std::io::Error) -> NmblError {
