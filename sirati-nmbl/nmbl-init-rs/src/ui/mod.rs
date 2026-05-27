@@ -60,8 +60,8 @@ use crate::error::{NmblError, Result};
 use crate::generations::Generation;
 use crate::sys::tty::{RawModeGuard, open_console};
 use crate::ui::view::{
-    EditScreenData, EmergencyScreenData, ListScreenData, PassphraseScreenData, render_edit,
-    render_emergency, render_list, render_passphrase,
+    EditScreenData, EmergencyScreenData, ListScreenData, PassphraseScreenData, render_boot_status,
+    render_edit, render_emergency, render_list, render_passphrase,
 };
 
 /// Default console path used by the activation-phase passphrase modal
@@ -91,7 +91,7 @@ use crate::splash::types::CellDims;
 #[cfg(feature = "image-splash")]
 use crate::ui::timeout::TimeoutOutcome;
 
-pub use app::{App, Decision, EmergencyChoice, EmergencyItem, Screen};
+pub use app::{App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, Screen};
 pub use emergency::run_emergency_screen;
 
 /// Slice we wait on input per iteration. Shared by the event loop and
@@ -457,6 +457,7 @@ pub(crate) fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_
             };
             render_emergency(frame, &data);
         }
+        Screen::BootStatus(data) => render_boot_status(frame, data),
     }
 }
 
