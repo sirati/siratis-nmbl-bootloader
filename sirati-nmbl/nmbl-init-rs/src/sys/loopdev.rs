@@ -119,14 +119,16 @@ impl LoopInfo64 {
 /// The trailing reserved field MUST be present and zero — the kernel
 /// reads `sizeof(struct loop_config)` bytes and would `EINVAL` on a
 /// short struct. The `config_size_matches_uapi` test pins the total
-/// at 312 bytes.
+/// at 304 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct LoopConfig {
     pub fd: u32,
     pub block_size: u32,
     pub info: LoopInfo64,
-    pub __reserved: [u64; 8],
+    // Maps to the C struct's `__u64 __reserved[8]`; named without the
+    // leading underscores because Rust reserves those for the language.
+    pub reserved: [u64; 8],
 }
 
 impl LoopConfig {
@@ -140,7 +142,7 @@ impl LoopConfig {
             fd,
             block_size: 0,
             info: LoopInfo64::zeroed(),
-            __reserved: [0; 8],
+            reserved: [0; 8],
         }
     }
 }
@@ -274,8 +276,12 @@ pub fn detach_loop_device(loop_fd: &impl AsFd) -> Result<()> {
 }
 
 /// Convenience for callers: open `/dev/loopN` after [`allocate_loop_device`]
-/// returned `N`. `read_write=true` opens RW (needed even for RO mounts when
-/// the loop driver wants to write the backing-file fd's open mode).
+/// returned `N`. `read_write=true` opens RW; `LOOP_CONFIGURE` (and the
+/// other set-state ioctls) refuse to run on an RO fd unless the caller
+/// holds `CAP_SYS_ADMIN`, so the bind path opens RW even when the
+/// resulting block device will be read-only — the device's RO-ness is
+/// set independently via `LO_FLAGS_READ_ONLY` plus the backing file's
+/// own open mode.
 pub fn open_loop_device(index: u32, read_write: bool) -> Result<OwnedFd> {
     let path = format!("/dev/loop{index}");
     let flags = if read_write {
@@ -342,14 +348,13 @@ mod tests {
 
     #[test]
     fn config_size_matches_uapi() {
-        // 4 + 4 + 232 + 8*8 = 304? Recompute carefully:
-        //   fd:           4
-        //   block_size:   4
-        //   info:       232
-        //   __reserved:  64
-        //   total:      304
-        // This must match what the running kernel reads. Check
-        // against the same arithmetic the kernel uses.
+        // Layout of `struct loop_config`:
+        //   fd:         4
+        //   block_size: 4
+        //   info:     232  (LoopInfo64)
+        //   reserved:  64  (8 * u64)
+        //   total:    304
+        // Must match what the running kernel reads.
         assert_eq!(size_of::<LoopConfig>(), 304);
     }
 
@@ -379,7 +384,7 @@ mod tests {
         assert_eq!(cfg.info.lo_flags, 0);
         assert_eq!(cfg.info.lo_offset, 0);
         assert_eq!(cfg.info.lo_sizelimit, 0);
-        assert_eq!(cfg.__reserved, [0; 8]);
+        assert_eq!(cfg.reserved, [0; 8]);
     }
 
     /// Skip the test body when `/dev/loop-control` isn't present
