@@ -489,6 +489,209 @@
             echo "Work dir kept at $WORK_DIR (disk1.qcow2, disk2.qcow2, stage{1,3}.log)"
           '';
         };
+      # Direct-kexec splash harness: hand the NMBL kernel + initrd straight
+      # to qemu-kvm without disks, OVMF, nixos-anywhere, LUKS or a full
+      # installed system. Boots in seconds, lands on the emergency TUI
+      # (no /boot generations to find), exposes the splash via VNC + a
+      # noVNC bridge, and pipes the serial console to a UNIX socket that
+      # the orchestrator can attach to with `socat`.
+      mkDirectOrchestrator =
+        {
+          configName,
+          vncDisplay ? 1, # qemu vnc=:1 → tcp 5901
+          novncPort ? 6080,
+        }:
+        let
+          # We only need two artifacts from the NixOS evaluation: the
+          # bootloader kernel and the matching NMBL initramfs. No disk
+          # image is produced because the VM never mounts one.
+          target = installConfigs.${configName}.config.system.build;
+        in
+        pkgs.writeShellApplication {
+          name = "nmbl-direct-vnc-${configName}";
+          runtimeInputs = [
+            pkgs.qemu_kvm
+            pkgs.coreutils
+            pkgs.socat
+            pkgs.novnc
+            pkgs.curl
+          ];
+          text = ''
+            set -euo pipefail
+
+            NAME="${configName}"
+            VNC_DISPLAY="${toString vncDisplay}"
+            VNC_PORT=$(( 5900 + VNC_DISPLAY ))
+            NOVNC_PORT="${toString novncPort}"
+
+            KERNEL="${target.nmblKernel}/bzImage"
+            INITRD="${target.nmblInitramfs}/initrd"
+
+            WORK_DIR="$PWD/.nmbl-direct-$NAME"
+            MEMORY="1024"
+            CORES="2"
+
+            usage() {
+              cat <<EOF
+            Usage: nmbl-direct-vnc-$NAME [options] [command]
+
+            Launch the NMBL kernel+initrd directly under qemu-kvm with no
+            disks, no installer, no LUKS. Exposes the splash via VNC and
+            noVNC, and routes the serial console to a UNIX socket.
+
+            Commands:
+              run    (default) start qemu + novnc, wait until qemu exits
+              exit   stop a previously-detached qemu + novnc and remove pidfiles
+
+            Options:
+              --work-dir PATH   Where to drop pidfiles + serial log
+                                (default: $PWD/.nmbl-direct-$NAME)
+              --memory MB       Guest memory (default: 1024)
+              --cores N         Guest vCPUs (default: 2)
+              -h, --help        Show this help
+            EOF
+            }
+
+            CMD="run"
+            while [[ $# -gt 0 ]]; do
+              case "$1" in
+                --work-dir) WORK_DIR="$2"; shift 2;;
+                --memory)   MEMORY="$2"; shift 2;;
+                --cores)    CORES="$2"; shift 2;;
+                run|exit)   CMD="$1"; shift;;
+                -h|--help)  usage; exit 0;;
+                *) echo "Unknown option: $1" >&2; usage >&2; exit 1;;
+              esac
+            done
+
+            mkdir -p "$WORK_DIR"
+            cd "$WORK_DIR"
+
+            QEMU_PIDFILE="$WORK_DIR/qemu.pid"
+            NOVNC_PIDFILE="$WORK_DIR/novnc.pid"
+            SER_LOG="$WORK_DIR/serial.log"
+
+            # AF_UNIX sun_path is capped at 108 bytes on Linux. The
+            # worktree-style WORK_DIR easily blows past that
+            # (e.g. .claude/worktrees/qemu-harness/...), so we park the
+            # socket under XDG_RUNTIME_DIR (or /tmp) and drop a symlink
+            # in WORK_DIR so docs/output stay consistent.
+            SOCK_BASE="''${XDG_RUNTIME_DIR:-/tmp}"
+            RUNDIR="$SOCK_BASE/nmbl-direct-$NAME"
+            mkdir -p "$RUNDIR"
+            SER_SOCK="$RUNDIR/ser0.sock"
+            WORK_SOCK_LINK="$WORK_DIR/ser0.sock"
+
+            stop_one() {
+              local pidfile="$1"
+              if [[ -f "$pidfile" ]]; then
+                local pid
+                pid=$(cat "$pidfile" 2>/dev/null || true)
+                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                  echo "Stopping pid $pid ($pidfile)"
+                  kill -TERM "$pid" 2>/dev/null || true
+                  local i=0
+                  while kill -0 "$pid" 2>/dev/null && (( i < 10 )); do
+                    sleep 1; i=$((i+1))
+                  done
+                  kill -KILL "$pid" 2>/dev/null || true
+                fi
+                rm -f "$pidfile"
+              fi
+            }
+
+            if [[ "$CMD" == "exit" ]]; then
+              stop_one "$NOVNC_PIDFILE"
+              stop_one "$QEMU_PIDFILE"
+              rm -f "$SER_SOCK" "$WORK_SOCK_LINK"
+              echo "All stopped."
+              exit 0
+            fi
+
+            # Refuse to clobber a running instance.
+            if [[ -f "$QEMU_PIDFILE" ]] && kill -0 "$(cat "$QEMU_PIDFILE")" 2>/dev/null; then
+              echo "qemu already running with pid $(cat "$QEMU_PIDFILE")" >&2
+              echo "Use \`$0 exit\` to stop it first." >&2
+              exit 1
+            fi
+            rm -f "$QEMU_PIDFILE" "$NOVNC_PIDFILE" "$SER_SOCK" "$WORK_SOCK_LINK" "$SER_LOG"
+            ln -sfn "$SER_SOCK" "$WORK_SOCK_LINK"
+
+            cleanup() {
+              stop_one "$NOVNC_PIDFILE" || true
+              stop_one "$QEMU_PIDFILE" || true
+            }
+            trap cleanup EXIT INT TERM
+
+            echo "Kernel : $KERNEL"
+            echo "Initrd : $INITRD"
+            echo "Work   : $WORK_DIR"
+            echo "Memory : $MEMORY MiB    Cores: $CORES"
+            echo
+
+            echo "===== Launching QEMU (no disks) ====="
+            # -no-reboot: NMBL emergency TUI 'reboot' shouldn't loop us.
+            # -nodefaults: avoid stray cdrom/floppy + default serial wiring.
+            # -device virtio-vga: provides the simpledrm/virtio-vga framebuffer
+            #                     the splash code path drives via /dev/dri/cardN.
+            # -display vnc=:N:    headless graphical output; we bridge with novnc.
+            qemu-system-x86_64 \
+              -machine q35,accel=kvm:tcg \
+              -cpu max \
+              -m "$MEMORY" \
+              -smp "$CORES" \
+              -kernel "$KERNEL" \
+              -initrd "$INITRD" \
+              -append "console=tty0 console=ttyS0,115200 earlyprintk=serial,ttyS0,115200 loglevel=7" \
+              -device "virtio-vga,xres=1920,yres=1080" \
+              -display "vnc=:$VNC_DISPLAY" \
+              -chardev "socket,id=ser0,path=$SER_SOCK,server=on,wait=off" \
+              -serial chardev:ser0 \
+              -monitor none \
+              -no-reboot \
+              -nodefaults \
+              -daemonize \
+              -pidfile "$QEMU_PIDFILE"
+
+            QEMU_PID=$(cat "$QEMU_PIDFILE")
+            echo "qemu pid : $QEMU_PID  ($QEMU_PIDFILE)"
+            echo "serial   : $SER_SOCK"
+            echo "           (also symlinked at $WORK_SOCK_LINK)"
+            echo "           attach: socat - UNIX-CONNECT:$SER_SOCK"
+            echo "vnc      : localhost:$VNC_PORT"
+
+            # Tee the serial socket into serial.log in the background so
+            # the operator can also tail -F it. socat exits when qemu
+            # closes the socket (i.e. on guest shutdown).
+            ( socat -u "UNIX-CONNECT:$SER_SOCK" "OPEN:$SER_LOG,creat,append" >/dev/null 2>&1 & )
+
+            echo
+            echo "===== Launching noVNC bridge ====="
+            novnc --listen "$NOVNC_PORT" --vnc "localhost:$VNC_PORT" \
+              >"$WORK_DIR/novnc.log" 2>&1 &
+            NOVNC_PID=$!
+            echo "$NOVNC_PID" > "$NOVNC_PIDFILE"
+            echo "novnc pid: $NOVNC_PID  ($NOVNC_PIDFILE)"
+
+            cat <<EOF
+
+            =========================================================
+              Open this in a browser:
+                http://localhost:$NOVNC_PORT/vnc.html?autoconnect=1&resize=scale
+
+              VNC      : localhost:$VNC_PORT
+              Serial   : socat - UNIX-CONNECT:$SER_SOCK
+                         tail -F $SER_LOG
+              Stop     : Ctrl-C, or  $(basename "$0") exit
+            =========================================================
+            EOF
+
+            echo "Waiting for QEMU pid $QEMU_PID to exit (or Ctrl-C)..."
+            while kill -0 "$QEMU_PID" 2>/dev/null; do sleep 5; done
+            echo "QEMU exited."
+          '';
+        };
+
       orchestrators = {
         install-test-gpt-bios = mkOrchestrator {
           configName = "install-gpt-bios";
@@ -531,6 +734,9 @@
           port = "22099";
           firmware = "uefi";
           displayMode = "vnc-demo";
+        };
+        nmbl-direct-vnc = mkDirectOrchestrator {
+          configName = "nmbl-direct-splash";
         };
       };
     in
