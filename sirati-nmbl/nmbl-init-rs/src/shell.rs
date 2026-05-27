@@ -35,7 +35,8 @@ use crate::nmbl_warn;
 use crate::rescue;
 use crate::terminal::{EmergencyBanner, TerminalAction};
 use crate::ui::console::{Console, open_console};
-use crate::ui::{EmergencyChoice, run_emergency_screen};
+use crate::ui::emergency_actions::{retry_boot, surface_action_failure, verify_kexec_readiness};
+use crate::ui::{EmergencyChoice, TuiPasswordSupplier, run_emergency_screen};
 
 /// Print the operator-facing emergency banner and hand off to the
 /// rescue dispatcher. Returns the [`TerminalAction`] the dispatcher
@@ -65,45 +66,77 @@ pub fn drop_to_emergency(
 ) -> TerminalAction {
     let mut console = console;
 
-    // With `image-splash` enabled the picker is re-entrant: the Pretty
-    // Shell branch returns control to this loop when the pty child
-    // exits or the session fails to start, then we re-show the
-    // picker. The Reboot / Shell branches diverge into a
-    // `TerminalAction` and break the loop. Without the feature there
-    // is no PrettyShell variant and the loop would always exit on
-    // the first iteration — which clippy::never_loop catches — so we
-    // skip the loop wrapper entirely on that build.
-    #[cfg(feature = "image-splash")]
+    // Re-entrant picker. The Pretty Shell, Retry boot, and Verify
+    // kexec readiness branches all return control to this loop on
+    // exit (sub-shell ended, retry failed, operator picked Back).
+    // The Reboot and Shell branches diverge into a `TerminalAction`
+    // and break out via `return`.
+    //
+    // Without `image-splash` there's no PrettyShell variant, but the
+    // Retry/Verify branches are still re-entrant so we keep the loop
+    // in both builds and silence the `never_loop` lint locally — the
+    // loop's exits are all `return`s from `handle_choice` or the
+    // success arms below.
+    #[allow(
+        clippy::never_loop,
+        reason = "Retry/Verify branches re-enter via `continue` even \
+                  on the no-feature build; the loop exits only via \
+                  `return` in the Reboot/Shell arms"
+    )]
     loop {
         let choice = run_emergency_screen(&mut *console, &err);
 
-        if matches!(choice, EmergencyChoice::PrettyShell) {
-            if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(&mut *console, config) {
-                let chain = format_chain(&e as &dyn std::error::Error);
-                nmbl_warn!("pretty-shell session failed: {chain}");
-                // Surface the failure in a modal so the operator
-                // actually sees what went wrong instead of bouncing
-                // straight back to the picker.
-                let _ = crate::ui::show_modal_error(
-                    &mut *console,
-                    "Pretty Shell failed to start",
-                    &chain,
-                    std::time::Duration::from_secs(10),
-                );
+        match choice {
+            #[cfg(feature = "image-splash")]
+            EmergencyChoice::PrettyShell => {
+                if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(&mut *console, config) {
+                    let chain = format_chain(&e as &dyn std::error::Error);
+                    nmbl_warn!("pretty-shell session failed: {chain}");
+                    let _ = crate::ui::show_modal_error(
+                        &mut *console,
+                        "Pretty Shell failed to start",
+                        &chain,
+                        std::time::Duration::from_secs(10),
+                    );
+                }
+                continue;
             }
-            // The pty session is over (success or error). Re-show
-            // the picker so the operator can pick again.
-            continue;
+            EmergencyChoice::RetryBoot => {
+                let mut supplier = TuiPasswordSupplier::new(config);
+                match retry_boot(config, &mut *console, &mut supplier) {
+                    Ok(action) => return action,
+                    Err(e) => {
+                        nmbl_warn!(
+                            "emergency retry-boot failed: {}",
+                            format_chain(&e as &dyn std::error::Error)
+                        );
+                        surface_action_failure(&mut *console, "Retry boot failed", &e);
+                        continue;
+                    }
+                }
+            }
+            EmergencyChoice::VerifyKexecReadiness => {
+                match verify_kexec_readiness(config, &mut *console) {
+                    Ok(Some(action)) => return action,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        nmbl_warn!(
+                            "emergency verify-kexec-readiness failed: {}",
+                            format_chain(&e as &dyn std::error::Error)
+                        );
+                        surface_action_failure(
+                            &mut *console,
+                            "Kexec readiness check failed",
+                            &e,
+                        );
+                        continue;
+                    }
+                }
+            }
+            EmergencyChoice::Reboot | EmergencyChoice::Shell => {
+                return handle_choice(choice, console, config, err);
+            }
         }
-
-        return handle_choice(choice, console, config, err);
-    }
-
-    // No-feature build: single-shot picker → terminal action.
-    #[cfg(not(feature = "image-splash"))]
-    {
-        let choice = run_emergency_screen(&mut *console, &err);
-        handle_choice(choice, console, config, err)
     }
 }
 
@@ -135,12 +168,13 @@ pub fn open_console_and_drop_to_emergency(config: &Config, err: NmblError) -> Te
 /// network-rescue screens paint through the same backend (no second
 /// `/dev/console` grab, no flicker between splash and tty).
 ///
-/// The [`EmergencyChoice::PrettyShell`] branch is intercepted by the
-/// outer loop in [`drop_to_emergency`] and never reaches this
-/// dispatcher. If a future refactor causes it to reach here we fall
-/// through to the legacy shell exec as the safest default — the
-/// `panic!`/`unreachable!` lint bans prevent us from asserting on
-/// the dead branch directly.
+/// The [`EmergencyChoice::PrettyShell`], [`EmergencyChoice::RetryBoot`],
+/// and [`EmergencyChoice::VerifyKexecReadiness`] branches are
+/// intercepted by the outer loop in [`drop_to_emergency`] and never
+/// reach this dispatcher. If a future refactor causes them to reach
+/// here we fall through to the legacy shell exec as the safest
+/// default — the `panic!`/`unreachable!` lint bans prevent us from
+/// asserting on the dead branch directly.
 fn handle_choice(
     choice: EmergencyChoice,
     console: Box<dyn Console>,
@@ -160,6 +194,14 @@ fn handle_choice(
         EmergencyChoice::Shell => exec_shell(console, config, err),
         #[cfg(feature = "image-splash")]
         EmergencyChoice::PrettyShell => exec_shell(console, config, err),
+        // The outer loop in `drop_to_emergency` handles these two; if
+        // a future caller invokes `handle_choice` with them directly,
+        // collapsing to `exec_shell` is the safest fallback (it gets
+        // the operator to a working prompt instead of looping in
+        // recovery state).
+        EmergencyChoice::RetryBoot | EmergencyChoice::VerifyKexecReadiness => {
+            exec_shell(console, config, err)
+        }
     }
 }
 
