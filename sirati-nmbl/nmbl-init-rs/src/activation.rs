@@ -341,6 +341,12 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
         fn kind(&self) -> crate::ui::console::ConsoleKind {
             crate::ui::console::ConsoleKind::Tty
         }
+        fn draw_with(
+            &mut self,
+            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]

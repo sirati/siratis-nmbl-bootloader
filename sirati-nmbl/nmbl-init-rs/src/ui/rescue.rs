@@ -3,9 +3,9 @@
 //! E.1 landed [`crate::rescue::net::try_network_rescue`] driving a
 //! [`crate::rescue::net::RescueUi`] trait object. This module ships
 //! [`RatatuiRescueUi`] — the production implementation that paints
-//! over `/dev/console` using the same raw-mode + ratatui plumbing as
-//! the boot selector. The fallback [`crate::rescue::net::ConsoleRescueUi`]
-//! stays in `src/rescue/net.rs` as a test/serial-console double.
+//! through the orchestrator-held [`crate::ui::console::Console`]
+//! handle. The fallback [`crate::rescue::net::ConsoleRescueUi`] stays
+//! in `src/rescue/net.rs` as a test/serial-console double.
 //!
 //! Four screens, each in its own private function:
 //!
@@ -19,17 +19,16 @@
 //!   with an editable expected field and a red MISMATCH banner when
 //!   the two disagree.
 //!
-//! Each method opens a fresh [`crate::ui::with_console_terminal`]
-//! session so a failed render or a panic during one screen does not
-//! poison the surrounding flow's terminal state.
+//! Every screen renders through the same `&mut dyn Console` the boot
+//! selector and emergency screen already hold, so no parallel
+//! /dev/console session is opened — the splash framebuffer or
+//! raw-mode tty in the orchestrator's hand stays the single render
+//! target for the whole boot.
 
-use std::io::Write;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -38,16 +37,21 @@ use ratatui::widgets::{Block, Gauge, Paragraph, Wrap};
 use crate::error::{NmblError, Result};
 use crate::rescue::net::{DownloadStatus, HashConfirmation, RescueSource, RescueUi};
 use crate::ui::POLL_SLICE;
-use crate::ui::with_console_terminal;
+use crate::ui::console::Console;
 
 /// Throttle progress repaints so a multi-megabyte download doesn't
 /// burn the serial line at gigabyte-per-second redraw rates.
 const PROGRESS_REDRAW_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Production [`RescueUi`] backed by ratatui. Renders each screen in
-/// its own raw-mode session so a failure on one screen leaves the
-/// terminal cleanly restored for the next.
-pub struct RatatuiRescueUi {
+/// Production [`RescueUi`] backed by ratatui, painting through the
+/// orchestrator-held [`Console`] handle. No new console is opened —
+/// the same splash or tty backend the boot selector used keeps owning
+/// `/dev/console` for the lifetime of the rescue flow.
+pub struct RatatuiRescueUi<'c> {
+    /// Live boot console borrowed from the orchestrator. Every screen
+    /// renders into this through [`Console::draw_with`] and polls
+    /// keystrokes through [`Console::poll_key`].
+    console: &'c mut dyn Console,
     /// Cursor position in the URL editor — preserved across redraws
     /// inside `prompt_url`. Stored on the struct so future screens
     /// can resume the same buffer.
@@ -65,17 +69,12 @@ pub struct RatatuiRescueUi {
     last_redraw: Option<std::time::Instant>,
 }
 
-impl Default for RatatuiRescueUi {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RatatuiRescueUi {
-    /// Construct a fresh UI. Cheap; allocates no terminal resources
-    /// until a screen method is called.
-    pub fn new() -> Self {
+impl<'c> RatatuiRescueUi<'c> {
+    /// Construct a fresh UI bound to the orchestrator-held console.
+    /// Cheap; allocates no terminal resources of its own.
+    pub fn new(console: &'c mut dyn Console) -> Self {
         Self {
+            console,
             url_cursor: 0,
             expected_cursor: 0,
             spinner_phase: 0,
@@ -84,9 +83,9 @@ impl RatatuiRescueUi {
     }
 }
 
-impl RescueUi for RatatuiRescueUi {
+impl RescueUi for RatatuiRescueUi<'_> {
     fn pick_source(&mut self, disk_reason: &str) -> Result<RescueSource> {
-        with_console_terminal(|terminal| pick_source(terminal, disk_reason))
+        run_pick_source(self.console, disk_reason)
     }
 
     fn prompt_url(&mut self, prefill: &str) -> Result<String> {
@@ -95,8 +94,7 @@ impl RescueUi for RatatuiRescueUi {
         } else {
             self.url_cursor.min(prefill.len())
         };
-        let (out, final_cursor) =
-            with_console_terminal(|terminal| prompt_url(terminal, prefill, cursor_seed))?;
+        let (out, final_cursor) = run_prompt_url(self.console, prefill, cursor_seed)?;
         self.url_cursor = final_cursor;
         Ok(out)
     }
@@ -115,12 +113,9 @@ impl RescueUi for RatatuiRescueUi {
         let phase = self.spinner_phase;
         // Errors on the progress repaint must not abort the download —
         // the operator can still confirm-or-abort on the hash screen.
-        let _ = with_console_terminal(|terminal| {
-            terminal
-                .draw(|f| render_progress(f, status, phase))
-                .map_err(tui_err)?;
-            Ok(())
-        });
+        let _ = self
+            .console
+            .draw_with(&mut |f| render_progress(f, status, phase));
     }
 
     fn confirm_hash(
@@ -133,9 +128,8 @@ impl RescueUi for RatatuiRescueUi {
         } else {
             self.expected_cursor.min(prefill_expected.len())
         };
-        let (out, final_cursor) = with_console_terminal(|terminal| {
-            confirm_hash(terminal, computed_hex, prefill_expected, cursor_seed)
-        })?;
+        let (out, final_cursor) =
+            run_confirm_hash(self.console, computed_hex, prefill_expected, cursor_seed)?;
         self.expected_cursor = final_cursor;
         Ok(out)
     }
@@ -146,20 +140,23 @@ impl RescueUi for RatatuiRescueUi {
 // ---------------------------------------------------------------------------
 
 /// Drive the source-picker screen in a poll-input + render loop until
-/// the operator commits with N/R/H (or arrow + Enter).
-fn pick_source<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
+/// the operator commits with N/R/H (or arrow + Enter). All paint and
+/// input goes through the orchestrator-held [`Console`].
+fn run_pick_source(
+    console: &mut dyn Console,
     disk_reason: &str,
 ) -> Result<RescueSource> {
-    poll_loop(terminal, |frame| render_pick_source(frame, disk_reason, 0))?;
     let mut highlight: usize = 0;
     let options = [RescueSource::Network, RescueSource::Reboot, RescueSource::Halt];
+    let mut dirty = true;
     loop {
-        terminal
-            .draw(|f| render_pick_source(f, disk_reason, highlight))
-            .map_err(tui_err)?;
-        let evt = read_key_event()?;
-        let Event::Key(key) = evt else { continue };
+        if dirty {
+            console.draw_with(&mut |f| render_pick_source(f, disk_reason, highlight))?;
+            dirty = false;
+        }
+        let Some(key) = console.poll_key(POLL_SLICE)? else {
+            continue;
+        };
         if key.kind != KeyEventKind::Press {
             continue;
         }
@@ -169,11 +166,13 @@ fn pick_source<W: Write>(
             KeyCode::Char('h') | KeyCode::Char('H') => return Ok(RescueSource::Halt),
             KeyCode::Up | KeyCode::Char('k') => {
                 highlight = highlight.saturating_sub(1);
+                dirty = true;
             }
             KeyCode::Down | KeyCode::Char('j')
                 if highlight < options.len().saturating_sub(1) =>
             {
                 highlight = highlight.saturating_add(1);
+                dirty = true;
             }
             KeyCode::Enter => {
                 if let Some(choice) = options.get(highlight) {
@@ -247,21 +246,27 @@ pub(crate) fn render_pick_source(frame: &mut Frame<'_>, disk_reason: &str, highl
 // ---------------------------------------------------------------------------
 
 /// Single-line URL editor. Returns the confirmed URL and the final
-/// cursor position so a follow-up call can resume editing.
-fn prompt_url<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
+/// cursor position so a follow-up call can resume editing. All paint
+/// and input goes through the orchestrator-held [`Console`].
+fn run_prompt_url(
+    console: &mut dyn Console,
     prefill: &str,
     cursor_seed: usize,
 ) -> Result<(String, usize)> {
     let mut buffer = prefill.to_string();
     let mut cursor = cursor_seed.min(buffer.len());
 
+    let mut dirty = true;
     loop {
-        terminal
-            .draw(|f| render_prompt_url(f, &buffer, cursor))
-            .map_err(tui_err)?;
-        let evt = read_key_event()?;
-        let Event::Key(key) = evt else { continue };
+        if dirty {
+            let snapshot_buf = buffer.clone();
+            let snapshot_cursor = cursor;
+            console.draw_with(&mut |f| render_prompt_url(f, &snapshot_buf, snapshot_cursor))?;
+            dirty = false;
+        }
+        let Some(key) = console.poll_key(POLL_SLICE)? else {
+            continue;
+        };
         if key.kind != KeyEventKind::Press {
             continue;
         }
@@ -273,6 +278,7 @@ fn prompt_url<W: Write>(
         {
             buffer.clear();
             cursor = 0;
+            dirty = true;
             continue;
         }
 
@@ -290,24 +296,34 @@ fn prompt_url<W: Write>(
                 let insert_at = clamp_to_char_boundary(&buffer, cursor);
                 buffer.insert(insert_at, c);
                 cursor = insert_at.saturating_add(c.len_utf8());
+                dirty = true;
             }
             KeyCode::Backspace => {
                 let current = clamp_to_char_boundary(&buffer, cursor);
                 if let Some(prev) = prev_char_boundary(&buffer, current) {
                     buffer.replace_range(prev..current, "");
                     cursor = prev;
+                    dirty = true;
                 }
             }
             KeyCode::Left => {
                 let current = clamp_to_char_boundary(&buffer, cursor);
                 cursor = prev_char_boundary(&buffer, current).unwrap_or(0);
+                dirty = true;
             }
             KeyCode::Right => {
                 let current = clamp_to_char_boundary(&buffer, cursor);
                 cursor = next_char_boundary(&buffer, current).unwrap_or(buffer.len());
+                dirty = true;
             }
-            KeyCode::Home => cursor = 0,
-            KeyCode::End => cursor = buffer.len(),
+            KeyCode::Home => {
+                cursor = 0;
+                dirty = true;
+            }
+            KeyCode::End => {
+                cursor = buffer.len();
+                dirty = true;
+            }
             _ => {}
         }
     }
@@ -488,9 +504,10 @@ pub(crate) fn handle_hash_key(
 }
 
 /// Two-pane hash confirm screen. Returns the chosen outcome and the
-/// final cursor offset on the (editable) expected pane.
-fn confirm_hash<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
+/// final cursor offset on the (editable) expected pane. All paint and
+/// input goes through the orchestrator-held [`Console`].
+fn run_confirm_hash(
+    console: &mut dyn Console,
     computed_hex: &str,
     prefill_expected: &str,
     cursor_seed: usize,
@@ -498,11 +515,14 @@ fn confirm_hash<W: Write>(
     let mut state = HashConfirmState::new(prefill_expected, cursor_seed);
 
     loop {
-        terminal
-            .draw(|f| render_confirm_hash(f, computed_hex, &state.expected, state.cursor))
-            .map_err(tui_err)?;
-        let evt = read_key_event()?;
-        let Event::Key(key) = evt else { continue };
+        let snapshot_expected = state.expected.clone();
+        let snapshot_cursor = state.cursor;
+        console.draw_with(&mut |f| {
+            render_confirm_hash(f, computed_hex, &snapshot_expected, snapshot_cursor);
+        })?;
+        let Some(key) = console.poll_key(POLL_SLICE)? else {
+            continue;
+        };
         if let Some(outcome) = handle_hash_key(key, &mut state, computed_hex) {
             return Ok((outcome, state.cursor));
         }
@@ -591,12 +611,6 @@ fn render_banner(frame: &mut Frame<'_>, area: Rect, title: &str, fg: Color) {
     frame.render_widget(para, area);
 }
 
-/// Map an `io::Error` from ratatui/crossterm into the project's
-/// [`NmblError::Tui`] variant.
-fn tui_err(source: std::io::Error) -> NmblError {
-    NmblError::Tui { source }
-}
-
 /// Group `hex` into space-separated chunks of `chunk` chars per line,
 /// wrapping every 16 chars (= 4 chunks of 4) so a 64-char SHA-256
 /// digest renders as four rows. Empty input renders as one empty row.
@@ -635,31 +649,6 @@ fn group_hex(hex: &str, chunk: usize) -> Vec<String> {
         rows.push(String::new());
     }
     rows
-}
-
-/// Block on `crossterm::event::read` indirectly: poll forever with
-/// the shared `POLL_SLICE` cadence until a non-empty event is
-/// available, then read it. Matches the cadence the boot selector
-/// uses so the user-visible responsiveness is identical.
-fn read_key_event() -> Result<Event> {
-    loop {
-        if event::poll(POLL_SLICE).map_err(tui_err)? {
-            return event::read().map_err(tui_err);
-        }
-    }
-}
-
-/// Single throw-away render — used to paint a frame before entering
-/// the input loop so the operator sees the screen during the first
-/// poll cycle. Mirrors the "draw once before polling" idiom in the
-/// boot selector.
-fn poll_loop<W, F>(terminal: &mut Terminal<CrosstermBackend<W>>, render: F) -> Result<()>
-where
-    W: Write,
-    F: FnOnce(&mut Frame<'_>),
-{
-    terminal.draw(render).map_err(tui_err)?;
-    Ok(())
 }
 
 /// Same byte→char column conversion as `ui::view::char_column_for_byte_cursor`.
@@ -719,13 +708,12 @@ fn next_char_boundary(s: &str, byte_idx: usize) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 /// Convenience constructor for the rescue dispatcher: returns the
-/// production ratatui-backed UI as a concrete type so callers can
-/// `&mut` it through the [`RescueUi`] trait. Kept here rather than
-/// in `rescue/mod.rs` so the trait wiring stays inside the `ui`
-/// module.
+/// production ratatui-backed UI bound to the orchestrator-held
+/// [`Console`]. Kept here rather than in `rescue/mod.rs` so the
+/// trait wiring stays inside the `ui` module.
 #[must_use]
-pub fn make_rescue_ui() -> RatatuiRescueUi {
-    RatatuiRescueUi::new()
+pub fn make_rescue_ui(console: &mut dyn Console) -> RatatuiRescueUi<'_> {
+    RatatuiRescueUi::new(console)
 }
 
 // ---------------------------------------------------------------------------
@@ -937,7 +925,8 @@ mod tests {
 
     #[test]
     fn make_rescue_ui_returns_default_state() {
-        let ui = make_rescue_ui();
+        let mut console = crate::ui::console::NoopConsole::new();
+        let ui = make_rescue_ui(&mut console);
         assert_eq!(ui.url_cursor, 0);
         assert_eq!(ui.expected_cursor, 0);
         assert_eq!(ui.spinner_phase, 0);

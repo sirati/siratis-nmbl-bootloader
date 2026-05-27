@@ -145,6 +145,13 @@ impl Console for TtyConsole {
     fn kind(&self) -> ConsoleKind {
         ConsoleKind::Tty
     }
+
+    fn draw_with(&mut self, body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
+        self.terminal
+            .draw(|f| body(f))
+            .map(|_| ())
+            .map_err(tui_err)
+    }
 }
 
 impl Drop for TtyConsole {

@@ -55,23 +55,46 @@ pub fn drop_to_emergency(
     err: NmblError,
 ) -> Infallible {
     // Ask the operator what to do via the TUI. If the caller still has
-    // the live boot console, drive the emergency screen over it.
-    // Otherwise open a fresh tty console (panic_recovery=true skips
-    // splash bring-up entirely, mirroring the panic-handler contract).
-    let choice = match console {
-        Some(c) => run_emergency_screen(c, &err),
+    // the live boot console, drive the emergency screen over it AND
+    // hand the same backend to the rescue dispatcher. Otherwise open a
+    // fresh tty console (panic_recovery=true skips splash bring-up
+    // entirely, mirroring the panic-handler contract) and reuse that
+    // single backend for both the emergency screen and the
+    // network-rescue screens — never two parallel terminals.
+    match console {
+        Some(c) => {
+            let choice = run_emergency_screen(c, &err);
+            handle_choice(choice, c, config, &err)
+        }
         None => match open_console(config, true) {
-            Ok(mut c) => run_emergency_screen(&mut *c, &err),
+            Ok(mut c) => {
+                let choice = run_emergency_screen(&mut *c, &err);
+                handle_choice(choice, &mut *c, config, &err)
+            }
             Err(open_err) => {
                 nmbl_warn!(
                     "emergency console bring-up failed: {}; defaulting to reboot",
                     format_chain(&open_err as &dyn std::error::Error),
                 );
-                EmergencyChoice::Reboot
+                eprintln!("[nmbl] operator (or timeout) chose reboot");
+                let _ = reboot(RebootMode::RB_AUTOBOOT);
+                halt_with("reboot(RB_AUTOBOOT) returned; halting");
             }
         },
-    };
+    }
+}
 
+/// Act on the operator's emergency-screen choice. `console` is the
+/// live boot console the caller already owns; on the shell branch it
+/// is threaded into `rescue::dispatch` so the network-rescue screens
+/// paint through the same backend (no second `/dev/console` grab, no
+/// flicker between splash and tty).
+fn handle_choice(
+    choice: EmergencyChoice,
+    console: &mut dyn Console,
+    config: &Config,
+    err: &NmblError,
+) -> Infallible {
     match choice {
         EmergencyChoice::Reboot => {
             eprintln!("[nmbl] operator (or timeout) chose reboot");
@@ -80,21 +103,22 @@ pub fn drop_to_emergency(
             // path execve uses, so we still preserve Infallible.
             halt_with("reboot(RB_AUTOBOOT) returned; halting");
         }
-        EmergencyChoice::Shell => exec_shell(config, &err),
+        EmergencyChoice::Shell => exec_shell(console, config, err),
     }
 }
 
 /// Execute the chosen-shell path: print the banner with the error
-/// chain so the operator has context, then `execve`. Does not return
-/// on success; on `execve` failure halts the system.
-fn exec_shell(config: &Config, err: &NmblError) -> Infallible {
+/// chain so the operator has context, then hand off to the rescue
+/// dispatcher. Does not return on success; on dispatch failure halts
+/// the system.
+fn exec_shell(console: &mut dyn Console, config: &Config, err: &NmblError) -> Infallible {
     print_banner(config, err);
 
     // rescue::dispatch returns Result<Infallible>: success is the
     // noreturn path (process image is replaced), so the Ok arm matches
     // against an uninhabited type. Any Err means no rescue strategy
     // could complete — we log the failure chain and halt.
-    match rescue::dispatch(config, err) {
+    match rescue::dispatch(config, console, err) {
         Ok(infallible) => match infallible {},
         Err(dispatch_err) => {
             eprintln!(
