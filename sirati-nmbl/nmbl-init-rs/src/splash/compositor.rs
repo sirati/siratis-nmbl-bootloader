@@ -204,8 +204,9 @@ fn named_color(n: NamedColor) -> RgbaColor {
         NamedColor::BrightMagenta => RgbaColor(0xAD, 0x7F, 0xA8, 0xFF),
         NamedColor::BrightCyan => RgbaColor(0x34, 0xE2, 0xE2, 0xFF),
         NamedColor::BrightWhite | NamedColor::BrightForeground => RgbaColor(0xEE, 0xEE, 0xEC, 0xFF),
-        // Foreground: opaque white; the overlay sits on top of the PNG.
-        NamedColor::Foreground => RgbaColor(0xFF, 0xFF, 0xFF, 0xFF),
+        // Foreground: white at 30% alpha so unset-fg text sits softly
+        // on top of the background image instead of glaring fully opaque.
+        NamedColor::Foreground => RgbaColor(0xFF, 0xFF, 0xFF, 0x4D),
         // Dim foreground: the Tango "white" tone.
         NamedColor::DimForeground => RgbaColor(0xD3, 0xD7, 0xCF, 0xFF),
         // Background: fully transparent so the PNG underneath shows
