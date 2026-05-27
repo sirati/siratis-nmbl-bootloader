@@ -205,10 +205,15 @@ fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
         "phase 0.5: loading full config from {}",
         full_path.display()
     );
-    let config = Config::load(&full_path).map_err(|source| NmblError::Bootstrap {
+    let mut config = Config::load(&full_path).map_err(|source| NmblError::Bootstrap {
         stage: "read-config",
         source: Box::new(source),
     })?;
+
+    // Hand the runtime boot mountpoint to the rescue dispatcher so
+    // `rescue::locate_sfs` can resolve `sfs_path` against it instead of
+    // the build-time `/boot` convention.
+    config.runtime_boot_mountpoint = Some(boot_fs.mountpoint.clone());
 
     Ok(config)
 }
