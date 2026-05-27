@@ -41,9 +41,9 @@ use crate::splash::terminal::SplashTerminal;
 use crate::splash::types::CellDims;
 use crate::sys::tty::open_console;
 use crate::ui::POLL_SLICE;
+use crate::ui::render_current_screen;
 use crate::ui::timeout::{TimeoutOutcome, run_countdown};
-use crate::ui::view::{EditScreenData, ListScreenData, PassphraseScreenData, render_edit, render_list, render_passphrase};
-use crate::ui::{App, Decision, Screen};
+use crate::ui::{App, Decision};
 
 /// Console node opened to acquire raw-mode keyboard input alongside
 /// the DRM framebuffer output.
@@ -211,49 +211,6 @@ fn render_frame(
         });
         Ok(())
     })
-}
-
-/// Dispatch a render of the current App screen. Mirrors the body of
-/// `ui::mod::render_current_screen` so the splash path stays decoupled
-/// from the tty path. If commit 3 promotes the tty function to
-/// `pub(crate)`, this can drop in favour of the shared one.
-fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
-    match &app.screen {
-        Screen::List => {
-            let max_idx = app.generations.len().saturating_sub(1);
-            let data = ListScreenData {
-                generations: app.generations,
-                selected_index: app.selected_index.min(max_idx),
-                countdown_remaining_secs: app.countdown_remaining_secs,
-                show_kernel_params: app.show_kernel_params,
-            };
-            render_list(frame, &data);
-        }
-        Screen::Editing {
-            generation_index,
-            buffer,
-            cursor,
-        } => {
-            if let Some(g) = app.generations.get(*generation_index) {
-                let data = EditScreenData {
-                    generation: g,
-                    edited_cmdline: buffer,
-                    cursor_position: *cursor,
-                };
-                render_edit(frame, &data);
-            }
-        }
-        Screen::Passphrase {
-            prompt_label,
-            buffer,
-        } => {
-            let data = PassphraseScreenData {
-                prompt_label,
-                buffer_len: buffer.len(),
-            };
-            render_passphrase(frame, &data);
-        }
-    }
 }
 
 fn tui_err(source: std::io::Error) -> NmblError {

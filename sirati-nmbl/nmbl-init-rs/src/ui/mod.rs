@@ -182,7 +182,10 @@ fn run_event_loop<W: Write>(
 }
 
 /// Dispatch render based on which screen the App is currently on.
-fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
+///
+/// `pub(crate)` so the splash orchestrator can reuse the same dispatch
+/// without forking the per-screen branching.
+pub(crate) fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
     match &app.screen {
         Screen::List => render_list(frame, &list_data(app)),
         Screen::Editing {
