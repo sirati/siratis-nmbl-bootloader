@@ -203,9 +203,7 @@ fn named_color(n: NamedColor) -> RgbaColor {
         NamedColor::BrightBlue => RgbaColor(0x72, 0x9F, 0xCF, 0xFF),
         NamedColor::BrightMagenta => RgbaColor(0xAD, 0x7F, 0xA8, 0xFF),
         NamedColor::BrightCyan => RgbaColor(0x34, 0xE2, 0xE2, 0xFF),
-        NamedColor::BrightWhite | NamedColor::BrightForeground => {
-            RgbaColor(0xEE, 0xEE, 0xEC, 0xFF)
-        }
+        NamedColor::BrightWhite | NamedColor::BrightForeground => RgbaColor(0xEE, 0xEE, 0xEC, 0xFF),
         // Foreground: opaque white; the overlay sits on top of the PNG.
         NamedColor::Foreground => RgbaColor(0xFF, 0xFF, 0xFF, 0xFF),
         // Dim foreground: the Tango "white" tone.
@@ -244,7 +242,12 @@ fn indexed_color(i: u8) -> RgbaColor {
             let r_idx = n / 36;
             let g_idx = (n / 6) % 6;
             let b_idx = n % 6;
-            RgbaColor(cube_channel(r_idx), cube_channel(g_idx), cube_channel(b_idx), 0xFF)
+            RgbaColor(
+                cube_channel(r_idx),
+                cube_channel(g_idx),
+                cube_channel(b_idx),
+                0xFF,
+            )
         }
         232..=255 => {
             let step = i.saturating_sub(232);
@@ -269,14 +272,22 @@ fn cube_channel(idx: u8) -> u8 {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::indexing_slicing, reason = "test assertions")]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    reason = "test assertions"
+)]
 mod tests {
     use super::*;
 
     #[test]
     fn blit_background_byte_order() {
         // 2×2 framebuffer, stride = 2*4 = 8 bytes.
-        let dims = FramebufferDims { w: 2, h: 2, stride: 8 };
+        let dims = FramebufferDims {
+            w: 2,
+            h: 2,
+            stride: 8,
+        };
         let mut fb = vec![0xAAu8; (dims.stride * dims.h) as usize];
 
         // Source row 0: pixel (0,0) = #112233FF, pixel (1,0) = #445566FF.
@@ -299,7 +310,11 @@ mod tests {
     #[test]
     fn blit_background_respects_stride() {
         // 1×2 framebuffer with stride = 8 (4 bytes of padding per row).
-        let dims = FramebufferDims { w: 1, h: 2, stride: 8 };
+        let dims = FramebufferDims {
+            w: 1,
+            h: 2,
+            stride: 8,
+        };
         let mut fb = vec![0xEEu8; (dims.stride * dims.h) as usize];
         let src: Vec<u8> = vec![
             0x11, 0x22, 0x33, 0xFF, // row 0, one pixel
@@ -319,7 +334,11 @@ mod tests {
     fn blit_background_short_input_doesnt_panic() {
         // Framebuffer claims 2 rows but the source only has data for 1.
         // The compositor must paint what it can and bail without panic.
-        let dims = FramebufferDims { w: 1, h: 2, stride: 4 };
+        let dims = FramebufferDims {
+            w: 1,
+            h: 2,
+            stride: 4,
+        };
         let mut fb = vec![0x55u8; (dims.stride * dims.h) as usize];
         let src: Vec<u8> = vec![0x11, 0x22, 0x33, 0xFF];
         blit_background(&mut fb, dims, &src);
@@ -332,7 +351,11 @@ mod tests {
     fn blit_cell_alpha_blend_center() {
         // 4×4 framebuffer pre-filled with bg = (10, 20, 30) stored as
         // BGRX = (30, 20, 10, 0).
-        let dims = FramebufferDims { w: 4, h: 4, stride: 16 };
+        let dims = FramebufferDims {
+            w: 4,
+            h: 4,
+            stride: 16,
+        };
         let mut fb = vec![0u8; (dims.stride * dims.h) as usize];
         for y in 0..4 {
             for x in 0..4 {
@@ -394,7 +417,11 @@ mod tests {
     fn blit_cell_fills_bg_then_glyph() {
         // 2×2 framebuffer with garbage so we can see the bg fill paint
         // over it before the glyph layer applies.
-        let dims = FramebufferDims { w: 2, h: 2, stride: 8 };
+        let dims = FramebufferDims {
+            w: 2,
+            h: 2,
+            stride: 8,
+        };
         let mut fb = vec![0u8; (dims.stride * dims.h) as usize];
 
         let glyph = GlyphBitmap {
@@ -423,7 +450,11 @@ mod tests {
     fn blit_cell_clips_to_framebuffer() {
         // 2×2 framebuffer, draw a 2×2 glyph at offset (1, 1). Only the
         // pixel at (1, 1) is in-bounds.
-        let dims = FramebufferDims { w: 2, h: 2, stride: 8 };
+        let dims = FramebufferDims {
+            w: 2,
+            h: 2,
+            stride: 8,
+        };
         let mut fb = vec![0u8; (dims.stride * dims.h) as usize];
         let glyph = GlyphBitmap {
             width: 2,
@@ -462,16 +493,16 @@ mod tests {
     #[test]
     fn resolve_color_named_background_is_transparent() {
         let c = resolve_color(Color::Named(NamedColor::Background));
-        assert_eq!(c.3, 0x00, "default background must be transparent so PNG shows");
+        assert_eq!(
+            c.3, 0x00,
+            "default background must be transparent so PNG shows"
+        );
     }
 
     #[test]
     fn resolve_color_indexed_cube() {
         // Index 16 = cube (0,0,0) = pure black.
-        assert_eq!(
-            resolve_color(Color::Indexed(16)),
-            RgbaColor(0, 0, 0, 0xFF)
-        );
+        assert_eq!(resolve_color(Color::Indexed(16)), RgbaColor(0, 0, 0, 0xFF));
         // Index 231 = cube (5,5,5) = pure white (55 + 40*5 = 255).
         assert_eq!(
             resolve_color(Color::Indexed(231)),
@@ -494,10 +525,7 @@ mod tests {
     #[test]
     fn resolve_color_indexed_greyscale() {
         // Index 232 = level 8.
-        assert_eq!(
-            resolve_color(Color::Indexed(232)),
-            RgbaColor(8, 8, 8, 0xFF)
-        );
+        assert_eq!(resolve_color(Color::Indexed(232)), RgbaColor(8, 8, 8, 0xFF));
         // Index 255 = level 8 + 10 * 23 = 238.
         assert_eq!(
             resolve_color(Color::Indexed(255)),
@@ -521,7 +549,11 @@ mod tests {
 
     #[test]
     fn resolve_color_spec() {
-        let c = resolve_color(Color::Spec(Rgb { r: 0x12, g: 0x34, b: 0x56 }));
+        let c = resolve_color(Color::Spec(Rgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56,
+        }));
         assert_eq!(c, RgbaColor(0x12, 0x34, 0x56, 0xFF));
     }
 }

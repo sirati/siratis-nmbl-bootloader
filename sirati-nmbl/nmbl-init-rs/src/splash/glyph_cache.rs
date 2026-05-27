@@ -60,7 +60,11 @@ pub struct GlyphCache {
 /// without ever returning a negative result.
 fn round_half_up(v: f32) -> u32 {
     let r = (v + 0.5).floor();
-    if r.is_finite() && r > 0.0 { r as u32 } else { 0 }
+    if r.is_finite() && r > 0.0 {
+        r as u32
+    } else {
+        0
+    }
 }
 
 /// Build a `Tui` error from a `fontdue` static-string error message.

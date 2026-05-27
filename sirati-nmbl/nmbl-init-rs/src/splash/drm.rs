@@ -172,7 +172,13 @@ fn bring_up(card: Card) -> Result<SplashDrm> {
 
     // Commit the mode. The dumb buffer is allocated but not mapped at
     // this point — mappings live only inside `render()`'s closure.
-    if let Err(e) = card.set_crtc(crtc_handle, Some(fb), (0, 0), &[connector_handle], Some(mode)) {
+    if let Err(e) = card.set_crtc(
+        crtc_handle,
+        Some(fb),
+        (0, 0),
+        &[connector_handle],
+        Some(mode),
+    ) {
         // Tear down the framebuffer and dumb buffer.
         if let Err(fe) = card.destroy_framebuffer(fb) {
             nmbl_warn!("splash::drm: destroy_framebuffer after set_crtc error: {fe}");
@@ -246,7 +252,10 @@ impl SplashDrm {
     where
         F: FnOnce(&mut [u8], FramebufferDims) -> Result<()>,
     {
-        let mut mapping = self.card.map_dumb_buffer(&mut self.buffer).map_err(tui_err)?;
+        let mut mapping = self
+            .card
+            .map_dumb_buffer(&mut self.buffer)
+            .map_err(tui_err)?;
         let dims = self.dims;
         f(mapping.as_mut(), dims)?;
         drop(mapping);

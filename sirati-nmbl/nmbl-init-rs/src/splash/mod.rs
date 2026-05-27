@@ -59,10 +59,7 @@ const SPLASH_FONT_PX: f32 = 16.0;
 ///   caller should fall back to the tty UI without surfacing an error.
 /// - `Err(_)`: splash was attempted and failed mid-flight; caller logs
 ///   and falls back to the tty UI.
-pub fn try_run_selector(
-    config: &Config,
-    generations: &[Generation],
-) -> Result<Option<Decision>> {
+pub fn try_run_selector(config: &Config, generations: &[Generation]) -> Result<Option<Decision>> {
     // 1. Open the DRM card. Missing / inaccessible nodes map to
     //    `Ok(None)` inside `open_card`, so this propagates only real
     //    bring-up errors.
@@ -177,8 +174,8 @@ fn render_frame(
     {
         let backend = CrosstermBackend::new(&mut buf);
         let viewport = Viewport::Fixed(Rect::new(0, 0, cell_dims.cols, cell_dims.rows));
-        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport })
-            .map_err(tui_err)?;
+        let mut terminal =
+            Terminal::with_options(backend, TerminalOptions { viewport }).map_err(tui_err)?;
         terminal
             .draw(|f| render_current_screen(f, app))
             .map_err(tui_err)?;

@@ -30,10 +30,7 @@ pub struct Image {
 /// caller can fall back to the tty UI on any failure.
 pub fn decode_rgba(path: &Path) -> Result<Image> {
     let file = File::open(path).map_err(|e| NmblError::Tui {
-        source: std::io::Error::other(format!(
-            "splash::png: open {}: {e}",
-            path.display()
-        )),
+        source: std::io::Error::other(format!("splash::png: open {}: {e}", path.display())),
     })?;
     decode_rgba_from_reader(BufReader::new(file))
 }
