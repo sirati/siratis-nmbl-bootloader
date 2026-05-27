@@ -9,26 +9,28 @@
 //!   loads config best-effort, drops straight to the emergency shell
 //!   with [`NmblError::Panicked`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nix::sys::reboot::{RebootMode, reboot};
 
-use nmbl_init::activation::run_all_activations;
+use nmbl_init::activation::{KeyInjection, run_all_activations};
 use nmbl_init::boot::kexec_into;
-use nmbl_init::config::Config;
+use nmbl_init::config::{BootstrapConfig, Config, resolve_full_config_path};
 use nmbl_init::devices::mount_system_filesystems;
 use nmbl_init::error::{NmblError, Result};
 use nmbl_init::generations::scan_generations;
-use nmbl_init::modules::{load_early_modules, load_explicit_modules};
+use nmbl_init::modules::{load_early_modules, load_explicit_modules, load_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
 use nmbl_init::panic::install_panic_hook;
 use nmbl_init::shell::drop_to_emergency;
+use nmbl_init::sys::{blkid, mount as sys_mount};
 use nmbl_init::ui::console::{Console, NoopConsole, open_console};
 use nmbl_init::ui::{BootReporter, Decision, TuiPasswordSupplier, run_selector};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/nmbl/config.toml";
+const BOOTSTRAP_CONFIG_PATH: &str = "/etc/nmbl/bootstrap.toml";
 
 struct Args {
     config_path: PathBuf,
@@ -116,23 +118,24 @@ fn recover_from_panic(args: Args, report_path: PathBuf) -> std::convert::Infalli
     drop_to_emergency(None, &config, NmblError::Panicked { report_path })
 }
 
-/// Execute the pre-console phases (1 and 2a). These run against a
-/// [`NoopConsole`] sentinel because the real console can't be opened
-/// yet: phase 2a is what brings up the DRM card the splash backend
-/// needs. `nmbl_info!` lines still reach the kernel ring, so the log
-/// snapshot the live reporter pulls a few hundred ms later replays the
-/// pre-console narration on the boot-status screen.
-fn run_phases_pre_console(config: &Config) -> Result<()> {
-    let mut noop = NoopConsole::new();
-    let mut reporter = BootReporter::new(&mut noop, "phase 1: mount pseudo-filesystems");
-
+/// Phase 1: mount /proc, /sys, /dev. Lives at the top of `main` so the
+/// optional bootstrap phase (0.5) can see those pseudo-filesystems
+/// before it touches blkid or mounts the boot partition. Uses a
+/// [`NoopConsole`] sentinel because the real console is not open yet.
+fn run_phase_1(reporter: &mut BootReporter<'_>) -> Result<()> {
     nmbl_info!("phase 1: mount pseudo-filesystems");
-    mount_pseudo_filesystems(&mut reporter)?;
+    mount_pseudo_filesystems(reporter)
+}
 
+/// Phase 2a: load early (graphics) kernel modules so the splash backend
+/// has a DRM card to attach to when `open_console` runs. Reads
+/// `config.kernel_modules.early`. The reporter wraps a [`NoopConsole`];
+/// status pushes do nothing visible, but the underlying log ring is
+/// still populated for the post-console reporter to surface.
+fn run_phase_2a(config: &Config, reporter: &mut BootReporter<'_>) -> Result<()> {
+    let _ = reporter.set_phase("phase 2a: load early kernel modules");
     nmbl_info!("phase 2a: load early kernel modules");
-    load_early_modules(config, &mut reporter)?;
-
-    Ok(())
+    load_early_modules(config, reporter)
 }
 
 /// Execute the post-console phases (2b, 3, 3b). The caller has already
@@ -141,7 +144,14 @@ fn run_phases_pre_console(config: &Config) -> Result<()> {
 /// reporter and the operator sees progress on the splash framebuffer
 /// or raw-mode tty. The reporter is dropped on return so the caller
 /// can reuse the underlying console for the generation selector.
-fn run_phases_post_console(config: &Config, console: &mut dyn Console) -> Result<()> {
+///
+/// Returns the LUKS-passphrase injections that the kexec phase must
+/// thread into the chained initrd (one per `luks-password` activation
+/// whose TOML sets `pass_to_stage1`; empty when none opted in).
+fn run_phases_post_console(
+    config: &Config,
+    console: &mut dyn Console,
+) -> Result<Vec<KeyInjection>> {
     let mut reporter = BootReporter::new(console, "phase 2b: loading kernel modules");
     // Paint the first frame so the operator sees a populated screen
     // before any work happens — otherwise a fast phase 2b would race
@@ -160,12 +170,95 @@ fn run_phases_post_console(config: &Config, console: &mut dyn Console) -> Result
 
     nmbl_info!("phase 3: storage activations");
     let mut supplier = TuiPasswordSupplier::new(config);
-    run_all_activations(config, &mut reporter, Some(&mut supplier))?;
+    let injections = run_all_activations(config, &mut reporter, Some(&mut supplier))?;
 
     nmbl_info!("phase 3b: mount system filesystems");
     mount_system_filesystems(config, &mut reporter)?;
 
-    Ok(())
+    Ok(injections)
+}
+
+/// Phase 0.5: two-tier bootstrap. Loads the embedded
+/// `/etc/nmbl/bootstrap.toml`, brings up the minimum kernel modules it
+/// names, sweeps blkid to populate `/dev/disk/by-*`, mounts the boot
+/// filesystem, and reads the full `Config` from there.
+///
+/// On any failure the returned `NmblError::Bootstrap` carries a `stage`
+/// string the emergency-shell banner surfaces. Once `boot_fs` is
+/// mounted we intentionally leave it mounted on the error path so the
+/// operator's shell still sees it under `bootstrap.boot_fs.mountpoint`.
+fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
+    nmbl_info!(
+        "phase 0.5: loading bootstrap config {}",
+        bootstrap_path.display()
+    );
+    let bootstrap = BootstrapConfig::load(bootstrap_path)?;
+    let section = &bootstrap.bootstrap;
+
+    nmbl_info!(
+        "phase 0.5: loading {} bootstrap kernel modules from {}",
+        section.kernel_modules.explicit.len(),
+        section.kernel_modules.modules_dir.display(),
+    );
+    load_modules(
+        &section.kernel_modules.modules_dir,
+        &section.kernel_modules.explicit,
+        &[],
+    )
+    .map_err(|source| NmblError::Bootstrap {
+        stage: "load-modules",
+        source: Box::new(source),
+    })?;
+
+    nmbl_info!("phase 0.5: populating /dev/disk/by-* symlinks");
+    blkid::populate_disk_by_symlinks().map_err(|source| NmblError::Bootstrap {
+        stage: "blkid-sweep",
+        source: Box::new(source),
+    })?;
+
+    let boot_fs = &section.boot_fs;
+    nmbl_info!(
+        "phase 0.5: mounting boot fs {} at {} (type {})",
+        boot_fs.device,
+        boot_fs.mountpoint.display(),
+        boot_fs.fstype,
+    );
+    std::fs::create_dir_all(&boot_fs.mountpoint).map_err(|source| NmblError::Bootstrap {
+        stage: "mount-boot",
+        source: Box::new(NmblError::Io {
+            source,
+            context: format!("creating boot mountpoint {}", boot_fs.mountpoint.display()),
+        }),
+    })?;
+    sys_mount::mount_fs(
+        Some(Path::new(&boot_fs.device)),
+        &boot_fs.mountpoint,
+        &boot_fs.fstype,
+        &boot_fs.options,
+    )
+    .map_err(|source| NmblError::Bootstrap {
+        stage: "mount-boot",
+        source: Box::new(source),
+    })?;
+
+    // boot_fs is mounted; from here on, any failure must NOT unmount
+    // it — the operator's emergency shell needs to see it.
+    let full_path = resolve_full_config_path(&boot_fs.mountpoint, &section.config_path);
+    nmbl_info!(
+        "phase 0.5: loading full config from {}",
+        full_path.display()
+    );
+    let mut config = Config::load(&full_path).map_err(|source| NmblError::Bootstrap {
+        stage: "read-config",
+        source: Box::new(source),
+    })?;
+
+    // Hand the runtime boot mountpoint to the rescue dispatcher so
+    // `rescue::locate_sfs` can resolve `sfs_path` against it instead of
+    // the build-time `/boot` convention.
+    config.runtime_boot_mountpoint = Some(boot_fs.mountpoint.clone());
+
+    Ok(config)
 }
 
 /// Run phases 4→6 (generation discovery, UI, decision dispatch). Kept
@@ -176,7 +269,11 @@ fn run_phases_post_console(config: &Config, console: &mut dyn Console) -> Result
 /// directory. The reporter is dropped before phase 5 so the bare
 /// console can be handed to `run_selector`, which swaps the App over
 /// to the boot-menu screen on top of the same backend.
-fn select_and_act(config: &Config, console: &mut dyn Console) -> Result<()> {
+fn select_and_act(
+    config: &Config,
+    console: &mut dyn Console,
+    key_injections: &[KeyInjection],
+) -> Result<()> {
     nmbl_info!("phase 4: scan generations");
     let generations = {
         let mut reporter = BootReporter::new(console, "phase 4: scan generations");
@@ -205,7 +302,7 @@ fn select_and_act(config: &Config, console: &mut dyn Console) -> Result<()> {
             // does not return. Match against the Infallible so a
             // future signature change becomes a compile error here
             // rather than a silently-ignored return value.
-            match kexec_into(config, target, cmdline_override.as_deref())? {}
+            match kexec_into(config, target, cmdline_override.as_deref(), key_injections)? {}
         }
         Decision::Shell => Err(NmblError::Io {
             source: std::io::Error::other("operator chose emergency shell"),
@@ -254,18 +351,44 @@ fn main() -> ExitCode {
         match recover_from_panic(args, report_path) {}
     }
 
+    // Two-tier vs single-tier branch. The bootstrap.toml file is shipped
+    // inside the initramfs by the new Nix path; its absence means the
+    // image was built with the legacy single-tier flow and the real
+    // config lives at `args.config_path` (default `/etc/nmbl/config.toml`).
+    //
+    // `try_exists()` (not `exists()`) so an unreadable bootstrap.toml
+    // (broken symlink, permission denied, …) routes into the bootstrap
+    // failure path instead of silently being mistaken for legacy mode
+    // — which would then resurface as a misleading missing
+    // `/etc/nmbl/config.toml` error.
+    let bootstrap_path = Path::new(BOOTSTRAP_CONFIG_PATH);
+    let bootstrap_probe = bootstrap_path.try_exists();
+    let bootstrap_mode = matches!(bootstrap_probe, Ok(true));
+
     // Config load is the chicken-and-egg moment: if it fails we have
-    // no `shell` path, no verbosity, no nothing. Fall back to the
-    // recovery default and route the load error through the shell.
-    let (config, load_err): (Config, Option<NmblError>) = match Config::load(&args.config_path) {
-        Ok(c) => (c, None),
-        Err(err) => (Config::recovery_default(), Some(err)),
+    // no `shell` path, no verbosity, no nothing. In bootstrap mode the
+    // real config only becomes reachable after Phase 0.5 mounts the
+    // boot filesystem, so seed from `recovery_default` and replace
+    // later. In single-tier mode load from `args.config_path` with a
+    // recovery-default fallback as before.
+    let (mut config, load_err): (Config, Option<NmblError>) = if bootstrap_mode {
+        (Config::recovery_default(), None)
+    } else {
+        match Config::load(&args.config_path) {
+            Ok(c) => (c, None),
+            Err(err) => (Config::recovery_default(), Some(err)),
+        }
     };
 
     // Install the panic hook now that we know where to write reports.
     // A panic during the brief window before this call would still
     // unwind through the default Rust hook, abort PID 1, and let the
-    // kernel panic — the documented worst case.
+    // kernel panic — the documented worst case. In bootstrap mode the
+    // configured `panic_report_dir` from the operator's `config.toml`
+    // is not yet reachable, so we install with the recovery default
+    // and re-install once `run_bootstrap_phase` returns the real config
+    // (`install_panic_hook` is idempotent: each call replaces the
+    // previously stored directory).
     install_panic_hook(&config.general.panic_report_dir);
 
     log::init(config.general.verbosity);
@@ -278,19 +401,68 @@ fn main() -> ExitCode {
         match drop_to_emergency(None, &config, err) {}
     }
 
-    // Phase 1 + 2a run BEFORE the real console is opened. The splash
-    // backend needs a DRM card to attach to and phase 2a is what
-    // brings up the graphics-driver modules (virtio_gpu / simpledrm /
-    // i915 / …) that materialise `/dev/dri/card*`. We use a
-    // `NoopConsole` sentinel inside `run_phases_pre_console` so the
-    // reporter wiring stays uniform across phases; `nmbl_info!` lines
-    // still reach the kernel ring and replay onto the live console as
-    // soon as it comes up.
-    if let Err(err) = run_phases_pre_console(&config) {
-        nmbl_warn!("pre-console phases failed: {err}");
-        // No live console yet — drop_to_emergency will open a tty
-        // console itself (panic_recovery=true so it skips splash).
+    // Probe error reported by `try_exists` — neither "exists" nor "does
+    // not exist". Route into the bootstrap failure path with a
+    // descriptive stage so the emergency-shell banner explains what was
+    // attempted instead of resurfacing the legacy-mode "no
+    // /etc/nmbl/config.toml" error.
+    if let Err(probe_err) = bootstrap_probe {
+        let err = NmblError::Bootstrap {
+            stage: "probe",
+            source: Box::new(NmblError::Io {
+                source: probe_err,
+                context: format!("probing {}", bootstrap_path.display()),
+            }),
+        };
         match drop_to_emergency(None, &config, err) {}
+    }
+
+    // Phase 1 lives at the top of `main` so Phase 0.5 (when active) and
+    // Phase 2a both see /proc, /sys, /dev already mounted. The reporter
+    // wraps a NoopConsole until phase 2b opens the real one; nmbl_info!
+    // lines still reach the kernel ring and replay onto the live
+    // console once it comes up.
+    let mut noop = NoopConsole::new();
+    {
+        let mut reporter = BootReporter::new(&mut noop, "phase 1: mount pseudo-filesystems");
+        if let Err(err) = run_phase_1(&mut reporter) {
+            // No live console yet — drop_to_emergency will open a tty
+            // console itself (panic_recovery=true so it skips splash).
+            match drop_to_emergency(None, &config, err) {}
+        }
+    }
+
+    if bootstrap_mode {
+        match run_bootstrap_phase(bootstrap_path) {
+            Ok(loaded) => {
+                config = loaded;
+                // Re-install the panic hook against the operator's
+                // configured directory and re-init the logger at the
+                // operator's verbosity. The early init used the recovery
+                // defaults because the real config was not yet
+                // reachable, but a panic or log line during the
+                // remaining phases must honour what the operator set in
+                // /boot's config.toml.
+                install_panic_hook(&config.general.panic_report_dir);
+                log::init(config.general.verbosity);
+            }
+            // boot_fs may have been mounted before the failure — the
+            // emergency shell wants to see it, so we do NOT unmount on
+            // this path.
+            Err(err) => match drop_to_emergency(None, &config, err) {},
+        }
+    }
+
+    // Phase 2a runs BEFORE the real console is opened: the splash
+    // backend needs a DRM card to attach to, and phase 2a brings up the
+    // graphics-driver modules (virtio_gpu / simpledrm / i915 / …) that
+    // materialise `/dev/dri/card*`.
+    {
+        let mut reporter = BootReporter::new(&mut noop, "phase 2a: load early kernel modules");
+        if let Err(err) = run_phase_2a(&config, &mut reporter) {
+            nmbl_warn!("phase 2a (early modules) failed: {err}");
+            match drop_to_emergency(None, &config, err) {}
+        }
     }
 
     // Bring the boot console up AFTER phase 2a so the splash backend
@@ -315,7 +487,7 @@ fn main() -> ExitCode {
     };
 
     let outcome = run_phases_post_console(&config, &mut *console)
-        .and_then(|()| select_and_act(&config, &mut *console));
+        .and_then(|injections| select_and_act(&config, &mut *console, &injections));
 
     match outcome {
         Ok(()) => ExitCode::from(0),

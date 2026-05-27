@@ -40,7 +40,13 @@ let
       # `open_console` so the splash backend has a DRM card to attach
       # to in `qemu_kernel_invoke` mode (no kmod auto-load).
       early = cfg.earlyExplicitKernelModules;
-      explicit = cfg.explicitKernelModules ++ cfg.activation.extraKernelModules;
+      # Activation modules load FIRST: LUKS needs AES + cipher modes
+      # registered with the kernel crypto API before encrypted_keys can
+      # init successfully (it calls alloc_cipher("ecb(aes)") at module-
+      # load time). The base explicit list typically contains dm-crypt
+      # pulled in via boot.initrd.kernelModules, whose dep walk pulls
+      # in encrypted_keys — so AES + ecb must be live before then.
+      explicit = cfg.activation.extraKernelModules ++ cfg.explicitKernelModules;
       blacklist = cfg.blacklistedKernelModules;
       modules_dir = "/lib/modules";
     };
@@ -82,6 +88,30 @@ let
       system_root = toString cfg.paths.systemRoot;
       shell = toString cfg.paths.shell;
     };
+
+    # Rescue config consumed by the Rust `RescueConfig` struct (C.1).
+    # `mode` maps to the `RescueMode` enum (`embedded` | `external` |
+    # `none`); `sfs_path` is a boot-partition-relative path the Rust
+    # side joins against the runtime boot mountpoint, so it is emitted
+    # verbatim (no rewrite) and omitted when it matches the Rust-side
+    # default basename (`nmbl-rescue.sfs`).
+    #
+    # Network-rescue keys (`network`, `default_url`, `default_sha256`)
+    # mirror E.1's additions to RescueConfig. They are omitted entirely
+    # when `cfg.rescue.network = false` so the Rust serde defaults take
+    # effect — the wire shape for non-network builds stays unchanged.
+    rescue =
+      {
+        mode = cfg.rescue.mode;
+      }
+      // lib.optionalAttrs (cfg.rescue.sfsPath != "nmbl-rescue.sfs") {
+        sfs_path = cfg.rescue.sfsPath;
+      }
+      // lib.optionalAttrs cfg.rescue.network {
+        network = true;
+        default_url = cfg.rescue.defaultUrl;
+        default_sha256 = cfg.rescue.defaultSha256;
+      };
   }
   # Splash rendering. Emitted only when the graphical splash is enabled
   # so the validator (`deny_unknown_fields`) accepts the TOML on builds

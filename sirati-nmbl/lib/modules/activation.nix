@@ -52,13 +52,13 @@ let
 
   # --- extraKernelModules ---------------------------------------------------
 
+  # encrypted_keys.ko's init calls alloc_cipher("ecb(aes)") which needs
+  # both an AES provider (aesni_intel) AND the ecb cipher mode module
+  # registered with the kernel crypto API. Load them here so they're
+  # live by the time the base list pulls in dm-crypt (whose dep walk
+  # pulls in encrypted_keys). xts is the LUKS2 data-encryption mode.
   extraKernelModules = lib.unique (
-    # encrypted_keys.ko's init calls alloc_cipher("ecb(aes)") which needs
-    # both an AES provider (aesni_intel) AND the ecb cipher mode module
-    # registered with the kernel crypto API. Load them here so they're
-    # live by the time the base list pulls in dm-crypt (whose dep walk
-    # pulls in encrypted_keys). xts is the LUKS2 data-encryption mode.
-    lib.optionals luksAny [ "dm_mod" "aesni_intel" "dm-crypt" ]
+    lib.optionals luksAny [ "dm_mod" "aesni_intel" "ecb" "xts" "sha256_generic" "dm-crypt" ]
     ++ lib.optionals luksTpm [ "tpm_crb" "tpm_tis" ]
     ++ lib.optional lvmOn "dm_mod"
     ++ lib.optionals mdOn [ "md_mod" "raid0" "raid1" "raid10" "raid456" ]
@@ -79,7 +79,7 @@ let
 
   # --- activationBlocks ([[activation]] TOML rows) --------------------------
 
-  luksBaseMods = [ "dm_mod" "dm-crypt" "aesni_intel" ];
+  luksBaseMods = [ "dm_mod" "dm-crypt" "aesni_intel" "xts" "sha256_generic" ];
   luksTpmMods = luksBaseMods ++ [ "tpm_crb" "tpm_tis" ];
 
   mkLuksBlock = l:
@@ -98,6 +98,7 @@ let
       binary = "/bin/cryptsetup"; argv = [ "open" l.device l.name "--key-file=-" ];
       produces_devices = [ mapper ]; description = "Unlock ${l.name} via passphrase";
       prompt_label = l.promptLabel;
+      pass_to_stage1 = l.passToStage1;
     };
 
   # Order: mdraid (lowest level) -> LVM -> LUKS -> ZFS.
@@ -188,6 +189,20 @@ let
         default = "Enter passphrase";
         description = lib.mdDoc "Label shown in the TUI password modal. Only meaningful when unlock = \"password\".";
       };
+      passToStage1 = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/etc/nmbl-luks/cryptroot";
+        description = lib.mdDoc ''
+          When non-null, NMBL captures the typed passphrase after a
+          successful unlock and injects it into the kexec'd initrd at
+          this path as a cryptsetup-compatible keyfile (memory only,
+          never written to disk). The post-kexec NixOS stage-1 should
+          carry `boot.initrd.luks.devices.<name>.keyFile = "<this path>"`
+          so the operator types the passphrase exactly once. Only
+          meaningful when unlock = "password".
+        '';
+      };
     };
   };
 
@@ -197,6 +212,28 @@ let
     readOnly = true;
     description = lib.mdDoc desc;
   };
+
+  # ---- post-stage-0 keyfile wipe -----------------------------------------
+  # For every passToStage1 entry we emit a stage-1 cleanup that overwrites
+  # the injected keyfile bytes in tmpfs before unlinking, then removes the
+  # parent directory. Overwriting before free is what actually scrubs the
+  # bytes: tmpfs pages live in RAM, and the kernel does not zero freed
+  # pages — only what we write in place is guaranteed-gone post-unlink.
+  injectedPaths = map (l: l.passToStage1)
+    (lib.filter (l: l.unlock == "password" && l.passToStage1 != null) act.luks);
+
+  wipeSnippet = path: ''
+    if [ -e ${path} ]; then
+      size=$(stat -c%s ${path} 2>/dev/null || echo 0)
+      if [ "$size" -gt 0 ]; then
+        dd if=/dev/zero of=${path} bs=1 count="$size" conv=notrunc 2>/dev/null || true
+      fi
+      rm -f ${path}
+      rmdir "$(dirname ${path})" 2>/dev/null || true
+    fi
+  '';
+
+  wipeShellScript = lib.concatMapStrings wipeSnippet injectedPaths;
 
 in
 {
@@ -255,5 +292,27 @@ in
     # Surface activation assertions through the standard NixOS mechanism so
     # they fail nixos-rebuild and our nmblAssertionCheck derivation alike.
     assertions = computedAssertions;
+
+    # Scripted stage-1 cleanup: runs after LUKS unlock, before pivot.
+    boot.initrd.postDeviceCommands = lib.mkIf (injectedPaths != [ ]) wipeShellScript;
+
+    # systemd-stage-1 cleanup: a oneshot that runs after cryptsetup
+    # targets have completed but before initrd-switch-root. The unit
+    # also Requires=cryptsetup.target so it definitely fires after the
+    # injected keyfile has done its job.
+    boot.initrd.systemd.services = lib.mkIf (injectedPaths != [ ]) {
+      nmbl-wipe-injected-keys = {
+        description = "Wipe NMBL-injected LUKS keyfiles from initrd tmpfs";
+        wantedBy = [ "initrd.target" ];
+        after = [ "cryptsetup.target" ];
+        before = [ "initrd-switch-root.target" "sysroot.mount" ];
+        unitConfig.DefaultDependencies = false;
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        script = wipeShellScript;
+      };
+    };
   };
 }

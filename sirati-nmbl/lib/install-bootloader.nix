@@ -19,6 +19,9 @@
   cfg,
   bootstrapper,
   legacyBootMode,
+  configLocation,
+  nmblConfigToml,
+  nmblRescueSquashfs,
 }:
 
 let
@@ -79,6 +82,54 @@ pkgs.writeScript "install-nmbl-bootloader" ''
   cp -f "$KERNEL" /boot/nmbl-kernel
   cp -f "$INITRD" /boot/nmbl-initrd
   echo "✓ Bootloader files installed: /boot/nmbl-kernel, /boot/nmbl-initrd"
+
+  ${lib.optionalString (configLocation == "external") (
+    let
+      # In external-config mode, copy the full config.toml onto the boot
+      # partition at the path the embedded bootstrap.toml will look for it.
+      # The `or "/nmbl/config.toml"` fallback matches
+      # `default_bootstrap_config_path` in `nmbl-init-rs/src/config.rs` so
+      # the runtime contract holds even if `boot.nmbl.bootstrap.configPath`
+      # is unset. Computed inside the optionalString body so embedded mode
+      # never evaluates it.
+      externalConfigPath =
+        let p = cfg.bootstrap.configPath or "/nmbl/config.toml";
+        in if lib.hasPrefix "/" p then lib.removePrefix "/" p else p;
+      # `lib.escapeShellArg` protects the heredoc-generated shell script
+      # against operator-supplied paths containing whitespace or quotes.
+      escapedDest = lib.escapeShellArg "/boot/${externalConfigPath}";
+    in ''
+      # External-config mode: stage the full config.toml on /boot at the
+      # path the embedded bootstrap.toml advertises. The initramfs itself
+      # carries only the bootstrap, so this file is what nmbl-init reads
+      # for filesystems / activations / TUI settings at boot time.
+      echo "Staging external NMBL config to ${escapedDest}..."
+      install -D -m 0644 ${nmblConfigToml} ${escapedDest}
+      echo "✓ External config installed: ${escapedDest}"
+    ''
+  )}
+
+  ${lib.optionalString (cfg.rescue.mode == "external") (
+    let
+      # `cfg.rescue.sfsPath` is interpreted relative to the boot mount
+      # by the Rust /init; strip a leading slash so the host-side
+      # install path joins cleanly under `/boot/`.
+      rescuePath =
+        if lib.hasPrefix "/" cfg.rescue.sfsPath
+        then lib.removePrefix "/" cfg.rescue.sfsPath
+        else cfg.rescue.sfsPath;
+      escapedDest = lib.escapeShellArg "/boot/${rescuePath}";
+    in ''
+      # External-rescue mode: stage the squashfs blob on /boot at the
+      # path the Rust disk-rescue path reads from. The initramfs itself
+      # carries no busybox / activation tools in this mode — they all
+      # live in the squashfs and are loop-mounted on the emergency
+      # path.
+      echo "Staging NMBL rescue squashfs to ${escapedDest}..."
+      install -D -m 0644 ${nmblRescueSquashfs} ${escapedDest}
+      echo "✓ Rescue squashfs installed: ${escapedDest}"
+    ''
+  )}
 
   ${lib.optionalString (bootstrapper.bootMode == "bios" && actualLoader == "grub") ''
         echo "Configuring GPT+BIOS bootloader with GRUB..."

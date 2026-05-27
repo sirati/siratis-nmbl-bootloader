@@ -8,6 +8,13 @@
   utils,
   nmblInit,
   nmblInitSplash,
+  # Builder form supplied by flake.nix. When extra Cargo features are
+  # requested (e.g. `network-rescue` when `boot.nmbl.rescue.network`
+  # is enabled, combined with `image-splash` when both are on) we
+  # re-build the binary with those features. Defaults to ignoring
+  # features and returning the prebuilt `nmblInit` if the host flake
+  # is older.
+  mkNmblInit ? (_: nmblInit),
   ...
 }:
 
@@ -15,10 +22,26 @@ let
   cfg = config.boot.nmbl;
   bootstrapper = cfg.bootstrapper;
 
-  # Pick the /init binary based on whether the graphical splash is
-  # enabled. The splash variant is the same crate built with the
-  # `image-splash` cargo feature (drm + png + fontdue pulled in).
-  selectedNmblInit = if cfg.splash.enable then nmblInitSplash else nmblInit;
+  # Cargo features to enable in the /init binary. Gated on splash and
+  # rescue options so feature-free builds (default) stay byte-identical
+  # to today's binary. When only `image-splash` is requested we prefer
+  # the prebuilt `nmblInitSplash` to keep the existing CI cache hot;
+  # when only `network-rescue` is requested we use `mkNmblInit`. When
+  # both are requested we build a combined binary via `mkNmblInit`.
+  nmblFeatures =
+    lib.optional cfg.splash.enable "image-splash"
+    ++ lib.optional cfg.rescue.network "network-rescue";
+
+  # Resolved /init binary used by the initramfs builder. Identity-equal
+  # to the prebuilt `nmblInit` / `nmblInitSplash` in the single-feature
+  # cases so Nix's store-path dedup keeps the existing CI cache hot.
+  selectedNmblInit =
+    if nmblFeatures == [ ] then
+      nmblInit
+    else if nmblFeatures == [ "image-splash" ] then
+      nmblInitSplash
+    else
+      mkNmblInit { features = nmblFeatures; };
 
   # Activation options are contributed by ./modules/activation.nix. Read
   # defensively so this file still evaluates if that module hasn't been
@@ -58,6 +81,30 @@ let
   # Import storage validation module
   storageValidation = import ./modules/storage-validation.nix { inherit lib; };
 
+  # Auto-detected NIC drivers from hardware-configuration.nix
+  # (boot.initrd.{kernelModules,availableKernelModules}). Only consumed
+  # when the rescue network path is enabled; otherwise the list is
+  # built but never referenced.
+  detectedNicModules = import ./modules/nic-modules.nix {
+    inherit lib config;
+  };
+
+  # Modules NMBL must load + ship for the network rescue fallback. Empty
+  # unless rescue.network is on AND the rescue lives off-initramfs
+  # (external mode), so the default build stays byte-identical.
+  rescueNicModules =
+    if cfg.rescue.network && cfg.rescue.mode == "external" then
+      lib.unique (cfg.rescue.nicDrivers ++ detectedNicModules)
+    else
+      [ ];
+
+  # loop + squashfs are required for the external-rescue disk path: NMBL
+  # calls LOOP_CTL_GET_FREE on /dev/loop-control (needs the loop driver)
+  # and then mounts the .sfs as squashfs. Both modules must be in the
+  # initramfs so they can be insmod'd on demand before allocate_loop_device.
+  rescueDiskModules =
+    if cfg.rescue.mode == "external" then [ "loop" "squashfs" ] else [ ];
+
   # Import kernel modules management module
   kernelModulesManager = import ./modules/kernel-modules.nix {
     inherit
@@ -66,6 +113,7 @@ let
       config
       cfg
       ;
+    extraExplicitModules = lib.unique (rescueNicModules ++ rescueDiskModules);
   };
 
   # Import assertions module
@@ -105,6 +153,30 @@ let
     inherit pkgs lib config;
     nmblInit = selectedNmblInit;
   };
+
+  # Render the embedded bootstrap TOML used in external-config mode.
+  # The bootstrap file points at /boot's device + fs + the relative path
+  # to the full config.toml on the boot partition. Helper owned by B.2.
+  nmblBootstrapToml = import ./bootstrap-toml.nix {
+    inherit pkgs lib config;
+  };
+
+  # Build the external rescue squashfs from `cfg.rescue.squashfsContents`.
+  # The derivation is always evaluated (cheap when nothing references it)
+  # but only staged onto the boot partition when `cfg.rescue.mode ==
+  # "external"`. Embedded / none modes keep today's behaviour.
+  nmblRescueSquashfs = import ./rescue-sfs.nix {
+    inherit pkgs lib;
+    contents = cfg.rescue.squashfsContents;
+  };
+
+  # Where the runtime config TOML lives at boot. In embedded mode it
+  # ships inside the initramfs; in external mode the initramfs only
+  # carries the bootstrap TOML and the full config is staged onto the
+  # boot partition by install-bootloader.nix. Default mirrors the Rust
+  # bootstrap default (`/nmbl/config.toml`) so the field is defensible
+  # if B.2's option tree hasn't been merged yet.
+  configLocation = cfg.configLocation or "embedded";
 
   # Determine legacy boot mode string for compatibility
   legacyBootMode =
@@ -152,9 +224,20 @@ in
     #
     # Contents are deliberately small:
     #   - /init                       : the static-musl Rust binary (PID 1)
-    #   - /etc/nmbl/config.toml       : runtime config it reads at startup
+    #   - /etc/nmbl/config.toml       : runtime config (embedded mode only)
+    #   - /etc/nmbl/bootstrap.toml    : minimal bootstrap config used to
+    #                                   locate the full config on /boot
+    #                                   (external mode only)
     #   - /bin/sh                     : busybox, used ONLY for the emergency
-    #                                   shell on failure (never by /init itself)
+    #                                   shell on failure (never by /init
+    #                                   itself); staged only when
+    #                                   `rescue.mode = "embedded"`. For the
+    #                                   "external" / "none" modes the
+    #                                   emergency path either pivots into
+    #                                   the rescue squashfs (which carries
+    #                                   its own /bin/sh) or halts with a
+    #                                   structured banner — no in-initramfs
+    #                                   shell is reachable.
     #   - /bin/blkid                  : util-linux's blkid, called by the
     #                                   Rust /init to populate /dev/disk/by-*
     #                                   symlinks (udev-less stage-0).
@@ -166,19 +249,44 @@ in
     # ./modules/activation.nix only when fileSystems require it.
     system.build.nmblInitramfs =
       let
+        # External-config mode embeds ONLY bootstrap.toml; the full
+        # config.toml is staged onto /boot by install-bootloader.nix.
+        # That separation is the whole point of external mode: edits to
+        # the runtime config no longer require an initramfs rebuild.
+        configContents =
+          if configLocation == "external" then
+            [
+              {
+                object = nmblBootstrapToml;
+                symlink = "/etc/nmbl/bootstrap.toml";
+              }
+            ]
+          else
+            [
+              {
+                object = nmblConfigToml;
+                symlink = "/etc/nmbl/config.toml";
+              }
+            ];
+
+        # Busybox is only needed in the initramfs when the emergency
+        # path execs `cfg.paths.shell` directly (embedded mode). In
+        # "external" mode the rescue squashfs carries its own /bin/sh
+        # and is loop-mounted before any shell exec; in "none" mode the
+        # rescue dispatcher halts via `halt_with_banner` without ever
+        # touching a shell. Keeping busybox out of the initramfs for
+        # those two modes is the bulk of the F.6 size delta.
+        shellContents = lib.optional (cfg.rescue.mode == "embedded") {
+          object = "${pkgs.busybox}/bin/busybox";
+          symlink = "/bin/sh";
+        };
+
         baseContents = [
           {
             object = "${selectedNmblInit}/bin/nmbl-init";
             symlink = "/init";
           }
-          {
-            object = nmblConfigToml;
-            symlink = "/etc/nmbl/config.toml";
-          }
-          {
-            object = "${pkgs.busybox}/bin/busybox";
-            symlink = "/bin/sh";
-          }
+        ] ++ configContents ++ shellContents ++ [
           {
             # util-linux's blkid is used by nmbl-init to populate
             # /dev/disk/by-{partlabel,label,uuid,partuuid}/ symlinks
@@ -229,6 +337,18 @@ in
     # Expose the actually-selected /init binary for downstream tooling
     # (debug scripts, manual nix builds). Mirrors nmblKernel/nmblInitramfs.
     system.build.nmblInit = selectedNmblInit;
+
+    # Expose the rendered runtime config TOML so it can be inspected
+    # (and validated) independently of the initramfs build. Used by
+    # the C.2 validation step (`nix eval ... --raw`) and by the
+    # external-config staging path inside install-bootloader.nix.
+    system.build.nmblConfigToml = nmblConfigToml;
+
+    # Expose the external rescue squashfs derivation. Always evaluable
+    # (the underlying derivation is built from `cfg.rescue.squashfsContents`
+    # regardless of mode), but only staged onto the boot partition when
+    # `cfg.rescue.mode == "external"` — see install-bootloader.nix.
+    system.build.nmblRescueSquashfs = nmblRescueSquashfs;
 
     # Debug output to verify module configuration
     system.build.nmblDebugInfo = pkgs.writeText "nmbl-debug-info" ''
@@ -316,6 +436,9 @@ in
         cfg
         bootstrapper
         legacyBootMode
+        configLocation
+        nmblConfigToml
+        nmblRescueSquashfs
         ;
     };
 

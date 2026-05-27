@@ -7,7 +7,10 @@ pub mod generations;
 pub mod log;
 pub mod modules;
 pub mod mount;
+#[cfg(feature = "network-rescue")]
+pub mod net;
 pub mod panic;
+pub mod rescue;
 pub mod shell;
 #[cfg(feature = "image-splash")]
 pub mod splash;

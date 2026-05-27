@@ -34,7 +34,7 @@
       pkgs = nixpkgs.legacyPackages.${system};
 
       # Import testing utilities
-      testing = import ./testing/build_configurations.nix { inherit self nixpkgs; };
+      testing = import ./testing/build_configurations.nix { inherit self nixpkgs disko; };
 
       # Import test runners
       testRunners = import ./testing/test-runners.nix { inherit nixpkgs system; };
@@ -56,6 +56,14 @@
       # `boot.nmbl.splash.enable`; this attribute is injected
       # unconditionally so the option can be toggled at evaluation time.
       nmblInitSplash = nmbl-init-rs.packages.${system}.nmbl-init-splash;
+
+      # Builder form: lib/config.nix uses this to build a /init with
+      # extra Cargo features (currently `network-rescue` when
+      # `boot.nmbl.rescue.network = true`). Falls back to the default
+      # binary if the sibling flake hasn't been updated yet.
+      mkNmblInit =
+        nmbl-init-rs.legacyPackages.${system}.mkNmblInit
+          or (_: nmblInit);
 
       # Import rescue-vm-test app directly
       rescueVmTestFlake = import ../rescue-vm-test/flake.nix;
@@ -91,6 +99,9 @@
         install-test-gpt-bios-raid1 = nixosAnywhereTest.apps.${system}.install-test-gpt-bios-raid1;
         install-test-gpt-uefi-grub-raid1 = nixosAnywhereTest.apps.${system}.install-test-gpt-uefi-grub-raid1;
         install-test-gpt-uefi-systemd-raid1 = nixosAnywhereTest.apps.${system}.install-test-gpt-uefi-systemd-raid1;
+        install-test-gpt-bios-btrfs-raid1 = nixosAnywhereTest.apps.${system}.install-test-gpt-bios-btrfs-raid1;
+        install-test-gpt-uefi-grub-btrfs-raid1 = nixosAnywhereTest.apps.${system}.install-test-gpt-uefi-grub-btrfs-raid1;
+        install-test-gpt-uefi-systemd-btrfs-raid1 = nixosAnywhereTest.apps.${system}.install-test-gpt-uefi-systemd-btrfs-raid1;
       };
 
       # Build test runner apps for each configuration
@@ -143,6 +154,10 @@
           # on `boot.nmbl.splash.enable`.
           _module.args.nmblInit = nmblInit;
           _module.args.nmblInitSplash = nmblInitSplash;
+          # Builder used by lib/config.nix when the rescue-network path
+          # is enabled — produces a /init with the `network-rescue`
+          # Cargo feature compiled in.
+          _module.args.mkNmblInit = mkNmblInit;
         };
 
       # Test configurations

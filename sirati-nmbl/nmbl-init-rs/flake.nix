@@ -78,6 +78,30 @@
           doCheck = false;
         };
 
+        # Builder so callers (sirati-nmbl/flake.nix) can request a build
+        # with optional Cargo features (e.g. `network-rescue`). The
+        # default build below passes `features = []`, so it stays
+        # byte-identical to the feature-free build.
+        mkNmblInit = { features ? [ ] }:
+          let
+            featureArgs =
+              if features == [ ] then
+                ""
+              else
+                "--features=" + builtins.concatStringsSep "," features;
+            argsWithFeatures = commonArgs // {
+              cargoExtraArgs = featureArgs;
+            };
+            artifacts = craneLib.buildDepsOnly argsWithFeatures;
+          in
+          craneLib.buildPackage (
+            argsWithFeatures
+            // {
+              cargoArtifacts = artifacts;
+              pname = "nmbl-init";
+            }
+          );
+
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
         nmbl-init = craneLib.buildPackage (
@@ -101,6 +125,11 @@
         );
       in
       {
+        # Function form: callers wire Cargo features through this
+        # (sirati-nmbl/flake.nix uses it to gate `network-rescue` on
+        # `boot.nmbl.rescue.network`).
+        legacyPackages.mkNmblInit = mkNmblInit;
+
         packages = {
           default = nmbl-init;
           nmbl-init = nmbl-init;
@@ -161,13 +190,15 @@
           };
 
           # Enforce that the only sites that may exec a new process or
-          # invoke std::process::Command are the three allow-listed
-          # files: the emergency-shell exec site, the panic-recovery
-          # re-exec site, and the activation-runner fork/exec helper.
+          # invoke std::process::Command are the allow-listed files:
+          # the emergency-shell exec site, the panic-recovery re-exec
+          # site, the activation-runner fork/exec helper, the rescue
+          # dispatcher's embedded execve, and the disk/network rescue
+          # pivot-into-shell sites.
           nmbl-init-no-exec = pkgs.runCommand "nmbl-init-no-exec" { } ''
             cd ${./.}
             if grep -RIn -E '\bCommand::|\bexecve\(' src/ \
-                 | grep -v -E '^src/(shell\.rs|panic\.rs|sys/activation\.rs)'; then
+                 | grep -v -E '^src/(shell\.rs|panic\.rs|sys/activation\.rs|rescue/(mod|disk|net)\.rs)'; then
               echo "ERROR: Command:: or execve() found outside allowlisted files"
               exit 1
             fi
