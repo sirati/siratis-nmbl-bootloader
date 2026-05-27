@@ -81,6 +81,15 @@ pub fn run_selector(config: &Config, generations: &[Generation]) -> Result<Decis
         return select_generation_serial(config, generations);
     }
 
+    #[cfg(feature = "image-splash")]
+    if config.splash.enable {
+        match crate::splash::try_run_selector(config, generations) {
+            Ok(Some(d)) => return Ok(d),
+            Ok(None) => crate::nmbl_warn!("splash unavailable, using tty UI"),
+            Err(e) => crate::nmbl_warn!("splash failed: {e}, using tty UI"),
+        }
+    }
+
     let console = open_console(Path::new(CONSOLE_PATH))?;
     let _raw = RawModeGuard::new(console.as_fd())?;
 
@@ -173,7 +182,10 @@ fn run_event_loop<W: Write>(
 }
 
 /// Dispatch render based on which screen the App is currently on.
-fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
+///
+/// `pub(crate)` so the splash orchestrator can reuse the same dispatch
+/// without forking the per-screen branching.
+pub(crate) fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
     match &app.screen {
         Screen::List => render_list(frame, &list_data(app)),
         Screen::Editing {
@@ -373,6 +385,11 @@ fn serial_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
 /// Render the passphrase modal under a raw-mode guard and poll keys
 /// until the operator submits or cancels. Esc returns an error so the
 /// caller can drop to the emergency shell.
+///
+/// The splash passphrase modal is deferred: activation runs after the
+/// boot menu, so the DRM card may have been handed off back to the
+/// kernel console already. Routing this through the tty path keeps the
+/// passphrase prompt reliable across both splash and non-splash boots.
 fn tui_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
     let console = open_console(Path::new(CONSOLE_PATH))?;
     let _raw = RawModeGuard::new(console.as_fd())?;
