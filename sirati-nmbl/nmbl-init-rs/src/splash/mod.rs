@@ -16,18 +16,17 @@
 pub mod compositor;
 pub mod drm;
 pub mod glyph_cache;
+pub mod input;
 pub mod png;
 pub mod scale;
 pub mod terminal;
 pub mod types;
 
-use std::os::fd::AsFd;
 use std::path::Path;
 use std::time::Duration;
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
-use crossterm::event::{self, Event};
 use ratatui::Terminal;
 use ratatui::TerminalOptions;
 use ratatui::Viewport;
@@ -39,15 +38,16 @@ use crate::error::{NmblError, Result};
 use crate::generations::Generation;
 use crate::splash::terminal::SplashTerminal;
 use crate::splash::types::CellDims;
-use crate::sys::tty::open_console;
 use crate::ui::POLL_SLICE;
 use crate::ui::render_current_screen;
 use crate::ui::timeout::{TimeoutOutcome, run_countdown};
 use crate::ui::{App, Decision};
 
-/// Console node opened to acquire raw-mode keyboard input alongside
-/// the DRM framebuffer output.
-const CONSOLE_PATH: &str = "/dev/console";
+/// Tty node opened to acquire raw-mode keyboard input alongside the
+/// DRM framebuffer output. `/dev/tty0` is the kernel's active VT, so
+/// VNC PS/2 keypresses land here even when `console=` points stdin at
+/// a serial line.
+const INPUT_TTY_PATH: &str = "/dev/tty0";
 
 /// Font size, in pixels, used to rasterise the splash glyph cache.
 const SPLASH_FONT_PX: f32 = 16.0;
@@ -93,11 +93,12 @@ pub fn try_run_selector(config: &Config, generations: &[Generation]) -> Result<O
         cell_h,
     };
 
-    // 4. Open /dev/console for raw-mode keyboard input. crossterm's
-    //    `event::poll` will read from stdin which the kernel pointed
-    //    at /dev/console in early userspace.
-    let console = open_console(Path::new(CONSOLE_PATH))?;
-    let _raw = crate::sys::tty::RawModeGuard::new(console.as_fd())?;
+    // 4. Open /dev/tty0 for raw-mode keyboard input. We can't rely on
+    //    stdin: the kernel's `console=` directive may have pointed it
+    //    at a serial line, so PS/2 keypresses (e.g. via VNC) only
+    //    land on the VT directly. SplashInput owns the fd, enters raw
+    //    mode, and restores termios on drop.
+    let mut input = input::SplashInput::open(Path::new(INPUT_TTY_PATH))?;
 
     // 5. Build the App. The headless terminal pipeline is built fresh
     //    per frame inside render_frame to bound SGR state to one frame.
@@ -132,9 +133,7 @@ pub fn try_run_selector(config: &Config, generations: &[Generation]) -> Result<O
             render_frame(&mut drm, &bg_scaled, &cache, cell_dims, &app)?;
             dirty = false;
         }
-        if event::poll(POLL_SLICE).map_err(tui_err)?
-            && let Event::Key(key) = event::read().map_err(tui_err)?
-        {
+        if let Some(key) = input.poll(POLL_SLICE)? {
             if app.on_key(key) {
                 break;
             }

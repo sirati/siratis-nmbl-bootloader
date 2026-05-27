@@ -81,4 +81,4 @@ default = []
 # Opt-in graphical boot splash. Adds DRM mode-set on simpledrm, a PNG
 # background, and a fontdue-rasterized overlay of the ratatui menu.
 # Any failure of the splash path falls back to today's tty UI.
-image-splash = ["dep:drm", "dep:png", "dep:fontdue", "dep:alacritty_terminal"]
+image-splash = ["dep:drm", "dep:png", "dep:fontdue", "dep:alacritty_terminal", "rustix/event"]
