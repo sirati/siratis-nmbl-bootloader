@@ -301,7 +301,11 @@ in
               bootMode = "qemu_kernel_invoke";
             };
             kernelPackage = pkgs.linuxPackages_latest.kernel;
-            kernelModules = [ ];
+            # NMBL itself must insmod the virtio_gpu stack in
+            # qemu_kernel_invoke mode (no kmod auto-load), otherwise
+            # /dev/dri/card0 never materialises and the splash DRM
+            # bring-up falls back to "console unavailable".
+            kernelModules = [ "virtio_pci" "virtio_gpu" ];
             mountPrefix = "/mnt";
             kernelParams = [
               "console=ttyS0,115200"
@@ -324,9 +328,9 @@ in
           ];
 
           # Minimal kernel-module set: just enough to bring up the
-          # framebuffer + DRI for the splash. No storage drivers needed
-          # since the VM has no -drive.
-          boot.initrd.availableKernelModules = [ ];
+          # framebuffer + DRI for the splash. virtio_blk is harmless
+          # filler (the VM has no -drive but matches other tests).
+          boot.initrd.availableKernelModules = [ "virtio_gpu" "virtio_pci" "virtio_blk" ];
           boot.initrd.kernelModules = [ ];
 
           boot.loader.grub.enable = false;
