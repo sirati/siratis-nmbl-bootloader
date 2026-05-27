@@ -157,12 +157,34 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     ${actualLoaderExtraArgs.extraEntries}
     EOF
 
-        # Install GRUB if device exists
-        if [ -b /dev/vda ]; then
-          echo "Installing GRUB (GPT+BIOS mode) to /dev/vda..."
-          ${pkgs.grub2}/bin/grub-install --target=i386-pc /dev/vda || true
-          echo "✓ GRUB bootloader installed"
+        # Discover boot disks (whole disks with an EF02 partition) unless
+        # the caller pinned bootstrapper.bootDisks. grub-install runs per
+        # disk so each member of e.g. a RAID1 mirror boots independently.
+        boot_disks=( ${lib.escapeShellArgs bootstrapper.bootDisks} )
+        if [ "''${#boot_disks[@]}" -eq 0 ]; then
+          for blk in /sys/class/block/*; do
+            [ -e "$blk/device" ] || continue      # skip loop/ram/dm/md
+            [ -e "$blk/partition" ] && continue   # skip partitions
+            dev="/dev/$(basename "$blk")"
+            [ -b "$dev" ] || continue
+            if ${pkgs.gptfdisk}/bin/sgdisk -p "$dev" 2>/dev/null \
+                | awk 'NR>5 && $5=="EF02" {found=1} END {exit !found}'; then
+              boot_disks+=("$dev")
+            fi
+          done
         fi
+
+        if [ "''${#boot_disks[@]}" -eq 0 ]; then
+          echo "ERROR: no boot disks with an EF02 partition found" >&2
+          echo "       set boot.nmbl.bootstrapper.bootDisks explicitly" >&2
+          exit 1
+        fi
+
+        for disk in "''${boot_disks[@]}"; do
+          echo "Installing GRUB (GPT+BIOS mode) to $disk..."
+          ${pkgs.grub2}/bin/grub-install --target=i386-pc "$disk" || true
+          echo "✓ GRUB bootloader installed to $disk"
+        done
   ''}
 
   ${lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "grub") ''
@@ -182,35 +204,35 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     ${actualLoaderExtraArgs.extraEntries}
     EOF
 
-        # Install GRUB EFI if device exists
-        if [ -b /dev/vda ]; then
-          echo "Installing GRUB (UEFI mode) to /boot ESP..."
-          GRUB_INSTALL_ARGS="--target=x86_64-efi --efi-directory=/boot --bootloader-id=NMBL"
+        # Install GRUB to the mounted /boot ESP. UEFI doesn't need a per-disk
+        # `grub-install` like BIOS does — grub-install writes the EFI binary
+        # into the ESP, and firmware finds it via the fallback path or NVRAM.
+        echo "Installing GRUB (UEFI mode) to /boot ESP..."
+        GRUB_INSTALL_ARGS="--target=x86_64-efi --efi-directory=/boot --bootloader-id=NMBL"
 
-          ${lib.optionalString (!actualLoaderExtraArgs.canTouchEfiVariables) ''
-            GRUB_INSTALL_ARGS="$GRUB_INSTALL_ARGS --no-nvram"
-          ''}
+        ${lib.optionalString (!actualLoaderExtraArgs.canTouchEfiVariables) ''
+          GRUB_INSTALL_ARGS="$GRUB_INSTALL_ARGS --no-nvram"
+        ''}
 
-          ${lib.optionalString actualLoaderExtraArgs.efiInstallAsRemovable ''
-            GRUB_INSTALL_ARGS="$GRUB_INSTALL_ARGS --removable"
-          ''}
+        ${lib.optionalString actualLoaderExtraArgs.efiInstallAsRemovable ''
+          GRUB_INSTALL_ARGS="$GRUB_INSTALL_ARGS --removable"
+        ''}
 
-          ${pkgs.grub2_efi}/bin/grub-install $GRUB_INSTALL_ARGS || true
+        ${pkgs.grub2_efi}/bin/grub-install $GRUB_INSTALL_ARGS || true
 
-          # Copy GRUB EFI to fallback location for UEFI firmware boot
-          # UEFI looks for /EFI/BOOT/BOOTX64.EFI when no NVRAM entries exist
-          ${lib.optionalString (!actualLoaderExtraArgs.efiInstallAsRemovable) ''
-            if [ -f /boot/EFI/NMBL/grubx64.efi ]; then
-              echo "Copying GRUB EFI to fallback location /EFI/BOOT/BOOTX64.EFI..."
-              cp /boot/EFI/NMBL/grubx64.efi /boot/EFI/BOOT/BOOTX64.EFI
-              echo "✓ GRUB EFI fallback bootloader installed"
-            else
-              echo "WARNING: GRUB EFI binary not found at /boot/EFI/NMBL/grubx64.efi"
-            fi
-          ''}
+        # Copy GRUB EFI to fallback location for UEFI firmware boot
+        # UEFI looks for /EFI/BOOT/BOOTX64.EFI when no NVRAM entries exist
+        ${lib.optionalString (!actualLoaderExtraArgs.efiInstallAsRemovable) ''
+          if [ -f /boot/EFI/NMBL/grubx64.efi ]; then
+            echo "Copying GRUB EFI to fallback location /EFI/BOOT/BOOTX64.EFI..."
+            cp /boot/EFI/NMBL/grubx64.efi /boot/EFI/BOOT/BOOTX64.EFI
+            echo "✓ GRUB EFI fallback bootloader installed"
+          else
+            echo "WARNING: GRUB EFI binary not found at /boot/EFI/NMBL/grubx64.efi"
+          fi
+        ''}
 
-          echo "✓ GRUB EFI bootloader installed"
-        fi
+        echo "✓ GRUB EFI bootloader installed"
   ''}
 
   ${lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "systemd") ''
@@ -234,34 +256,31 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     options ${lib.concatStringsSep " " cfg.kernelParams}
     EOF
 
-        # Install systemd-boot if device exists
-        if [ -b /dev/vda ]; then
-          echo "Installing systemd-boot to /boot ESP..."
-          BOOTCTL_ARGS="install --esp-path=/boot"
+        echo "Installing systemd-boot to /boot ESP..."
+        BOOTCTL_ARGS="install --esp-path=/boot"
 
-          ${lib.optionalString (!actualLoaderExtraArgs.canTouchEfiVariables) ''
-            BOOTCTL_ARGS="$BOOTCTL_ARGS --no-variables"
-          ''}
+        ${lib.optionalString (!actualLoaderExtraArgs.canTouchEfiVariables) ''
+          BOOTCTL_ARGS="$BOOTCTL_ARGS --no-variables"
+        ''}
 
-          ${pkgs.systemd}/bin/bootctl $BOOTCTL_ARGS || true
+        ${pkgs.systemd}/bin/bootctl $BOOTCTL_ARGS || true
 
-          # Copy systemd-boot EFI binary directly from Nix store.
-          # bootctl install may fail silently (--graceful) when /boot is on an
-          # MD RAID device (not a raw GPT partition), so we always copy the EFI
-          # binary ourselves as a fallback.  UEFI firmware finds it at the
-          # well-known removable media path /EFI/BOOT/BOOTX64.EFI.
-          mkdir -p /boot/EFI/systemd /boot/EFI/BOOT
-          SDBOOT_EFI="${pkgs.systemd}/lib/systemd/boot/efi/systemd-bootx64.efi"
-          if [ -f "$SDBOOT_EFI" ]; then
-            cp "$SDBOOT_EFI" /boot/EFI/systemd/systemd-bootx64.efi
-            cp "$SDBOOT_EFI" /boot/EFI/BOOT/BOOTX64.EFI
-            echo "✓ systemd-boot EFI installed to /EFI/systemd/ and /EFI/BOOT/BOOTX64.EFI"
-          else
-            echo "WARNING: systemd-boot EFI binary not found at $SDBOOT_EFI"
-          fi
-
-          echo "✓ systemd-boot bootloader installed"
+        # Copy systemd-boot EFI binary directly from Nix store.
+        # bootctl install may fail silently (--graceful) when /boot is on an
+        # MD RAID device (not a raw GPT partition), so we always copy the EFI
+        # binary ourselves as a fallback.  UEFI firmware finds it at the
+        # well-known removable media path /EFI/BOOT/BOOTX64.EFI.
+        mkdir -p /boot/EFI/systemd /boot/EFI/BOOT
+        SDBOOT_EFI="${pkgs.systemd}/lib/systemd/boot/efi/systemd-bootx64.efi"
+        if [ -f "$SDBOOT_EFI" ]; then
+          cp "$SDBOOT_EFI" /boot/EFI/systemd/systemd-bootx64.efi
+          cp "$SDBOOT_EFI" /boot/EFI/BOOT/BOOTX64.EFI
+          echo "✓ systemd-boot EFI installed to /EFI/systemd/ and /EFI/BOOT/BOOTX64.EFI"
+        else
+          echo "WARNING: systemd-boot EFI binary not found at $SDBOOT_EFI"
         fi
+
+        echo "✓ systemd-boot bootloader installed"
   ''}
 
   # Create /init symlink for NixOS stage-1
