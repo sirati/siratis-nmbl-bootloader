@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::error::{NmblError, Result};
 use crate::log::Verbosity;
+use crate::rescue::RescueMode;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +26,22 @@ pub struct Config {
 
     #[serde(default)]
     pub paths: Paths,
+
+    /// Rescue-dispatch settings. Minimal stub on this branch — C.1
+    /// lands the canonical shape with more fields. `#[serde(default)]`
+    /// keeps existing `config.toml` files parsing unchanged.
+    #[serde(default)]
+    pub rescue: RescueConfig,
+}
+
+/// Stub `RescueConfig`. C.1 owns the canonical version with additional
+/// fields (defaults for network rescue, etc.); this branch only needs
+/// `mode` to typecheck `rescue::dispatch`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RescueConfig {
+    #[serde(default)]
+    pub mode: RescueMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -254,6 +271,7 @@ impl Config {
             activations: Vec::new(),
             tui: Tui::default(),
             paths: Paths::default(),
+            rescue: RescueConfig::default(),
         }
     }
 }
