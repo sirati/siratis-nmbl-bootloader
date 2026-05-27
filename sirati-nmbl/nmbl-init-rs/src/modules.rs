@@ -11,12 +11,21 @@ use std::collections::{HashMap, HashSet};
 use crate::config::Config;
 use crate::error::Result;
 use crate::sys::module::{self, LoadOutcome, ModuleEntry};
+use crate::ui::BootReporter;
 use crate::{nmbl_info, nmbl_verbose, nmbl_warn};
 
 /// Load every explicit module + its transitive deps. Blacklisted module
 /// names (top-level or transitive) are skipped with a log line; a
 /// blacklisted dep is a config inconsistency and gets a warning.
-pub fn load_explicit_modules(config: &Config) -> Result<()> {
+///
+/// `reporter` carries the live boot console; we surface the current
+/// module name as the boot-status phase label so a long modprobe chain
+/// shows progress to the operator.
+pub fn load_explicit_modules(
+    config: &Config,
+    reporter: &mut BootReporter<'_, '_>,
+) -> Result<()> {
+    let _ = reporter.set_phase("phase 2: loading kernel modules");
     let release = crate::sys::uname::kernel_release()?;
     let entries = module::load_modules_dep(&config.kernel_modules.modules_dir, &release)?;
     let by_name: HashMap<String, &ModuleEntry> = module::index_by_name(&entries);
@@ -29,6 +38,7 @@ pub fn load_explicit_modules(config: &Config) -> Result<()> {
 
     let mut loaded: usize = 0;
     for name in &config.kernel_modules.explicit {
+        let _ = reporter.set_phase(format!("phase 2: modprobe {name}"));
         if blacklist.contains(name.as_str()) {
             nmbl_verbose!("skipping blacklisted module {}", name);
             continue;

@@ -41,13 +41,14 @@
 pub mod app;
 pub mod console;
 pub mod emergency;
+pub mod reporter;
 pub mod timeout;
 pub mod view;
 
 use std::io::{BufRead, Write};
 use std::os::fd::AsFd;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event};
 use ratatui::Terminal;
@@ -59,6 +60,8 @@ use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::generations::Generation;
 use crate::sys::tty::{RawModeGuard, open_console};
+use crate::ui::console::Console;
+use crate::ui::timeout::TimeoutOutcome;
 use crate::ui::view::{
     EditScreenData, EmergencyScreenData, ListScreenData, PassphraseScreenData, render_boot_status,
     render_edit, render_emergency, render_list, render_passphrase,
@@ -69,13 +72,9 @@ use crate::ui::view::{
 const CONSOLE_PATH: &str = "/dev/console";
 
 #[cfg(feature = "image-splash")]
-use std::time::Instant;
-#[cfg(feature = "image-splash")]
 use alacritty_terminal::term::cell::Flags;
 #[cfg(feature = "image-splash")]
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
-#[cfg(feature = "image-splash")]
-use crossterm::event::{KeyCode, KeyModifiers};
 #[cfg(feature = "image-splash")]
 use ratatui::TerminalOptions;
 #[cfg(feature = "image-splash")]
@@ -83,16 +82,15 @@ use ratatui::Viewport;
 #[cfg(feature = "image-splash")]
 use ratatui::layout::Rect;
 #[cfg(feature = "image-splash")]
-use crate::splash::{compositor, drm, glyph_cache, input, passphrase_demo, png, scale};
+use crate::splash::{compositor, drm, glyph_cache, input, png, scale};
 #[cfg(feature = "image-splash")]
 use crate::splash::terminal::SplashTerminal;
 #[cfg(feature = "image-splash")]
 use crate::splash::types::CellDims;
-#[cfg(feature = "image-splash")]
-use crate::ui::timeout::TimeoutOutcome;
 
 pub use app::{App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, Screen};
 pub use emergency::run_emergency_screen;
+pub use reporter::BootReporter;
 
 /// Slice we wait on input per iteration. Shared by the event loop and
 /// the countdown ticker so they have the same responsiveness profile
@@ -112,42 +110,127 @@ const INPUT_TTY_PATH: &str = "/dev/tty1";
 #[cfg(feature = "image-splash")]
 const SPLASH_FONT_PX: f32 = 16.0;
 
-/// Run the boot-selection TUI and return the operator's decision.
+/// Run the boot-selection TUI on the provided [`Console`] and return
+/// the operator's decision.
+///
+/// The console is brought up once by the orchestrator (main.rs) at the
+/// start of phase 1 and held through every phase; this function reuses
+/// it instead of opening a parallel splash bring-up, so the same DRM
+/// card / raw-mode tty serves the whole boot.
 ///
 /// Falls back to a line-oriented serial prompt when the config opts
 /// in via `general.serial_console`.
-pub fn run_selector(config: &Config, generations: &[Generation]) -> Result<Decision> {
+pub fn run_selector(
+    config: &Config,
+    generations: &[Generation],
+    console: &mut dyn Console,
+) -> Result<Decision> {
     if config.general.serial_console {
         return select_generation_serial(config, generations);
     }
+    run_selector_on_console(config, generations, console)
+}
 
-    #[cfg(feature = "image-splash")]
-    if config.splash.enable {
-        match run_splash_selector(config, generations)? {
-            Some(d) => return Ok(d),
-            None => {
-                crate::nmbl_warn!(
-                    "splash unavailable; falling back to serial prompt on stdin"
-                );
-                return select_generation_serial(config, generations);
+/// TUI event loop. Backend-agnostic: every render and key-poll goes
+/// through the [`Console`] trait. Hosts the countdown, the List/Editing
+/// state machine, and the timeout-defaults-to-first-generation rule.
+fn run_selector_on_console(
+    config: &Config,
+    generations: &[Generation],
+    console: &mut dyn Console,
+) -> Result<Decision> {
+    let mut app = App::new(generations);
+    app.show_kernel_params = config.tui.show_kernel_params;
+
+    // 1. Countdown phase.
+    let countdown = Duration::from_secs(u64::from(config.general.timeout_secs));
+    let outcome = run_console_countdown(console, &mut app, countdown)?;
+    app.countdown_remaining_secs = None;
+
+    if matches!(outcome, TimeoutOutcome::Expired) && app.decision.is_none() {
+        return Ok(Decision::Boot {
+            generation_index: 0,
+            cmdline_override: None,
+        });
+    }
+
+    // 2. Event loop. Renders on dirty, polls in short slices so future
+    //    callers that need to drive an animation can plug in without
+    //    rewriting the loop.
+    let mut dirty = true;
+    loop {
+        if dirty {
+            console.render(&app)?;
+            dirty = false;
+        }
+        if let Some(key) = console.poll_key(POLL_SLICE)? {
+            if app.on_key(key) {
+                break;
             }
+            dirty = true;
+        }
+        if app.decision.is_some() {
+            break;
         }
     }
 
-    // No splash available (either not enabled or feature not built in)
-    // and serial mode not requested: drop to the line-oriented prompt
-    // anyway. It works on any console the kernel pointed stdin at.
-    select_generation_serial(config, generations)
+    app.decision.ok_or_else(|| NmblError::Tui {
+        source: std::io::Error::other("selector exited without decision"),
+    })
+}
+
+/// Countdown driver that polls the [`Console`] for keys instead of
+/// stdin, so cancel-on-keypress works on both the splash framebuffer
+/// (input via `/dev/tty1`) and the raw-mode tty.
+fn run_console_countdown(
+    console: &mut dyn Console,
+    app: &mut App<'_>,
+    duration: Duration,
+) -> Result<TimeoutOutcome> {
+    let start = Instant::now();
+    let deadline = start.checked_add(duration).unwrap_or(start);
+
+    let initial = duration.as_secs();
+    app.countdown_remaining_secs = Some(initial);
+    console.render(app)?;
+    let mut last_reported = initial;
+
+    loop {
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Ok(TimeoutOutcome::Expired);
+        };
+
+        let slice = remaining.min(POLL_SLICE);
+        if console.poll_key(slice)?.is_some() {
+            return Ok(TimeoutOutcome::Cancelled);
+        }
+
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Ok(TimeoutOutcome::Expired);
+        };
+        let secs = remaining.as_secs();
+        if secs != last_reported {
+            app.countdown_remaining_secs = Some(secs);
+            console.render(app)?;
+            last_reported = secs;
+        }
+    }
 }
 
 /// Live splash-console handles. Holds everything `render_splash_frame`
 /// needs plus the input source; lets a caller paint a frame and poll
 /// for keys without owning the bring-up details.
 ///
-/// Constructed via [`open_splash_console`]; the rest of the splash
-/// orchestration (`run_splash_selector`, `run_emergency_screen`) calls
-/// `render` and `poll` against this handle so the bring-up boilerplate
-/// is centralised.
+/// Constructed via [`open_splash_console`]. Only
+/// [`emergency::run_emergency_screen`] still uses this path — the main
+/// boot flow goes through the [`Console`] trait (see
+/// `crate::ui::console::SplashConsole` for the trait-impl backend).
+/// A follow-up subagent will refactor `run_emergency_screen` to accept
+/// an existing [`Console`] handle, at which point this struct (and the
+/// associated `open_splash_console` + `render_splash_frame`) become dead
+/// code and can be removed.
 #[cfg(feature = "image-splash")]
 pub(crate) struct SplashConsole {
     drm: drm::SplashDrm,
@@ -226,136 +309,6 @@ pub(crate) fn open_splash_console(config: &Config) -> Result<Option<SplashConsol
         cell_dims,
         input,
     }))
-}
-
-/// Run the graphical boot selector backed by DRM + alacritty + SplashInput.
-///
-/// Returns `Ok(Some(decision))` on a clean operator choice, `Ok(None)`
-/// when the splash backend is unavailable (no DRM device, no font, etc.),
-/// and `Err(_)` when bring-up failed mid-flight.
-#[cfg(feature = "image-splash")]
-fn run_splash_selector(
-    config: &Config,
-    generations: &[Generation],
-) -> Result<Option<Decision>> {
-    let Some(mut console) = open_splash_console(config)? else {
-        return Ok(None);
-    };
-
-    // 5. Build the App. The headless terminal pipeline is built fresh
-    //    per frame inside render_frame to bound SGR state to one frame.
-    let mut app = App::new(generations);
-    app.show_kernel_params = config.tui.show_kernel_params;
-
-    // 6. Countdown phase.
-    let countdown = Duration::from_secs(u64::from(config.general.timeout_secs));
-    let countdown_outcome = run_splash_countdown(
-        countdown,
-        &mut console.input,
-        &mut |secs| {
-            app.countdown_remaining_secs = Some(secs);
-            let _ = render_splash_frame(
-                &mut console.drm,
-                &console.bg_scaled,
-                &console.cache,
-                console.cell_dims,
-                &app,
-            );
-        },
-    )?;
-    app.countdown_remaining_secs = None;
-
-    if matches!(countdown_outcome, TimeoutOutcome::Expired) && app.decision.is_none() {
-        return Ok(Some(Decision::Boot {
-            generation_index: 0,
-            cmdline_override: None,
-        }));
-    }
-
-    // 7. Event loop.
-    let mut dirty = true;
-    loop {
-        if dirty {
-            console.render(&app)?;
-            dirty = false;
-        }
-        if let Some(key) = console.poll(POLL_SLICE)? {
-            // Intercept Ctrl+P from the list screen to demo the
-            // passphrase dialog. Plain `p` is already a list-view
-            // hotkey (toggles show_kernel_params) and a literal in
-            // many kernel cmdline edits (loglevel, console=tty1,
-            // ip=), so we use the modifier and gate on screen state.
-            if matches!(app.screen, Screen::List)
-                && key.code == KeyCode::Char('p')
-                && key.modifiers == KeyModifiers::CONTROL
-            {
-                let outcome = passphrase_demo::run(
-                    &mut console.drm,
-                    &console.bg_scaled,
-                    &console.cache,
-                    console.cell_dims,
-                    &mut console.input,
-                )?;
-                crate::nmbl_info!("passphrase demo returned: {outcome:?}");
-                dirty = true;
-                continue;
-            }
-            if app.on_key(key) {
-                break;
-            }
-            dirty = true;
-        }
-        if app.decision.is_some() {
-            break;
-        }
-    }
-
-    match app.decision {
-        Some(d) => Ok(Some(d)),
-        None => Err(NmblError::Tui {
-            source: std::io::Error::other("splash exited without decision"),
-        }),
-    }
-}
-
-/// Splash-side countdown loop. Mirrors [`crate::ui::timeout::run_countdown`]
-/// but polls [`input::SplashInput`] instead of stdin so cancel-on-keypress
-/// works on VT inputs even when the kernel's `console=` directive has
-/// pointed stdin at a serial line.
-#[cfg(feature = "image-splash")]
-fn run_splash_countdown(
-    duration: Duration,
-    input: &mut input::SplashInput,
-    on_tick: &mut dyn FnMut(u64),
-) -> Result<TimeoutOutcome> {
-    let start = Instant::now();
-    let deadline = start.checked_add(duration).unwrap_or(start);
-
-    let initial = duration.as_secs();
-    on_tick(initial);
-    let mut last_reported = initial;
-
-    loop {
-        let now = Instant::now();
-        let Some(remaining) = deadline.checked_duration_since(now) else {
-            return Ok(TimeoutOutcome::Expired);
-        };
-
-        let slice = remaining.min(POLL_SLICE);
-        if input.poll(slice)?.is_some() {
-            return Ok(TimeoutOutcome::Cancelled);
-        }
-
-        let now = Instant::now();
-        let Some(remaining) = deadline.checked_duration_since(now) else {
-            return Ok(TimeoutOutcome::Expired);
-        };
-        let secs = remaining.as_secs();
-        if secs != last_reported {
-            on_tick(secs);
-            last_reported = secs;
-        }
-    }
 }
 
 /// Render one frame: ratatui-draw → vte parse → cell-walk → blit.

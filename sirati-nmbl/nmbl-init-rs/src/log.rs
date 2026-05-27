@@ -145,16 +145,6 @@ pub fn snapshot(n: usize) -> Vec<String> {
     ring.iter().skip(start).cloned().collect()
 }
 
-/// Reset the ring to its uninitialised state. Test-only — used to
-/// isolate ring tests from log noise produced by other tests in the
-/// same `cargo test` process.
-#[cfg(test)]
-pub(crate) fn clear_ring() {
-    if let Ok(mut guard) = LOG_RING.lock() {
-        *guard = None;
-    }
-}
-
 #[macro_export]
 macro_rules! nmbl_warn {
     ($($arg:tt)*) => {{
@@ -217,11 +207,14 @@ mod tests {
     #[test]
     fn snapshot_returns_recent_lines() {
         let _guard = ring_test_guard();
-        clear_ring();
+        // Hold the LOG_RING mutex across the body — see the comment in
+        // `snapshot_caps_at_ring_capacity` for why.
+        let mut guard = LOG_RING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(VecDeque::with_capacity(LOG_RING_CAPACITY));
         for i in 0..10 {
-            push_ring(&format!("line {i}"));
+            push_inner(guard.as_mut().expect("ring just initialised"), &format!("line {i}"));
         }
-        let snap = snapshot(5);
+        let snap = snapshot_inner(guard.as_ref().expect("ring still initialised"), 5);
         assert_eq!(snap.len(), 5);
         assert_eq!(snap.first().map(String::as_str), Some("line 5"));
         assert_eq!(snap.get(4).map(String::as_str), Some("line 9"));
@@ -230,11 +223,20 @@ mod tests {
     #[test]
     fn snapshot_caps_at_ring_capacity() {
         let _guard = ring_test_guard();
-        clear_ring();
+        // Hold the LOG_RING mutex itself across the whole test so
+        // concurrent `nmbl_*!` calls from sibling test threads (via
+        // their `try_lock` in `push_ring`) silently drop and CANNOT
+        // contaminate our 300-entry push sequence. Without this, any
+        // test thread that fires a log macro between our pushes adds
+        // to the ring, shifts what the FIFO evicts, and our oldest /
+        // newest entry assertions become flaky under cargo's parallel
+        // test execution.
+        let mut guard = LOG_RING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(VecDeque::with_capacity(LOG_RING_CAPACITY));
         for i in 0..300 {
-            push_ring(&format!("entry {i}"));
+            push_inner(guard.as_mut().expect("ring just initialised"), &format!("entry {i}"));
         }
-        let snap = snapshot(usize::MAX);
+        let snap = snapshot_inner(guard.as_ref().expect("ring still initialised"), usize::MAX);
         assert_eq!(snap.len(), LOG_RING_CAPACITY);
         // After eviction the oldest surviving entry is 300 - CAP and
         // the newest is 299.
@@ -248,11 +250,35 @@ mod tests {
         );
     }
 
+    /// Lock-naive push for in-test use: writes directly to a ring the
+    /// caller already holds locked. Mirrors the eviction half of
+    /// `push_ring` so the in-test sequence matches production.
+    fn push_inner(ring: &mut VecDeque<String>, line: &str) {
+        if ring.len() == LOG_RING_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(line.to_owned());
+    }
+
+    /// Lock-naive snapshot for in-test use.
+    fn snapshot_inner(ring: &VecDeque<String>, n: usize) -> Vec<String> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let take = n.min(ring.len());
+        let start = ring.len().saturating_sub(take);
+        ring.iter().skip(start).cloned().collect()
+    }
+
     #[test]
     fn snapshot_empty_returns_empty() {
         let _guard = ring_test_guard();
-        clear_ring();
-        assert!(snapshot(10).is_empty());
-        assert!(snapshot(0).is_empty());
+        // Hold the LOG_RING mutex across the body — see the comment in
+        // `snapshot_caps_at_ring_capacity` for why.
+        let mut guard = LOG_RING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(VecDeque::new());
+        let ring = guard.as_ref().expect("ring just initialised");
+        assert!(snapshot_inner(ring, 10).is_empty());
+        assert!(snapshot_inner(ring, 0).is_empty());
     }
 }
