@@ -1,170 +1,178 @@
 //! Emergency-shell entrypoint (PLAN.md §6.3 / §9).
 //!
-//! This module is one of the few crate sites permitted to replace the
-//! current process via `execve(2)` (see also `src/panic.rs` and
-//! `src/sys/activation.rs`). When any top-level phase returns `Err`,
-//! `main` routes the error through [`drop_to_emergency`], which:
+//! When any top-level phase returns `Err`, `main` routes the error
+//! through [`drop_to_emergency`], which:
 //!
 //! 1. Runs the [`crate::ui::run_emergency_screen`] TUI over the splash
 //!    backend (or a tty/serial fallback) to ask the operator whether
 //!    they want to reboot or get a shell.
-//! 2. On [`EmergencyChoice::Reboot`] calls `reboot(RB_AUTOBOOT)`.
-//! 3. On [`EmergencyChoice::Shell`] prints the operator-facing banner
-//!    including the full error chain and a variant-specific hint, then
-//!    hands off to [`crate::rescue::dispatch`]. The dispatcher decides
-//!    whether to `execve(2)` the embedded busybox, loop-mount the
-//!    external rescue squashfs, fetch one over HTTP, or halt — see
-//!    `src/rescue/mod.rs`.
+//! 2. On [`EmergencyChoice::Reboot`] returns
+//!    [`TerminalAction::Reboot`].
+//! 3. On [`EmergencyChoice::Shell`] hands off to
+//!    [`crate::rescue::dispatch`], which produces a
+//!    [`TerminalAction::Execve`] (or `HaltWithBanner` when no rescue
+//!    path is reachable). The dispatcher decides whether to execve
+//!    the embedded busybox, loop-mount the external rescue squashfs,
+//!    fetch one over HTTP, or halt — see `src/rescue/mod.rs`.
 //!
-//! On success the function does not return — either `reboot` reboots
-//! the machine or the chosen shell process inherits PID 1. The
-//! signature uses [`std::convert::Infallible`] to document that
-//! contract at the type level: a caller that does
-//! `let _: Infallible = drop_to_emergency(...);` will never proceed.
-//!
-//! Failure modes are themselves "no-return": if `rescue::dispatch`
-//! returns `Err` (no rescue path reachable, embedded execve failed,
-//! …) we print one last diagnostic and halt the system via
-//! `reboot(RB_HALT_SYSTEM)` — a kernel panic is preferable to silently
-//! returning to a caller that expects `Infallible`.
-
-use std::convert::Infallible;
-
-use nix::sys::reboot::{RebootMode, reboot};
+//! All terminal-action syscalls — `execve`, `reboot(RB_AUTOBOOT)`,
+//! `reboot(RB_HALT_SYSTEM)`, `reboot(RB_KEXEC)` — happen in one
+//! place: `main::execute_terminal_action`. By the time control
+//! reaches that dispatcher the call stack has fully unwound, so
+//! every [`crate::ui::console::Console`] backend's `Drop` impl has
+//! already run (KD_TEXT restored, termios reset, fds closed) and the
+//! shell that inherits PID 1 sees a clean VT.
 
 use crate::config::Config;
 use crate::error::{NmblError, format_chain};
 use crate::nmbl_warn;
 use crate::rescue;
+use crate::terminal::{EmergencyBanner, TerminalAction};
 use crate::ui::console::{Console, open_console};
 use crate::ui::{EmergencyChoice, run_emergency_screen};
 
 /// Print the operator-facing emergency banner and hand off to the
-/// rescue dispatcher. Does not return on success; on dispatch failure
-/// halts the system rather than returning to the caller.
+/// rescue dispatcher. Returns the [`TerminalAction`] the dispatcher
+/// in `main` will perform once the call stack has fully unwound.
 ///
-/// `console` is the live boot console when the orchestrator still has
-/// one — phase-failure paths pass it down BY OWNERSHIP so the rescue
-/// dispatcher can DROP it before any `execve(2)` (and so restore VT
-/// text mode + termios via the backend's `Drop` impl). Without that
-/// drop the kernel keeps the VT in `KD_GRAPHICS` and the operator's
-/// shell runs invisibly under a frozen splash frame. When `None`
-/// (panic-recovery re-exec, or initial console bring-up failed) we
-/// open a tty console as a last resort; that path forces
-/// `panic_recovery=true` so the splash code is never re-entered.
+/// `console` is the live boot console the orchestrator still holds.
+/// We render the emergency-screen TUI through it, then hand it on to
+/// [`rescue::dispatch`] for any further UI (e.g. network-rescue
+/// screens). The box is dropped by normal scope exit before the
+/// `TerminalAction` is fired in `main`, which is what restores
+/// KD_TEXT and termios — without that ordering the freshly-execve'd
+/// shell would run invisibly under a frozen splash frame.
 pub fn drop_to_emergency(
-    console: Option<Box<dyn Console>>,
+    console: Box<dyn Console>,
     config: &Config,
     err: NmblError,
-) -> Infallible {
-    // Take ownership of the boot console so the rescue dispatcher can
-    // DROP it before any `execve(2)` into the rescue shell. Without
-    // that drop the TtyConsole / SplashConsole Drop impl never runs,
-    // so the VT stays in KD_GRAPHICS and the operator's shell renders
-    // invisibly under a frozen splash frame.
-    //
-    // When the caller has no live console (panic-recovery re-exec, or
-    // early-phase failure before open_console), open a fresh tty
-    // console; `panic_recovery=true` keeps us out of the splash code
-    // path which may itself be the cause of the failure we are
-    // recovering from. The same handle is reused for the emergency
-    // TUI and the network-rescue screens — never two parallel
-    // terminals.
-    let mut console = match console {
-        Some(c) => c,
-        None => match open_console(config, true) {
-            Ok(c) => c,
-            Err(open_err) => {
-                nmbl_warn!(
-                    "emergency console bring-up failed: {}; defaulting to reboot",
-                    format_chain(&open_err as &dyn std::error::Error),
-                );
-                eprintln!("[nmbl] operator (or timeout) chose reboot");
-                let _ = reboot(RebootMode::RB_AUTOBOOT);
-                halt_with("reboot(RB_AUTOBOOT) returned; halting");
-            }
-        },
-    };
-
+) -> TerminalAction {
+    // Run the emergency-screen TUI over the live console. The TUI
+    // returns the operator's pick (or `Reboot` on the 30s timeout).
+    let mut console = console;
     let choice = run_emergency_screen(&mut *console, &err);
-    handle_choice(choice, console, config, &err)
+    handle_choice(choice, console, config, err)
+}
+
+/// Open a fresh tty console (panic-recovery mode skips splash) and
+/// then run [`drop_to_emergency`]. Used by call sites that have no
+/// live console yet — the initial bring-up failure, the
+/// panic-recovery re-exec, the pre-console phases.
+///
+/// On console bring-up failure we log it, print a reboot reason, and
+/// return [`TerminalAction::Reboot`] so the dispatcher reboots
+/// instead of leaving the operator at an inert PID 1.
+pub fn open_console_and_drop_to_emergency(config: &Config, err: NmblError) -> TerminalAction {
+    match open_console(config, true) {
+        Ok(c) => drop_to_emergency(c, config, err),
+        Err(open_err) => {
+            nmbl_warn!(
+                "emergency console bring-up failed: {}; defaulting to reboot",
+                format_chain(&open_err as &dyn std::error::Error),
+            );
+            eprintln!("[nmbl] operator (or timeout) chose reboot");
+            TerminalAction::Reboot
+        }
+    }
 }
 
 /// Act on the operator's emergency-screen choice. `console` is the
 /// live boot console (owned) the caller routed down; on the shell
-/// branch it is threaded into `rescue::dispatch` so the network-rescue
-/// screens paint through the same backend (no second `/dev/console`
-/// grab, no flicker between splash and tty) and the dispatcher drops
-/// the box before `execve`.
+/// branch it is threaded into `rescue::dispatch` so the
+/// network-rescue screens paint through the same backend (no second
+/// `/dev/console` grab, no flicker between splash and tty).
 fn handle_choice(
     choice: EmergencyChoice,
     console: Box<dyn Console>,
     config: &Config,
-    err: &NmblError,
-) -> Infallible {
+    err: NmblError,
+) -> TerminalAction {
     match choice {
         EmergencyChoice::Reboot => {
-            // Tear down the boot console before reboot so the VT mode
-            // and termios are restored even on this path.
-            drop(console);
+            // `console` is owned by this arm and drops on the closing
+            // brace via scope exit; the dispatcher in `main` performs
+            // `reboot(RB_AUTOBOOT)` only after this whole call has
+            // returned.
+            let _ = console;
             eprintln!("[nmbl] operator (or timeout) chose reboot");
-            let _ = reboot(RebootMode::RB_AUTOBOOT);
-            // reboot() returned Err — fall through to the same halt
-            // path execve uses, so we still preserve Infallible.
-            halt_with("reboot(RB_AUTOBOOT) returned; halting");
+            TerminalAction::Reboot
         }
         EmergencyChoice::Shell => exec_shell(console, config, err),
     }
 }
 
-/// Execute the chosen-shell path: print the banner with the error
-/// chain so the operator has context, then hand off to the rescue
-/// dispatcher. Does not return on success; on dispatch failure halts
-/// the system.
-fn exec_shell(console: Box<dyn Console>, config: &Config, err: &NmblError) -> Infallible {
-    print_banner(config, err);
-
-    // rescue::dispatch returns Result<Infallible>: success is the
-    // noreturn path (process image is replaced), so the Ok arm matches
-    // against an uninhabited type. Any Err means no rescue strategy
-    // could complete — we log the failure chain and halt. The Box is
-    // moved into the dispatcher which drops it before any execve so
-    // the backend's Drop impl restores VT text mode and termios.
+/// Execute the chosen-shell path: hand off to the rescue dispatcher
+/// and let it produce a [`TerminalAction`]. On dispatch failure we
+/// print one last diagnostic and collapse to a halt-with-banner.
+fn exec_shell(console: Box<dyn Console>, config: &Config, err: NmblError) -> TerminalAction {
+    // rescue::dispatch builds a TerminalAction the caller in `main`
+    // will fire after every stack-allocated resource is dropped. The
+    // box is moved into the dispatcher; either it drops the console
+    // inside its arms or returns it dropped through the network-UI
+    // helper. Any Err means no rescue strategy could complete — we
+    // log the failure chain and surface a halt-with-banner so the
+    // operator sees a structured diagnostic.
     match rescue::dispatch(config, console, err) {
-        Ok(infallible) => match infallible {},
+        Ok(action) => action,
         Err(dispatch_err) => {
             eprintln!(
                 "[nmbl] EMERGENCY RESCUE DISPATCH FAILED: {}",
                 format_chain(&dispatch_err as &dyn std::error::Error)
             );
-            halt_with("rescue dispatch failed; halting")
+            TerminalAction::HaltWithBanner {
+                cause: dispatch_err,
+            }
         }
     }
 }
 
 /// Print the full operator-facing banner: header, suggested action,
-/// the error chain. Plain ASCII — the early-userspace console may not
-/// have UTF-8 box-drawing glyphs.
-fn print_banner(config: &Config, err: &NmblError) {
+/// the error chain. Plain ASCII — the early-userspace console may
+/// not have UTF-8 box-drawing glyphs. Called by the dispatcher in
+/// `main` immediately before the execve syscall fires, so the
+/// operator sees the chain printed onto the freshly-restored VT.
+pub fn print_banner(banner: &EmergencyBanner) {
     let separator = "=".repeat(72);
     eprintln!("{separator}");
     eprintln!("NMBL: dropped to emergency shell");
     eprintln!("{separator}");
     eprintln!();
     eprintln!("Suggested action:");
-    eprintln!("  {}", suggested_action(err));
+    eprintln!("  {}", suggested_action(&banner.err));
     eprintln!();
     eprintln!("Error chain:");
-    let chain = format_chain(err as &dyn std::error::Error);
+    let chain = format_chain(&banner.err as &dyn std::error::Error);
     for line in chain.lines() {
         eprintln!("  {line}");
     }
     eprintln!();
     eprintln!(
         "Shell: {}  (will execve next)",
-        config.paths.shell.display()
+        banner.shell_path.display()
     );
     eprintln!("Type `exit` to reboot, or fix the issue and re-exec /init.");
+    eprintln!("{separator}");
+}
+
+/// Print the halt-with-banner banner: same shape as
+/// [`print_banner`] but tailored to the no-rescue-toolkit scenario.
+/// Called by the dispatcher in `main` immediately before the
+/// `reboot(RB_HALT_SYSTEM)` syscall fires.
+pub fn print_halt_banner(cause: &NmblError) {
+    let separator = "=".repeat(72);
+    eprintln!("{separator}");
+    eprintln!("NMBL: no rescue toolkit available — halting");
+    eprintln!("{separator}");
+    eprintln!();
+    eprintln!("Configured rescue mode is `none`. The initramfs ships no");
+    eprintln!("interactive shell, and the operator did not enable the");
+    eprintln!("external squashfs rescue. The system will halt.");
+    eprintln!();
+    eprintln!("Error chain:");
+    let chain = format_chain(cause as &dyn std::error::Error);
+    for line in chain.lines() {
+        eprintln!("  {line}");
+    }
     eprintln!("{separator}");
 }
 
@@ -226,20 +234,6 @@ fn suggested_action(err: &NmblError) -> String {
     }
 }
 
-/// Print a one-line final-fallback message and halt. Returns
-/// `Infallible` because [`reboot`] with `RB_HALT_SYSTEM` does not
-/// return on success and we route the error case into a second halt
-/// attempt (then `_exit(1)`).
-fn halt_with(reason: &str) -> ! {
-    eprintln!("[nmbl] {reason}");
-    let _ = reboot(RebootMode::RB_HALT_SYSTEM);
-    // reboot() returned Err — kernel refused (lacking CAP_SYS_BOOT in
-    // a test/sandbox, or we are not PID 1). Best we can do is _exit.
-    // SAFETY: libc::_exit is async-signal-safe and unconditionally
-    // terminates the process; no crate wraps it (rustix issue #844).
-    unsafe { libc::_exit(1) };
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -249,11 +243,117 @@ fn halt_with(reason: &str) -> ! {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::Duration;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Frame;
+
+    use crate::error::Result;
+    use crate::rescue::RescueMode;
+    use crate::terminal::TerminalAction;
+    use crate::ui::app::App;
+    use crate::ui::console::ConsoleKind;
 
     fn io_err(ctx: &str) -> NmblError {
         NmblError::Io {
             source: std::io::Error::other("test"),
             context: ctx.to_string(),
+        }
+    }
+
+    /// Scripted in-process [`Console`] for unit-testing
+    /// `drop_to_emergency`. Drives a queued sequence of key events on
+    /// `poll_key()` and stays in lockstep with the emergency-screen
+    /// loop's render/poll cadence.
+    ///
+    /// Mirrors the `TestConsole` in `ui::emergency::tests`; lives
+    /// here because the cross-module visibility rules make the
+    /// emergency-module one unreachable from `shell::tests`.
+    struct ScriptedConsole {
+        events: Vec<Option<KeyEvent>>,
+        cursor: usize,
+    }
+
+    impl ScriptedConsole {
+        fn new(events: Vec<Option<KeyEvent>>) -> Self {
+            Self { events, cursor: 0 }
+        }
+    }
+
+    impl Console for ScriptedConsole {
+        fn render(&mut self, _app: &App<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+            let v = self.events.get(self.cursor).copied().flatten();
+            self.cursor = self.cursor.saturating_add(1);
+            Ok(v)
+        }
+        fn size(&self) -> (u16, u16) {
+            (80, 24)
+        }
+        fn kind(&self) -> ConsoleKind {
+            ConsoleKind::Tty
+        }
+        fn draw_with(&mut self, _body: &mut dyn FnMut(&mut Frame<'_>)) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn drop_to_emergency_returns_execve_on_shell_choice() {
+        // Down (selects Shell) + Enter. drop_to_emergency must hand
+        // off to rescue::dispatch which, with mode=Embedded
+        // (recovery-default), builds a TerminalAction::Execve aimed
+        // at config.paths.shell.
+        let mut config = Config::recovery_default();
+        config.rescue.mode = RescueMode::Embedded;
+        // Pin the shell path to a known value so we can assert the
+        // execve target without depending on the recovery-default
+        // string.
+        config.paths.shell = PathBuf::from("/bin/test-emergency-shell");
+
+        let console: Box<dyn Console> = Box::new(ScriptedConsole::new(vec![
+            Some(press(KeyCode::Down)),
+            Some(press(KeyCode::Enter)),
+        ]));
+
+        let action = drop_to_emergency(console, &config, io_err("synthetic boot failure"));
+
+        match action {
+            TerminalAction::Execve { path, banner, .. } => {
+                let path_bytes = path.as_bytes();
+                assert_eq!(
+                    path_bytes, b"/bin/test-emergency-shell",
+                    "execve target must match the configured shell"
+                );
+                let banner = banner.expect("emergency execve must carry a banner");
+                assert_eq!(banner.shell_path, PathBuf::from("/bin/test-emergency-shell"));
+            }
+            other => panic!("expected Execve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_to_emergency_returns_reboot_on_r_hotkey() {
+        // The emergency screen surfaces 'r' as a one-shot reboot
+        // hotkey (matches the operator muscle-memory call-out in
+        // ui::app::handle_emergency_key). drop_to_emergency must
+        // surface that as TerminalAction::Reboot.
+        let config = Config::recovery_default();
+
+        let console: Box<dyn Console> =
+            Box::new(ScriptedConsole::new(vec![Some(press(KeyCode::Char('r')))]));
+
+        let action = drop_to_emergency(console, &config, io_err("synthetic"));
+
+        match action {
+            TerminalAction::Reboot => {}
+            other => panic!("expected Reboot, got {other:?}"),
         }
     }
 
