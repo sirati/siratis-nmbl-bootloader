@@ -73,9 +73,14 @@ pub fn emit_kmsg(line: &str) {
         }
     }
     if let Some(file) = guard.as_mut() {
+        // Kernel `/dev/kmsg` treats each write(2) as one record.
+        // Format the entire line up-front and submit it in a single
+        // write_all so we don't get "<6>[nmbl]" / message / "\n" as
+        // three separate records.
         // Use printk level 6 (KERN_INFO). The kernel parses "<6>" at
         // the start of each line and routes the rest as the message.
-        let _ = writeln!(file, "<6>[nmbl] {line}");
+        let buf = format!("<6>[nmbl] {line}\n");
+        let _ = file.write_all(buf.as_bytes());
     }
 }
 
