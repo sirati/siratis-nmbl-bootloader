@@ -622,3 +622,77 @@ made:
 4. **Should we drop `busybox` entirely** and ship a self-built static `sh`
    replacement? Almost certainly not worth it: busybox is small, has a
    well-known interface, and the operator already knows it.
+
+---
+
+## 13. Size deltas
+
+Measured against the four meaningful runtime configurations from
+`testing/build_configurations.nix`. All numbers are bytes as reported
+by `du -b` of the built store paths. The `initramfs` column is the
+gzip-9 `initrd` blob shipped in `/boot`. The `nmbl-init` column is
+the static-musl PID 1 ELF inside that initramfs. The `rescue.sfs`
+column is the external zstd-19 squashfs staged at
+`/boot/nmbl-rescue.sfs` (only present when
+`boot.nmbl.rescue.mode = "external"`).
+
+| Configuration                       | initramfs (bytes) | nmbl-init (bytes) | rescue.sfs (bytes) |
+|-------------------------------------|------------------:|------------------:|-------------------:|
+| embedded (back-compat default)      |        37,570,137 |         1,351,920 |                n/a |
+| external-config                     |        37,570,319 |         1,351,920 |                n/a |
+| external-rescue                     |        36,914,256 |         1,351,920 |            700,416 |
+| external-rescue + network           |        37,546,091 |         1,810,704 |            700,416 |
+
+Notes:
+
+- **embedded** is `test-gpt-uefi-grub` — the back-compat baseline
+  with `configLocation = "embedded"` and `rescue.mode = "embedded"`
+  (the defaults). Everything ships inside the initramfs, including
+  busybox under `/bin/sh`.
+- **external-config** (`test-external-config`) keeps
+  `rescue.mode = "embedded"` (busybox still on the initramfs) but
+  moves the runtime config TOML onto the boot partition via
+  `lib/install-bootloader.nix`. The +182-byte delta is just the
+  bootstrap.toml header overhead vs the full config.toml — both
+  files live under `/etc/nmbl/` and compress nearly identically
+  with gzip -9.
+- **external-rescue** (`test-external-rescue`) sets
+  `boot.nmbl.rescue.mode = "external"` and bundles a squashfs at
+  install time with `pkgs.busybox-sandbox-shell` + `pkgs.pkgsStatic.strace`.
+  The initramfs SHRINKS by ~640 KiB versus embedded: busybox is
+  dropped from `baseContents` (the rescue path now switch_roots
+  into the squashfs, which carries its own /bin/sh) and that saving
+  outweighs the ~54 KiB pulled in for the `loop`+`squashfs` kernel
+  modules. The squashfs itself adds ~684 KiB of staged content to
+  the boot partition.
+- **external-rescue + network** (`test-external-rescue-network`)
+  flips `rescue.network = true` on top of external-rescue. The
+  initramfs grows by ~617 KiB versus external-rescue: ~448 KiB
+  comes from compiling the `network-rescue` Cargo feature into
+  `nmbl-init` (the binary jumps from 1.29 MiB to 1.73 MiB — pulls
+  in `smoltcp` + the embedded HTTP client), and the rest comes from
+  the auto-pulled `virtio_net` driver and DHCP wiring closure.
+- The `nmbl-init` binary is byte-identical across the first three
+  rows because Nix's store-path dedup keeps the feature-free build
+  shared whenever `rescue.network = false` (see `lib/config.nix`'s
+  `resolvedNmblInit` identity-equal short-circuit).
+
+### Plan's "external mode at least 500 KiB smaller" claim
+
+**PASS.** With busybox gated on `rescue.mode == "embedded"` in
+`lib/config.nix`, the external-rescue initramfs is **655,881 bytes
+(~640 KiB) smaller** than the embedded baseline, exceeding the
+500 KiB goal. The fix scopes the `/bin/sh` symlink under a
+`lib.optional (cfg.rescue.mode == "embedded")` so the
+`external` and `none` modes ship no in-initramfs shell at all —
+the rescue dispatcher either pivots into `nmbl-rescue.sfs` (which
+carries its own `/bin/sh`) or halts via `halt_with_banner` without
+ever invoking a shell. Activation tooling (LUKS / LVM / mdadm /
+zfs) remains conditional on `boot.nmbl.activation.*`, which the
+test configs do not trigger, so those binaries do not move the
+needle here.
+
+The external-config row still saves ~no bytes (the only delta is
+the bootstrap-vs-full TOML swap), because external-config keeps
+`rescue.mode = "embedded"` — the two options are orthogonal. The
+500 KiB goal is met specifically by `rescue.mode = "external"`.

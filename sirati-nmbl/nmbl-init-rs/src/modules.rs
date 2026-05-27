@@ -15,6 +15,7 @@
 //! is visible to the operator.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use crate::config::Config;
 use crate::error::Result;
@@ -72,14 +73,14 @@ impl ModuleSet {
 /// status pushes do nothing visible, but the underlying log-ring is
 /// still populated for the post-console reporter to surface.
 pub fn load_early_modules(config: &Config, reporter: &mut BootReporter<'_>) -> Result<()> {
-    load_modules(config, reporter, ModuleSet::Early)
+    load_module_set(config, reporter, ModuleSet::Early)
 }
 
 /// Load the [`ModuleSet::Explicit`] subset — storage, filesystem,
 /// activation drivers. Called in phase 2b after `open_console` so the
 /// operator sees per-module progress on the live boot console.
 pub fn load_explicit_modules(config: &Config, reporter: &mut BootReporter<'_>) -> Result<()> {
-    load_modules(config, reporter, ModuleSet::Explicit)
+    load_module_set(config, reporter, ModuleSet::Explicit)
 }
 
 /// Walk the chosen [`ModuleSet`] list, loading each entry + its
@@ -90,7 +91,7 @@ pub fn load_explicit_modules(config: &Config, reporter: &mut BootReporter<'_>) -
 /// `reporter` carries either the live boot console (phase 2b) or the
 /// pre-console `NoopConsole` (phase 2a); the call sequence is identical
 /// in both phases — only the visible side-effect differs.
-pub fn load_modules(
+pub fn load_module_set(
     config: &Config,
     reporter: &mut BootReporter<'_>,
     which: ModuleSet,
@@ -106,20 +107,44 @@ pub fn load_modules(
         return Ok(());
     }
 
-    let release = crate::sys::uname::kernel_release()?;
-    let entries = module::load_modules_dep(&config.kernel_modules.modules_dir, &release)?;
-    let by_name: HashMap<String, &ModuleEntry> = module::index_by_name(&entries);
-    let blacklist: HashSet<&str> = config
-        .kernel_modules
-        .blacklist
-        .iter()
-        .map(String::as_str)
-        .collect();
+    load_modules_inner(
+        &config.kernel_modules.modules_dir,
+        module_list,
+        &config.kernel_modules.blacklist,
+        Some((reporter, which.modprobe_prefix())),
+    )?;
+    Ok(())
+}
 
-    let prefix = which.modprobe_prefix();
+/// Lower-level loader used by the bootstrap stage (Phase 0.5), which
+/// only has a tiny explicit list and no blacklist. Reporter-free so the
+/// bootstrap path can call it before the live console is open and
+/// before the full [`Config`] is even loaded.
+pub fn load_modules(modules_dir: &Path, explicit: &[String], blacklist: &[String]) -> Result<()> {
+    load_modules_inner(modules_dir, explicit, blacklist, None)
+}
+
+/// Shared core for both [`load_module_set`] (post-console, with
+/// reporter) and [`load_modules`] (pre-console, no reporter). When
+/// `reporter_ctx` is `Some`, each top-level module pushes a
+/// `"<prefix>: modprobe <name>"` status frame so the operator sees
+/// per-module progress.
+fn load_modules_inner(
+    modules_dir: &Path,
+    explicit: &[String],
+    blacklist: &[String],
+    mut reporter_ctx: Option<(&mut BootReporter<'_>, &'static str)>,
+) -> Result<()> {
+    let release = crate::sys::uname::kernel_release()?;
+    let entries = module::load_modules_dep(modules_dir, &release)?;
+    let by_name: HashMap<String, &ModuleEntry> = module::index_by_name(&entries);
+    let blacklist: HashSet<&str> = blacklist.iter().map(String::as_str).collect();
+
     let mut loaded: usize = 0;
-    for name in module_list {
-        let _ = reporter.set_phase(format!("{prefix}: modprobe {name}"));
+    for name in explicit {
+        if let Some((reporter, prefix)) = reporter_ctx.as_mut() {
+            let _ = reporter.set_phase(format!("{prefix}: modprobe {name}"));
+        }
         if blacklist.contains(name.as_str()) {
             nmbl_verbose!("skipping blacklisted module {}", name);
             continue;
@@ -160,11 +185,20 @@ pub fn load_modules(
                         source
                     );
                 }
+                LoadOutcome::FileMissing => {
+                    nmbl_warn!(
+                        "module {} listed in modules.dep but {} is not in the \
+                         initrd; skipping (closure was likely shrunk with \
+                         allowMissing=true)",
+                        entry.name,
+                        entry.path.display()
+                    );
+                }
             }
         }
     }
 
-    nmbl_info!("loaded {} modules ({:?})", loaded, which);
+    nmbl_info!("loaded {} modules", loaded);
     Ok(())
 }
 
@@ -326,11 +360,13 @@ mod tests {
             crate::sys::module::LoadOutcome::KernelRefused {
                 source: Errno::EOPNOTSUPP,
             },
+            crate::sys::module::LoadOutcome::FileMissing,
             crate::sys::module::LoadOutcome::Loaded,
         ];
 
         let mut loaded: usize = 0;
         let mut refused: usize = 0;
+        let mut missing: usize = 0;
         // This match must stay in lock-step with `load_explicit_modules`.
         for outcome in outcomes {
             match outcome {
@@ -341,9 +377,13 @@ mod tests {
                 crate::sys::module::LoadOutcome::KernelRefused { source: _ } => {
                     refused += 1;
                 }
+                crate::sys::module::LoadOutcome::FileMissing => {
+                    missing += 1;
+                }
             }
         }
         assert_eq!(loaded, 3);
         assert_eq!(refused, 1);
+        assert_eq!(missing, 1);
     }
 }

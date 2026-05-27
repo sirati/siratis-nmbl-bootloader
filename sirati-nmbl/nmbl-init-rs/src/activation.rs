@@ -9,6 +9,7 @@
 //! is pure exec mechanism.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use zeroize::Zeroizing;
@@ -20,6 +21,16 @@ use crate::sys::activation::{ProcessOutcome, run};
 use crate::ui::BootReporter;
 use crate::ui::console::Console;
 use crate::{nmbl_info, nmbl_warn};
+
+/// One passphrase to inject into the kexec'd initrd as a keyfile. The
+/// activation runner emits one of these per `luks-password` activation
+/// whose TOML carries a `pass_to_stage1 = "<path>"` field. The kexec
+/// path appends a cpio fragment containing `<path>` with `secret` as
+/// its contents, so stage-1's NixOS init can use it as a keyFile.
+pub struct KeyInjection {
+    pub path: PathBuf,
+    pub secret: Zeroizing<Vec<u8>>,
+}
 
 const PROC_MODULES: &str = "/proc/modules";
 /// Per-device wait budget; matches the Phase 3 loop.
@@ -45,13 +56,18 @@ pub trait PasswordSupplier {
 /// `reporter` carries the live boot console; we surface each activation
 /// kind + description as the boot-status phase label so the operator
 /// sees which step is in flight (LUKS unlock, LVM activate, …).
+///
+/// Returns the set of [`KeyInjection`]s the kexec path must append to
+/// the system initrd (one per `luks-password` activation whose TOML
+/// sets `pass_to_stage1`). The vec is empty when no activation opts in.
 pub fn run_all_activations(
     config: &Config,
     reporter: &mut BootReporter<'_>,
     mut password_supplier: Option<&mut dyn PasswordSupplier>,
-) -> Result<()> {
+) -> Result<Vec<KeyInjection>> {
+    let mut injections: Vec<KeyInjection> = Vec::new();
     if config.activations.is_empty() {
-        return Ok(());
+        return Ok(injections);
     }
 
     let loaded = loaded_modules()?;
@@ -97,6 +113,21 @@ pub fn run_all_activations(
             )?;
         }
 
+        // After a successful luks-password unlock, if pass_to_stage1
+        // is set, hand the passphrase bytes off for kexec injection.
+        // The stdin buffer is the same Zeroizing-wrapped bytes
+        // cryptsetup just consumed; moving it into the injection
+        // keeps it under Zeroizing all the way through.
+        if activation.kind == ActivationKind::LuksPassword
+            && let Some(path) = activation.pass_to_stage1.as_ref()
+            && let Some(secret) = stdin_owned
+        {
+            injections.push(KeyInjection {
+                path: path.clone(),
+                secret,
+            });
+        }
+
         nmbl_info!(
             "activation {} completed: {} device(s) ready",
             kind_label(activation.kind),
@@ -104,11 +135,15 @@ pub fn run_all_activations(
         );
     }
 
-    Ok(())
+    Ok(injections)
 }
 
 /// `None` for every kind except `LuksPassword`, where we prompt and
-/// append a newline so cryptsetup sees interactive-prompt termination.
+/// return the raw passphrase bytes. We do NOT append a newline: the
+/// cryptsetup argv uses `--key-file=-`, which reads stdin verbatim as
+/// binary key data (no stripping). Appending `\n` would turn a 4-byte
+/// passphrase "test" into the 5-byte key "test\n", which doesn't match
+/// the stored LUKS header digest.
 fn collect_stdin(
     activation: &Activation,
     console: &mut dyn Console,
@@ -139,15 +174,17 @@ fn collect_stdin(
         .as_deref()
         .unwrap_or("Enter passphrase");
     let secret = supplier.prompt(console, label)?;
-    let mut buf = Zeroizing::new(Vec::with_capacity(secret.len().saturating_add(1)));
+    let mut buf = Zeroizing::new(Vec::with_capacity(secret.len()));
     buf.extend_from_slice(secret.as_bytes());
-    buf.push(b'\n');
     Ok(Some(buf))
 }
 
 fn check_required_modules(activation: &Activation, loaded: &HashSet<String>) {
     for module in &activation.required_modules {
-        if !loaded.contains(module) {
+        // /proc/modules always uses the underscore spelling; config
+        // entries may use either (e.g. "dm-crypt" vs "dm_crypt").
+        let canonical = module.replace('-', "_");
+        if !loaded.contains(&canonical) {
             nmbl_warn!(
                 "activation {} requires module {} but it's not loaded; attempting anyway",
                 kind_label(activation.kind),

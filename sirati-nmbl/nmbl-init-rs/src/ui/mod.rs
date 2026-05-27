@@ -40,6 +40,8 @@ pub mod app;
 pub mod console;
 pub mod emergency;
 pub mod reporter;
+#[cfg(feature = "network-rescue")]
+pub mod rescue;
 pub mod timeout;
 pub mod view;
 
@@ -58,6 +60,20 @@ use crate::ui::view::{
     EditScreenData, EmergencyScreenData, ListScreenData, PassphraseScreenData, render_boot_status,
     render_edit, render_emergency, render_list, render_passphrase,
 };
+
+#[cfg(feature = "network-rescue")]
+use std::os::fd::AsFd;
+#[cfg(feature = "network-rescue")]
+use std::path::Path;
+#[cfg(feature = "network-rescue")]
+use ratatui::Terminal as RatatuiTerminal;
+#[cfg(feature = "network-rescue")]
+use ratatui::backend::CrosstermBackend as RatatuiCrosstermBackend;
+#[cfg(feature = "network-rescue")]
+use crate::sys::tty::{RawModeGuard, open_console as sys_open_console};
+
+#[cfg(feature = "network-rescue")]
+const RESCUE_CONSOLE_PATH: &str = "/dev/console";
 
 #[cfg(feature = "image-splash")]
 use alacritty_terminal::term::cell::Flags;
@@ -530,6 +546,32 @@ pub(crate) fn passphrase_prompt_on_console(
 
 fn tui_err(source: std::io::Error) -> NmblError {
     NmblError::Tui { source }
+}
+
+/// Compatibility helper for the `network-rescue` UI (`src/ui/rescue.rs`).
+///
+/// Opens `/dev/console`, enters raw mode via the legacy [`RawModeGuard`],
+/// builds a ratatui terminal over stdout, and hands it to `body`. The
+/// raw-mode guard is dropped on return so the operator's terminal is
+/// restored even when `body` returns an error.
+///
+/// The main boot flow (`run_selector`, `tui_passphrase_prompt`,
+/// emergency screen) uses the live [`Console`] handed down from
+/// `main.rs` instead of opening a parallel session here. This helper
+/// exists only so the network-rescue screens, which predate the Console
+/// trait, keep compiling without a parallel refactor — see
+/// `src/ui/rescue.rs`.
+#[cfg(feature = "network-rescue")]
+pub(crate) fn with_console_terminal<R>(
+    body: impl FnOnce(
+        &mut RatatuiTerminal<RatatuiCrosstermBackend<std::io::Stdout>>,
+    ) -> Result<R>,
+) -> Result<R> {
+    let console_fd = sys_open_console(Path::new(RESCUE_CONSOLE_PATH))?;
+    let _raw = RawModeGuard::new(console_fd.as_fd())?;
+    let backend = RatatuiCrosstermBackend::new(std::io::stdout());
+    let mut terminal = RatatuiTerminal::new(backend).map_err(tui_err)?;
+    body(&mut terminal)
 }
 
 #[cfg(test)]

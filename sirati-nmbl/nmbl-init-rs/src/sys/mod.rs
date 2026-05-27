@@ -1,6 +1,8 @@
 pub mod activation;
 pub mod blkid;
+pub mod cpio;
 pub mod kexec;
+pub mod loopdev;
 pub mod module;
 pub mod mount;
 pub mod tty;

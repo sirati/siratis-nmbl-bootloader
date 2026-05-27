@@ -27,6 +27,13 @@ let
         sha256 = "sha256-dQD3AvBIjUqN8sWr63ypEHp8p5mOBEFyfLr3lGWwI4g=";
       }} -strip -define png:color-type=6 "$out"
     '';
+
+  # Auto-detected NIC driver modules from hardware-configuration.nix.
+  # Pure function over `lib` + `config`; consumed only when
+  # `boot.nmbl.rescue.network = true`.
+  nicDetectedKernelModules = import ./modules/nic-modules.nix {
+    inherit lib config;
+  };
 in
 {
   imports = [
@@ -404,13 +411,20 @@ in
           cfg.kernelModules
           ++ config.boot.initrd.kernelModules
           ++ fsDerivedKernelModules
+          ++ lib.optionals (cfg.rescue.network && cfg.rescue.mode == "external") (
+            cfg.rescue.nicDrivers ++ nicDetectedKernelModules
+          )
         )
       );
       defaultText = lib.literalMD ''
         union of `boot.nmbl.kernelModules`, `boot.initrd.kernelModules`,
         and filesystem driver modules derived from
         `config.fileSystems.*.fsType` (e.g. `ext4`, `vfat`, `btrfs`),
-        with `boot.nmbl.blacklistedKernelModules` removed.
+        plus `boot.nmbl.rescue.nicDrivers` and any NIC modules detected
+        from hardware-configuration when
+        `boot.nmbl.rescue.network = true` and
+        `boot.nmbl.rescue.mode = "external"`, with
+        `boot.nmbl.blacklistedKernelModules` removed.
       '';
       description = lib.mdDoc ''
         Kernel modules the NMBL /init will load explicitly at startup
@@ -517,6 +531,221 @@ in
         description = lib.mdDoc ''
           TrueType font (monospaced) used to rasterize the splash menu.
           Embedded into the initramfs at `/etc/splash/font.ttf`.
+        '';
+      };
+    };
+
+    # --- Bootstrap (Option 1: external config on the boot partition) ----
+    # When `configLocation = "external"`, the initramfs only carries the
+    # tiny bootstrap.toml emitted by `lib/bootstrap-toml.nix`; the full
+    # runtime config lives on the boot partition and is loaded via Phase
+    # 0.5 of the Rust /init. The default `"embedded"` keeps today's
+    # behaviour (full config.toml embedded in the initramfs).
+    configLocation = lib.mkOption {
+      type = lib.types.enum [ "embedded" "external" ];
+      default = "embedded";
+      description = lib.mdDoc ''
+        Where the NMBL runtime config lives: `"embedded"` ships the full
+        `config.toml` inside the initramfs; `"external"` embeds only the
+        bootstrap.toml descriptor and reads `config.toml` from the boot
+        partition at runtime.
+      '';
+    };
+
+    bootstrap = {
+      configPath = lib.mkOption {
+        # `types.str`, not `types.path`: this is a target-filesystem
+        # path interpreted by the NMBL runtime, not a build-host path
+        # Nix should resolve to the store.
+        type = lib.types.str;
+        default = "/nmbl/config.toml";
+        description = lib.mdDoc ''
+          Path to the full runtime `config.toml`, relative to
+          `boot.nmbl.bootstrap.bootFs.mountpoint`, used when
+          `configLocation = "external"`.
+        '';
+      };
+
+      bootFs = {
+        device = lib.mkOption {
+          type = lib.types.str;
+          default = "/dev/disk/by-partlabel/disk-main-ESP";
+          example = "/dev/disk/by-partlabel/disk-main-ESP";
+          description = lib.mdDoc ''
+            Block device holding the boot partition that contains the
+            external `config.toml`. Must be a `/dev/disk/by-*` symlink or
+            a raw `/dev/...` path; short forms (`LABEL=`, `UUID=`,
+            `PARTUUID=`) are rejected by the Rust loader.
+          '';
+        };
+
+        fstype = lib.mkOption {
+          type = lib.types.str;
+          default = "vfat";
+          description = lib.mdDoc ''
+            Filesystem type of the boot partition (e.g. `vfat`, `ext4`).
+          '';
+        };
+
+        options = lib.mkOption {
+          type = lib.types.str;
+          default = "ro";
+          description = lib.mdDoc ''
+            Comma-joined `mount(2)` options applied when the bootstrap
+            stage mounts the boot partition. Defaults to read-only.
+          '';
+        };
+
+        mountpoint = lib.mkOption {
+          # `types.str`, not `types.path`: this is a target-filesystem
+          # path interpreted by the NMBL runtime, not a build-host path
+          # Nix should resolve to the store.
+          type = lib.types.str;
+          default = "/mnt/boot";
+          description = lib.mdDoc ''
+            Mountpoint inside the NMBL initramfs where the boot
+            partition is mounted by the bootstrap stage.
+          '';
+        };
+      };
+
+      kernelModules = {
+        explicit = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ "vfat" "nls_cp437" "nls_iso8859_1" "ahci" "nvme" ];
+          example = [ "vfat" "nls_cp437" "nls_iso8859_1" "ahci" "nvme" ];
+          description = lib.mdDoc ''
+            Kernel modules the bootstrap stage loads before mounting the
+            boot partition. Must cover the boot filesystem driver and
+            the storage controller drivers needed to expose its block
+            device.
+          '';
+        };
+
+        modulesDir = lib.mkOption {
+          # `types.str`: target-fs path interpreted by the NMBL runtime,
+          # not a build-host path Nix should resolve to the store.
+          type = lib.types.str;
+          default = "/lib/modules";
+          description = lib.mdDoc ''
+            Directory inside the NMBL initramfs that contains
+            `modules.dep` for the bootstrap stage's module loader. Mirrors
+            the analogous knob the full-config stage respects via the
+            runtime `kernel_modules.modules_dir` key.
+          '';
+        };
+      };
+
+      rescue = {
+        defaultUrl = lib.mkOption {
+          type = lib.types.str;
+          default = "";
+          example = "https://example.invalid/rescue.cpio";
+          description = lib.mdDoc ''
+            Pre-filled URL for the rescue prompt (Option 2). Leave empty
+            to omit; if set, `defaultSha256` must also be set — the Rust
+            validator rejects half-configured rescue defaults.
+          '';
+        };
+
+        defaultSha256 = lib.mkOption {
+          type = lib.types.str;
+          default = "";
+          example = "deadbeef";
+          description = lib.mdDoc ''
+            Pre-filled SHA-256 for the rescue prompt (Option 2). Leave
+            empty to omit; if set, `defaultUrl` must also be set.
+          '';
+        };
+      };
+    };
+
+    # --- Rescue mode (Option 2: external rescue squashfs) ---------------
+    # When `rescue.mode = "external"`, the initramfs no longer ships
+    # busybox + storage activation tools. Instead, they live in a
+    # squashfs blob (`nmbl-rescue.sfs`) on the boot partition, which
+    # the Rust /init loop-mounts and switch_roots into when the
+    # emergency shell is requested. The default `"embedded"` keeps the
+    # legacy v1 behaviour so existing setups don't silently lose their
+    # rescue path.
+    rescue = {
+      mode = lib.mkOption {
+        type = lib.types.enum [ "embedded" "external" "none" ];
+        default = "embedded";
+        description = lib.mdDoc ''
+          - `embedded`: busybox + activation tools live in the initramfs (legacy v1 behaviour).
+          - `external`: tools live in `nmbl-rescue.sfs` on the boot partition; loop-mounted on demand.
+          - `none`: no rescue tools shipped; PID 1 halts on the emergency path.
+        '';
+      };
+
+      squashfsContents = lib.mkOption {
+        type = lib.types.listOf lib.types.package;
+        default = with pkgs; [ busybox-sandbox-shell cryptsetup lvm2 mdadm ];
+        defaultText = lib.literalExpression "with pkgs; [ busybox-sandbox-shell cryptsetup lvm2 mdadm ]";
+        description = lib.mdDoc ''
+          Packages bundled into `nmbl-rescue.sfs` when
+          `rescue.mode = "external"`. The Rust loader expects
+          `/bin/sh` to exist in the resulting tree (provided by
+          busybox).
+        '';
+      };
+
+      sfsPath = lib.mkOption {
+        type = lib.types.str;
+        default = "nmbl-rescue.sfs";
+        description = lib.mdDoc ''
+          Path on the boot partition, relative to the boot partition
+          root, where the rescue squashfs is staged when
+          `rescue.mode = "external"`. Leading slash is tolerated and
+          stripped at install time and at runtime. The Rust disk-rescue
+          path joins this against the runtime boot mountpoint
+          (`bootstrap.bootFs.mountpoint` in bootstrap mode).
+        '';
+      };
+
+      network = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = lib.mdDoc ''
+          Enable HTTP rescue fallback. When true, NMBL ships NIC
+          drivers + DHCP + HTTP client in the initramfs so the rescue
+          path can pull `nmbl-rescue.sfs` over the network when the
+          disk copy is unavailable. Enables the Rust `network-rescue`
+          Cargo feature in the built /init binary.
+        '';
+      };
+
+      nicDrivers = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ "virtio_net" "e1000e" "igb" "r8169" ];
+        description = lib.mdDoc ''
+          Kernel modules bundled into the initramfs when
+          `rescue.network = true`. NIC modules already recorded in
+          `config.boot.initrd.availableKernelModules` or
+          `config.boot.initrd.kernelModules` (typically by
+          hardware-configuration.nix) are appended automatically and
+          deduplicated.
+        '';
+      };
+
+      defaultUrl = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "https://example.invalid/nmbl-rescue.sfs";
+        description = lib.mdDoc ''
+          Pre-fills the URL field in the network rescue prompt. Only
+          emitted into the runtime TOML when `rescue.network = true`.
+        '';
+      };
+
+      defaultSha256 = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "deadbeef";
+        description = lib.mdDoc ''
+          Pre-fills the SHA-256 field in the hash-confirm prompt. Only
+          emitted into the runtime TOML when `rescue.network = true`.
         '';
       };
     };

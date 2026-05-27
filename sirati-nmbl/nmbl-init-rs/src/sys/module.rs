@@ -132,6 +132,13 @@ pub enum LoadOutcome {
     /// `ENODEV` (see [`is_recoverable_module_error`]). Callers should
     /// log a warning and continue; this is **not** fatal.
     KernelRefused { source: nix::Error },
+    /// The `.ko` file referenced by `modules.dep` is absent from the
+    /// initrd. NixOS `makeModulesClosure { allowMissing = true; }`
+    /// leaves dangling dep entries in `modules.dep` for transitive
+    /// modules it pruned; the kernel usually has the relevant symbols
+    /// built-in (or the parent module doesn't actually need them at
+    /// runtime), so this is non-fatal — callers log + skip.
+    FileMissing,
 }
 
 /// Errnos returned by `init_module(2)` that mean "this kernel cannot
@@ -147,6 +154,12 @@ pub enum LoadOutcome {
 ///   logic refuses with no hardware to bind to.
 /// * `ENOSYS` — syscall family unavailable / disabled.
 /// * `EINVAL` — kernel rejected the module's parameters or signature.
+/// * `ENOENT` — the module's own `init()` returned -ENOENT (typically
+///   "a backend the module wanted is unavailable" — e.g. encrypted_keys
+///   failing `aes_get_sizes()` when the trusted-keys cipher isn't
+///   built into the kernel). Safe to skip because file-not-found at the
+///   .ko path itself is caught earlier by [`load_module`]'s existence
+///   pre-check (returns [`LoadOutcome::FileMissing`]).
 ///
 /// `EEXIST` is handled separately as [`LoadOutcome::AlreadyLoaded`] and
 /// is NOT routed through this classifier. `ELOOP` (cycle detection from
@@ -155,7 +168,12 @@ pub enum LoadOutcome {
 pub fn is_recoverable_module_error(errno: Errno) -> bool {
     matches!(
         errno,
-        Errno::EOPNOTSUPP | Errno::ENOEXEC | Errno::ENODEV | Errno::ENOSYS | Errno::EINVAL
+        Errno::EOPNOTSUPP
+            | Errno::ENOEXEC
+            | Errno::ENODEV
+            | Errno::ENOSYS
+            | Errno::EINVAL
+            | Errno::ENOENT
     )
 }
 
@@ -207,10 +225,20 @@ fn visit<'a>(
             .unwrap_or_default();
         return Err(module_err(name, &path, Errno::ELOOP));
     }
-    let entry = by_name
-        .get(name)
-        .copied()
-        .ok_or_else(|| module_err(name, Path::new(""), Errno::ENOENT))?;
+    let Some(entry) = by_name.get(name).copied() else {
+        // Name not in modules.dep — almost always means it's built
+        // into the kernel (CONFIG_FOO=y instead of =m). Soft-skip:
+        // if downstream code actually needs it the missing-symbol
+        // error there will be more specific than aborting the boot
+        // for what is, in the common case, a non-event.
+        nmbl_warn!(
+            "module {} not in modules.dep; assuming built-in and skipping",
+            name
+        );
+        visiting.remove(name);
+        visited.insert(name.to_owned());
+        return Ok(());
+    };
     for dep in &entry.deps {
         visit(dep, by_name, order, visited, visiting)?;
     }
@@ -386,6 +414,13 @@ fn init_module(image: &[u8], params: &CString, name: &str, path: &Path) -> Resul
 /// and must be logged + skipped by the caller rather than aborting
 /// the boot.
 pub fn load_module(entry: &ModuleEntry) -> Result<LoadOutcome> {
+    // Shrunk module closures (NixOS `makeModulesClosure { allowMissing
+    // = true; }`) can leave `modules.dep` referencing `.ko` files that
+    // aren't on disk. Surface that as `FileMissing` so callers warn +
+    // skip instead of aborting the boot for an over-eager soft dep.
+    if !entry.path.exists() {
+        return Ok(LoadOutcome::FileMissing);
+    }
     let image = decompress_module(&entry.path, &entry.name)?;
     // `modules.dep` carries no parameters and the bash bootloader never
     // set them — pass an empty string and move on.
@@ -413,6 +448,15 @@ pub fn load_with_deps(name: &str, by_name: &HashMap<String, &ModuleEntry>) -> Re
                      error will be clearer there",
                     entry.name,
                     source
+                );
+            }
+            LoadOutcome::FileMissing => {
+                nmbl_warn!(
+                    "module {} listed in modules.dep but {} is not in the \
+                     initrd; skipping (closure was likely shrunk with \
+                     allowMissing=true)",
+                    entry.name,
+                    entry.path.display()
                 );
             }
         }
@@ -471,14 +515,34 @@ c.ko:
     }
 
     #[test]
-    fn missing_module_errors() {
+    fn missing_module_resolves_to_empty_order() {
+        // A module name absent from modules.dep is treated as built-in
+        // (warn-and-skip), not as a fatal error — that's the bash-side
+        // modprobe semantics: built-in modules have nothing to load.
         let entries: Vec<ModuleEntry> = Vec::new();
         let idx = index_by_name(&entries);
-        let err = resolve_load_order("ghost", &idx).expect_err("must error");
-        match err {
-            NmblError::Module { name, .. } => assert_eq!(name, "ghost"),
-            other => panic!("wrong variant: {other:?}"),
+        let order = resolve_load_order("ghost", &idx).expect("must not error");
+        assert!(order.is_empty(), "built-in modules produce empty load order");
+    }
+
+    #[test]
+    fn missing_transitive_dep_is_skipped_not_fatal() {
+        // Realistic case: a .ko file lists encrypted-keys as a dep but
+        // encrypted-keys is built into the kernel. The parent's load
+        // order must still include the parent itself; the missing dep
+        // is silently skipped.
+        let text = "kernel/parent.ko.xz: kernel/builtin_dep.ko.xz\n";
+        let root = PathBuf::from("/m");
+        let entries = parse_modules_dep_text(text, &root);
+        // by_name has only 'parent'; 'builtin_dep' is intentionally
+        // not present to simulate kernel-built-in deps.
+        let mut idx: HashMap<String, &ModuleEntry> = HashMap::new();
+        if let Some(parent) = entries.iter().find(|e| e.name == "parent") {
+            idx.insert("parent".to_owned(), parent);
         }
+        let order = resolve_load_order("parent", &idx).expect("must not error");
+        let names: Vec<&str> = order.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["parent"]);
     }
 
     #[test]
@@ -559,13 +623,17 @@ kernel/drivers/md/dm-mod.ko.xz:
     fn recoverable_classifier_covers_kernel_refusals() {
         // Every errno that the task / `init_module(2)` manpage flags as
         // "kernel cannot load this module right now" must be classified
-        // as recoverable so we don't abort the boot for it.
+        // as recoverable so we don't abort the boot for it. ENOENT here
+        // is the module's own init() returning -ENOENT (e.g. a backend
+        // cipher is unavailable); file-not-found at the .ko path itself
+        // is intercepted earlier by load_module's existence pre-check.
         for errno in [
             Errno::EOPNOTSUPP,
             Errno::ENOEXEC,
             Errno::ENODEV,
             Errno::ENOSYS,
             Errno::EINVAL,
+            Errno::ENOENT,
         ] {
             assert!(
                 is_recoverable_module_error(errno),
@@ -576,13 +644,12 @@ kernel/drivers/md/dm-mod.ko.xz:
 
     #[test]
     fn recoverable_classifier_does_not_swallow_real_errors() {
-        // File-IO failures (ENOENT, EACCES, …) and dep-graph bugs
-        // (ELOOP) must NOT be classified as recoverable — they need to
-        // surface as `NmblError::Module`. EEXIST is also excluded
-        // because it has its own `LoadOutcome::AlreadyLoaded` variant
-        // and never reaches the classifier.
+        // Filesystem permission / OOM / generic IO failures and
+        // dep-graph bugs (ELOOP) must NOT be classified as recoverable.
+        // EEXIST is excluded because it has its own
+        // `LoadOutcome::AlreadyLoaded` variant and never reaches the
+        // classifier.
         for errno in [
-            Errno::ENOENT,
             Errno::EACCES,
             Errno::EPERM,
             Errno::ELOOP,
@@ -713,6 +780,23 @@ kernel/drivers/md/dm-mod.ko.xz:
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn load_module_returns_file_missing_for_absent_ko_file() {
+        // makeModulesClosure { allowMissing = true; } prunes transitive
+        // modules out of the closure but leaves them referenced in
+        // modules.dep. load_module must surface that as a non-fatal
+        // FileMissing outcome rather than propagating the underlying
+        // ENOENT as a fatal error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let entry = ModuleEntry {
+            name: "ghostly".to_owned(),
+            path: dir.path().join("ghostly.ko.xz"),
+            deps: Vec::new(),
+        };
+        let outcome = load_module(&entry).expect("must not error");
+        assert!(matches!(outcome, LoadOutcome::FileMissing));
     }
 
     #[test]
