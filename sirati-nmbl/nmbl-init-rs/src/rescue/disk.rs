@@ -19,7 +19,7 @@
 //!    `/oldroot` is intentionally LEFT MOUNTED so the operator can
 //!    inspect what failed (`ls /oldroot/etc/nmbl/`, the panic report,
 //!    the in-progress generation tree under `/mnt/system`, …).
-//! 7. `execve("/bin/sh", …)` with the existing environment.
+//! 7. `execve("/bin/sh", …)` with a minimal TERM+PATH environment.
 //!
 //! Every failure point is wrapped in [`NmblError::Rescue`] with a
 //! `stage` string the emergency-shell banner surfaces verbatim.
@@ -60,7 +60,7 @@ const RESCUE_SHELL: &str = "/bin/sh";
 /// before the loop-mount dance so the operator can see what failed
 /// even if the squashfs mount itself misbehaves.
 pub fn try_disk_rescue(config: &Config, cause: &NmblError) -> Result<Infallible> {
-    let sfs_path = super::locate_sfs(config);
+    let sfs_path = super::locate_sfs(config)?;
     eprintln!(
         "[nmbl] external rescue: mounting {} (triggered by: {})",
         sfs_path.display(),
@@ -233,12 +233,13 @@ mod tests {
     use crate::rescue::RescueMode;
     use crate::sys::loopdev::LOOP_CONTROL_PATH;
 
-    fn cfg_with_sfs(sfs: Option<PathBuf>) -> Config {
+    fn cfg_with_sfs(sfs: Option<PathBuf>, mountpoint: Option<PathBuf>) -> Config {
         let mut c = Config::recovery_default();
         c.rescue = RescueConfig {
             mode: RescueMode::External,
             sfs_path: sfs,
         };
+        c.runtime_boot_mountpoint = mountpoint;
         c
     }
 
@@ -248,14 +249,16 @@ mod tests {
         // fires before we touch /dev/loop-control. This lets the test
         // assert error shape on every host, not just ones with a loop
         // control node available.
-        let bogus = std::env::temp_dir().join(format!(
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bogus_name = format!(
             "nmbl-rescue-missing-{}-{}.sfs",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0),
-        ));
+        );
+        let bogus = dir.path().join(&bogus_name);
         assert!(
             !bogus.exists(),
             "test precondition: bogus path must be absent"
@@ -265,7 +268,10 @@ mod tests {
             reason: "synthetic".to_string(),
             context: "test".to_string(),
         };
-        let cfg = cfg_with_sfs(Some(bogus.clone()));
+        let cfg = cfg_with_sfs(
+            Some(PathBuf::from(&bogus_name)),
+            Some(dir.path().to_path_buf()),
+        );
         let err = try_disk_rescue(&cfg, &cause).expect_err("missing sfs must error");
         match err {
             NmblError::Rescue { stage, source } => {
@@ -276,6 +282,29 @@ mod tests {
                     }
                     other => panic!("expected Io inside Rescue, got {other:?}"),
                 }
+            }
+            other => panic!("expected Rescue variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_disk_rescue_without_mountpoint_is_locate_sfs_error() {
+        // Legacy embedded-config mode: no runtime boot mountpoint is set,
+        // so the locate-sfs guard must short-circuit before any disk I/O.
+        let cause = NmblError::ConfigInvalid {
+            reason: "synthetic".to_string(),
+            context: "test".to_string(),
+        };
+        let cfg = cfg_with_sfs(None, None);
+        let err =
+            try_disk_rescue(&cfg, &cause).expect_err("missing runtime boot mountpoint must error");
+        match err {
+            NmblError::Rescue { stage, source } => {
+                assert_eq!(stage, "locate-sfs");
+                assert!(
+                    matches!(*source, NmblError::ConfigInvalid { .. }),
+                    "expected ConfigInvalid inside Rescue, got {source:?}",
+                );
             }
             other => panic!("expected Rescue variant, got {other:?}"),
         }
@@ -300,7 +329,10 @@ mod tests {
         let sfs = dir.path().join("nmbl-rescue.sfs");
         std::fs::write(&sfs, b"placeholder").expect("write sfs");
 
-        let cfg = cfg_with_sfs(Some(sfs));
+        let cfg = cfg_with_sfs(
+            Some(PathBuf::from("nmbl-rescue.sfs")),
+            Some(dir.path().to_path_buf()),
+        );
         let cause = NmblError::ConfigInvalid {
             reason: "synthetic".to_string(),
             context: "test".to_string(),

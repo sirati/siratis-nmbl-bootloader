@@ -87,14 +87,15 @@ let
 
     # Rescue config consumed by the Rust `RescueConfig` struct (C.1).
     # `mode` maps to the `RescueMode` enum (`embedded` | `external` |
-    # `none`); `sfs_path` is omitted when it matches the Rust-side
-    # default (`/nmbl-rescue.sfs`) so the on-disk TOML stays minimal
-    # for the common case.
+    # `none`); `sfs_path` is a boot-partition-relative path the Rust
+    # side joins against the runtime boot mountpoint, so it is emitted
+    # verbatim (no rewrite) and omitted when it matches the Rust-side
+    # default basename (`nmbl-rescue.sfs`).
     rescue =
       {
         mode = cfg.rescue.mode;
       }
-      // lib.optionalAttrs (cfg.rescue.sfsPath != "/nmbl-rescue.sfs") {
+      // lib.optionalAttrs (cfg.rescue.sfsPath != "nmbl-rescue.sfs") {
         sfs_path = cfg.rescue.sfsPath;
       };
   };

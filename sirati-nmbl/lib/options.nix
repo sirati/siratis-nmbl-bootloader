@@ -576,12 +576,14 @@ in
 
       sfsPath = lib.mkOption {
         type = lib.types.str;
-        default = "/nmbl-rescue.sfs";
+        default = "nmbl-rescue.sfs";
         description = lib.mdDoc ''
-          Path on the boot partition (relative to the boot
-          mountpoint) where the rescue squashfs is staged when
-          `rescue.mode = "external"`. The Rust disk-rescue path
-          reads from this location.
+          Path on the boot partition, relative to the boot partition
+          root, where the rescue squashfs is staged when
+          `rescue.mode = "external"`. Leading slash is tolerated and
+          stripped at install time and at runtime. The Rust disk-rescue
+          path joins this against the runtime boot mountpoint
+          (`bootstrap.bootFs.mountpoint` in bootstrap mode).
         '';
       };
     };
