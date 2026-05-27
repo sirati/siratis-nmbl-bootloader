@@ -188,6 +188,30 @@ in
               Set to null for qemu_kernel_invoke mode (no bootloader).
             '';
           };
+
+          bootDisks = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            example = [
+              "/dev/nvme0n1"
+              "/dev/nvme1n1"
+            ];
+            description = lib.mdDoc ''
+              Block devices to install the bootloader to.
+
+              When empty (the default), NMBL auto-discovers boot disks at
+              install time:
+              - BIOS: every whole disk with an EF02 partition gets
+                `grub-install`, so each member of e.g. a RAID1 mirror is
+                independently bootable.
+              - UEFI: the single mounted /boot ESP is used; multi-ESP
+                mirroring is currently a manual post-install step.
+
+              Set this to pin the candidate set explicitly — e.g. when
+              EF02 discovery would match disks you don't want touched, or
+              when your layout doesn't expose EF02 partitions (rare).
+            '';
+          };
         };
       };
       default = { };
