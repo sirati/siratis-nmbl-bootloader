@@ -258,6 +258,98 @@ impl Config {
     }
 }
 
+/// Top-level wrapper for `/etc/nmbl/bootstrap.toml`, the tiny pre-stage
+/// config that is embedded directly into the initramfs. It points at the
+/// boot filesystem holding the real (per-generation) `Config` and lists
+/// the kernel modules required to mount that filesystem.
+///
+/// Kept deliberately separate from [`Config`]: the bootstrap step runs
+/// before any user-controlled config is reachable, so its schema is
+/// frozen at initramfs build time and must stay minimal.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapConfig {
+    pub bootstrap: BootstrapSection,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapSection {
+    /// Path to the real config relative to [`BootstrapBootFs::mountpoint`].
+    #[serde(default = "default_bootstrap_config_path")]
+    pub config_path: PathBuf,
+
+    pub boot_fs: BootstrapBootFs,
+
+    #[serde(default)]
+    pub kernel_modules: BootstrapKernelModules,
+
+    #[serde(default)]
+    pub rescue: BootstrapRescue,
+}
+
+/// Boot-filesystem descriptor used by the bootstrap stage. Shape mirrors
+/// [`FilesystemEntry`] but is intentionally a distinct type: the bootstrap
+/// schema is frozen at initramfs build time and must not grow fields that
+/// only make sense for the user-controlled [`Config`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapBootFs {
+    pub device: String,
+    pub fstype: String,
+
+    #[serde(default)]
+    pub options: String,
+
+    pub mountpoint: PathBuf,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapKernelModules {
+    #[serde(default)]
+    pub explicit: Vec<String>,
+}
+
+/// Optional network-rescue defaults. Tolerated even when network rescue
+/// is off so the same `bootstrap.toml` can be shared across builds.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapRescue {
+    #[serde(default)]
+    pub default_url: String,
+
+    #[serde(default)]
+    pub default_sha256: String,
+}
+
+fn default_bootstrap_config_path() -> PathBuf {
+    PathBuf::from("/nmbl/config.toml")
+}
+
+impl BootstrapConfig {
+    /// Read and parse `/etc/nmbl/bootstrap.toml` (or whichever embedded
+    /// path the caller passes). Mirrors [`Config::load`]: I/O errors are
+    /// wrapped in [`NmblError::Io`] and TOML errors in [`NmblError::Config`].
+    // NOTE: when a dedicated `NmblError::Bootstrap` variant lands, prefer
+    // wrapping with that — it would let callers distinguish bootstrap
+    // failure from user-config failure without string matching.
+    pub fn load(path: &Path) -> Result<BootstrapConfig> {
+        let text = std::fs::read_to_string(path).map_err(|source| NmblError::Io {
+            source,
+            context: format!("reading bootstrap config {}", path.display()),
+        })?;
+
+        let config: BootstrapConfig =
+            toml::from_str(&text).map_err(|source| NmblError::Config {
+                source,
+                path: path.to_path_buf(),
+            })?;
+
+        Ok(config)
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -335,5 +427,167 @@ mod tests {
         let c = config_with(vec![fs_entry("PARTUUID=abc-123", "/data")]);
         c.validate()
             .expect_err("PARTUUID= short form must be rejected");
+    }
+
+    #[test]
+    fn bootstrap_parses_full_schema() {
+        let toml = r#"
+[bootstrap]
+config_path = "/nmbl/config.toml"
+
+[bootstrap.boot_fs]
+device     = "/dev/disk/by-partlabel/disk-main-ESP"
+fstype     = "vfat"
+options    = "ro"
+mountpoint = "/mnt/boot"
+
+[bootstrap.kernel_modules]
+explicit = ["vfat", "nls_cp437", "nls_iso8859_1", "ahci", "nvme"]
+
+[bootstrap.rescue]
+default_url    = "https://example.invalid/rescue.cpio"
+default_sha256 = "deadbeef"
+"#;
+        let cfg: BootstrapConfig = toml::from_str(toml).expect("full schema must parse");
+        assert_eq!(
+            cfg.bootstrap.config_path,
+            PathBuf::from("/nmbl/config.toml")
+        );
+        assert_eq!(
+            cfg.bootstrap.boot_fs.device,
+            "/dev/disk/by-partlabel/disk-main-ESP",
+        );
+        assert_eq!(cfg.bootstrap.boot_fs.fstype, "vfat");
+        assert_eq!(cfg.bootstrap.boot_fs.options, "ro");
+        assert_eq!(cfg.bootstrap.boot_fs.mountpoint, PathBuf::from("/mnt/boot"));
+        assert_eq!(
+            cfg.bootstrap.kernel_modules.explicit,
+            vec!["vfat", "nls_cp437", "nls_iso8859_1", "ahci", "nvme"],
+        );
+        assert_eq!(
+            cfg.bootstrap.rescue.default_url,
+            "https://example.invalid/rescue.cpio",
+        );
+        assert_eq!(cfg.bootstrap.rescue.default_sha256, "deadbeef");
+    }
+
+    #[test]
+    fn bootstrap_parses_minimal_with_defaults() {
+        let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+"#;
+        let cfg: BootstrapConfig = toml::from_str(toml).expect("minimal schema must parse");
+        assert_eq!(
+            cfg.bootstrap.config_path,
+            PathBuf::from("/nmbl/config.toml")
+        );
+        assert_eq!(cfg.bootstrap.boot_fs.options, "");
+        assert!(cfg.bootstrap.kernel_modules.explicit.is_empty());
+        assert_eq!(cfg.bootstrap.rescue.default_url, "");
+        assert_eq!(cfg.bootstrap.rescue.default_sha256, "");
+    }
+
+    #[test]
+    fn bootstrap_rejects_unknown_top_level_field() {
+        let toml = r#"
+[bootstrap]
+config_path = "/nmbl/config.toml"
+mystery     = "nope"
+
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+"#;
+        let err = toml::from_str::<BootstrapConfig>(toml)
+            .expect_err("unknown field in [bootstrap] must be rejected");
+        assert!(
+            err.to_string().contains("mystery"),
+            "error should mention the unknown field, got: {err}",
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_unknown_boot_fs_field() {
+        let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+secret     = "boom"
+"#;
+        toml::from_str::<BootstrapConfig>(toml)
+            .expect_err("unknown field in boot_fs must be rejected");
+    }
+
+    #[test]
+    fn bootstrap_rejects_missing_device() {
+        let toml = r#"
+[bootstrap.boot_fs]
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+"#;
+        let err = toml::from_str::<BootstrapConfig>(toml)
+            .expect_err("missing boot_fs.device must be rejected");
+        assert!(
+            err.to_string().contains("device"),
+            "error should mention the missing field, got: {err}",
+        );
+    }
+
+    #[test]
+    fn bootstrap_rejects_missing_boot_fs_section() {
+        let toml = r#"
+[bootstrap]
+config_path = "/nmbl/config.toml"
+"#;
+        toml::from_str::<BootstrapConfig>(toml)
+            .expect_err("missing boot_fs section must be rejected");
+    }
+
+    #[test]
+    fn bootstrap_rescue_section_optional() {
+        let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+"#;
+        let cfg: BootstrapConfig = toml::from_str(toml).expect("rescue must be optional");
+        assert_eq!(cfg.bootstrap.rescue.default_url, "");
+        assert_eq!(cfg.bootstrap.rescue.default_sha256, "");
+    }
+
+    #[test]
+    fn bootstrap_load_reads_from_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bootstrap.toml");
+        std::fs::write(
+            &path,
+            r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+"#,
+        )
+        .expect("write bootstrap toml");
+
+        let cfg = BootstrapConfig::load(&path).expect("load must succeed");
+        assert_eq!(cfg.bootstrap.boot_fs.device, "/dev/sda1");
+    }
+
+    #[test]
+    fn bootstrap_load_missing_file_is_io_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("nope.toml");
+        let err = BootstrapConfig::load(&path).expect_err("missing file must error");
+        assert!(
+            matches!(err, NmblError::Io { .. }),
+            "expected Io error, got: {err:?}",
+        );
     }
 }
