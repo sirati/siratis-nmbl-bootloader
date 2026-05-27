@@ -78,6 +78,30 @@
           doCheck = false;
         };
 
+        # Builder so callers (sirati-nmbl/flake.nix) can request a build
+        # with optional Cargo features (e.g. `network-rescue`). The
+        # default build below passes `features = []`, so it stays
+        # byte-identical to the feature-free build.
+        mkNmblInit = { features ? [ ] }:
+          let
+            featureArgs =
+              if features == [ ] then
+                ""
+              else
+                "--features=" + builtins.concatStringsSep "," features;
+            argsWithFeatures = commonArgs // {
+              cargoExtraArgs = featureArgs;
+            };
+            artifacts = craneLib.buildDepsOnly argsWithFeatures;
+          in
+          craneLib.buildPackage (
+            argsWithFeatures
+            // {
+              cargoArtifacts = artifacts;
+              pname = "nmbl-init";
+            }
+          );
+
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
         nmbl-init = craneLib.buildPackage (
@@ -89,6 +113,11 @@
         );
       in
       {
+        # Function form: callers wire Cargo features through this
+        # (sirati-nmbl/flake.nix uses it to gate `network-rescue` on
+        # `boot.nmbl.rescue.network`).
+        legacyPackages.mkNmblInit = mkNmblInit;
+
         packages = {
           default = nmbl-init;
           nmbl-init = nmbl-init;
