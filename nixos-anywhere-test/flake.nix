@@ -515,6 +515,12 @@
           firmware = "uefi";
           displayMode = "vnc-demo";
         };
+        install-test-splash-luks-vnc-demo = mkOrchestrator {
+          configName = "splash-luks-vnc-demo";
+          port = "22099";
+          firmware = "uefi";
+          displayMode = "vnc-demo";
+        };
       };
     in
     {
