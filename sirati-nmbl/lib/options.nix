@@ -561,7 +561,7 @@ in
     # When `rescue.mode = "external"`, the initramfs no longer ships
     # busybox + storage activation tools. Instead, they live in a
     # squashfs blob (`nmbl-rescue.sfs`) on the boot partition, which
-    # the Rust /init loop-mounts and `pivot_root`s into when the
+    # the Rust /init loop-mounts and switch_roots into when the
     # emergency shell is requested. The default `"embedded"` keeps the
     # legacy v1 behaviour so existing setups don't silently lose their
     # rescue path.
@@ -578,8 +578,8 @@ in
 
       squashfsContents = lib.mkOption {
         type = lib.types.listOf lib.types.package;
-        default = with pkgs; [ busybox cryptsetup lvm2 mdadm ];
-        defaultText = lib.literalExpression "with pkgs; [ busybox cryptsetup lvm2 mdadm ]";
+        default = with pkgs; [ busybox-sandbox-shell cryptsetup lvm2 mdadm ];
+        defaultText = lib.literalExpression "with pkgs; [ busybox-sandbox-shell cryptsetup lvm2 mdadm ]";
         description = lib.mdDoc ''
           Packages bundled into `nmbl-rescue.sfs` when
           `rescue.mode = "external"`. The Rust loader expects

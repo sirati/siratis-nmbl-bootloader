@@ -129,9 +129,11 @@ let
       extraModules = [
         ({ pkgs, ... }: {
           boot.nmbl.rescue.mode = "external";
-          # strace is the F.4 smoke-test target; busybox provides /bin/sh
-          # which the Rust loader requires inside the squashfs tree.
-          boot.nmbl.rescue.squashfsContents = [ pkgs.busybox pkgs.strace ];
+          # Static busybox provides /bin/sh without needing glibc in the
+          # squashfs chroot. pkgsStatic.strace is the F.4 smoke-test target;
+          # both must be statically linked since /nix/store is absent after
+          # switch_root into the squashfs.
+          boot.nmbl.rescue.squashfsContents = [ pkgs.busybox-sandbox-shell pkgs.pkgsStatic.strace ];
           # External rescue requires bootstrap mode so that Phase 0.5
           # mounts /boot and sets runtime_boot_mountpoint, which
           # rescue::locate_sfs needs to find nmbl-rescue.sfs.
@@ -171,7 +173,7 @@ let
       extraModules = [
         ({ pkgs, ... }: {
           boot.nmbl.rescue.mode = "external";
-          boot.nmbl.rescue.squashfsContents = [ pkgs.busybox pkgs.strace ];
+          boot.nmbl.rescue.squashfsContents = [ pkgs.busybox-sandbox-shell pkgs.pkgsStatic.strace ];
           boot.nmbl.rescue.network = true;
           boot.nmbl.rescue.defaultUrl = "";
           # External rescue requires bootstrap mode so that Phase 0.5
