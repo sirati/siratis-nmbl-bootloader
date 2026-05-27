@@ -17,6 +17,7 @@ use crate::config::{Activation, ActivationKind, Config};
 use crate::devices::wait_for;
 use crate::error::{NmblError, Result};
 use crate::sys::activation::{ProcessOutcome, run};
+use crate::ui::BootReporter;
 use crate::{nmbl_info, nmbl_warn};
 
 const PROC_MODULES: &str = "/proc/modules";
@@ -32,8 +33,13 @@ pub trait PasswordSupplier {
 /// Run every entry in declaration order. First failure is fatal —
 /// activations chain (LUKS → LVM → fs), so a partial run leaves
 /// Phase 3 unable to find its devices.
+///
+/// `reporter` carries the live boot console; we surface each activation
+/// kind + description as the boot-status phase label so the operator
+/// sees which step is in flight (LUKS unlock, LVM activate, …).
 pub fn run_all_activations(
     config: &Config,
+    reporter: &mut BootReporter<'_, '_>,
     mut password_supplier: Option<&mut dyn PasswordSupplier>,
 ) -> Result<()> {
     if config.activations.is_empty() {
@@ -43,6 +49,11 @@ pub fn run_all_activations(
     let loaded = loaded_modules()?;
 
     for activation in &config.activations {
+        let _ = reporter.set_phase(format!(
+            "phase 3: {} ({})",
+            kind_label(activation.kind),
+            activation.description,
+        ));
         check_required_modules(activation, &loaded);
 
         // Per-iteration reborrow; without it the compiler keeps the

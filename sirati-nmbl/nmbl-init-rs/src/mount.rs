@@ -12,6 +12,7 @@ use nix::errno::Errno;
 
 use crate::error::{NmblError, Result};
 use crate::sys::mount::mount_fs;
+use crate::ui::BootReporter;
 use crate::{nmbl_verbose, nmbl_warn};
 
 /// One pseudo-filesystem we mount during phase 1. `source` stays `None`
@@ -54,9 +55,18 @@ const PSEUDO_FILESYSTEMS: &[PseudoFs] = &[
 /// /dev (devtmpfs), /run (tmpfs), /tmp (tmpfs). Idempotent — a mount
 /// that fails with `EBUSY` is logged at warn level and treated as
 /// success, since re-mounting one of these is a benign no-op.
-pub fn mount_pseudo_filesystems() -> Result<()> {
+///
+/// `reporter` carries the live boot console; we surface the current
+/// pseudo-fs being mounted as the boot-status phase label so the
+/// operator sees what we're working on.
+pub fn mount_pseudo_filesystems(reporter: &mut BootReporter<'_, '_>) -> Result<()> {
     for fs in PSEUDO_FILESYSTEMS {
         let target = Path::new(fs.target);
+        // Best-effort: a render failure here must not abort the mount
+        // chain. The reporter's render path swallows non-critical errors
+        // but we still defensively ignore Err so a broken console can't
+        // brick a real boot.
+        let _ = reporter.set_phase(format!("phase 1: mounting {}", fs.target));
         ensure_dir(target)?;
         match mount_fs(None, target, fs.fstype, fs.options) {
             Ok(()) => nmbl_verbose!("mounted {} on {}", fs.fstype, fs.target),

@@ -13,6 +13,7 @@ use rustix::fs::{FileType, stat};
 use crate::config::{Config, FilesystemEntry};
 use crate::error::{NmblError, Result};
 use crate::nmbl_info;
+use crate::ui::BootReporter;
 
 /// Default per-device readiness deadline used by
 /// [`mount_system_filesystems`]. Held here (not in `Config`) until the
@@ -114,10 +115,19 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// (`is_root=true`) is mounted at `system_root` itself regardless of
 /// its `mountpoint` field; other entries land beneath it per
 /// [`resolve_mountpoint`].
-pub fn mount_system_filesystems(config: &Config) -> Result<()> {
+///
+/// `reporter` carries the live boot console; we surface the current
+/// device / mountpoint as the boot-status phase label so the operator
+/// sees what we're waiting on (especially when a slow device drags out
+/// the 30s budget).
+pub fn mount_system_filesystems(
+    config: &Config,
+    reporter: &mut BootReporter<'_, '_>,
+) -> Result<()> {
     let system_root = config.paths.system_root.as_path();
     ensure_dir(system_root)?;
 
+    let _ = reporter.set_phase("phase 3b: scanning /dev/disk/by-* symlinks");
     // NMBL has no udev, so /dev/disk/by-{partlabel,label,uuid,partuuid}/
     // is empty unless we populate it ourselves. Do that BEFORE the
     // wait_for loop below — disko-style configs reference paths
@@ -127,11 +137,21 @@ pub fn mount_system_filesystems(config: &Config) -> Result<()> {
 
     for entry in &config.filesystems {
         let dev = Path::new(&entry.device);
+        let _ = reporter.set_phase(format!(
+            "phase 3b: waiting for {} -> {}",
+            dev.display(),
+            entry.mountpoint.display(),
+        ));
         wait_for(dev, DEFAULT_DEVICE_TIMEOUT)?;
 
         let target = resolve_mountpoint(system_root, entry);
         ensure_dir(&target)?;
 
+        let _ = reporter.set_phase(format!(
+            "phase 3b: mounting {} on {}",
+            dev.display(),
+            target.display(),
+        ));
         crate::sys::mount::mount_fs(Some(dev), &target, &entry.fstype, &entry.options)?;
     }
 
