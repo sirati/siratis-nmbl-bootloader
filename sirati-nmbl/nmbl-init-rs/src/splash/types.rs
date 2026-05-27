@@ -30,11 +30,19 @@ pub struct RgbaColor(pub u8, pub u8, pub u8, pub u8);
 /// Coverage bitmap for a rasterized glyph.
 /// `coverage[y * width + x]` is the alpha byte: 0 = transparent,
 /// 255 = opaque.
+///
+/// `offset_x` / `offset_y` are signed pixel offsets from the cell's
+/// top-left corner to where the bitmap's top-left pixel should land.
+/// `offset_x` covers the glyph's left side-bearing; `offset_y` places
+/// the bitmap relative to the baseline (so descenders sit below the
+/// baseline and ascenders rise above the cell mid-line).
 #[derive(Debug)]
 pub struct GlyphBitmap {
     pub width: u32,
     pub height: u32,
     pub coverage: Vec<u8>,
+    pub offset_x: i32,
+    pub offset_y: i32,
 }
 
 /// Framebuffer dimensions returned by the DRM bring-up. `stride` is

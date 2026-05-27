@@ -16,6 +16,18 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 use crate::splash::types::{FramebufferDims, GlyphBitmap, RgbaColor};
 
+/// Pixel rectangle describing one terminal cell on the framebuffer:
+/// origin in pixels (`x`, `y`) plus dimensions in pixels (`w`, `h`).
+/// Kept as a small POD so [`blit_cell`] stays under clippy's
+/// `too_many_arguments` threshold.
+#[derive(Copy, Clone, Debug)]
+pub struct CellRect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
 /// Copy the scaled background RGBA buffer into the framebuffer,
 /// respecting `fb_dims.stride`. The input is tight RGBA8 of exactly
 /// `fb_dims.w * fb_dims.h * 4` bytes; rows shorter than that are
@@ -70,46 +82,80 @@ pub fn blit_background(fb: &mut [u8], fb_dims: FramebufferDims, bg_rgba: &[u8]) 
 /// Fill the cell rectangle at `(cell_x, cell_y)` pixels with `bg` (if
 /// `bg.3 > 0`), then alpha-blend the glyph in `fg` color over it. Any
 /// pixel that would fall outside the framebuffer is silently clipped.
+///
+/// The background fill always covers the whole cell box
+/// (`cell_w` × `cell_h`). The glyph overlay honours
+/// `glyph.offset_x` / `glyph.offset_y` so the bitmap sits at
+/// `(cell_x + offset_x, cell_y + offset_y)`; offsets are signed and can
+/// place the bitmap outside the cell box (e.g. descenders), in which
+/// case the surrounding cells overlap visually. Out-of-framebuffer
+/// pixels are clipped without overflow.
 pub fn blit_cell(
     fb: &mut [u8],
     fb_dims: FramebufferDims,
     glyph: &GlyphBitmap,
-    cell_x: u32,
-    cell_y: u32,
+    cell: CellRect,
     fg: RgbaColor,
     bg: RgbaColor,
 ) {
     let stride = fb_dims.stride as usize;
     let fb_w = fb_dims.w;
     let fb_h = fb_dims.h;
+    let CellRect {
+        x: cell_x,
+        y: cell_y,
+        w: cell_w,
+        h: cell_h,
+    } = cell;
 
-    for gy in 0..glyph.height {
-        let py = cell_y.saturating_add(gy);
-        if py >= fb_h {
-            break;
-        }
-        let row_off = (py as usize).saturating_mul(stride);
-
-        for gx in 0..glyph.width {
-            let px = cell_x.saturating_add(gx);
-            if px >= fb_w {
+    // Stage 1: background fill over the full cell box.
+    if bg.3 > 0 {
+        let RgbaColor(br, bg_g, bb, ba) = bg;
+        for cy in 0..cell_h {
+            let py = cell_y.saturating_add(cy);
+            if py >= fb_h {
                 break;
             }
-            let pix_off = row_off.saturating_add((px as usize).saturating_mul(4));
-            let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
-                continue;
-            };
-
-            // Stage 1: optional background fill.
-            if bg.3 > 0 {
-                let RgbaColor(br, bg_g, bb, ba) = bg;
+            let row_off = (py as usize).saturating_mul(stride);
+            for cx in 0..cell_w {
+                let px = cell_x.saturating_add(cx);
+                if px >= fb_w {
+                    break;
+                }
+                let pix_off = row_off.saturating_add((px as usize).saturating_mul(4));
+                let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
+                    continue;
+                };
                 let (dr, dg, db) = read_bgrx(dst);
                 let (nr, ng, nb) = src_over(br, bg_g, bb, ba, dr, dg, db);
                 write_bgrx(dst, nr, ng, nb);
             }
+        }
+    }
 
-            // Stage 2: alpha-blend the glyph coverage with `fg` over
-            // whatever currently sits in the pixel.
+    // Stage 2: glyph overlay positioned by the per-glyph offset.
+    let RgbaColor(fr, fg_g, fb_c, _) = fg;
+    for gy in 0..glyph.height {
+        let dy = i64::from(cell_y) + i64::from(glyph.offset_y) + i64::from(gy);
+        if dy < 0 {
+            continue;
+        }
+        let dy = dy as u64;
+        if dy >= u64::from(fb_h) {
+            continue;
+        }
+        let row_off = (dy as usize).saturating_mul(stride);
+
+        for gx in 0..glyph.width {
+            let dx = i64::from(cell_x) + i64::from(glyph.offset_x) + i64::from(gx);
+            if dx < 0 {
+                continue;
+            }
+            let dx = dx as u64;
+            if dx >= u64::from(fb_w) {
+                continue;
+            }
+
             let cov_idx = (gy as usize)
                 .saturating_mul(glyph.width as usize)
                 .saturating_add(gx as usize);
@@ -118,7 +164,10 @@ pub fn blit_cell(
                 continue;
             }
 
-            let RgbaColor(fr, fg_g, fb_c, _) = fg;
+            let pix_off = row_off.saturating_add((dx as usize).saturating_mul(4));
+            let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
+                continue;
+            };
             let (dr, dg, db) = read_bgrx(dst);
             let (nr, ng, nb) = src_over(fr, fg_g, fb_c, coverage, dr, dg, db);
             write_bgrx(dst, nr, ng, nb);
@@ -372,13 +421,23 @@ mod tests {
             width: 2,
             height: 2,
             coverage: vec![255, 128, 128, 128],
+            offset_x: 0,
+            offset_y: 0,
         };
         let fg = RgbaColor(200, 100, 50, 0xFF);
         // Transparent bg → only the glyph blend stage runs.
         let bg = RgbaColor(0, 0, 0, 0);
 
         // Place the glyph at (1, 1) so the top-left lands on pixel (1, 1).
-        blit_cell(&mut fb, dims, &glyph, 1, 1, fg, bg);
+        // Use a 2×2 cell box so the bg-fill stage stays within the glyph
+        // extents (the bg here is transparent anyway).
+        let rect = CellRect {
+            x: 1,
+            y: 1,
+            w: 2,
+            h: 2,
+        };
+        blit_cell(&mut fb, dims, &glyph, rect, fg, bg);
 
         // Pixel (1, 1): full coverage → fg overwrites dst exactly.
         let p11: usize = 16 + 4;
@@ -428,11 +487,19 @@ mod tests {
             width: 2,
             height: 2,
             coverage: vec![0, 0, 0, 0], // glyph contributes nothing
+            offset_x: 0,
+            offset_y: 0,
         };
         let fg = RgbaColor(255, 255, 255, 0xFF);
         let bg = RgbaColor(0x40, 0x60, 0x80, 0xFF);
 
-        blit_cell(&mut fb, dims, &glyph, 0, 0, fg, bg);
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 2,
+        };
+        blit_cell(&mut fb, dims, &glyph, rect, fg, bg);
 
         // All four pixels should be bg (BGRX = 80 60 40 00).
         for y in 0..2 {
@@ -460,11 +527,19 @@ mod tests {
             width: 2,
             height: 2,
             coverage: vec![255, 255, 255, 255],
+            offset_x: 0,
+            offset_y: 0,
         };
         let fg = RgbaColor(10, 20, 30, 0xFF);
         let bg = RgbaColor(0, 0, 0, 0);
 
-        blit_cell(&mut fb, dims, &glyph, 1, 1, fg, bg);
+        let rect = CellRect {
+            x: 1,
+            y: 1,
+            w: 2,
+            h: 2,
+        };
+        blit_cell(&mut fb, dims, &glyph, rect, fg, bg);
 
         // Pixel (1, 1) painted.
         let p11: usize = 8 + 4;
@@ -476,6 +551,101 @@ mod tests {
         assert_eq!(&fb[0..4], &[0, 0, 0, 0]);
         assert_eq!(&fb[4..8], &[0, 0, 0, 0]);
         assert_eq!(&fb[8..12], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn blit_cell_shifts_glyph_by_offset_y() {
+        // 4×8 framebuffer; one cell occupies the whole height. Stamp a
+        // 1×2 fully-opaque glyph with offset_y = 4. The glyph's first
+        // row must land on framebuffer row 4 (not row 0), proving the
+        // baseline shift takes effect.
+        let dims = FramebufferDims {
+            w: 4,
+            h: 8,
+            stride: 16,
+        };
+        let mut fb = vec![0u8; (dims.stride * dims.h) as usize];
+
+        let glyph = GlyphBitmap {
+            width: 1,
+            height: 2,
+            coverage: vec![255, 255],
+            offset_x: 0,
+            offset_y: 4,
+        };
+        let fg = RgbaColor(0xAA, 0xBB, 0xCC, 0xFF);
+        let bg = RgbaColor(0, 0, 0, 0);
+
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 8,
+        };
+        blit_cell(&mut fb, dims, &glyph, rect, fg, bg);
+
+        // Rows 0..3 untouched (the glyph offset shifted past them).
+        for y in 0..4 {
+            let off = y * 16;
+            assert_eq!(&fb[off..off + 16], &[0u8; 16], "row {y} must remain zero");
+        }
+        // Row 4 col 0: glyph stamped here (BGRX = CC BB AA 00).
+        let r4 = 4 * 16;
+        assert_eq!(fb[r4], 0xCC, "B at (0,4)");
+        assert_eq!(fb[r4 + 1], 0xBB, "G at (0,4)");
+        assert_eq!(fb[r4 + 2], 0xAA, "R at (0,4)");
+        // Row 5 col 0: second glyph row also stamped.
+        let r5 = 5 * 16;
+        assert_eq!(fb[r5], 0xCC, "B at (0,5)");
+        assert_eq!(fb[r5 + 1], 0xBB, "G at (0,5)");
+        assert_eq!(fb[r5 + 2], 0xAA, "R at (0,5)");
+        // Rows 6..7 untouched (glyph height is 2).
+        for y in 6..8 {
+            let off = y * 16;
+            assert_eq!(&fb[off..off + 16], &[0u8; 16], "row {y} must remain zero");
+        }
+    }
+
+    #[test]
+    fn blit_cell_negative_offset_clips_without_underflow() {
+        // A 2×2 glyph placed at cell origin (0, 0) with offset_y = -1
+        // must skip its first row (would land at framebuffer row -1) and
+        // paint only its second row at framebuffer row 0.
+        let dims = FramebufferDims {
+            w: 2,
+            h: 2,
+            stride: 8,
+        };
+        let mut fb = vec![0u8; (dims.stride * dims.h) as usize];
+
+        let glyph = GlyphBitmap {
+            width: 2,
+            height: 2,
+            coverage: vec![255, 255, 255, 255],
+            offset_x: 0,
+            offset_y: -1,
+        };
+        let fg = RgbaColor(10, 20, 30, 0xFF);
+        let bg = RgbaColor(0, 0, 0, 0);
+
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 2,
+        };
+        blit_cell(&mut fb, dims, &glyph, rect, fg, bg);
+
+        // Row 0: glyph row 1 lands here (full coverage).
+        assert_eq!(fb[0], 30);
+        assert_eq!(fb[1], 20);
+        assert_eq!(fb[2], 10);
+        assert_eq!(fb[4], 30);
+        assert_eq!(fb[5], 20);
+        assert_eq!(fb[6], 10);
+        // Row 1: glyph row 2 would land at framebuffer row 1 → off the
+        // glyph extent (height 2). Stays zero.
+        assert_eq!(&fb[8..16], &[0u8; 8]);
     }
 
     #[test]
