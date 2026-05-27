@@ -45,11 +45,13 @@ print_stdout     = "allow"
 # Phase D rescue-fallback network primitives. When OFF the `src/net/`
 # tree is `#[cfg]`d out and the optional deps are not compiled, so
 # enabling this feature is purely additive — the default build is
-# byte-for-byte identical to a feature-free build.
-network-rescue = ["dep:dhcproto", "dep:sha2", "dep:getrandom"]
+# byte-for-byte identical to a feature-free build. The
+# `nix/net` activator pulls in `nix::sys::socket` only when the
+# rescue path is compiled in, so DHCP's `sockaddr_ll` is in scope.
+network-rescue = ["dep:dhcproto", "dep:sha2", "dep:getrandom", "nix/net"]
 
 [dependencies]
-nix = { version = "0.29", default-features = false, features = ["mount", "fs", "process", "term", "user", "signal", "reboot", "feature", "net"] }
+nix = { version = "0.29", default-features = false, features = ["mount", "fs", "process", "term", "user", "signal", "reboot", "feature"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }

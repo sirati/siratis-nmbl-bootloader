@@ -358,13 +358,14 @@ pub fn wait_for_link(name: &str, timeout: Duration) -> Result<bool> {
             Err(_) => {}
         }
 
-        match deadline {
-            Some(d) if Instant::now() >= d => return Ok(false),
-            // checked_add overflowed (caller passed Duration::MAX);
-            // treat as an effectively-infinite wait.
-            None => {}
-            Some(_) => {}
+        if let Some(d) = deadline
+            && Instant::now() >= d
+        {
+            return Ok(false);
         }
+        // When `deadline` is `None` the caller passed `Duration::MAX`
+        // and `checked_add` overflowed; treat that as an
+        // effectively-infinite wait and keep polling.
         std::thread::sleep(Duration::from_millis(100));
     }
 }
