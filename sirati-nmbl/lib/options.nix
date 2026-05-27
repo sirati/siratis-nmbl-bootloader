@@ -14,6 +14,13 @@ let
   fsDerivedKernelModules = import ./modules/fs-modules.nix {
     inherit lib config;
   };
+
+  # Auto-detected NIC driver modules from hardware-configuration.nix.
+  # Pure function over `lib` + `config`; consumed only when
+  # `boot.nmbl.rescue.network = true`.
+  nicDetectedKernelModules = import ./modules/nic-modules.nix {
+    inherit lib config;
+  };
 in
 {
   imports = [
@@ -361,13 +368,20 @@ in
           cfg.kernelModules
           ++ config.boot.initrd.kernelModules
           ++ fsDerivedKernelModules
+          ++ lib.optionals (cfg.rescue.network && cfg.rescue.mode == "external") (
+            cfg.rescue.nicDrivers ++ nicDetectedKernelModules
+          )
         )
       );
       defaultText = lib.literalMD ''
         union of `boot.nmbl.kernelModules`, `boot.initrd.kernelModules`,
         and filesystem driver modules derived from
         `config.fileSystems.*.fsType` (e.g. `ext4`, `vfat`, `btrfs`),
-        with `boot.nmbl.blacklistedKernelModules` removed.
+        plus `boot.nmbl.rescue.nicDrivers` and any NIC modules detected
+        from hardware-configuration when
+        `boot.nmbl.rescue.network = true` and
+        `boot.nmbl.rescue.mode = "external"`, with
+        `boot.nmbl.blacklistedKernelModules` removed.
       '';
       description = lib.mdDoc ''
         Kernel modules the NMBL /init will load explicitly at startup
@@ -584,6 +598,51 @@ in
           stripped at install time and at runtime. The Rust disk-rescue
           path joins this against the runtime boot mountpoint
           (`bootstrap.bootFs.mountpoint` in bootstrap mode).
+        '';
+      };
+
+      network = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = lib.mdDoc ''
+          Enable HTTP rescue fallback. When true, NMBL ships NIC
+          drivers + DHCP + HTTP client in the initramfs so the rescue
+          path can pull `nmbl-rescue.sfs` over the network when the
+          disk copy is unavailable. Enables the Rust `network-rescue`
+          Cargo feature in the built /init binary.
+        '';
+      };
+
+      nicDrivers = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ "virtio_net" "e1000e" "igb" "r8169" ];
+        description = lib.mdDoc ''
+          Kernel modules bundled into the initramfs when
+          `rescue.network = true`. NIC modules already recorded in
+          `config.boot.initrd.availableKernelModules` or
+          `config.boot.initrd.kernelModules` (typically by
+          hardware-configuration.nix) are appended automatically and
+          deduplicated.
+        '';
+      };
+
+      defaultUrl = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "https://example.invalid/nmbl-rescue.sfs";
+        description = lib.mdDoc ''
+          Pre-fills the URL field in the network rescue prompt. Only
+          emitted into the runtime TOML when `rescue.network = true`.
+        '';
+      };
+
+      defaultSha256 = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "deadbeef";
+        description = lib.mdDoc ''
+          Pre-fills the SHA-256 field in the hash-confirm prompt. Only
+          emitted into the runtime TOML when `rescue.network = true`.
         '';
       };
     };

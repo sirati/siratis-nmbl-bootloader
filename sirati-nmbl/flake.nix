@@ -51,6 +51,14 @@
       # Built by the sibling flake at ./nmbl-init-rs.
       nmblInit = nmbl-init-rs.packages.${system}.default;
 
+      # Builder form: lib/config.nix uses this to build a /init with
+      # extra Cargo features (currently `network-rescue` when
+      # `boot.nmbl.rescue.network = true`). Falls back to the default
+      # binary if the sibling flake hasn't been updated yet.
+      mkNmblInit =
+        nmbl-init-rs.legacyPackages.${system}.mkNmblInit
+          or (_: nmblInit);
+
       # Import rescue-vm-test app directly
       rescueVmTestFlake = import ../rescue-vm-test/flake.nix;
       rescueVmTestApp =
@@ -137,6 +145,10 @@
           # Make the Rust /init binary available to lib/config.nix without
           # forcing every caller to pass it explicitly.
           _module.args.nmblInit = nmblInit;
+          # Builder used by lib/config.nix when the rescue-network path
+          # is enabled — produces a /init with the `network-rescue`
+          # Cargo feature compiled in.
+          _module.args.mkNmblInit = mkNmblInit;
         };
 
       # Test configurations

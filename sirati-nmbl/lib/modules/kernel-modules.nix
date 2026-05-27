@@ -6,6 +6,10 @@
   pkgs,
   config,
   cfg,
+  # Caller-supplied modules to merge into the explicit-load list
+  # (e.g. NIC drivers added when boot.nmbl.rescue.network = true).
+  # Defaults to [] so the existing call sites stay unchanged.
+  extraExplicitModules ? [ ],
 }:
 
 rec {
@@ -15,7 +19,7 @@ rec {
   # Filter out blacklisted modules
   explicitKernelModules = lib.unique (
     lib.filter (m: !(lib.elem m cfg.blacklistedKernelModules)) (
-      cfg.kernelModules ++ config.boot.initrd.kernelModules
+      cfg.kernelModules ++ config.boot.initrd.kernelModules ++ extraExplicitModules
     )
   );
 
