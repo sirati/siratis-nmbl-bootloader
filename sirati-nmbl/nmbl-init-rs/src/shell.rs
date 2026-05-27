@@ -139,6 +139,12 @@ fn suggested_action(err: &NmblError) -> String {
         NmblError::Activation { kind, .. } => {
             format!("Activation '{kind}' failed; check the relevant tool's stderr above.")
         }
+        NmblError::Bootstrap { stage, .. } => format!(
+            "Bootstrap stage '{stage}' failed; check bootstrap.toml and the boot partition."
+        ),
+        NmblError::Rescue { stage, .. } => {
+            format!("Rescue stage '{stage}' failed; check the rescue squashfs/network state.")
+        }
         NmblError::Panicked { report_path } => format!(
             "Recovered from a panic; report at {}.",
             report_path.display()

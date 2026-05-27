@@ -89,6 +89,20 @@ pub enum NmblError {
         source: Box<NmblError>,
     },
 
+    #[error("bootstrap stage {stage} failed: {source}")]
+    Bootstrap {
+        stage: &'static str,
+        #[source]
+        source: Box<NmblError>,
+    },
+
+    #[error("rescue stage {stage} failed: {source}")]
+    Rescue {
+        stage: &'static str,
+        #[source]
+        source: Box<NmblError>,
+    },
+
     #[error("recovered from panic (report at {report_path})")]
     Panicked { report_path: PathBuf },
 
@@ -119,4 +133,94 @@ pub fn format_chain(err: &dyn Error) -> String {
         out.pop();
     }
     out
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests assert on contract failures"
+)]
+mod tests {
+    use super::*;
+
+    fn inner_no_generations() -> NmblError {
+        NmblError::NoGenerations {
+            searched: PathBuf::from("/sysroot/nix/var/nix/profiles"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_display_mentions_stage_and_inner() {
+        let e = NmblError::Bootstrap {
+            stage: "load-toml",
+            source: Box::new(inner_no_generations()),
+        };
+        let s = e.to_string();
+        assert!(s.contains("bootstrap stage load-toml failed"), "{s}");
+        assert!(s.contains("no NixOS generations found"), "{s}");
+    }
+
+    #[test]
+    fn rescue_display_mentions_stage_and_inner() {
+        let e = NmblError::Rescue {
+            stage: "loop-alloc",
+            source: Box::new(inner_no_generations()),
+        };
+        let s = e.to_string();
+        assert!(s.contains("rescue stage loop-alloc failed"), "{s}");
+        assert!(s.contains("no NixOS generations found"), "{s}");
+    }
+
+    #[test]
+    fn bootstrap_source_chain_reaches_inner() {
+        let inner = inner_no_generations();
+        let inner_msg = inner.to_string();
+        let e = NmblError::Bootstrap {
+            stage: "mount-boot",
+            source: Box::new(inner),
+        };
+        let src = Error::source(&e).expect("Bootstrap should expose a source");
+        assert_eq!(src.to_string(), inner_msg);
+    }
+
+    #[test]
+    fn rescue_source_chain_reaches_inner() {
+        let inner = inner_no_generations();
+        let inner_msg = inner.to_string();
+        let e = NmblError::Rescue {
+            stage: "http-fetch",
+            source: Box::new(inner),
+        };
+        let src = Error::source(&e).expect("Rescue should expose a source");
+        assert_eq!(src.to_string(), inner_msg);
+    }
+
+    #[test]
+    fn format_chain_walks_bootstrap_then_rescue() {
+        // Nest a Rescue inside a Bootstrap to prove format_chain follows
+        // both layers transparently through the standard `Error::source`.
+        let leaf = inner_no_generations();
+        let mid = NmblError::Rescue {
+            stage: "hash-mismatch",
+            source: Box::new(leaf),
+        };
+        let top = NmblError::Bootstrap {
+            stage: "read-config",
+            source: Box::new(mid),
+        };
+        let formatted = format_chain(&top as &dyn Error);
+        assert!(
+            formatted.contains("bootstrap stage read-config"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains("caused by: rescue stage hash-mismatch"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains("caused by: no NixOS generations found"),
+            "{formatted}"
+        );
+    }
 }
