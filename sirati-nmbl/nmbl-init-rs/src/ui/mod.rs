@@ -95,6 +95,53 @@ pub use reporter::{BootReporter, ProgressSink};
 /// and only one knob to tune.
 pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
 
+/// Show a centred modal dialog with `title` + `message` on the supplied
+/// console and block until the operator presses any key (or
+/// `timeout_secs` elapses, whichever comes first). Use this for
+/// surfacing action failures (PTY allocation, network mount, …) so the
+/// operator sees what just went wrong instead of staring at the stale
+/// screen underneath.
+///
+/// Falls back to a serial-style stderr dump when the render fails so
+/// the operator on a degraded console still gets the diagnostic.
+pub fn show_modal_error(
+    console: &mut dyn Console,
+    title: &str,
+    message: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let hint = "press any key to continue";
+    let data = view::ModalErrorScreenData {
+        title,
+        message,
+        hint,
+    };
+    // Render once. If the backend itself is broken we still want the
+    // operator to see the failure — print to stderr as a fallback so
+    // the modal isn't the only chance.
+    if let Err(e) = console.draw_with(&mut |frame| view::render_modal_error(frame, &data)) {
+        eprintln!("[nmbl] {title}: {message}");
+        // Surfaced as a warning so the boot transcript shows we tried.
+        crate::nmbl_warn!("modal-error render failed: {e}");
+        return Ok(());
+    }
+
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        let slice = match deadline {
+            Some(d) => match d.checked_duration_since(Instant::now()) {
+                Some(remaining) => remaining.min(POLL_SLICE),
+                None => return Ok(()),
+            },
+            None => POLL_SLICE,
+        };
+        match console.poll_key(slice)? {
+            Some(_) => return Ok(()),
+            None => continue,
+        }
+    }
+}
+
 /// Run the boot-selection TUI on the provided [`Console`] and return
 /// the operator's decision.
 ///
