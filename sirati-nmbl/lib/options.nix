@@ -368,6 +368,13 @@ in
           cfg.kernelModules
           ++ config.boot.initrd.kernelModules
           ++ fsDerivedKernelModules
+          ++ lib.optionals (cfg.rescue.mode == "external") [
+            # loop is needed by allocate_loop_device (LOOP_CTL_GET_FREE on
+            # /dev/loop-control). squashfs is the filesystem type for the
+            # rescue blob. Both must be loaded before rescue dispatch runs.
+            "loop"
+            "squashfs"
+          ]
           ++ lib.optionals (cfg.rescue.network && cfg.rescue.mode == "external") (
             cfg.rescue.nicDrivers ++ nicDetectedKernelModules
             # af_packet is the kernel module that enables AF_PACKET sockets.
