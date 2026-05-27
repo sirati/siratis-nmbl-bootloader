@@ -57,20 +57,57 @@ use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::generations::Generation;
 use crate::sys::tty::{RawModeGuard, open_console};
-use crate::ui::timeout::{TimeoutOutcome, run_countdown};
 use crate::ui::view::{
     EditScreenData, ListScreenData, PassphraseScreenData, render_edit, render_list,
     render_passphrase,
 };
 
+/// Default console path used by the activation-phase passphrase modal
+/// when the splash isn't owning the framebuffer anymore.
+const CONSOLE_PATH: &str = "/dev/console";
+
+#[cfg(feature = "image-splash")]
+use std::time::Instant;
+#[cfg(feature = "image-splash")]
+use alacritty_terminal::term::cell::Flags;
+#[cfg(feature = "image-splash")]
+use alacritty_terminal::vte::ansi::{Color, NamedColor};
+#[cfg(feature = "image-splash")]
+use crossterm::event::{KeyCode, KeyModifiers};
+#[cfg(feature = "image-splash")]
+use ratatui::TerminalOptions;
+#[cfg(feature = "image-splash")]
+use ratatui::Viewport;
+#[cfg(feature = "image-splash")]
+use ratatui::layout::Rect;
+#[cfg(feature = "image-splash")]
+use crate::splash::{compositor, drm, glyph_cache, input, passphrase_demo, png, scale};
+#[cfg(feature = "image-splash")]
+use crate::splash::terminal::SplashTerminal;
+#[cfg(feature = "image-splash")]
+use crate::splash::types::CellDims;
+#[cfg(feature = "image-splash")]
+use crate::ui::timeout::TimeoutOutcome;
+
 pub use app::{App, Decision, Screen};
 
-/// Default console path used for early-userspace TUI rendering.
-const CONSOLE_PATH: &str = "/dev/console";
-/// Slice we wait on `crossterm::event::poll` per iteration. Shared by
-/// the event loop and the countdown ticker so they have the same
-/// responsiveness profile and only one knob to tune.
+/// Slice we wait on input per iteration. Shared by the event loop and
+/// the countdown ticker so they have the same responsiveness profile
+/// and only one knob to tune.
 pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
+
+/// Tty node opened to acquire raw-mode keyboard input alongside the
+/// DRM framebuffer output. `/dev/tty0` is the kernel's "current VT" —
+/// write-only per the device docs — so reads return nothing. The
+/// kernel routes PS/2 (and VNC) keypresses to `/dev/tty1`, which we
+/// open directly so they land in our SplashInput buffer even when
+/// `console=` points stdin at a serial line.
+#[cfg(feature = "image-splash")]
+const INPUT_TTY_PATH: &str = "/dev/tty1";
+
+/// Font size, in pixels, used to rasterise the splash glyph cache.
+#[cfg(feature = "image-splash")]
+const SPLASH_FONT_PX: f32 = 16.0;
 
 /// Run the boot-selection TUI and return the operator's decision.
 ///
@@ -83,102 +120,226 @@ pub fn run_selector(config: &Config, generations: &[Generation]) -> Result<Decis
 
     #[cfg(feature = "image-splash")]
     if config.splash.enable {
-        match crate::splash::try_run_selector(config, generations) {
-            Ok(Some(d)) => return Ok(d),
-            Ok(None) => crate::nmbl_warn!("splash unavailable, using tty UI"),
-            Err(e) => crate::nmbl_warn!("splash failed: {e}, using tty UI"),
+        match run_splash_selector(config, generations)? {
+            Some(d) => return Ok(d),
+            None => {
+                crate::nmbl_warn!(
+                    "splash unavailable; falling back to serial prompt on stdin"
+                );
+                return select_generation_serial(config, generations);
+            }
         }
     }
 
-    let console = open_console(Path::new(CONSOLE_PATH))?;
-    let _raw = RawModeGuard::new(console.as_fd())?;
+    // No splash available (either not enabled or feature not built in)
+    // and serial mode not requested: drop to the line-oriented prompt
+    // anyway. It works on any console the kernel pointed stdin at.
+    select_generation_serial(config, generations)
+}
 
-    let backend = CrosstermBackend::new(std::io::stdout());
-    let mut terminal = Terminal::new(backend).map_err(tui_err)?;
+/// Run the graphical boot selector backed by DRM + alacritty + SplashInput.
+///
+/// Returns `Ok(Some(decision))` on a clean operator choice, `Ok(None)`
+/// when the splash backend is unavailable (no DRM device, no font, etc.),
+/// and `Err(_)` when bring-up failed mid-flight.
+#[cfg(feature = "image-splash")]
+fn run_splash_selector(
+    config: &Config,
+    generations: &[Generation],
+) -> Result<Option<Decision>> {
+    // 1. Open the DRM card. Missing / inaccessible nodes map to
+    //    `Ok(None)` inside `open_card_with_fallback`, so this
+    //    propagates only real bring-up errors.
+    let mut drm = match drm::open_card_with_fallback(&config.splash.dri_path)? {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let fb_dims = drm.dims();
 
+    // 2. Load the background PNG and cover-scale it to the framebuffer.
+    let bg_image = png::decode_rgba(&config.splash.background_image)?;
+    let bg_scaled =
+        scale::cover_scale_nearest(&bg_image.rgba, bg_image.width, bg_image.height, fb_dims);
+
+    // 3. Load the font and derive grid dimensions from the cell size.
+    let cache = glyph_cache::load(&config.splash.font_path, SPLASH_FONT_PX)?;
+    let cell_size = cache.cell_size();
+    let cell_w = cell_size.w.max(1);
+    let cell_h = cell_size.h.max(1);
+    let cols = (fb_dims.w / cell_w).min(u32::from(u16::MAX)) as u16;
+    let rows = (fb_dims.h / cell_h).min(u32::from(u16::MAX)) as u16;
+    if cols == 0 || rows == 0 {
+        return Err(NmblError::Tui {
+            source: std::io::Error::other("splash framebuffer too small for one cell"),
+        });
+    }
+    let cell_dims = CellDims {
+        cols,
+        rows,
+        cell_w,
+        cell_h,
+    };
+
+    // 4. Open /dev/tty1 for raw-mode keyboard input.
+    let mut input = input::SplashInput::open(Path::new(INPUT_TTY_PATH))?;
+
+    // 5. Build the App. The headless terminal pipeline is built fresh
+    //    per frame inside render_frame to bound SGR state to one frame.
     let mut app = App::new(generations);
     app.show_kernel_params = config.tui.show_kernel_params;
 
+    // 6. Countdown phase.
     let countdown = Duration::from_secs(u64::from(config.general.timeout_secs));
-    let countdown_outcome = run_countdown_and_render(&mut terminal, &mut app, countdown)?;
-
-    match countdown_outcome {
-        TimeoutOutcome::Expired if app.decision.is_none() => {
-            // Auto-boot the default (index 0). The countdown reached
-            // zero without input — this is the documented happy path.
-            Ok(Decision::Boot {
-                generation_index: 0,
-                cmdline_override: None,
-            })
-        }
-        _ => {
-            run_event_loop(&mut terminal, &mut app)?;
-            app.decision.ok_or_else(|| NmblError::Tui {
-                source: std::io::Error::other("TUI exited without a decision"),
-            })
-        }
-    }
-}
-
-/// Run the countdown phase, redrawing the list screen on each tick
-/// the countdown reports. Returns the countdown's outcome.
-fn run_countdown_and_render<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
-    app: &mut App<'_>,
-    countdown: Duration,
-) -> Result<TimeoutOutcome> {
-    // The first frame must show the initial countdown value, then we
-    // redraw on every tick. We pass the redraw closure into the
-    // countdown so the ticker drives our rendering cadence.
-    let result = {
-        let mut on_tick = |secs: u64| {
+    let countdown_outcome = run_splash_countdown(
+        countdown,
+        &mut input,
+        &mut |secs| {
             app.countdown_remaining_secs = Some(secs);
-            let data = list_data(app);
-            // Drawing errors during the countdown shouldn't tear down
-            // the boot — log via stderr and keep going. We can't
-            // bubble through the on_tick callback signature.
-            let _ = terminal.draw(|f| render_list(f, &data));
-        };
-        run_countdown(countdown, &mut on_tick)
-    };
-
-    // Whatever the outcome, the countdown is over — clear the
-    // displayed remaining time.
+            let _ = render_splash_frame(&mut drm, &bg_scaled, &cache, cell_dims, &app);
+        },
+    )?;
     app.countdown_remaining_secs = None;
-    result
-}
 
-/// Poll for input until the App produces a decision.
-fn run_event_loop<W: Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
-    app: &mut App<'_>,
-) -> Result<()> {
-    // Repaint only on state changes — every iteration without a key
-    // event used to redraw, burning CPU and flickering on slow
-    // serial-bridged terminals. The first frame is always dirty.
+    if matches!(countdown_outcome, TimeoutOutcome::Expired) && app.decision.is_none() {
+        return Ok(Some(Decision::Boot {
+            generation_index: 0,
+            cmdline_override: None,
+        }));
+    }
+
+    // 7. Event loop.
     let mut dirty = true;
     loop {
         if dirty {
-            terminal
-                .draw(|f| render_current_screen(f, app))
-                .map_err(tui_err)?;
+            render_splash_frame(&mut drm, &bg_scaled, &cache, cell_dims, &app)?;
             dirty = false;
         }
-
-        if event::poll(POLL_SLICE).map_err(tui_err)? {
-            let evt = event::read().map_err(tui_err)?;
-            if let Event::Key(key) = evt {
-                if app.on_key(key) {
-                    return Ok(());
-                }
+        if let Some(key) = input.poll(POLL_SLICE)? {
+            // Intercept Ctrl+P from the list screen to demo the
+            // passphrase dialog. Plain `p` is already a list-view
+            // hotkey (toggles show_kernel_params) and a literal in
+            // many kernel cmdline edits (loglevel, console=tty1,
+            // ip=), so we use the modifier and gate on screen state.
+            if matches!(app.screen, Screen::List)
+                && key.code == KeyCode::Char('p')
+                && key.modifiers == KeyModifiers::CONTROL
+            {
+                let outcome =
+                    passphrase_demo::run(&mut drm, &bg_scaled, &cache, cell_dims, &mut input)?;
+                crate::nmbl_info!("passphrase demo returned: {outcome:?}");
                 dirty = true;
+                continue;
             }
+            if app.on_key(key) {
+                break;
+            }
+            dirty = true;
         }
-
         if app.decision.is_some() {
-            return Ok(());
+            break;
         }
     }
+
+    match app.decision {
+        Some(d) => Ok(Some(d)),
+        None => Err(NmblError::Tui {
+            source: std::io::Error::other("splash exited without decision"),
+        }),
+    }
+}
+
+/// Splash-side countdown loop. Mirrors [`crate::ui::timeout::run_countdown`]
+/// but polls [`input::SplashInput`] instead of stdin so cancel-on-keypress
+/// works on VT inputs even when the kernel's `console=` directive has
+/// pointed stdin at a serial line.
+#[cfg(feature = "image-splash")]
+fn run_splash_countdown(
+    duration: Duration,
+    input: &mut input::SplashInput,
+    on_tick: &mut dyn FnMut(u64),
+) -> Result<TimeoutOutcome> {
+    let start = Instant::now();
+    let deadline = start.checked_add(duration).unwrap_or(start);
+
+    let initial = duration.as_secs();
+    on_tick(initial);
+    let mut last_reported = initial;
+
+    loop {
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Ok(TimeoutOutcome::Expired);
+        };
+
+        let slice = remaining.min(POLL_SLICE);
+        if input.poll(slice)?.is_some() {
+            return Ok(TimeoutOutcome::Cancelled);
+        }
+
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Ok(TimeoutOutcome::Expired);
+        };
+        let secs = remaining.as_secs();
+        if secs != last_reported {
+            on_tick(secs);
+            last_reported = secs;
+        }
+    }
+}
+
+/// Render one frame: ratatui-draw → vte parse → cell-walk → blit.
+///
+/// The ratatui side emits absolute cursor positions every frame, but
+/// `alacritty_terminal::Term` accumulates SGR state across feeds. A
+/// fresh `SplashTerminal` per frame is the simplest way to guarantee
+/// the grid reflects only the current frame's bytes.
+#[cfg(feature = "image-splash")]
+fn render_splash_frame(
+    drm: &mut drm::SplashDrm,
+    bg_scaled: &[u8],
+    cache: &glyph_cache::GlyphCache,
+    cell_dims: CellDims,
+    app: &App<'_>,
+) -> Result<()> {
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let backend = CrosstermBackend::new(&mut buf);
+        let viewport = Viewport::Fixed(Rect::new(0, 0, cell_dims.cols, cell_dims.rows));
+        let mut terminal =
+            Terminal::with_options(backend, TerminalOptions { viewport }).map_err(tui_err)?;
+        terminal
+            .draw(|f| render_current_screen(f, app))
+            .map_err(tui_err)?;
+    }
+
+    let mut term_pipe = SplashTerminal::new(cell_dims);
+    term_pipe.feed(&buf);
+
+    drm.render(|fb, fb_dims| {
+        compositor::blit_background(fb, fb_dims, bg_scaled);
+        term_pipe.for_each_cell(|col, row, cell| {
+            if cell.c == ' ' && cell.bg == Color::Named(NamedColor::Background) {
+                return;
+            }
+            let bold = cell.flags.contains(Flags::BOLD);
+            let Some(glyph) = cache.get(cell.c, bold) else {
+                return;
+            };
+            let fg = compositor::resolve_color(cell.fg);
+            let bg = compositor::resolve_color(cell.bg);
+            let x = u32::from(col).saturating_mul(cell_dims.cell_w);
+            let y = u32::from(row).saturating_mul(cell_dims.cell_h);
+            let rect = compositor::CellRect {
+                x,
+                y,
+                w: cell_dims.cell_w,
+                h: cell_dims.cell_h,
+            };
+            compositor::blit_cell(fb, fb_dims, glyph, rect, fg, bg);
+        });
+        Ok(())
+    })
 }
 
 /// Dispatch render based on which screen the App is currently on.
