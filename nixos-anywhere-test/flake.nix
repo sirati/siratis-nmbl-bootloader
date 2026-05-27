@@ -392,6 +392,12 @@
                   STAGE3_DISPLAY=(-display none)
                 ''
             }
+            # Bidirectional serial via UNIX socket: log captured by a
+            # tee'd `socat`, input available by writing to the socket.
+            # `tee` keeps the file mirror of what the VM emits while
+            # letting operators inject keystrokes from the orchestrator
+            # host.
+            rm -f ser0.sock stage3.log
             qemu-system-x86_64 \
               -machine q35,accel=kvm:tcg \
               -cpu max \
@@ -403,13 +409,18 @@
               -netdev "user,id=net0,hostfwd=tcp::$PORT-:22" \
               -device virtio-net-pci,netdev=net0 \
               "''${STAGE3_DISPLAY[@]}" \
-              -serial file:stage3.log \
+              -chardev socket,id=ser0,path=ser0.sock,server=on,wait=off \
+              -serial chardev:ser0 \
               -monitor none \
               -daemonize \
               -pidfile qemu-stage3.pid
 
             QEMU_PID=$(cat qemu-stage3.pid)
-            echo "Stage 3 QEMU pid: $QEMU_PID  (serial log: $WORK_DIR/stage3.log)"
+            echo "Stage 3 QEMU pid: $QEMU_PID  (serial sock: $WORK_DIR/ser0.sock, log: $WORK_DIR/stage3.log)"
+            # Pump the VM's serial output into stage3.log in the
+            # background. The socat process exits when the VM closes
+            # the socket (i.e. when QEMU dies).
+            ( ${pkgs.socat}/bin/socat -u "UNIX-CONNECT:ser0.sock" "OPEN:stage3.log,creat,append" >/dev/null 2>&1 & )
 
             ${
               if displayMode == "vnc-demo" then
