@@ -71,11 +71,21 @@ fn build_message(err: &NmblError) -> String {
     s
 }
 
-/// The two items shown on the emergency screen. Order matters: index 0
-/// is the default if the operator just presses Enter, and it's what the
+/// Items shown on the emergency screen. Order matters: index 0 is the
+/// default if the operator just presses Enter, and it's what the
 /// timeout rolls over to.
+///
+/// `Pretty Shell` is appended after `Shell` only when the
+/// `image-splash` Cargo feature is compiled in — it depends on the
+/// `alacritty_terminal` parser which is only an optional dep of that
+/// feature. Builds without `image-splash` see the same two-row picker
+/// as before.
 fn default_items() -> Vec<EmergencyItem> {
-    vec![
+    // `mut` is conditionally used (the `push` below is feature-gated);
+    // suppress the unused_mut warning on no-feature builds without
+    // duplicating the vec literal.
+    #[cfg_attr(not(feature = "image-splash"), allow(unused_mut))]
+    let mut items = vec![
         EmergencyItem {
             label: "Reboot",
             choice: EmergencyChoice::Reboot,
@@ -84,7 +94,13 @@ fn default_items() -> Vec<EmergencyItem> {
             label: "Shell",
             choice: EmergencyChoice::Shell,
         },
-    ]
+    ];
+    #[cfg(feature = "image-splash")]
+    items.push(EmergencyItem {
+        label: "Pretty Shell",
+        choice: EmergencyChoice::PrettyShell,
+    });
+    items
 }
 
 /// Build an `App` parked on the Emergency screen with the given

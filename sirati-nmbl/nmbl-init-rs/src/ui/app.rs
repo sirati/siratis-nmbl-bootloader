@@ -60,6 +60,20 @@ pub enum EmergencyChoice {
     Reboot,
     /// Drop to the configured emergency shell.
     Shell,
+    /// Stay inside NMBL and host an emulated terminal inside the
+    /// existing ratatui chrome. Unlike [`EmergencyChoice::Shell`] this
+    /// does NOT `execve(2)` — NMBL keeps PID 1 and pumps bytes between
+    /// the operator's keystrokes and a forked shell on a PTY. When the
+    /// shell exits, control returns to the emergency screen.
+    ///
+    /// Gated behind the `image-splash` feature because the terminal
+    /// emulator reuses `alacritty_terminal` (already an optional dep
+    /// for the splash backend). The build without the feature has no
+    /// way to render an ANSI grid and would either need a private
+    /// terminal emulator (forbidden by the no-reimplement rule) or a
+    /// degraded plain-text mode that defeats the purpose.
+    #[cfg(feature = "image-splash")]
+    PrettyShell,
 }
 
 /// One row on the emergency screen.
