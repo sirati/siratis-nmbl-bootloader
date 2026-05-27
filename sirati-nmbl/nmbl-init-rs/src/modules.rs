@@ -33,6 +33,19 @@ pub fn load_explicit_modules(config: &Config) -> Result<()> {
             nmbl_verbose!("skipping blacklisted module {}", name);
             continue;
         }
+        // Skip entries that don't exist in the modules tree. Modern
+        // kernels fold many former crypto modules (ecb, xts, sha256_generic,
+        // and friends) into the built-in libcrypto, so the .ko file is
+        // simply absent. A missing top-level entry is not an error — if
+        // a downstream phase genuinely needs the module the kernel will
+        // surface that with a clearer failure.
+        if !by_name.contains_key(name.as_str()) {
+            nmbl_verbose!(
+                "module {} not in modules tree; assuming built-in",
+                name
+            );
+            continue;
+        }
         let order = module::resolve_load_order(name, &by_name)?;
         let (to_load, skipped) = filter_blacklisted(order, &blacklist);
         for skipped_name in skipped {

@@ -236,6 +236,21 @@ in
           boot.nmbl.serialConsole = lib.mkForce null;
           # Bump the menu timeout so the operator has time to look around.
           boot.nmbl.timeoutSeconds = lib.mkForce 600;
+          # Mirror kernel + NMBL output to both serial AND the framebuffer
+          # so emergency-shell output is visible in VNC, not just on the
+          # captured serial log. Last console= wins for stdin/console-read.
+          boot.nmbl.kernelParams = lib.mkForce [
+            "console=ttyS0,115200"
+            "earlyprintk=serial,ttyS0,115200"
+            "console=tty1"
+            "dyndbg=file super1.c +p"
+          ];
+          boot.kernelParams = lib.mkForce [
+            "console=ttyS0,115200"
+            "earlyprintk=serial,ttyS0,115200"
+            "console=tty1"
+            "loglevel=7"
+          ];
         }
       )
     ];
@@ -252,8 +267,6 @@ in
       "dm_mod"
       "dm-crypt"
       "aesni_intel"
-      "ecb"
-      "xts"
     ];
     # Linux 6.6 trips a crypto-API init bug in dm-crypt; use latest.
     nmblKernelPackage = pkgs.linuxPackages_latest.kernel;
@@ -272,6 +285,18 @@ in
           boot.nmbl.splash.enable = true;
           boot.nmbl.serialConsole = lib.mkForce null;
           boot.nmbl.timeoutSeconds = lib.mkForce 600;
+          boot.nmbl.kernelParams = lib.mkForce [
+            "console=ttyS0,115200"
+            "earlyprintk=serial,ttyS0,115200"
+            "console=tty1"
+            "dyndbg=file super1.c +p"
+          ];
+          boot.kernelParams = lib.mkForce [
+            "console=ttyS0,115200"
+            "earlyprintk=serial,ttyS0,115200"
+            "console=tty1"
+            "loglevel=7"
+          ];
           # LUKS unlock executed by NMBL stage-0 before mounting /.
           # passToStage1 hand-off isn't on this branch yet, so the
           # post-kexec NixOS stage-1 will re-prompt for the same
