@@ -118,7 +118,10 @@ fn collect_stdin(
 
 fn check_required_modules(activation: &Activation, loaded: &HashSet<String>) {
     for module in &activation.required_modules {
-        if !loaded.contains(module) {
+        // /proc/modules always uses the underscore spelling; config
+        // entries may use either (e.g. "dm-crypt" vs "dm_crypt").
+        let canonical = module.replace('-', "_");
+        if !loaded.contains(&canonical) {
             nmbl_warn!(
                 "activation {} requires module {} but it's not loaded; attempting anyway",
                 kind_label(activation.kind),
