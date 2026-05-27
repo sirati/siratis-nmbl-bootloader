@@ -44,33 +44,36 @@ use crate::ui::{EmergencyChoice, run_emergency_screen};
 /// halts the system rather than returning to the caller.
 ///
 /// `console` is the live boot console when the orchestrator still has
-/// one — phase-failure paths pass it down so the emergency TUI reuses
-/// the same backend the operator was already looking at. When `None`
+/// one — phase-failure paths pass it down BY OWNERSHIP so the rescue
+/// dispatcher can DROP it before any `execve(2)` (and so restore VT
+/// text mode + termios via the backend's `Drop` impl). Without that
+/// drop the kernel keeps the VT in `KD_GRAPHICS` and the operator's
+/// shell runs invisibly under a frozen splash frame. When `None`
 /// (panic-recovery re-exec, or initial console bring-up failed) we
 /// open a tty console as a last resort; that path forces
 /// `panic_recovery=true` so the splash code is never re-entered.
 pub fn drop_to_emergency(
-    console: Option<&mut dyn Console>,
+    console: Option<Box<dyn Console>>,
     config: &Config,
     err: NmblError,
 ) -> Infallible {
-    // Ask the operator what to do via the TUI. If the caller still has
-    // the live boot console, drive the emergency screen over it AND
-    // hand the same backend to the rescue dispatcher. Otherwise open a
-    // fresh tty console (panic_recovery=true skips splash bring-up
-    // entirely, mirroring the panic-handler contract) and reuse that
-    // single backend for both the emergency screen and the
-    // network-rescue screens — never two parallel terminals.
-    match console {
-        Some(c) => {
-            let choice = run_emergency_screen(c, &err);
-            handle_choice(choice, c, config, &err)
-        }
+    // Take ownership of the boot console so the rescue dispatcher can
+    // DROP it before any `execve(2)` into the rescue shell. Without
+    // that drop the TtyConsole / SplashConsole Drop impl never runs,
+    // so the VT stays in KD_GRAPHICS and the operator's shell renders
+    // invisibly under a frozen splash frame.
+    //
+    // When the caller has no live console (panic-recovery re-exec, or
+    // early-phase failure before open_console), open a fresh tty
+    // console; `panic_recovery=true` keeps us out of the splash code
+    // path which may itself be the cause of the failure we are
+    // recovering from. The same handle is reused for the emergency
+    // TUI and the network-rescue screens — never two parallel
+    // terminals.
+    let mut console = match console {
+        Some(c) => c,
         None => match open_console(config, true) {
-            Ok(mut c) => {
-                let choice = run_emergency_screen(&mut *c, &err);
-                handle_choice(choice, &mut *c, config, &err)
-            }
+            Ok(c) => c,
             Err(open_err) => {
                 nmbl_warn!(
                     "emergency console bring-up failed: {}; defaulting to reboot",
@@ -81,22 +84,29 @@ pub fn drop_to_emergency(
                 halt_with("reboot(RB_AUTOBOOT) returned; halting");
             }
         },
-    }
+    };
+
+    let choice = run_emergency_screen(&mut *console, &err);
+    handle_choice(choice, console, config, &err)
 }
 
 /// Act on the operator's emergency-screen choice. `console` is the
-/// live boot console the caller already owns; on the shell branch it
-/// is threaded into `rescue::dispatch` so the network-rescue screens
-/// paint through the same backend (no second `/dev/console` grab, no
-/// flicker between splash and tty).
+/// live boot console (owned) the caller routed down; on the shell
+/// branch it is threaded into `rescue::dispatch` so the network-rescue
+/// screens paint through the same backend (no second `/dev/console`
+/// grab, no flicker between splash and tty) and the dispatcher drops
+/// the box before `execve`.
 fn handle_choice(
     choice: EmergencyChoice,
-    console: &mut dyn Console,
+    console: Box<dyn Console>,
     config: &Config,
     err: &NmblError,
 ) -> Infallible {
     match choice {
         EmergencyChoice::Reboot => {
+            // Tear down the boot console before reboot so the VT mode
+            // and termios are restored even on this path.
+            drop(console);
             eprintln!("[nmbl] operator (or timeout) chose reboot");
             let _ = reboot(RebootMode::RB_AUTOBOOT);
             // reboot() returned Err — fall through to the same halt
@@ -111,13 +121,15 @@ fn handle_choice(
 /// chain so the operator has context, then hand off to the rescue
 /// dispatcher. Does not return on success; on dispatch failure halts
 /// the system.
-fn exec_shell(console: &mut dyn Console, config: &Config, err: &NmblError) -> Infallible {
+fn exec_shell(console: Box<dyn Console>, config: &Config, err: &NmblError) -> Infallible {
     print_banner(config, err);
 
     // rescue::dispatch returns Result<Infallible>: success is the
     // noreturn path (process image is replaced), so the Ok arm matches
     // against an uninhabited type. Any Err means no rescue strategy
-    // could complete — we log the failure chain and halt.
+    // could complete — we log the failure chain and halt. The Box is
+    // moved into the dispatcher which drops it before any execve so
+    // the backend's Drop impl restores VT text mode and termios.
     match rescue::dispatch(config, console, err) {
         Ok(infallible) => match infallible {},
         Err(dispatch_err) => {

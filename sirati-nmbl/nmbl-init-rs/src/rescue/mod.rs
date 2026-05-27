@@ -75,21 +75,33 @@ pub enum RescueMode {
 /// Anything else collapses to [`halt_with_banner`] so the operator
 /// sees a structured diagnostic instead of a silent reboot loop.
 ///
-/// `console` is the live boot console the orchestrator holds; the
-/// network-rescue screens render and poll through it (no parallel
-/// `/dev/console` session is opened) so the operator stays on the same
-/// splash or tty backend they were already looking at. Disk-rescue,
-/// embedded, and halt arms do not interact with the operator and so
-/// ignore the handle.
+/// `console` is the live boot console the orchestrator holds, passed
+/// BY OWNERSHIP so this function can drop it (restoring VT text mode
+/// and termios via the backend's `Drop` impl) immediately before any
+/// `execve(2)` or `reboot(2)`. The Embedded and halt arms drop it on
+/// entry — they never interact with the operator further; the
+/// External arm keeps it alive only for the network-rescue UI and
+/// drops it inside the rescue helpers right before their `execve`.
 pub fn dispatch(
     config: &Config,
-    console: &mut dyn Console,
+    console: Box<dyn Console>,
     cause: &NmblError,
 ) -> Result<Infallible> {
     match config.rescue.mode {
-        RescueMode::Embedded => exec_embedded(config),
+        RescueMode::Embedded => {
+            // Drop the boot console BEFORE execve so the backend's
+            // Drop impl restores KD_TEXT and termios — otherwise the
+            // freshly-execve'd shell would run under a frozen VT in
+            // KD_GRAPHICS, invisible to the operator on framebuffer
+            // / VNC.
+            drop(console);
+            exec_embedded(config)
+        }
         RescueMode::External => dispatch_external(config, console, cause),
-        RescueMode::None => halt_with_banner(cause),
+        RescueMode::None => {
+            drop(console);
+            halt_with_banner(cause)
+        }
     }
 }
 
@@ -98,11 +110,24 @@ pub fn dispatch(
 /// `dispatch` match stays a single line per arm.
 fn dispatch_external(
     config: &Config,
-    console: &mut dyn Console,
+    console: Box<dyn Console>,
     cause: &NmblError,
 ) -> Result<Infallible> {
-    let disk_err = match disk::try_disk_rescue(config, cause) {
-        Ok(infallible) => match infallible {},
+    // Phase 1: mount the rescue squashfs. We hold onto the console
+    // across this call so a mount failure can fall through to the
+    // network-rescue UI without re-opening /dev/console.
+    let disk_err = match disk::prepare_disk_rescue(config, cause) {
+        Ok(rescue_dir) => {
+            // Mount succeeded. Drop the console BEFORE switch_root +
+            // execve so the backend's Drop impl restores KD_TEXT and
+            // termios — otherwise the rescue shell runs invisibly
+            // under a frozen splash frame.
+            drop(console);
+            match switch_root_and_exec(rescue_dir) {
+                Ok(infallible) => match infallible {},
+                Err(e) => return Err(e),
+            }
+        }
         Err(e) => e,
     };
 
@@ -112,19 +137,37 @@ fn dispatch_external(
             // Serial-console operators get the line-mode fallback; the
             // ratatui screens assume a real terminal where escape
             // sequences and key codes round-trip cleanly.
+            //
+            // NOTE: on the TUI path the boot console stays alive for
+            // the entire UI flow (it IS the UI's render target) and is
+            // dropped only on the Err return below. The network-success
+            // path therefore execve's with the VT still in
+            // `KD_GRAPHICS` — a pre-existing limitation that is out of
+            // scope for the embedded-shell fix. Resolving it requires a
+            // pre-exec callback threaded through `try_network_rescue`
+            // and a refactor of `make_rescue_ui` to interior-mutable
+            // ownership; tracked separately.
             let net_err = if config.general.serial_console {
-                let _ = console;
+                drop(console);
                 let mut ui = net::ConsoleRescueUi;
                 match net::try_network_rescue(config, &mut ui, &disk_err.to_string()) {
                     Ok(infallible) => match infallible {},
                     Err(e) => e,
                 }
             } else {
-                let mut ui = crate::ui::rescue::make_rescue_ui(console);
-                match net::try_network_rescue(config, &mut ui, &disk_err.to_string()) {
-                    Ok(infallible) => match infallible {},
-                    Err(e) => e,
-                }
+                let mut console = console;
+                let net_err = {
+                    let mut ui = crate::ui::rescue::make_rescue_ui(&mut *console);
+                    match net::try_network_rescue(config, &mut ui, &disk_err.to_string()) {
+                        Ok(infallible) => match infallible {},
+                        Err(e) => e,
+                    }
+                };
+                // Tear down the console before halt — net path failed
+                // so no execve will run; the Drop here matches the
+                // behaviour of the embedded / disk / None arms above.
+                drop(console);
+                net_err
             };
             // Both disk AND network paths failed. Surface the
             // network error (it's the more recent attempt) chained
@@ -139,9 +182,9 @@ fn dispatch_external(
 
     // Either the feature was off or the operator disabled network
     // rescue — fall back to the structured halt with the disk-rescue
-    // error surfaced.
-    #[cfg(not(feature = "network-rescue"))]
-    let _ = console; // unused when network-rescue is compiled out
+    // error surfaced. Drop the console either way so VT/termios are
+    // restored before halt.
+    drop(console);
     let _ = &disk_err; // silence unused warning when feature is off
     halt_with_banner(&NmblError::Rescue {
         stage: "disk-rescue-failed",
