@@ -18,6 +18,8 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
+use nix::errno::Errno;
+use nix::mount::{MsFlags, mount};
 use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -26,10 +28,74 @@ use rustix::fs::fcntl_setfl;
 use rustix::fs::OFlags as RustixOFlags;
 
 use crate::error::{NmblError, Result};
+use crate::nmbl_warn;
 
 /// Conventional shell exit code surfaced when the post-fork `execve(2)`
 /// fails. Matches the value used in `src/sys/activation.rs`.
 const EXEC_FAILED_EXIT_CODE: i32 = 127;
+
+/// Mount `devpts` on `/dev/pts` so `openpty(3)` can hand out slave
+/// terminals via `/dev/ptmx`. Idempotent: `EBUSY` (already mounted) and
+/// `ENOENT` on `/dev/pts` (directory missing → create it once) are
+/// transparently handled.
+///
+/// `nmbl-init`'s phase 1 deliberately keeps the pseudo-fs set minimal
+/// (`/proc`, `/sys`, `/dev`, `/run`, `/tmp`); devpts only matters here,
+/// inside the pretty-shell session, so we mount on demand rather than
+/// pay the cost on every boot.
+fn ensure_devpts_mounted() -> Result<()> {
+    let target = Path::new("/dev/pts");
+    if let Err(e) = std::fs::create_dir_all(target) {
+        // `AlreadyExists` is the happy path on a second invocation.
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(NmblError::Io {
+                source: e,
+                context: "creating /dev/pts mountpoint".to_string(),
+            });
+        }
+    }
+    // gid=5 mirrors the standard `tty` group on most distros. mode=620
+    // matches what util-linux mounts at boot.
+    let opts = "newinstance,ptmxmode=0666,mode=0620,gid=5";
+    match mount(
+        Some("devpts"),
+        target,
+        Some("devpts"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+        Some(opts),
+    ) {
+        Ok(()) => {}
+        Err(Errno::EBUSY) => {
+            // Already mounted; benign.
+        }
+        Err(e) => {
+            return Err(NmblError::Mount {
+                src: Some(std::path::PathBuf::from("devpts")),
+                dst: target.to_path_buf(),
+                fstype: "devpts".to_string(),
+                source: e,
+            });
+        }
+    }
+    // A `newinstance` mount populates `/dev/pts/ptmx` but leaves
+    // `/dev/ptmx` (which libc's openpty uses) untouched. Symlink it.
+    // Best-effort: pre-existing `/dev/ptmx` is left alone.
+    let ptmx = Path::new("/dev/ptmx");
+    if let Err(e) = std::fs::symlink_metadata(ptmx)
+        && e.kind() == std::io::ErrorKind::NotFound
+    {
+        // Create the symlink. Failure here is non-fatal — many
+        // distros ship the char-device version of /dev/ptmx via
+        // devtmpfs, in which case our symlink isn't needed.
+        if let Err(se) = std::os::unix::fs::symlink("pts/ptmx", ptmx) {
+            nmbl_warn!(
+                "could not create /dev/ptmx -> pts/ptmx symlink: {se}; \
+                 openpty may still work via the devtmpfs ptmx node",
+            );
+        }
+    }
+    Ok(())
+}
 
 /// Handle to a child shell process running on a PTY pair. The parent
 /// (NMBL) reads/writes the master fd; the slave fd is owned by the
@@ -92,6 +158,11 @@ impl PtyChild {
 /// minus a minimal `TERM=xterm-256color` injection so curses-style
 /// applications work.
 pub fn spawn_shell(shell_path: &Path, cols: u16, rows: u16) -> Result<PtyChild> {
+    // `nmbl-init`'s phase 1 doesn't mount `/dev/pts`; openpty(3) reads
+    // `/dev/ptmx` and writes the PTY name back to `/dev/pts/N`, so we
+    // mount devpts on demand before the first PTY allocation.
+    ensure_devpts_mounted()?;
+
     // === Parent-side allocation: ALL CString / Vec construction MUST
     // happen here, before fork(2). The post-fork child path is restricted
     // to async-signal-safe operations. ===

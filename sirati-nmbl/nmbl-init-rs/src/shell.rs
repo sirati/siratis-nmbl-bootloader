@@ -86,33 +86,76 @@ pub fn drop_to_emergency(
         },
     };
 
-    // Pretty Shell is re-entrant: when the operator exits the
-    // emulated shell we drop back to the emergency picker so they can
-    // choose again. The loop terminates on any "no-return" choice
-    // (Reboot, Shell) because `handle_choice` returns `Infallible`.
+    // The picker loop is re-entrant: any choice that can fail bounces
+    // back here with a modal explaining what went wrong, instead of
+    // silently rejoining the stale "boot failed" panel.
     //
-    // Without the `image-splash` feature the loop has no `continue`
-    // branch — every iteration diverges via `handle_choice` — so
-    // clippy's `never_loop` lint fires. Suppress it here: the loop
-    // shape is intentional and matches the feature-on path so the
-    // diff between builds stays minimal.
-    #[cfg_attr(not(feature = "image-splash"), allow(clippy::never_loop))]
+    // - Reboot: drop the console (VT restore!) then `reboot()`. If
+    //   the kernel refuses we recover the console and surface the
+    //   error in a modal before re-entering the picker.
+    // - Shell: `exec_shell` calls `rescue::dispatch` which moves the
+    //   console by value (so it can drop before `execve`); diverges
+    //   on success, halts on failure. The console is gone either way,
+    //   so the modal is paint-on-stderr.
+    // - PrettyShell: stays in-process; on Err show modal, re-loop.
     loop {
         let choice = run_emergency_screen(&mut *console, &err);
         #[cfg(feature = "image-splash")]
         if matches!(choice, crate::ui::EmergencyChoice::PrettyShell) {
             if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(&mut *console, config) {
-                nmbl_warn!(
-                    "pretty-shell session failed: {}",
-                    format_chain(&e as &dyn std::error::Error)
+                let chain = format_chain(&e as &dyn std::error::Error);
+                nmbl_warn!("pretty-shell session failed: {chain}");
+                let _ = crate::ui::show_modal_error(
+                    &mut *console,
+                    "Pretty Shell failed to start",
+                    &chain,
+                    std::time::Duration::from_secs(30),
                 );
             }
-            // Re-display the emergency menu.
             continue;
         }
-        // All remaining choices diverge inside `handle_choice` (it
-        // returns `Infallible`). The empty match consumes the
-        // uninhabited type without re-entering the loop.
+        if matches!(choice, EmergencyChoice::Reboot) {
+            // Try the reboot. On Err recover gracefully and let the
+            // operator try again — halting on a failed reboot is the
+            // worst possible outcome (the operator can't see why).
+            eprintln!("[nmbl] operator (or timeout) chose reboot");
+            match reboot(RebootMode::RB_AUTOBOOT) {
+                Ok(_) => {
+                    // The Linux kernel doesn't actually return Ok from
+                    // reboot(2) on success — the syscall does not
+                    // return — but the type system insists on this
+                    // arm. Treat it like Err for safety.
+                    let _ = crate::ui::show_modal_error(
+                        &mut *console,
+                        "reboot returned",
+                        "reboot(RB_AUTOBOOT) returned Ok without actually \
+                         rebooting. The kernel is in an unexpected state. \
+                         You can try again or pick another action.",
+                        std::time::Duration::from_secs(30),
+                    );
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "reboot(RB_AUTOBOOT) failed: {e}.\n\
+                         The kernel refused the reboot — typically this \
+                         means CAP_SYS_BOOT is missing (we are not PID 1) \
+                         or the system is in a degraded state.\n\n\
+                         Pick another action."
+                    );
+                    let _ = crate::ui::show_modal_error(
+                        &mut *console,
+                        "reboot failed",
+                        &msg,
+                        std::time::Duration::from_secs(30),
+                    );
+                }
+            }
+            continue;
+        }
+        // Shell branch (and the unreachable PrettyShell fall-through)
+        // diverge inside `handle_choice` (returns `Infallible`). The
+        // empty match consumes the uninhabited type so this `loop`
+        // iteration cannot fall off the end.
         match handle_choice(choice, console, config, &err) {}
     }
 }
@@ -131,14 +174,13 @@ fn handle_choice(
 ) -> Infallible {
     match choice {
         EmergencyChoice::Reboot => {
-            // Tear down the boot console before reboot so the VT mode
-            // and termios are restored even on this path.
+            // The outer loop in `drop_to_emergency` handles Reboot
+            // directly so it can survive a failed `reboot(2)` and
+            // surface the cause to the operator. If we reach this
+            // arm something has gone wrong upstream; tear the console
+            // down (VT restore) and halt rather than spinning.
             drop(console);
-            eprintln!("[nmbl] operator (or timeout) chose reboot");
-            let _ = reboot(RebootMode::RB_AUTOBOOT);
-            // reboot() returned Err — fall through to the same halt
-            // path execve uses, so we still preserve Infallible.
-            halt_with("reboot(RB_AUTOBOOT) returned; halting");
+            halt_with("Reboot reached handle_choice; halting")
         }
         EmergencyChoice::Shell => exec_shell(console, config, err),
         // The PrettyShell branch is intercepted by the outer loop in

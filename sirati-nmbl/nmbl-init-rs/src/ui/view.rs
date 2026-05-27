@@ -374,6 +374,44 @@ pub fn render_key_echo(frame: &mut Frame<'_>, data: &KeyEchoScreenData<'_>) {
     );
 }
 
+/// State needed to render a transient modal-error dialog (used by the
+/// pretty-shell path when openpty / fork / mount fails so the operator
+/// sees what happened instead of a stale "boot failed" panel underneath).
+pub struct ModalErrorScreenData<'a> {
+    /// Short title shown on the modal's title bar.
+    pub title: &'a str,
+    /// Pre-formatted error chain. Rendered with `Wrap { trim: false }`.
+    pub message: &'a str,
+    /// Footer hint, typically "press any key to continue".
+    pub hint: &'a str,
+}
+
+/// Render a centred modal dialog over the body area. The bordered
+/// modal carries the error chain in red on a fresh `Clear` so the
+/// stale emergency-screen content does not bleed through.
+pub fn render_modal_error(frame: &mut Frame<'_>, data: &ModalErrorScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    // Centred modal: 70 cols wide, half the body height (min 8).
+    let h = body.height.saturating_div(2).max(8);
+    let modal = centered_rect(body, 70, h);
+    frame.render_widget(Clear, modal);
+
+    let block = Block::bordered().title(Span::styled(
+        data.title.to_owned(),
+        Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let para = Paragraph::new(Text::from(data.message.to_owned()))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, modal);
+
+    render_footer(frame, footer, data.hint);
+}
+
 /// State needed to render the pretty-shell screen.
 ///
 /// Owned by the [`crate::ui::pretty_shell::PtyShellState`] driver; the
@@ -619,6 +657,28 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("*****|"), "wrong mask count in:\n{text}");
         assert!(text.contains("Unlock /dev/sda2"));
+    }
+
+    #[test]
+    fn test_render_modal_error_shows_title_message_and_hint() {
+        // Modal must surface the title, the error chain body, and the
+        // any-key hint in the footer. Cell-by-cell text scan is enough
+        // — the actual layout/colour is incidental detail tested in
+        // ratatui's own suite.
+        let data = ModalErrorScreenData {
+            title: "Pretty Shell failed to start",
+            message: "openpty failed: ENOENT: No such file or directory",
+            hint: "press any key to continue",
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_modal_error(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Pretty Shell failed to start"),
+            "title missing in:\n{text}"
+        );
+        assert!(text.contains("openpty failed"), "message missing in:\n{text}");
+        assert!(text.contains("press any key"), "hint missing in:\n{text}");
     }
 
     fn boot_status_data<'a>(
