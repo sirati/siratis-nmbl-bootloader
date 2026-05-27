@@ -15,12 +15,16 @@ let
     inherit lib config;
   };
 
+  # The cosmic-greeter repo stores assets via Git LFS, so the
+  # raw.githubusercontent.com URL returns a pointer file. The
+  # media.githubusercontent.com prefix transparently smudges LFS
+  # content and gives us the actual JPEG.
   cosmicGreeterBackgroundPng = pkgs.runCommand "cosmic-greeter-background.png"
     { nativeBuildInputs = [ pkgs.imagemagick ]; }
     ''
       magick ${pkgs.fetchurl {
-        url = "https://raw.githubusercontent.com/pop-os/cosmic-greeter/master/res/background.jpg";
-        sha256 = "sha256-/gcRiJ7lMUdtMRol5Rfo+sTGB0sM7VLcsLf+LL6p3u4=";
+        url = "https://media.githubusercontent.com/media/pop-os/cosmic-greeter/master/res/background.jpg";
+        sha256 = "sha256-dQD3AvBIjUqN8sWr63ypEHp8p5mOBEFyfLr3lGWwI4g=";
       }} -strip -define png:color-type=6 "$out"
     '';
 in
