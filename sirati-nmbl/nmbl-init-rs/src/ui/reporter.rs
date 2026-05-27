@@ -63,17 +63,22 @@ const LOG_SNAPSHOT_LINES: usize = 64;
 /// Boot status reporter — a thin wrapper around `&mut dyn Console` plus
 /// the active [`App`] so phase code can report status without needing
 /// to know the underlying render plumbing.
-pub struct BootReporter<'c, 'a> {
+///
+/// The inner [`App`] is parameterised over `'static`: every production
+/// caller passes a `&'static str` literal as the initial phase, and
+/// [`Self::set_phase`] / [`ProgressSink::tick`] always promote into an
+/// owned `Cow`, so a second lifetime would be dead weight.
+pub struct BootReporter<'c> {
     pub console: &'c mut dyn Console,
-    pub app: App<'a>,
+    pub app: App<'static>,
 }
 
-impl<'c, 'a> BootReporter<'c, 'a> {
+impl<'c> BootReporter<'c> {
     /// Build a reporter parked on the boot-status screen with the given
     /// initial phase label. Does NOT render — the caller decides when
     /// the first frame is meaningful (typically right after construction
     /// via [`Self::set_phase`] or [`Self::refresh_log`]).
-    pub fn new(console: &'c mut dyn Console, phase: impl Into<Cow<'a, str>>) -> Self {
+    pub fn new(console: &'c mut dyn Console, phase: impl Into<Cow<'static, str>>) -> Self {
         let app = App::boot_status(phase);
         Self { console, app }
     }
@@ -83,7 +88,7 @@ impl<'c, 'a> BootReporter<'c, 'a> {
     /// This is the canonical "phase transition" call: in one go we
     /// update everything the operator sees so a slow phase doesn't
     /// leave a stale label on screen.
-    pub fn set_phase(&mut self, phase: impl Into<Cow<'a, str>>) -> Result<()> {
+    pub fn set_phase(&mut self, phase: impl Into<Cow<'static, str>>) -> Result<()> {
         self.app.set_boot_phase(phase);
         self.app.set_boot_log_lines(log::snapshot(LOG_SNAPSHOT_LINES));
         self.console.render(&self.app)
@@ -109,17 +114,17 @@ impl<'c, 'a> BootReporter<'c, 'a> {
     }
 }
 
-impl ProgressSink for BootReporter<'_, '_> {
+impl ProgressSink for BootReporter<'_> {
     /// Update the phase label, refresh the log snapshot, advance the
     /// spinner, and render. Errors from the backend are deliberately
     /// dropped: a flaky DRM ioctl shouldn't abort a 30 s device wait —
     /// the next iteration will retry. Phase code still sees a
     /// fatal error if the underlying wait itself fails.
     fn tick(&mut self, phase: &str) {
-        // Reborrow into an owned Cow so the App's lifetime is satisfied
-        // (BootStatusData::phase is `Cow<'a, str>`; `phase` is borrowed
-        // for `tick`'s scope only).
-        self.app.set_boot_phase(Cow::<'_, str>::Owned(phase.to_string()));
+        // Promote to an owned Cow so the borrow on `phase` doesn't
+        // escape this call (BootStatusData::phase is `Cow<'static, str>`).
+        self.app
+            .set_boot_phase(Cow::<'static, str>::Owned(phase.to_string()));
         self.app.set_boot_log_lines(log::snapshot(LOG_SNAPSHOT_LINES));
         self.app.tick_boot_spinner();
         let _ = self.console.render(&self.app);

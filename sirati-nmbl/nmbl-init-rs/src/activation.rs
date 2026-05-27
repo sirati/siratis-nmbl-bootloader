@@ -17,7 +17,7 @@ use crate::config::{Activation, ActivationKind, Config};
 use crate::devices::wait_for;
 use crate::error::{NmblError, Result};
 use crate::sys::activation::{ProcessOutcome, run};
-use crate::ui::{BootReporter, ProgressSink};
+use crate::ui::BootReporter;
 use crate::{nmbl_info, nmbl_warn};
 
 const PROC_MODULES: &str = "/proc/modules";
@@ -39,7 +39,7 @@ pub trait PasswordSupplier {
 /// sees which step is in flight (LUKS unlock, LVM activate, …).
 pub fn run_all_activations(
     config: &Config,
-    reporter: &mut BootReporter<'_, '_>,
+    reporter: &mut BootReporter<'_>,
     mut password_supplier: Option<&mut dyn PasswordSupplier>,
 ) -> Result<()> {
     if config.activations.is_empty() {
@@ -81,7 +81,7 @@ pub fn run_all_activations(
                 device,
                 DEVICE_WAIT_TIMEOUT,
                 &wait_operation,
-                Some(reporter as &mut dyn ProgressSink),
+                Some(&mut *reporter),
             )?;
         }
 
