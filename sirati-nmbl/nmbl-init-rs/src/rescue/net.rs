@@ -30,7 +30,6 @@
 //! so the emergency-shell banner surfaces a structured cause.
 
 use std::cell::Cell;
-use std::convert::Infallible;
 use std::io::{self, Write as _};
 use std::mem;
 use std::net::Ipv4Addr;
@@ -51,6 +50,7 @@ use crate::net::iface::{self, Interface};
 use crate::nmbl_warn;
 use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
 use crate::sys::mount::mount_fs;
+use crate::terminal::TerminalAction;
 
 /// Mountpoint where the downloaded squashfs is staged before the
 /// `switch_root`. Mirrors `rescue::disk::RESCUE_MOUNT` so the operator
@@ -136,8 +136,9 @@ pub trait RescueUi {
 ///
 /// `disk_reason` is the formatted error chain of the disk-rescue
 /// attempt that triggered the fallback; it is shown verbatim on the
-/// source-picker screen. On success this function does not return —
-/// the process is replaced by the rescue shell.
+/// source-picker screen. Returns a [`TerminalAction`] the dispatcher
+/// in `main` performs after every stack-allocated resource is
+/// dropped.
 ///
 /// When `config.rescue.network` is `false` the function short-circuits
 /// with `NmblError::Rescue { stage: "net-disabled", ... }`, letting
@@ -146,7 +147,7 @@ pub fn try_network_rescue<R: RescueUi>(
     config: &Config,
     ui: &mut R,
     disk_reason: &str,
-) -> Result<Infallible> {
+) -> Result<TerminalAction> {
     if !config.rescue.network {
         return Err(NmblError::Rescue {
             stage: "net-disabled",
@@ -162,13 +163,23 @@ pub fn try_network_rescue<R: RescueUi>(
     let mut latest_reason = disk_reason.to_string();
     loop {
         match ui.pick_source(&latest_reason)? {
-            RescueSource::Reboot => return reboot_system(),
-            RescueSource::Halt => return halt_system(),
+            RescueSource::Reboot => return Ok(TerminalAction::Reboot),
+            RescueSource::Halt => {
+                return Ok(TerminalAction::HaltWithBanner {
+                    cause: NmblError::Rescue {
+                        stage: "operator-halt",
+                        source: Box::new(NmblError::ConfigInvalid {
+                            reason: "operator chose halt from rescue source picker".to_string(),
+                            context: "network-rescue UI".to_string(),
+                        }),
+                    },
+                });
+            }
             RescueSource::Network => {}
         }
 
         match run_network_attempt(config, ui) {
-            Ok(infallible) => match infallible {},
+            Ok(action) => return Ok(action),
             Err(NetAttemptOutcome::Restart(reason)) => {
                 // Mismatched hash / operator-aborted download — show
                 // the picker again with the updated reason so they
@@ -196,13 +207,15 @@ impl From<NmblError> for NetAttemptOutcome {
 }
 
 /// One trip through "bring up NIC + DHCP + download + verify + pivot".
-/// Returns `Infallible` on the success path (process is replaced),
-/// `NetAttemptOutcome::Restart` on operator-driven retries, and
-/// `NetAttemptOutcome::Fatal` for non-recoverable errors.
+/// Returns a [`TerminalAction`] on the success path (the dispatcher
+/// in `main` performs the execve after every stack-allocated
+/// resource has been dropped), `NetAttemptOutcome::Restart` on
+/// operator-driven retries, and `NetAttemptOutcome::Fatal` for
+/// non-recoverable errors.
 fn run_network_attempt<R: RescueUi>(
     config: &Config,
     ui: &mut R,
-) -> std::result::Result<Infallible, NetAttemptOutcome> {
+) -> std::result::Result<TerminalAction, NetAttemptOutcome> {
     let (iface, lease) = bring_up_and_dhcp()?;
     apply_lease(&iface, &lease)?;
 
@@ -595,9 +608,9 @@ fn write_all_to_fd<F: rustix::fd::AsFd>(fd: F, mut buf: &[u8]) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Loop-mount the memfd at `/rescue`, then hand off to the shared
-/// [`super::switch_root_and_exec`] helper. On success the process
-/// image is replaced by the rescue shell so this never returns.
-fn mount_and_switch_root(backing: &rustix::fd::OwnedFd) -> Result<Infallible> {
+/// [`super::switch_root_and_exec`] helper to produce the
+/// [`TerminalAction`] the dispatcher will execve.
+fn mount_and_switch_root(backing: &rustix::fd::OwnedFd) -> Result<TerminalAction> {
     let index = allocate_loop_device().map_err(|source| NmblError::Rescue {
         stage: "loop-alloc",
         source: Box::new(source),
@@ -628,26 +641,6 @@ fn mount_and_switch_root(backing: &rustix::fd::OwnedFd) -> Result<Infallible> {
     })?;
 
     super::switch_root_and_exec(rescue_dir)
-}
-
-// ---------------------------------------------------------------------------
-// Halt / reboot exits
-// ---------------------------------------------------------------------------
-
-/// Operator opted to reboot from the source picker. Falls through to
-/// [`libc::_exit`] if the kernel refuses the syscall.
-fn reboot_system() -> Result<Infallible> {
-    let _ = nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_AUTOBOOT);
-    // SAFETY: libc::_exit is async-signal-safe and unconditionally
-    // terminates the process. Mirrors `super::halt_with_banner`.
-    unsafe { libc::_exit(1) };
-}
-
-/// Operator opted to halt from the source picker.
-fn halt_system() -> Result<Infallible> {
-    let _ = nix::sys::reboot::reboot(nix::sys::reboot::RebootMode::RB_HALT_SYSTEM);
-    // SAFETY: see `reboot_system`.
-    unsafe { libc::_exit(1) };
 }
 
 // ---------------------------------------------------------------------------
