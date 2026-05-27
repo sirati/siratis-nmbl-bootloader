@@ -13,9 +13,10 @@
 //! When the user makes a final decision the `decision` field is set
 //! and [`App::on_key`] returns `true`, signalling the run loop to exit.
 //! The passphrase modal is the exception: Enter on a passphrase screen
-//! leaves the App alive (the caller — [`crate::ui::TuiPasswordSupplier`]
-//! — drains the buffer and returns it without exiting the App), and
-//! only Esc on the passphrase modal sets a [`Decision::Shell`] exit.
+//! leaves the App alive (the caller — the supplier driving
+//! [`crate::ui::passphrase_prompt_on_console`] — drains the buffer and
+//! returns it without exiting the App), and only Esc on the passphrase
+//! modal sets a [`Decision::Shell`] exit.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use zeroize::Zeroizing;
@@ -434,8 +435,8 @@ impl<'a> App<'a> {
                 false
             }
             KeyCode::Enter => {
-                // Caller (TuiPasswordSupplier) detects the buffer is
-                // ready by polling — we do NOT exit the App here.
+                // Caller (the passphrase prompt loop) detects the buffer
+                // is ready by polling — we do NOT exit the App here.
                 // Signal "consumed" with `true` so the supplier's
                 // dispatch loop can return cleanly.
                 true
