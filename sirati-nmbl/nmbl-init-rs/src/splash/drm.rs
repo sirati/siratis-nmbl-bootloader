@@ -1,9 +1,16 @@
 //! DRM / simpledrm bring-up.
 //!
 //! Opens `/dev/dri/card0`, picks the preferred mode of the first
-//! connected connector, allocates an XRGB8888 dumb buffer, mmaps it,
-//! and exposes a page-flip primitive. `SplashDrm`'s `Drop` impl
-//! munmaps and restores the original CRTC without panicking.
+//! connected connector, allocates an XRGB8888 dumb buffer, and exposes
+//! a closure-based render primitive. `SplashDrm`'s `Drop` impl
+//! restores the original CRTC without panicking.
+//!
+//! No self-referential storage: the buffer mapping lives only inside
+//! [`SplashDrm::render`]'s closure, so the lifetime of the mmap region
+//! is tied to the closure body and never needs to be widened. Do not
+//! reintroduce a stored `DumbMapping` field; that path required a
+//! `mem::transmute` lifetime widening in an unsafe block, and the
+//! project rule is to minimise unsafe code everywhere.
 
 use std::fs::OpenOptions;
 use std::io;
@@ -15,7 +22,7 @@ use drm::Device as BasicDevice;
 use drm::buffer::{Buffer, DrmFourcc};
 use drm::control::{
     Device as ControlDevice, Mode, ModeTypeFlags, connector, crtc, dumbbuffer::DumbBuffer,
-    dumbbuffer::DumbMapping, framebuffer,
+    framebuffer,
 };
 
 use crate::error::{NmblError, Result};
@@ -38,11 +45,15 @@ impl ControlDevice for Card {}
 
 /// RAII handle to the open DRM device + active dumb buffer.
 ///
-/// On `Drop` the buffer is unmapped (by `DumbMapping`'s own `Drop`),
-/// the original CRTC mode is restored, and the framebuffer + dumb
-/// buffer are destroyed. The fd is then closed by `OwnedFd`'s `Drop`.
-/// None of these steps panic; cleanup failures are logged through
-/// `nmbl_warn!` and execution continues.
+/// On `Drop` the original CRTC mode is restored and the framebuffer +
+/// dumb buffer are destroyed. The fd is then closed by `OwnedFd`'s
+/// `Drop`. None of these steps panic; cleanup failures are logged
+/// through `nmbl_warn!` and execution continues.
+///
+/// The dumb buffer is mapped on demand inside [`Self::render`] and
+/// unmapped at the end of every render pass, so there is no
+/// self-referential field that would force a lifetime-widening
+/// unsafe block.
 pub struct SplashDrm {
     card: Card,
     dims: FramebufferDims,
@@ -53,12 +64,6 @@ pub struct SplashDrm {
     mode: Mode,
     fb: framebuffer::Handle,
     buffer: DumbBuffer,
-
-    // Mapping must outlive `buffer` (it borrows `card`) but be dropped
-    // before `card` so the munmap ioctl still has a valid fd. `Option`
-    // is the standard trick: take it in `Drop` so the mapping's own
-    // destructor runs first.
-    mapping: Option<DumbMapping<'static>>,
 
     // Saved state to restore on drop. simpledrm boots with a CRTC
     // driving the firmware framebuffer; if we don't restore the
@@ -148,7 +153,7 @@ fn bring_up(card: Card) -> Result<SplashDrm> {
 
     // XRGB8888: 32 bpp, 4 bytes per pixel. simpledrm exposes only this
     // format across every NixOS-shipped firmware framebuffer path.
-    let mut buffer = card
+    let buffer = card
         .create_dumb_buffer((width, height), DrmFourcc::Xrgb8888, 32)
         .map_err(tui_err)?;
     let pitch = buffer.pitch();
@@ -165,41 +170,10 @@ fn bring_up(card: Card) -> Result<SplashDrm> {
         }
     };
 
-    // Map the buffer. `DumbMapping<'a>` borrows `&'a mut DumbBuffer`,
-    // but the mmap region itself outlives that borrow — it stays valid
-    // until `DumbMapping`'s own `Drop` calls `munmap`. We need to widen
-    // the lifetime to `'static` so the struct can store it alongside
-    // `buffer`. The `Result` is mapped in one shot to release the
-    // mutable borrow on `buffer` immediately, freeing up cleanup paths.
-    //
-    // SAFETY: the mmap region is independent of `&mut buffer`; it
-    // persists until munmap. We store both `mapping` and `card` inside
-    // `SplashDrm`, and `Drop` explicitly `.take()`s the mapping before
-    // any field — including `card` — runs its own destructor, so the
-    // munmap ioctl in `DumbMapping::drop` always sees a live fd. The
-    // mapping is never exposed by reference outside `&mut self`, so the
-    // widened lifetime never escapes.
-    let map_res: io::Result<DumbMapping<'static>> = card
-        .map_dumb_buffer(&mut buffer)
-        .map(|m| unsafe { std::mem::transmute::<DumbMapping<'_>, DumbMapping<'static>>(m) });
-    let mapping = match map_res {
-        Ok(m) => m,
-        Err(e) => {
-            if let Err(fe) = card.destroy_framebuffer(fb) {
-                nmbl_warn!("splash::drm: destroy_framebuffer after map error: {fe}");
-            }
-            if let Err(de) = card.destroy_dumb_buffer(buffer) {
-                nmbl_warn!("splash::drm: destroy_dumb_buffer after map error: {de}");
-            }
-            return Err(tui_err(e));
-        }
-    };
-
-    // Commit the mode.
+    // Commit the mode. The dumb buffer is allocated but not mapped at
+    // this point — mappings live only inside `render()`'s closure.
     if let Err(e) = card.set_crtc(crtc_handle, Some(fb), (0, 0), &[connector_handle], Some(mode)) {
-        // Tear down in reverse order. `mapping` is dropped here, which
-        // munmaps; then the framebuffer and dumb buffer.
-        drop(mapping);
+        // Tear down the framebuffer and dumb buffer.
         if let Err(fe) = card.destroy_framebuffer(fb) {
             nmbl_warn!("splash::drm: destroy_framebuffer after set_crtc error: {fe}");
         }
@@ -221,7 +195,6 @@ fn bring_up(card: Card) -> Result<SplashDrm> {
         mode,
         fb,
         buffer,
-        mapping: Some(mapping),
         original_crtc,
     })
 }
@@ -261,13 +234,23 @@ impl SplashDrm {
         self.dims
     }
 
-    /// Mutable view over the active dumb buffer. The compositor writes
-    /// XRGB8888 pixels here; [`Self::flip`] then commits them.
-    pub fn buffer_mut(&mut self) -> Result<&mut [u8]> {
-        match self.mapping.as_mut() {
-            Some(m) => Ok(m.as_mut()),
-            None => Err(io_other("dumb buffer mapping is gone")),
-        }
+    /// Map the dumb buffer for one render pass, hand the writable byte
+    /// slice to `f`, then commit the result with a page-flip.
+    ///
+    /// The mapping's lifetime is tied to this method's stack frame, so
+    /// `SplashDrm` never holds a self-referential mmap region and the
+    /// previous `mem::transmute` lifetime widening is gone. The
+    /// closure receives the framebuffer dimensions (including the
+    /// scanline stride) so it can index rows correctly.
+    pub fn render<F>(&mut self, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut [u8], FramebufferDims) -> Result<()>,
+    {
+        let mut mapping = self.card.map_dumb_buffer(&mut self.buffer).map_err(tui_err)?;
+        let dims = self.dims;
+        f(mapping.as_mut(), dims)?;
+        drop(mapping);
+        self.flip_internal()
     }
 
     /// Commit the current buffer contents to the connector.
@@ -276,7 +259,7 @@ impl SplashDrm {
     /// correct on simpledrm, which doesn't expose page-flip events.
     /// Splash redraws are coarse (key press / dirty tick), so the
     /// vblank stall is not a concern.
-    pub fn flip(&mut self) -> Result<()> {
+    fn flip_internal(&mut self) -> Result<()> {
         self.card
             .set_crtc(
                 self.crtc,
@@ -291,10 +274,8 @@ impl SplashDrm {
 
 impl Drop for SplashDrm {
     fn drop(&mut self) {
-        // Unmap the buffer first: `DumbMapping`'s own `Drop` calls
-        // `munmap`. Taking it out of the `Option` guarantees it runs
-        // before any of the destroy ioctls below.
-        let _ = self.mapping.take();
+        // No mapping to unmap: `render()` maps and unmaps per call, so
+        // the dumb buffer is unmapped by the time `Drop` runs.
 
         // Restore the original CRTC mode. If the firmware left the
         // CRTC in some non-mode-set state we just disable the CRTC

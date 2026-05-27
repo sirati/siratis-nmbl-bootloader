@@ -57,17 +57,26 @@ fn decode_rgba_from_reader<R: Read>(reader: R) -> Result<Image> {
     let height = info.height;
 
     // After EXPAND|ALPHA the crate may still hand us Rgb, Grayscale,
-    // or GrayscaleAlpha (only palette is rewritten to RGBA). Convert
-    // those layouts to RGBA8 ourselves; Rgba and Indexed-after-ALPHA
-    // are already the right shape.
+    // or GrayscaleAlpha; we convert those layouts to RGBA8 ourselves.
+    // Palette images are expanded to Rgba by the ALPHA transformation
+    // above; if the Indexed arm fires the transformation chain has
+    // been changed and we no longer know how to interpret the buffer.
     let rgba = match info.color_type {
-        ColorType::Rgba | ColorType::Indexed => {
+        ColorType::Rgba => {
             buf.truncate(info.buffer_size());
             buf
         }
         ColorType::Rgb => expand_rgb_to_rgba(&buf, width, height)?,
         ColorType::Grayscale => expand_gray_to_rgba(&buf, width, height)?,
         ColorType::GrayscaleAlpha => expand_gray_alpha_to_rgba(&buf, width, height)?,
+        ColorType::Indexed => {
+            return Err(NmblError::Tui {
+                source: std::io::Error::other(
+                    "splash::png: palette images must be expanded by png::Transformations::ALPHA \
+                     before decode_rgba reaches them",
+                ),
+            });
+        }
     };
 
     // Final shape check: width * height * 4 bytes, no padding.

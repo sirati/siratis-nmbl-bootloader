@@ -85,7 +85,7 @@ pub fn cover_scale_nearest(
         let sy_f = src_y0 + f64::from(y) * inv_scale;
         // Clamp to [0, src_h - 1]. Truncation matches the task's
         // "nearest-neighbor (truncation, no interpolation)" spec.
-        let sy = clamp_index(sy_f, src_h_usize);
+        let sy = clamp_to_usize_index(sy_f, src_h_usize);
         let src_row_start = match sy.checked_mul(src_w_usize).and_then(|p| p.checked_mul(4)) {
             Some(n) => n,
             None => return Vec::new(),
@@ -100,7 +100,7 @@ pub fn cover_scale_nearest(
 
         for x in 0..dst.w {
             let sx_f = src_x0 + f64::from(x) * inv_scale;
-            let sx = clamp_index(sx_f, src_w_usize);
+            let sx = clamp_to_usize_index(sx_f, src_w_usize);
 
             let s_off = match src_row_start.checked_add(sx.saturating_mul(4)) {
                 Some(n) => n,
@@ -129,31 +129,19 @@ pub fn cover_scale_nearest(
     out
 }
 
-/// Clamp a source coordinate to `[0, max_exclusive - 1]` using floor
-/// (truncation toward negative infinity), then cast to usize. The
-/// caller guarantees `max_exclusive >= 1`.
-fn clamp_index(coord: f64, max_exclusive: usize) -> usize {
-    if !coord.is_finite() || coord <= 0.0 {
+/// Clamp a source coordinate to `[0, limit - 1]` (or 0 if `limit` is
+/// zero), truncating toward zero. NaN and negative inputs map to 0.
+fn clamp_to_usize_index(v: f64, limit: usize) -> usize {
+    // `f64::clamp` treats NaN as a passthrough, so guard explicitly.
+    if !v.is_finite() || v <= 0.0 {
         return 0;
     }
-    let limit = max_exclusive.saturating_sub(1);
-    // floor() on a finite non-negative f64 fits in u64 for any
-    // realistic framebuffer/image; cast via u64 then clamp.
-    let floored = coord.floor();
-    if floored >= u64::MAX as f64 {
-        return limit;
-    }
-    let as_u64 = floored as u64;
-    let as_usize = if as_u64 > usize::MAX as u64 {
-        usize::MAX
-    } else {
-        as_u64 as usize
-    };
-    if as_usize > limit {
-        limit
-    } else {
-        as_usize
-    }
+    let lim = limit.saturating_sub(1);
+    // `as usize` on a finite non-negative f64 truncates toward zero
+    // and saturates at usize::MAX, both of which are fine here since
+    // we immediately clamp to `lim`.
+    let truncated = v as usize;
+    truncated.min(lim)
 }
 
 #[cfg(test)]
