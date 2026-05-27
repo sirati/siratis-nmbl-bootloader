@@ -630,11 +630,13 @@
             echo
 
             echo "===== Launching QEMU (no disks) ====="
-            # -no-reboot: NMBL emergency TUI 'reboot' shouldn't loop us.
             # -nodefaults: avoid stray cdrom/floppy + default serial wiring.
             # -device virtio-vga: provides the simpledrm/virtio-vga framebuffer
             #                     the splash code path drives via /dev/dri/cardN.
             # -display vnc=:N:    headless graphical output; we bridge with novnc.
+            # No -no-reboot: the emergency TUI's 30s reboot timer would otherwise
+            # kill QEMU and drop the operator's VNC mid-look. Letting the VM
+            # reboot back into the same emergency TUI matches the iteration loop.
             qemu-system-x86_64 \
               -machine q35,accel=kvm:tcg \
               -cpu max \
@@ -648,7 +650,6 @@
               -chardev "socket,id=ser0,path=$SER_SOCK,server=on,wait=off" \
               -serial chardev:ser0 \
               -monitor none \
-              -no-reboot \
               -nodefaults \
               -daemonize \
               -pidfile "$QEMU_PIDFILE"
