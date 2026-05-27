@@ -90,19 +90,32 @@ let
       nmblKernelPackage = (nixpkgs.legacyPackages.x86_64-linux).linuxPackages_latest.kernel;
       diskoModule = ./disko-luks-password.nix;
       extraModules = [
-        {
+        ({ lib, ... }: {
           # disko already wires boot.initrd.luks.devices.cryptroot for the
           # post-kexec NixOS stage-1; we only need to teach NMBL itself to
-          # unlock the volume in stage-0 before mounting /.
+          # unlock the volume in stage-0 before mounting /. passToStage1
+          # tells NMBL to inject the typed passphrase into the kexec'd
+          # initrd at a fixed path (memory only) so stage-1 doesn't prompt
+          # again — the NixOS keyFile setting below picks it up.
           boot.nmbl.activation.luks = [
             {
               name = "cryptroot";
               device = "/dev/vda3";
               unlock = "password";
               promptLabel = "Enter LUKS passphrase for cryptroot";
+              passToStage1 = "/etc/nmbl-luks/cryptroot";
             }
           ];
-        }
+          # Tell the post-kexec NixOS initrd to read the injected
+          # passphrase instead of prompting. fallbackToPassword keeps the
+          # operator able to recover if injection ever fails.
+          boot.initrd.luks.devices.cryptroot = lib.mkForce {
+            device = "/dev/disk/by-partlabel/disk-main-luks";
+            keyFile = "/etc/nmbl-luks/cryptroot";
+            fallbackToPassword = true;
+            allowDiscards = true;
+          };
+        })
       ];
     };
   };

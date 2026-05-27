@@ -98,6 +98,7 @@ let
       binary = "/bin/cryptsetup"; argv = [ "open" l.device l.name "--key-file=-" ];
       produces_devices = [ mapper ]; description = "Unlock ${l.name} via passphrase";
       prompt_label = l.promptLabel;
+      pass_to_stage1 = l.passToStage1;
     };
 
   # Order: mdraid (lowest level) -> LVM -> LUKS -> ZFS.
@@ -187,6 +188,20 @@ let
         type = lib.types.str;
         default = "Enter passphrase";
         description = lib.mdDoc "Label shown in the TUI password modal. Only meaningful when unlock = \"password\".";
+      };
+      passToStage1 = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/etc/nmbl-luks/cryptroot";
+        description = lib.mdDoc ''
+          When non-null, NMBL captures the typed passphrase after a
+          successful unlock and injects it into the kexec'd initrd at
+          this path as a cryptsetup-compatible keyfile (memory only,
+          never written to disk). The post-kexec NixOS stage-1 should
+          carry `boot.initrd.luks.devices.<name>.keyFile = "<this path>"`
+          so the operator types the passphrase exactly once. Only
+          meaningful when unlock = "password".
+        '';
       };
     };
   };
