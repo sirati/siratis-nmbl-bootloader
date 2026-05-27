@@ -17,6 +17,7 @@ pub mod compositor;
 pub mod drm;
 pub mod glyph_cache;
 pub mod input;
+pub mod passphrase_demo;
 pub mod png;
 pub mod scale;
 pub mod terminal;
@@ -27,6 +28,7 @@ use std::time::Duration;
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
+use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::TerminalOptions;
 use ratatui::Viewport;
@@ -134,6 +136,15 @@ pub fn try_run_selector(config: &Config, generations: &[Generation]) -> Result<O
             dirty = false;
         }
         if let Some(key) = input.poll(POLL_SLICE)? {
+            // Intercept the `p` hotkey to demo the passphrase dialog
+            // before the App sees it (App maps `p` to toggle params).
+            if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::NONE {
+                let outcome =
+                    passphrase_demo::run(&mut drm, &bg_scaled, &cache, cell_dims, &mut input)?;
+                crate::nmbl_info!("passphrase demo returned: {outcome:?}");
+                dirty = true;
+                continue;
+            }
             if app.on_key(key) {
                 break;
             }
