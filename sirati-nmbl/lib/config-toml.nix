@@ -91,12 +91,22 @@ let
     # side joins against the runtime boot mountpoint, so it is emitted
     # verbatim (no rewrite) and omitted when it matches the Rust-side
     # default basename (`nmbl-rescue.sfs`).
+    #
+    # Network-rescue keys (`network`, `default_url`, `default_sha256`)
+    # mirror E.1's additions to RescueConfig. They are omitted entirely
+    # when `cfg.rescue.network = false` so the Rust serde defaults take
+    # effect — the wire shape for non-network builds stays unchanged.
     rescue =
       {
         mode = cfg.rescue.mode;
       }
       // lib.optionalAttrs (cfg.rescue.sfsPath != "nmbl-rescue.sfs") {
         sfs_path = cfg.rescue.sfsPath;
+      }
+      // lib.optionalAttrs cfg.rescue.network {
+        network = true;
+        default_url = cfg.rescue.defaultUrl;
+        default_sha256 = cfg.rescue.defaultSha256;
       };
   };
 
