@@ -1,5 +1,5 @@
 //! Hand-rolled HTTP/1.0 GET client used by the rescue network
-//! fallback (Phase E.1). Streams the response body chunk-by-chunk
+//! fallback (Phase D.3). Streams the response body chunk-by-chunk
 //! through a caller-supplied sink so the operator can SHA-256 the
 //! payload and write it to a memfd in a single pass — no full-body
 //! buffering happens in this module.
@@ -51,7 +51,11 @@ pub struct HttpUrl {
 
 impl HttpUrl {
     /// Parse `http://host[:port][/path]`. Rejects `https://`,
-    /// URLs with userinfo, empty hosts, or malformed ports.
+    /// URLs with userinfo, empty hosts, or malformed ports. Also
+    /// rejects any ASCII control byte (`< 0x20` or `== 0x7f`) in the
+    /// URL — those would otherwise be interpolated verbatim into the
+    /// request line and Host header, letting a malicious URL forge
+    /// HTTP headers (request smuggling).
     pub fn parse(input: &str) -> Result<Self> {
         const SCHEME: &str = "http://";
         let rest = input
@@ -63,6 +67,16 @@ impl HttpUrl {
                     context: "parsing rescue URL".to_string(),
                 }),
             })?;
+
+        if let Some(bad) = rest.bytes().find(|b| *b < 0x20 || *b == 0x7f) {
+            return Err(NmblError::Rescue {
+                stage: "http-parse-url",
+                source: Box::new(NmblError::ConfigInvalid {
+                    reason: format!("URL {input:?} contains control byte {bad:#04x}"),
+                    context: "parsing rescue URL".to_string(),
+                }),
+            });
+        }
 
         // Reject userinfo — we don't ship a Basic-Auth implementation.
         if rest.contains('@') {
@@ -230,10 +244,15 @@ fn send_request(mut stream: &TcpStream, url: &HttpUrl) -> Result<()> {
 /// Read and parse the status line, returning the numeric status
 /// code. Accepts both `HTTP/1.0` and `HTTP/1.1` replies because some
 /// origins always send 1.1 regardless of the request version.
+///
+/// The read is capped at [`MAX_HEADER_BYTES`] so a malicious peer
+/// that holds the socket open feeding a single unterminated line
+/// can't drain the TCP read timeout indefinitely.
 fn read_status_line<R: BufRead>(reader: &mut R) -> Result<u16> {
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     let n = reader
-        .read_line(&mut line)
+        .take(MAX_HEADER_BYTES as u64)
+        .read_until(b'\n', &mut buf)
         .map_err(|source| NmblError::Rescue {
             stage: "http-recv-status",
             source: Box::new(NmblError::Io {
@@ -250,7 +269,23 @@ fn read_status_line<R: BufRead>(reader: &mut R) -> Result<u16> {
             }),
         });
     }
-    parse_status_line(&line)
+    if !buf.ends_with(b"\n") {
+        return Err(NmblError::Rescue {
+            stage: "http-recv-status",
+            source: Box::new(NmblError::ConfigInvalid {
+                reason: format!("status line exceeded {MAX_HEADER_BYTES} bytes"),
+                context: "reading status line".to_string(),
+            }),
+        });
+    }
+    let line = std::str::from_utf8(&buf).map_err(|_| NmblError::Rescue {
+        stage: "http-recv-status",
+        source: Box::new(NmblError::ConfigInvalid {
+            reason: "status line contains non-UTF-8 bytes".to_string(),
+            context: "reading status line".to_string(),
+        }),
+    })?;
+    parse_status_line(line)
 }
 
 /// Pure parser separated for unit-testability. Returns the status
@@ -534,6 +569,37 @@ mod tests {
     #[test]
     fn parse_url_rejects_ipv6_literal() {
         let e = HttpUrl::parse("http://[::1]/").expect_err("ipv6 must fail");
+        match e {
+            NmblError::Rescue { stage, .. } => assert_eq!(stage, "http-parse-url"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_url_rejects_crlf_injection() {
+        // An attacker-pasted URL that smuggles CR/LF into the Host
+        // header would otherwise let them inject a second HTTP
+        // request after the legitimate one (request smuggling).
+        let e = HttpUrl::parse("http://evil.example.com\r\nX-Injected: 1/path")
+            .expect_err("crlf must fail");
+        match e {
+            NmblError::Rescue { stage, .. } => assert_eq!(stage, "http-parse-url"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_url_rejects_control_byte_in_path() {
+        let e = HttpUrl::parse("http://example.com/\x00bad").expect_err("nul byte must fail");
+        match e {
+            NmblError::Rescue { stage, .. } => assert_eq!(stage, "http-parse-url"),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_url_rejects_del_byte() {
+        let e = HttpUrl::parse("http://example.com/\x7f").expect_err("DEL byte must fail");
         match e {
             NmblError::Rescue { stage, .. } => assert_eq!(stage, "http-parse-url"),
             other => panic!("wrong variant: {other:?}"),
