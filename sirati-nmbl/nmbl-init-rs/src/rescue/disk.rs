@@ -238,6 +238,7 @@ mod tests {
         c.rescue = RescueConfig {
             mode: RescueMode::External,
             sfs_path: sfs,
+            ..RescueConfig::default()
         };
         c.runtime_boot_mountpoint = mountpoint;
         c

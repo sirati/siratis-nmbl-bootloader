@@ -19,8 +19,8 @@
 //! must not change without orchestrator coordination.
 
 pub mod disk;
-// Phase E adds `pub mod net;` here once the network primitives land
-// behind the `network-rescue` Cargo feature.
+#[cfg(feature = "network-rescue")]
+pub mod net;
 
 use std::convert::Infallible;
 use std::ffi::CString;
@@ -61,12 +61,56 @@ pub enum RescueMode {
 /// squashfs, or halt. `cause` is the error that triggered the rescue
 /// (surfaced in the banner). On success this function does not return —
 /// it execs the rescue shell or halts the system.
+///
+/// The `External` arm tries the disk-rescue path first; on failure it
+/// falls through to the network-rescue path when the `network-rescue`
+/// Cargo feature is compiled in AND `config.rescue.network` is true.
+/// Anything else collapses to [`halt_with_banner`] so the operator
+/// sees a structured diagnostic instead of a silent reboot loop.
 pub fn dispatch(config: &Config, cause: &NmblError) -> Result<Infallible> {
     match config.rescue.mode {
         RescueMode::Embedded => exec_embedded(config),
-        RescueMode::External => disk::try_disk_rescue(config, cause),
+        RescueMode::External => dispatch_external(config, cause),
         RescueMode::None => halt_with_banner(cause),
     }
+}
+
+/// Internal helper: try disk-rescue, then network-rescue (when
+/// compiled in + enabled), then halt-with-banner. Split out so the
+/// `dispatch` match stays a single line per arm.
+fn dispatch_external(config: &Config, cause: &NmblError) -> Result<Infallible> {
+    let disk_err = match disk::try_disk_rescue(config, cause) {
+        Ok(infallible) => match infallible {},
+        Err(e) => e,
+    };
+
+    #[cfg(feature = "network-rescue")]
+    {
+        if config.rescue.network {
+            let mut ui = net::ConsoleRescueUi;
+            let net_err = match net::try_network_rescue(config, &mut ui, &disk_err.to_string()) {
+                Ok(infallible) => match infallible {},
+                Err(e) => e,
+            };
+            // Both disk AND network paths failed. Surface the
+            // network error (it's the more recent attempt) chained
+            // under the original `cause` so the banner shows every
+            // step.
+            return halt_with_banner(&NmblError::Rescue {
+                stage: "network-rescue-failed",
+                source: Box::new(net_err),
+            });
+        }
+    }
+
+    // Either the feature was off or the operator disabled network
+    // rescue — fall back to the structured halt with the disk-rescue
+    // error surfaced.
+    let _ = &disk_err; // silence unused warning when feature is off
+    halt_with_banner(&NmblError::Rescue {
+        stage: "disk-rescue-failed",
+        source: Box::new(disk_err),
+    })
 }
 
 /// `execve(2)` the operator-configured shell (`cfg.paths.shell`) with
@@ -272,6 +316,7 @@ mod tests {
             RescueConfig {
                 mode: RescueMode::External,
                 sfs_path: Some(PathBuf::from("foo.sfs")),
+                ..RescueConfig::default()
             },
             Some(PathBuf::from("/mnt/boot")),
         );
@@ -287,6 +332,7 @@ mod tests {
             RescueConfig {
                 mode: RescueMode::External,
                 sfs_path: Some(PathBuf::from("/foo.sfs")),
+                ..RescueConfig::default()
             },
             Some(PathBuf::from("/mnt/boot")),
         );
@@ -302,6 +348,7 @@ mod tests {
             RescueConfig {
                 mode: RescueMode::External,
                 sfs_path: Some(PathBuf::from("/custom/r.sfs")),
+                ..RescueConfig::default()
             },
             Some(PathBuf::from("/mnt/boot")),
         );
