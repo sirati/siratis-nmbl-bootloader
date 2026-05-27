@@ -14,11 +14,10 @@
 //! 4. Open the squashfs `O_RDONLY | CLOEXEC` and feed both fds to
 //!    [`crate::sys::loopdev::configure_loop_device`].
 //! 5. Mount `/dev/loopN` at `/rescue` as `squashfs,ro`.
-//! 6. `pivot_root("/rescue", "/rescue/oldroot")` so the operator's
-//!    `cd /` lands in the rescue image rather than the initramfs.
-//!    `/oldroot` is intentionally LEFT MOUNTED so the operator can
-//!    inspect what failed (`ls /oldroot/etc/nmbl/`, the panic report,
-//!    the in-progress generation tree under `/mnt/system`, …).
+//! 6. `switch_root`: `chdir /rescue`, `mount --move . /`, `chroot .`,
+//!    `chdir /`. The initramfs rootfs pseudo-filesystem is not used as
+//!    the outgoing root, so this avoids `pivot_root(2)`'s EINVAL when
+//!    called from an initramfs where the current root is a rootfs.
 //! 7. `execve("/bin/sh", …)` with a minimal TERM+PATH environment.
 //!
 //! Every failure point is wrapped in [`NmblError::Rescue`] with a
@@ -29,7 +28,8 @@ use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use nix::unistd::{chdir, execve, pivot_root};
+use nix::mount::MsFlags;
+use nix::unistd::{chdir, chroot, execve};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno as RustixErrno;
 
@@ -39,23 +39,18 @@ use crate::modules::load_modules;
 use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
 use crate::sys::mount::mount_fs;
 
-/// Mountpoint where the rescue squashfs is staged before `pivot_root`.
-/// Lives at the initramfs root because (a) `/rescue` is unlikely to
-/// collide with anything the initramfs created and (b) after pivot it
-/// becomes `/`, so the path itself is ephemeral.
+/// Mountpoint where the rescue squashfs is staged before the root switch.
+/// Lives at the initramfs root because `/rescue` is unlikely to collide
+/// with anything the initramfs created.
 const RESCUE_MOUNT: &str = "/rescue";
-
-/// Subdirectory inside the rescue squashfs's root that receives the
-/// old initramfs after `pivot_root`. `/oldroot` is the path the
-/// operator will see from the rescue shell.
-const OLDROOT_NAME: &str = "oldroot";
 
 /// Shell binary expected inside the rescue squashfs. The squashfs ships
 /// busybox under `/bin/sh`, so this path is the post-pivot one.
 const RESCUE_SHELL: &str = "/bin/sh";
 
-/// Mount the rescue squashfs from the boot partition, `pivot_root` into
-/// it, and `execve` its `/bin/sh`. On success this never returns.
+/// Mount the rescue squashfs from the boot partition, switch root into
+/// it via the switch_root dance (MS_MOVE + chroot), and `execve` its
+/// `/bin/sh`. On success this never returns.
 ///
 /// `cause` is the error that triggered the rescue. It is logged
 /// before the loop-mount dance so the operator can see what failed
@@ -131,51 +126,54 @@ pub fn try_disk_rescue(config: &Config, cause: &NmblError) -> Result<Infallible>
         }
     })?;
 
-    let oldroot = rescue_dir.join(OLDROOT_NAME);
-    ensure_dir(&oldroot).map_err(|source| NmblError::Rescue {
-        stage: "pivot-root",
-        source: Box::new(source),
+    // `switch_root` dance: chdir into the squashfs, move its mount to `/`,
+    // chroot into the new root. This avoids `pivot_root(2)` which rejects
+    // the initramfs rootfs pseudo-filesystem as the outgoing root.
+    //
+    // Step 1: cd into the new root (the mounted squashfs).
+    chdir(rescue_dir).map_err(|source| NmblError::Rescue {
+        stage: "switch-root",
+        source: Box::new(NmblError::Io {
+            source: io::Error::from_raw_os_error(source as i32),
+            context: format!("chdir({})", rescue_dir.display()),
+        }),
     })?;
 
-    // `pivot_root(2)` requires that the current root filesystem is a proper
-    // mount point, not the kernel's initial `rootfs` pseudo-filesystem. In
-    // an initramfs the root is always `rootfs`, so we bind-mount it over
-    // itself to promote it to a regular mount that `pivot_root` accepts.
-    // The kernel ignores the fstype for bind mounts.
-    mount_fs(
-        Some(Path::new("/")),
-        Path::new("/"),
-        "none",
-        "bind",
+    // Step 2: Move the squashfs mount from /rescue to /, making it the new /.
+    // MS_MOVE reassigns the mount point atomically; the old initramfs rootfs
+    // is simply detached — it is no longer reachable via any path.
+    nix::mount::mount(
+        Some("."),
+        "/",
+        Option::<&str>::None,
+        MsFlags::MS_MOVE,
+        Option::<&str>::None,
     )
     .map_err(|source| NmblError::Rescue {
-        stage: "pivot-root",
-        source: Box::new(source),
+        stage: "switch-root",
+        source: Box::new(NmblError::Io {
+            source: io::Error::from_raw_os_error(source as i32),
+            context: "mount --move . /".to_string(),
+        }),
     })?;
 
-    pivot_root(rescue_dir, &oldroot).map_err(|source| NmblError::Rescue {
-        stage: "pivot-root",
+    // Step 3: chroot into the new `/` (the squashfs).
+    chroot(".").map_err(|source| NmblError::Rescue {
+        stage: "switch-root",
         source: Box::new(NmblError::Io {
             source: io::Error::from_raw_os_error(source as i32),
-            context: format!(
-                "pivot_root({} -> {})",
-                rescue_dir.display(),
-                oldroot.display(),
-            ),
+            context: "chroot(.)".to_string(),
         }),
     })?;
+
+    // Step 4: Update the cwd to the new root.
     chdir("/").map_err(|source| NmblError::Rescue {
-        stage: "pivot-root",
+        stage: "switch-root",
         source: Box::new(NmblError::Io {
             source: io::Error::from_raw_os_error(source as i32),
-            context: "chdir(/) after pivot_root".to_string(),
+            context: "chdir(/) after chroot".to_string(),
         }),
     })?;
-    // The old initramfs stays mounted at `/oldroot` on purpose — the
-    // operator wants to inspect the panic report, the half-mounted
-    // /mnt/system tree, and /etc/nmbl/* without a separate mount step.
-    // A pre-kexec sweep is unnecessary because the rescue shell is the
-    // operator's final destination on this path.
 
     let path_c = CString::new(RESCUE_SHELL).map_err(|_| NmblError::Rescue {
         stage: "exec-shell",
