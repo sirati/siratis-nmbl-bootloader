@@ -24,7 +24,8 @@ use nmbl_init::modules::load_explicit_modules;
 use nmbl_init::mount::mount_pseudo_filesystems;
 use nmbl_init::panic::install_panic_hook;
 use nmbl_init::shell::drop_to_emergency;
-use nmbl_init::ui::{Decision, TuiPasswordSupplier, run_selector};
+use nmbl_init::ui::console::{Console, open_console};
+use nmbl_init::ui::{BootReporter, Decision, TuiPasswordSupplier, run_selector};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/nmbl/config.toml";
@@ -118,37 +119,61 @@ fn recover_from_panic(args: Args, report_path: PathBuf) -> std::convert::Infalli
 /// Execute the normal boot phases in order. Each phase that errors
 /// short-circuits to the caller, which routes through the emergency
 /// shell.
-fn run_phases(config: &Config) -> Result<()> {
+///
+/// `console` is the live boot console (splash framebuffer or raw-mode
+/// tty) brought up by the caller before phase 1. We construct a
+/// short-lived [`BootReporter`] around it so every phase pushes its
+/// current "what am I doing" string through the reporter and the
+/// operator sees progress instead of a frozen logo. The reporter is
+/// dropped on return so the caller can reuse the underlying console
+/// for the generation selector.
+fn run_phases(config: &Config, console: &mut dyn Console) -> Result<()> {
+    let mut reporter = BootReporter::new(console, "phase 1: mount pseudo-filesystems");
+    // Paint the first frame so the operator sees a populated screen
+    // before any work happens — otherwise a fast phase 1 would race the
+    // first kmsg push and the log panel would be empty for one frame.
+    let _ = reporter.refresh_log();
+
     nmbl_info!("phase 1: mount pseudo-filesystems");
-    mount_pseudo_filesystems()?;
+    mount_pseudo_filesystems(&mut reporter)?;
 
     nmbl_info!("phase 2: load explicit kernel modules");
-    load_explicit_modules(config)?;
+    load_explicit_modules(config, &mut reporter)?;
 
-    // Make VT1 the foreground virtual console. PS/2 (and VNC) keypresses
-    // follow the active VT; without this they sometimes land on whichever
-    // VT the kernel made foreground after framebuffer bring-up, so the
-    // text-mode passphrase prompt in phase 3 would silently get no input.
-    nmbl_init::sys::tty::activate_vt1();
+    // The splash backend opens /dev/tty1 and calls VT_ACTIVATE itself
+    // (see `splash::input::SplashInput::open`), so an explicit
+    // `activate_vt1()` here is redundant in the splash code path. For
+    // the tty backend `/dev/console` already points at the kernel-chosen
+    // VT, so reads land correctly without forcing a VT switch.
 
     nmbl_info!("phase 3: storage activations");
     let mut supplier = TuiPasswordSupplier::new(config);
-    run_all_activations(config, Some(&mut supplier))?;
+    run_all_activations(config, &mut reporter, Some(&mut supplier))?;
 
     nmbl_info!("phase 3b: mount system filesystems");
-    mount_system_filesystems(config)?;
+    mount_system_filesystems(config, &mut reporter)?;
 
     Ok(())
 }
 
 /// Run phases 4→6 (generation discovery, UI, decision dispatch). Kept
 /// separate so the call sites for `drop_to_emergency` stay obvious.
-fn select_and_act(config: &Config) -> Result<()> {
+///
+/// Phase 4 uses a [`BootReporter`] around `console` so the operator
+/// keeps seeing the boot-status screen while we walk the profiles
+/// directory. The reporter is dropped before phase 5 so the bare
+/// console can be handed to `run_selector`, which swaps the App over
+/// to the boot-menu screen on top of the same backend.
+fn select_and_act(config: &Config, console: &mut dyn Console) -> Result<()> {
     nmbl_info!("phase 4: scan generations");
-    let generations = scan_generations(config)?;
+    let generations = {
+        let mut reporter = BootReporter::new(console, "phase 4: scan generations");
+        scan_generations(config, &mut reporter)?
+        // reporter drops here, releasing the &mut console borrow.
+    };
 
     nmbl_info!("phase 5: TUI generation selector");
-    let decision = run_selector(config, &generations)?;
+    let decision = run_selector(config, &generations, console)?;
 
     match decision {
         Decision::Boot {
@@ -238,10 +263,39 @@ fn main() -> ExitCode {
         match drop_to_emergency(&config, err) {}
     }
 
-    let outcome = run_phases(&config).and_then(|()| select_and_act(&config));
+    // Bring the boot console up BEFORE phase 1 so the operator sees a
+    // populated BootStatus screen during the first mount, the module
+    // loads, storage activations, and the generation scan. The same
+    // backend is reused all the way through the boot-menu selector;
+    // emergency fallback (when a phase errors) still re-opens its own
+    // console for now — that's a later subagent's refactor.
+    //
+    // If we cannot bring up ANY console at all, log it and route the
+    // bring-up error through the emergency shell. We never want a
+    // half-up TUI to block kexec; emergency.rs has its own backend
+    // fallback chain (splash → tty → serial) so the operator still gets
+    // a usable screen.
+    let mut console: Box<dyn Console> = match open_console(&config, false) {
+        Ok(c) => c,
+        Err(err) => {
+            nmbl_warn!("boot console bring-up failed: {err}");
+            match drop_to_emergency(&config, err) {}
+        }
+    };
+
+    let outcome = run_phases(&config, &mut *console)
+        .and_then(|()| select_and_act(&config, &mut *console));
 
     match outcome {
         Ok(()) => ExitCode::from(0),
-        Err(err) => match drop_to_emergency(&config, err) {},
+        Err(err) => {
+            // Drop the boot console before handing control to the
+            // emergency screen. emergency.rs brings up its own backend
+            // (a B3 subagent will unify these); releasing the splash
+            // DRM card / raw-mode tty now keeps the two paths from
+            // fighting over /dev/tty1.
+            drop(console);
+            match drop_to_emergency(&config, err) {}
+        }
     }
 }
