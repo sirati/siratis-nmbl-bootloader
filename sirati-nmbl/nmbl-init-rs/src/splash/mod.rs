@@ -102,19 +102,19 @@ pub fn try_run_selector(
     let console = open_console(Path::new(CONSOLE_PATH))?;
     let _raw = crate::sys::tty::RawModeGuard::new(console.as_fd())?;
 
-    // 5. Build the App and the headless terminal pipeline.
+    // 5. Build the App. The headless terminal pipeline is built fresh
+    //    per frame inside render_frame to bound SGR state to one frame.
     let mut app = App::new(generations);
     app.show_kernel_params = config.tui.show_kernel_params;
-    let mut term_pipe = SplashTerminal::new(cell_dims);
 
     // 6. Countdown phase: drive run_countdown; redraw on each tick.
-    //    Drawing errors during the countdown shouldn't tear down the
-    //    boot — log via stderr (via the `_ = ` discard) and continue.
+    //    Drawing errors during the countdown are intentionally
+    //    swallowed — the boot must continue even if one frame fails.
     let countdown = Duration::from_secs(u64::from(config.general.timeout_secs));
     let countdown_outcome = {
         let mut on_tick = |secs: u64| {
             app.countdown_remaining_secs = Some(secs);
-            let _ = render_frame(&mut drm, &bg_scaled, &cache, cell_dims, &mut term_pipe, &app);
+            let _ = render_frame(&mut drm, &bg_scaled, &cache, cell_dims, &app);
         };
         run_countdown(countdown, &mut on_tick)?
     };
@@ -132,7 +132,7 @@ pub fn try_run_selector(
     let mut dirty = true;
     loop {
         if dirty {
-            render_frame(&mut drm, &bg_scaled, &cache, cell_dims, &mut term_pipe, &app)?;
+            render_frame(&mut drm, &bg_scaled, &cache, cell_dims, &app)?;
             dirty = false;
         }
         if event::poll(POLL_SLICE).map_err(tui_err)?
@@ -167,7 +167,6 @@ fn render_frame(
     bg_scaled: &[u8],
     cache: &glyph_cache::GlyphCache,
     cell_dims: CellDims,
-    term_pipe: &mut SplashTerminal,
     app: &App<'_>,
 ) -> Result<()> {
     // (a) Render the current App screen into a Vec<u8> by way of a
@@ -185,9 +184,9 @@ fn render_frame(
             .map_err(tui_err)?;
     }
 
-    // (b) Reset the alacritty Term so SGR state from the previous frame
-    //     can't bleed into this one, then feed the ratatui bytes.
-    *term_pipe = SplashTerminal::new(cell_dims);
+    // (b) Build a fresh terminal pipeline so SGR state from a previous
+    //     frame can't bleed in, then feed the ratatui-rendered bytes.
+    let mut term_pipe = SplashTerminal::new(cell_dims);
     term_pipe.feed(&buf);
 
     // (c) Blit the background then walk every cell and stamp glyphs.
@@ -215,4 +214,30 @@ fn render_frame(
 
 fn tui_err(source: std::io::Error) -> NmblError {
     NmblError::Tui { source }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests assert with panics on contract failure"
+)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn try_run_selector_returns_ok_none_when_dri_missing() {
+        // The fallback contract: when /dev/dri/cardN is missing the
+        // splash entry-point must short-circuit to Ok(None) so the
+        // caller can fall through to the tty UI without surfacing the
+        // ENOENT as an error.
+        let mut config = Config::recovery_default();
+        config.splash.dri_path = PathBuf::from("/dev/this/does/not/exist");
+        let decision = try_run_selector(&config, &[]).expect("missing DRI must not error");
+        assert!(
+            decision.is_none(),
+            "missing DRI must yield Ok(None), got {decision:?}",
+        );
+    }
 }
