@@ -207,8 +207,9 @@ fn default_shell() -> PathBuf {
 
 /// `[rescue]` section of the operator's runtime config. Selects the
 /// rescue mode (see [`RescueMode`]) and optionally pins the on-disk
-/// path of `nmbl-rescue.sfs`. Phase E will extend this with network
-/// fields (`network`, `default_url`, `default_sha256`, `nic_drivers`).
+/// path of `nmbl-rescue.sfs`. The network-rescue fields (Phase E.1)
+/// supply the disk-rescue fallback that fetches `nmbl-rescue.sfs`
+/// from an operator-pinned HTTP URL.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RescueConfig {
@@ -227,6 +228,27 @@ pub struct RescueConfig {
     /// regardless of where the operator's boot is mounted.
     #[serde(default)]
     pub sfs_path: Option<PathBuf>,
+
+    /// Master switch for the network-rescue fallback. When `false`
+    /// (the default) the External arm of [`crate::rescue::dispatch`]
+    /// halts after the disk-rescue attempt fails, even if the
+    /// `network-rescue` Cargo feature is compiled in. Matches the
+    /// Nix-side `boot.nmbl.rescue.network` option emitted by E.3.
+    #[serde(default)]
+    pub network: bool,
+
+    /// Pre-filled URL shown on the rescue source-picker's URL prompt.
+    /// Empty string means "no prefill" — the operator types the URL
+    /// from scratch. Matches `boot.nmbl.rescue.defaultUrl`.
+    #[serde(default)]
+    pub default_url: String,
+
+    /// Pre-filled expected SHA-256 (lowercase hex) for the rescue
+    /// squashfs. Empty string means "no prefill" — the operator
+    /// confirms the computed hash without a pinned reference. Matches
+    /// `boot.nmbl.rescue.defaultSha256`.
+    #[serde(default)]
+    pub default_sha256: String,
 }
 
 impl Config {
