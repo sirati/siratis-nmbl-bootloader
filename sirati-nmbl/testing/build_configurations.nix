@@ -132,6 +132,18 @@ let
           # strace is the F.4 smoke-test target; busybox provides /bin/sh
           # which the Rust loader requires inside the squashfs tree.
           boot.nmbl.rescue.squashfsContents = [ pkgs.busybox pkgs.strace ];
+          # External rescue requires bootstrap mode so that Phase 0.5
+          # mounts /boot and sets runtime_boot_mountpoint, which
+          # rescue::locate_sfs needs to find nmbl-rescue.sfs.
+          boot.nmbl.configLocation = "external";
+          boot.nmbl.bootstrap.bootFs.device = "/dev/vda1";
+          boot.nmbl.bootstrap.kernelModules.explicit = [
+            "virtio_pci"
+            "virtio_blk"
+            "vfat"
+            "nls_cp437"
+            "nls_iso8859_1"
+          ];
         })
       ];
     };
@@ -162,6 +174,17 @@ let
           boot.nmbl.rescue.squashfsContents = [ pkgs.busybox pkgs.strace ];
           boot.nmbl.rescue.network = true;
           boot.nmbl.rescue.defaultUrl = "";
+          # External rescue requires bootstrap mode so that Phase 0.5
+          # mounts /boot and sets runtime_boot_mountpoint.
+          boot.nmbl.configLocation = "external";
+          boot.nmbl.bootstrap.bootFs.device = "/dev/vda1";
+          boot.nmbl.bootstrap.kernelModules.explicit = [
+            "virtio_pci"
+            "virtio_blk"
+            "vfat"
+            "nls_cp437"
+            "nls_iso8859_1"
+          ];
         })
       ];
     };
