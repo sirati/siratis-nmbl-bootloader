@@ -36,7 +36,13 @@ let
     };
 
     kernel_modules = {
-      explicit = cfg.explicitKernelModules ++ cfg.activation.extraKernelModules;
+      # Activation modules load FIRST: LUKS needs AES + cipher modes
+      # registered with the kernel crypto API before encrypted_keys can
+      # init successfully (it calls alloc_cipher("ecb(aes)") at module-
+      # load time). The base explicit list typically contains dm-crypt
+      # pulled in via boot.initrd.kernelModules, whose dep walk pulls
+      # in encrypted_keys — so AES + ecb must be live before then.
+      explicit = cfg.activation.extraKernelModules ++ cfg.explicitKernelModules;
       blacklist = cfg.blacklistedKernelModules;
       modules_dir = "/lib/modules";
     };
