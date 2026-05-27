@@ -134,7 +134,14 @@ pub fn blit_cell(
     }
 
     // Stage 2: glyph overlay positioned by the per-glyph offset.
-    let RgbaColor(fr, fg_g, fb_c, _) = fg;
+    // The blend alpha combines glyph coverage with the foreground's
+    // own alpha (e.g. NamedColor::Foreground at 0x4D for the soft
+    // 30% white) so that an "unset fg" still respects the palette.
+    let RgbaColor(fr, fg_g, fb_c, fa) = fg;
+    if fa == 0 {
+        return;
+    }
+    let fa16 = u16::from(fa);
     for gy in 0..glyph.height {
         let dy = i64::from(cell_y) + i64::from(glyph.offset_y) + i64::from(gy);
         if dy < 0 {
@@ -163,13 +170,21 @@ pub fn blit_cell(
             if coverage == 0 {
                 continue;
             }
+            // (coverage * fa + 127) / 255 — round-to-nearest, keeps
+            // the +127 trick from src_over so the two stages share
+            // identical rounding behaviour.
+            let effective = ((u16::from(coverage).saturating_mul(fa16)) + 127) / 255;
+            let effective = if effective > 255 { 255u8 } else { effective as u8 };
+            if effective == 0 {
+                continue;
+            }
 
             let pix_off = row_off.saturating_add((dx as usize).saturating_mul(4));
             let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
                 continue;
             };
             let (dr, dg, db) = read_bgrx(dst);
-            let (nr, ng, nb) = src_over(fr, fg_g, fb_c, coverage, dr, dg, db);
+            let (nr, ng, nb) = src_over(fr, fg_g, fb_c, effective, dr, dg, db);
             write_bgrx(dst, nr, ng, nb);
         }
     }
