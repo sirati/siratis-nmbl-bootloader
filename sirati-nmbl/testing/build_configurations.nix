@@ -84,6 +84,10 @@ let
           '';
         };
       };
+      # Linux 6.6's dm-crypt module pulls in trusted-keys + encrypted-keys
+      # which fail to init when the crypto-API ecb(aes) cipher isn't
+      # available at that exact moment. Newer kernels avoid the issue.
+      nmblKernelPackage = (nixpkgs.legacyPackages.x86_64-linux).linuxPackages_latest.kernel;
       diskoModule = ./disko-luks-password.nix;
       extraModules = [
         {

@@ -25,6 +25,11 @@ let
       # disko.diskoImages instead of make-disk-image.nix. The disko module
       # is also added to extraModules automatically.
       diskoModule ? null,
+      # Kernel used by NMBL itself (the bootloader, not the post-kexec
+      # system). LUKS configs benefit from a newer kernel because the
+      # 6.6 series has dm-crypt → trusted-keys → encrypted-keys → ecb(aes)
+      # init-order issues that newer kernels handle differently.
+      nmblKernelPackage ? pkgs.linux_6_6,
     }:
     let
       # Base NixOS system configuration
@@ -43,7 +48,7 @@ let
             boot.nmbl = {
               enable = true;
               inherit bootstrapper;
-              kernelPackage = pkgs.linux_6_6;
+              kernelPackage = nmblKernelPackage;
 
               # availableKernelModules defaults to ["crc32c"]
               # kernelModules can be added if needed for explicit loading
