@@ -23,7 +23,7 @@ use crate::{nmbl_info, nmbl_verbose, nmbl_warn};
 /// shows progress to the operator.
 pub fn load_explicit_modules(
     config: &Config,
-    reporter: &mut BootReporter<'_, '_>,
+    reporter: &mut BootReporter<'_>,
 ) -> Result<()> {
     let _ = reporter.set_phase("phase 2: loading kernel modules");
     let release = crate::sys::uname::kernel_release()?;

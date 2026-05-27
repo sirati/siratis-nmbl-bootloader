@@ -141,10 +141,9 @@ fn run_phases(config: &Config, console: &mut dyn Console) -> Result<()> {
     load_explicit_modules(config, &mut reporter)?;
 
     // The splash backend opens /dev/tty1 and calls VT_ACTIVATE itself
-    // (see `splash::input::SplashInput::open`), so an explicit
-    // `activate_vt1()` here is redundant in the splash code path. For
-    // the tty backend `/dev/console` already points at the kernel-chosen
-    // VT, so reads land correctly without forcing a VT switch.
+    // (see `splash::input::SplashInput::open`); the tty backend uses
+    // `/dev/console`, which already points at the kernel-chosen VT.
+    // Neither path needs an extra VT switch here.
 
     nmbl_info!("phase 3: storage activations");
     let mut supplier = TuiPasswordSupplier::new(config);

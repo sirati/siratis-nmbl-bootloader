@@ -141,7 +141,7 @@ fn resolve_init_path(profile_link: &Path, toplevel: &Path) -> Result<PathBuf> {
 /// inspected.
 pub fn scan_generations(
     config: &Config,
-    reporter: &mut BootReporter<'_, '_>,
+    reporter: &mut BootReporter<'_>,
 ) -> Result<Vec<Generation>> {
     let dir = config.paths.nix_profiles_dir.clone();
     let _ = reporter.set_phase(format!("phase 4: scanning generations in {}", dir.display()));
@@ -264,9 +264,9 @@ mod tests {
 
     /// Run a closure with a fresh [`BootReporter`] backed by a no-op
     /// console. The reporter is dropped before the closure returns, so
-    /// the closure can pass it as `&mut BootReporter<'_, '_>` without
+    /// the closure can pass it as `&mut BootReporter<'_>` without
     /// fighting lifetimes against the surrounding test body.
-    fn with_reporter<R>(f: impl FnOnce(&mut BootReporter<'_, '_>) -> R) -> R {
+    fn with_reporter<R>(f: impl FnOnce(&mut BootReporter<'_>) -> R) -> R {
         let mut console = NoopConsole;
         let mut reporter = BootReporter::new(&mut console, "test");
         f(&mut reporter)

@@ -11,9 +11,7 @@
 //! No external processes (`stty(1)` is forbidden); everything is done
 //! via direct termios syscalls through `rustix`/`nix`.
 
-use std::fs::OpenOptions;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use rustix::fs::{Mode, OFlags};
@@ -21,38 +19,6 @@ use rustix::termios::{OptionalActions, Termios, tcgetattr, tcsetattr};
 
 use crate::error::{NmblError, Result};
 use crate::nmbl_warn;
-
-/// Force VT1 to the foreground virtual console.
-///
-/// Linux routes PS/2 (and VNC) keypresses to whichever VT is currently
-/// active. After framebuffer bring-up the kernel sometimes lands on a
-/// non-VT1 console, so reads from `/dev/tty1` (or stdin when the kernel
-/// pointed it at the VT) return nothing. Calling `VT_ACTIVATE` once
-/// during early boot fixes that for every downstream reader. Failures
-/// (no VT layer, missing /dev/tty1) are non-fatal and just logged.
-pub fn activate_vt1() {
-    const VT_ACTIVATE: libc::Ioctl = 0x5606;
-    let file = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .custom_flags(libc::O_CLOEXEC)
-        .open("/dev/tty1")
-    {
-        Ok(f) => f,
-        Err(e) => {
-            nmbl_warn!("activate_vt1: open /dev/tty1 failed: {e}");
-            return;
-        }
-    };
-    // SAFETY: VT_ACTIVATE takes a small-int VT number as its third arg;
-    // the kernel reads it by value. The fd was just opened r/w on a tty
-    // char device.
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), VT_ACTIVATE, 1i32) };
-    if rc < 0 {
-        let err = std::io::Error::last_os_error();
-        nmbl_warn!("activate_vt1: VT_ACTIVATE(1) failed: {err}");
-    }
-}
 
 /// Open `/dev/console` (or another tty path) read/write.
 ///
