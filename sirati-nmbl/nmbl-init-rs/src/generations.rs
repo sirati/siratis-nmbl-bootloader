@@ -260,6 +260,12 @@ mod tests {
         fn kind(&self) -> ConsoleKind {
             ConsoleKind::Tty
         }
+        fn draw_with(
+            &mut self,
+            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     /// Run a closure with a fresh [`BootReporter`] backed by a no-op

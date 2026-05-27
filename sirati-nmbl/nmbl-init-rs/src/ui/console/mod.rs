@@ -21,6 +21,7 @@
 use std::time::Duration;
 
 use crossterm::event::KeyEvent;
+use ratatui::Frame;
 
 use crate::config::Config;
 use crate::error::Result;
@@ -56,6 +57,12 @@ pub trait Console {
     fn size(&self) -> (u16, u16);
     /// Which backend this is.
     fn kind(&self) -> ConsoleKind;
+    /// Render an ad-hoc frame via a ratatui closure. Used by code paths
+    /// that paint dynamic widgets (download gauges, cursor-tracking
+    /// editors) that don't fit the App+Screen state-machine model.
+    /// The same backend (splash or tty) is reused — no new terminal
+    /// is constructed.
+    fn draw_with(&mut self, body: &mut dyn FnMut(&mut Frame<'_>)) -> Result<()>;
 }
 
 pub mod noop;

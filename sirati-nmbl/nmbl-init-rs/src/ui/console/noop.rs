@@ -85,6 +85,11 @@ impl Console for NoopConsole {
         // splash hadn't kicked in yet.
         ConsoleKind::Tty
     }
+
+    /// Discard the ad-hoc closure-driven frame, just like [`render`].
+    fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +159,23 @@ mod tests {
         let from_new = NoopConsole::new();
         assert_eq!(from_default.size(), from_new.size());
         assert_eq!(from_default.kind(), from_new.kind());
+    }
+
+    #[test]
+    fn noop_draw_with_discards_closure_and_returns_ok() {
+        // `draw_with` is the closure-driven counterpart to `render`;
+        // on the sentinel both must succeed without observable effect.
+        let mut console = NoopConsole::new();
+        let mut called = 0u32;
+        console
+            .draw_with(&mut |_f| {
+                called = called.saturating_add(1);
+            })
+            .expect("draw_with must always succeed on NoopConsole");
+        // The contract is "discard the frame" — the closure may run
+        // zero or more times, but if it does run the side-effect must
+        // not panic. We mainly assert the Result is Ok above.
+        let _ = called;
     }
 
     #[test]

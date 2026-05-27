@@ -27,7 +27,7 @@ use crate::splash::types::CellDims;
 use crate::ui::POLL_SLICE;
 use crate::ui::app::App;
 use crate::ui::console::{Console, ConsoleKind};
-use crate::ui::render_splash_frame;
+use crate::ui::{render_splash_frame, render_splash_frame_with};
 
 /// Tty node opened for raw-mode keyboard input alongside the DRM
 /// framebuffer output. See [`crate::ui::INPUT_TTY_PATH`] for the
@@ -140,5 +140,15 @@ impl Console for SplashConsole {
 
     fn kind(&self) -> ConsoleKind {
         ConsoleKind::Splash
+    }
+
+    fn draw_with(&mut self, body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
+        render_splash_frame_with(
+            &mut self.drm,
+            &self.bg_scaled,
+            &self.cache,
+            self.cell_dims,
+            body,
+        )
     }
 }
