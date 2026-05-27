@@ -87,10 +87,21 @@ fn dispatch_external(config: &Config, cause: &NmblError) -> Result<Infallible> {
     #[cfg(feature = "network-rescue")]
     {
         if config.rescue.network {
-            let mut ui = net::ConsoleRescueUi;
-            let net_err = match net::try_network_rescue(config, &mut ui, &disk_err.to_string()) {
-                Ok(infallible) => match infallible {},
-                Err(e) => e,
+            // Serial-console operators get the line-mode fallback; the
+            // ratatui screens assume a real terminal where escape
+            // sequences and key codes round-trip cleanly.
+            let net_err = if config.general.serial_console {
+                let mut ui = net::ConsoleRescueUi;
+                match net::try_network_rescue(config, &mut ui, &disk_err.to_string()) {
+                    Ok(infallible) => match infallible {},
+                    Err(e) => e,
+                }
+            } else {
+                let mut ui = crate::ui::rescue::make_rescue_ui();
+                match net::try_network_rescue(config, &mut ui, &disk_err.to_string()) {
+                    Ok(infallible) => match infallible {},
+                    Err(e) => e,
+                }
             };
             // Both disk AND network paths failed. Surface the
             // network error (it's the more recent attempt) chained
