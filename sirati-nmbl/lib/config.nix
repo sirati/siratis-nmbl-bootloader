@@ -212,7 +212,15 @@ in
     #                                   locate the full config on /boot
     #                                   (external mode only)
     #   - /bin/sh                     : busybox, used ONLY for the emergency
-    #                                   shell on failure (never by /init itself)
+    #                                   shell on failure (never by /init
+    #                                   itself); staged only when
+    #                                   `rescue.mode = "embedded"`. For the
+    #                                   "external" / "none" modes the
+    #                                   emergency path either pivots into
+    #                                   the rescue squashfs (which carries
+    #                                   its own /bin/sh) or halts with a
+    #                                   structured banner — no in-initramfs
+    #                                   shell is reachable.
     #   - /bin/blkid                  : util-linux's blkid, called by the
     #                                   Rust /init to populate /dev/disk/by-*
     #                                   symlinks (udev-less stage-0).
@@ -244,16 +252,24 @@ in
               }
             ];
 
+        # Busybox is only needed in the initramfs when the emergency
+        # path execs `cfg.paths.shell` directly (embedded mode). In
+        # "external" mode the rescue squashfs carries its own /bin/sh
+        # and is loop-mounted before any shell exec; in "none" mode the
+        # rescue dispatcher halts via `halt_with_banner` without ever
+        # touching a shell. Keeping busybox out of the initramfs for
+        # those two modes is the bulk of the F.6 size delta.
+        shellContents = lib.optional (cfg.rescue.mode == "embedded") {
+          object = "${pkgs.busybox}/bin/busybox";
+          symlink = "/bin/sh";
+        };
+
         baseContents = [
           {
             object = "${resolvedNmblInit}/bin/nmbl-init";
             symlink = "/init";
           }
-        ] ++ configContents ++ [
-          {
-            object = "${pkgs.busybox}/bin/busybox";
-            symlink = "/bin/sh";
-          }
+        ] ++ configContents ++ shellContents ++ [
           {
             # util-linux's blkid is used by nmbl-init to populate
             # /dev/disk/by-{partlabel,label,uuid,partuuid}/ symlinks
