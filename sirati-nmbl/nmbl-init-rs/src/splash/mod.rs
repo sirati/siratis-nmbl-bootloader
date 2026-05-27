@@ -46,10 +46,12 @@ use crate::ui::timeout::TimeoutOutcome;
 use crate::ui::{App, Decision, Screen};
 
 /// Tty node opened to acquire raw-mode keyboard input alongside the
-/// DRM framebuffer output. `/dev/tty0` is the kernel's active VT, so
-/// VNC PS/2 keypresses land here even when `console=` points stdin at
-/// a serial line.
-const INPUT_TTY_PATH: &str = "/dev/tty0";
+/// DRM framebuffer output. `/dev/tty0` is the kernel's "current VT"
+/// — write-only per the device docs — so reads return nothing. The
+/// kernel routes PS/2 (and VNC) keypresses to `/dev/tty1`, which we
+/// open directly here so they land in our SplashInput buffer even
+/// when `console=` points stdin at a serial line.
+const INPUT_TTY_PATH: &str = "/dev/tty1";
 
 /// Font size, in pixels, used to rasterise the splash glyph cache.
 const SPLASH_FONT_PX: f32 = 16.0;

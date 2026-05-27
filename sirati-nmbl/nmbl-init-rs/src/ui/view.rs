@@ -52,8 +52,8 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, countdown: Option<u64>) {
     let mut spans = vec![
-        Span::styled("NMBL ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("— NixOS Minimal BootLoader"),
+        Span::styled("sirati's NMBL ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("— no more boot loader"),
     ];
     if let Some(secs) = countdown {
         spans.push(Span::raw("   "));
@@ -86,30 +86,52 @@ fn char_column_for_byte_cursor(s: &str, byte_idx: usize) -> usize {
     s.get(..safe).map_or(0, |prefix| prefix.chars().count())
 }
 
-fn generation_item<'a>(g: &'a Generation, show_kernel_params: bool) -> ListItem<'a> {
+fn generation_item<'a>(g: &'a Generation, show_kernel_params: bool, body_width: u16) -> ListItem<'a> {
     let head = if g.label.is_empty() {
         format!("#{}", g.number)
     } else {
         format!("#{}  {}", g.number, g.label)
     };
-    let mut lines: Vec<Line<'a>> = vec![Line::from(head)];
-    if show_kernel_params {
-        lines.push(Line::styled(
-            format!("    {}", g.kernel_params.join(" ")),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+    if !show_kernel_params || g.kernel_params.is_empty() {
+        return ListItem::new(Line::from(head));
     }
-    ListItem::new(Text::from(lines))
+    // Compose head + (right-aligned) kernel params on a single line.
+    // Reserved chrome per row: 1 col border, 2 cols highlight symbol,
+    // 1 col gutter, 1 col border = 5. The list widget already accounts
+    // for the borders, so we subtract only the highlight symbol gutter.
+    let avail = body_width.saturating_sub(2) as usize;
+    let head_cols = head.chars().count();
+    let kp = g.kernel_params.join(" ");
+    let max_kp = avail.saturating_sub(head_cols).saturating_sub(2);
+    if max_kp == 0 {
+        return ListItem::new(Line::from(head));
+    }
+    let kp_truncated: String = if kp.chars().count() > max_kp {
+        let take = max_kp.saturating_sub(1);
+        kp.chars().take(take).chain(std::iter::once('…')).collect()
+    } else {
+        kp
+    };
+    let kp_cols = kp_truncated.chars().count();
+    let pad = avail.saturating_sub(head_cols).saturating_sub(kp_cols);
+    let line = Line::from(vec![
+        Span::raw(head),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(kp_truncated, Style::default().add_modifier(Modifier::DIM)),
+    ]);
+    ListItem::new(line)
 }
 
 /// Render the generation-picker screen.
 pub fn render_list(frame: &mut Frame<'_>, data: &ListScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, data.countdown_remaining_secs);
+    // Bordered block + highlight symbol consume 1 + 1 + 2 = 4 cols.
+    let inner_width = body.width.saturating_sub(4);
     let items: Vec<ListItem<'_>> = data
         .generations
         .iter()
-        .map(|g| generation_item(g, data.show_kernel_params))
+        .map(|g| generation_item(g, data.show_kernel_params, inner_width))
         .collect();
     let highlight = Style::default()
         .fg(Color::Black)

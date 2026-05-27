@@ -259,7 +259,10 @@ fn named_color(n: NamedColor) -> RgbaColor {
         NamedColor::Blue | NamedColor::DimBlue => RgbaColor(0x34, 0x65, 0xA4, 0xFF),
         NamedColor::Magenta | NamedColor::DimMagenta => RgbaColor(0x75, 0x50, 0x7B, 0xFF),
         NamedColor::Cyan | NamedColor::DimCyan => RgbaColor(0x06, 0x98, 0x9A, 0xFF),
-        NamedColor::White | NamedColor::DimWhite => RgbaColor(0xD3, 0xD7, 0xCF, 0xFF),
+        // Selection background (ratatui Color::Gray) lands here; keep
+        // the Tango tone but let the cosmic-greeter image bleed through
+        // at ~50% so the highlight reads as a soft tint, not a solid bar.
+        NamedColor::White | NamedColor::DimWhite => RgbaColor(0xD3, 0xD7, 0xCF, 0x80),
         NamedColor::BrightBlack => RgbaColor(0x55, 0x57, 0x53, 0xFF),
         NamedColor::BrightRed => RgbaColor(0xEF, 0x29, 0x29, 0xFF),
         NamedColor::BrightGreen => RgbaColor(0x8A, 0xE2, 0x34, 0xFF),
