@@ -64,6 +64,12 @@
           configName,
           port,
           firmware, # "bios" | "uefi"
+          # "headless" (default): stage 3 boots with -display none, verifies via
+          #   SSH, powers off. The canonical install test.
+          # "vnc-demo": stage 3 boots with -display vnc=:1 -vga std, spawns
+          #   websockify on :6080 serving noVNC, prints the browser URL, and
+          #   waits for SIGINT. Used to look at the splash menu by hand.
+          displayMode ? "headless",
         }:
         pkgs.writeShellApplication {
           name = "install-test-${configName}";
@@ -77,6 +83,8 @@
             pkgs.gawk
             pkgs.gnused
             nixos-anywhere.packages.${system}.default
+          ] ++ pkgs.lib.optionals (displayMode == "vnc-demo") [
+            pkgs.novnc
           ];
           text = ''
             set -euo pipefail
@@ -371,6 +379,16 @@
             fi
 
             rm -f stage3.log qemu-stage3.pid
+            ${
+              if displayMode == "vnc-demo" then
+                ''
+                  STAGE3_DISPLAY=(-display vnc=:1 -vga std)
+                ''
+              else
+                ''
+                  STAGE3_DISPLAY=(-display none)
+                ''
+            }
             qemu-system-x86_64 \
               -machine q35,accel=kvm:tcg \
               -cpu max \
@@ -381,7 +399,7 @@
               -drive file=disk2.qcow2,format=qcow2,if=virtio \
               -netdev "user,id=net0,hostfwd=tcp::$PORT-:22" \
               -device virtio-net-pci,netdev=net0 \
-              -display none \
+              "''${STAGE3_DISPLAY[@]}" \
               -serial file:stage3.log \
               -monitor none \
               -daemonize \
@@ -390,30 +408,67 @@
             QEMU_PID=$(cat qemu-stage3.pid)
             echo "Stage 3 QEMU pid: $QEMU_PID  (serial log: $WORK_DIR/stage3.log)"
 
-            wait_for_ssh 360
+            ${
+              if displayMode == "vnc-demo" then
+                ''
+                  echo
+                  echo "===== STAGE 3a: noVNC bridge ====="
+                  NOVNC_PID=""
+                  novnc_cleanup() {
+                    if [[ -n "$NOVNC_PID" ]] && kill -0 "$NOVNC_PID" 2>/dev/null; then
+                      echo "Stopping novnc pid $NOVNC_PID..."
+                      kill -TERM "$NOVNC_PID" 2>/dev/null || true
+                    fi
+                  }
+                  trap 'novnc_cleanup; cleanup' EXIT INT TERM
+                  novnc --listen 6080 --vnc localhost:5901 \
+                    >novnc.log 2>&1 &
+                  NOVNC_PID=$!
+                  echo "novnc pid: $NOVNC_PID  (log: $WORK_DIR/novnc.log)"
+                  cat <<EOF
 
-            echo
-            echo "===== STAGE 4: Verify installed system ====="
-            ssh -i "$KEY" -p "$PORT" "''${SSH_OPTS[@]}" root@localhost \
-              'set -e
-               echo "--- hostname / kernel ---"
-               hostname
-               uname -r
-               echo "--- os-release ---"
-               grep -E "PRETTY_NAME|VERSION=" /etc/os-release
-               echo "--- lsblk ---"
-               lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
-               echo "--- /boot contents ---"
-               ls -la /boot
-               echo "--- mounts ---"
-               findmnt /
-               findmnt /boot'
+                  =========================================================
+                    Open this in a browser:
+                      http://localhost:6080/vnc.html?autoconnect=1&resize=scale
 
-            echo
-            echo "Powering off installed system..."
-            ssh -i "$KEY" -p "$PORT" "''${SSH_OPTS[@]}" root@localhost 'systemctl poweroff' 2>/dev/null || true
-            wait_for_qemu_exit "$QEMU_PID" 30 || true
-            QEMU_PID=""
+                    QEMU VNC : localhost:5901
+                    Serial   : tail -F $WORK_DIR/stage3.log
+                    Stop     : Ctrl-C in this terminal
+                  =========================================================
+                  EOF
+                  echo "Waiting for QEMU pid $QEMU_PID to exit (or Ctrl-C)..."
+                  while kill -0 "$QEMU_PID" 2>/dev/null; do sleep 5; done
+                  novnc_cleanup
+                  QEMU_PID=""
+                ''
+              else
+                ''
+                  wait_for_ssh 360
+
+                  echo
+                  echo "===== STAGE 4: Verify installed system ====="
+                  ssh -i "$KEY" -p "$PORT" "''${SSH_OPTS[@]}" root@localhost \
+                    'set -e
+                     echo "--- hostname / kernel ---"
+                     hostname
+                     uname -r
+                     echo "--- os-release ---"
+                     grep -E "PRETTY_NAME|VERSION=" /etc/os-release
+                     echo "--- lsblk ---"
+                     lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
+                     echo "--- /boot contents ---"
+                     ls -la /boot
+                     echo "--- mounts ---"
+                     findmnt /
+                     findmnt /boot'
+
+                  echo
+                  echo "Powering off installed system..."
+                  ssh -i "$KEY" -p "$PORT" "''${SSH_OPTS[@]}" root@localhost 'systemctl poweroff' 2>/dev/null || true
+                  wait_for_qemu_exit "$QEMU_PID" 30 || true
+                  QEMU_PID=""
+                ''
+            }
 
             echo
             echo "===== PASS: $NAME ====="
@@ -450,6 +505,12 @@
           configName = "install-gpt-uefi-systemd-raid1";
           port = "22013";
           firmware = "uefi";
+        };
+        install-test-splash-vnc-demo = mkOrchestrator {
+          configName = "splash-vnc-demo";
+          port = "22099";
+          firmware = "uefi";
+          displayMode = "vnc-demo";
         };
       };
     in

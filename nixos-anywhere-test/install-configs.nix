@@ -18,6 +18,10 @@ let
       # RAID1 configs need a kernel >= 6.12 because the md v1.2 superblocks
       # written by modern kernels (6.18+) are not accepted by linux_6_6.
       nmblKernelPackage ? pkgs.linux_6_6,
+      # Additional NixOS modules to merge after the default install layout.
+      # Used by the splash-vnc-demo variant to enable boot.nmbl.splash and
+      # mkForce-override the default serialConsole.
+      extraModules ? [ ],
     }:
     nixpkgs.lib.nixosSystem {
       inherit system;
@@ -87,7 +91,7 @@ let
             system.stateVersion = "24.05";
           }
         )
-      ];
+      ] ++ extraModules;
     };
 in
 {
@@ -204,5 +208,36 @@ in
         timeout = 0;
       };
     };
+  };
+
+  # One-off splash demo variant: same install layout as install-gpt-uefi-grub
+  # but with boot.nmbl.splash.enable + serialConsole turned off so the splash
+  # path actually renders, and a long menu timeout so an operator looking at
+  # the splash in VNC has time to interact.
+  splash-vnc-demo = mkInstall {
+    hostName = "splash-vnc-demo";
+    bootstrapper = {
+      partition_table = "gpt";
+      bootMode = "uefi";
+      loader = "grub";
+      loader_extra_args = {
+        timeout = 0;
+      };
+    };
+    extraModules = [
+      (
+        { lib, ... }:
+        {
+          boot.nmbl.splash.enable = true;
+          # mkForce because mkInstall hard-codes serialConsole = "ttyS0,115200".
+          # The splash path is gated by `if config.general.serial_console`, so
+          # serial-on would short-circuit straight to line-mode menu and we'd
+          # never see the splash.
+          boot.nmbl.serialConsole = lib.mkForce null;
+          # Bump the menu timeout so the operator has time to look around.
+          boot.nmbl.timeoutSeconds = lib.mkForce 600;
+        }
+      )
+    ];
   };
 }
