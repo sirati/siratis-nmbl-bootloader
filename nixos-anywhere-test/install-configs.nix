@@ -240,4 +240,56 @@ in
       )
     ];
   };
+
+  # Splash + LUKS demo: same disko layout as the LUKS test (vda3 wrapped
+  # in a luks container unlocked with passphrase "test"), but with the
+  # splash enabled so the LUKS prompt renders through the graphical UI
+  # via /dev/dri/card1 + the cosmic-greeter background.
+  splash-luks-vnc-demo = mkInstall {
+    hostName = "splash-luks-vnc-demo";
+    diskoModule = ./disko-luks-password.nix;
+    extraInitrdKernelModules = [
+      "dm_mod"
+      "dm-crypt"
+      "aes"
+    ];
+    # Linux 6.6 trips a crypto-API init bug in dm-crypt; use latest.
+    nmblKernelPackage = pkgs.linuxPackages_latest.kernel;
+    bootstrapper = {
+      partition_table = "gpt";
+      bootMode = "uefi";
+      loader = "grub";
+      loader_extra_args = {
+        timeout = 0;
+      };
+    };
+    extraModules = [
+      (
+        { lib, ... }:
+        {
+          boot.nmbl.splash.enable = true;
+          boot.nmbl.serialConsole = lib.mkForce null;
+          boot.nmbl.timeoutSeconds = lib.mkForce 600;
+          # LUKS unlock executed by NMBL stage-0 before mounting /.
+          # The typed passphrase is injected into the kexec'd initrd so
+          # NixOS stage-1 doesn't re-prompt.
+          boot.nmbl.activation.luks = [
+            {
+              name = "cryptroot";
+              device = "/dev/vda3";
+              unlock = "password";
+              promptLabel = "Enter LUKS passphrase for cryptroot";
+              passToStage1 = "/etc/nmbl-luks/cryptroot";
+            }
+          ];
+          boot.initrd.luks.devices.cryptroot = lib.mkForce {
+            device = "/dev/disk/by-partlabel/disk-main-luks";
+            keyFile = "/etc/nmbl-luks/cryptroot";
+            fallbackToPassword = true;
+            allowDiscards = true;
+          };
+        }
+      )
+    ];
+  };
 }
