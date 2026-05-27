@@ -18,6 +18,7 @@ use crate::devices::wait_for;
 use crate::error::{NmblError, Result};
 use crate::sys::activation::{ProcessOutcome, run};
 use crate::ui::BootReporter;
+use crate::ui::console::Console;
 use crate::{nmbl_info, nmbl_warn};
 
 const PROC_MODULES: &str = "/proc/modules";
@@ -26,8 +27,15 @@ const DEVICE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Pluggable passphrase prompt; TUI implements it, tests mock it.
 /// `Zeroizing` wipes the buffer on drop, including on error paths.
+///
+/// The supplier receives the live boot console for the duration of the
+/// prompt so it can render the passphrase modal through the SAME backend
+/// (splash framebuffer or raw-mode tty) the operator has been looking at
+/// since phase 1 — no parallel console bring-up, no flicker. Production
+/// callers (`run_all_activations`) hand it the `BootReporter`'s console;
+/// tests can pass a mock that ignores it.
 pub trait PasswordSupplier {
-    fn prompt(&mut self, label: &str) -> Result<Zeroizing<String>>;
+    fn prompt(&mut self, console: &mut dyn Console, label: &str) -> Result<Zeroizing<String>>;
 }
 
 /// Run every entry in declaration order. First failure is fatal —
@@ -62,7 +70,11 @@ pub fn run_all_activations(
             Some(ref mut s) => Some(&mut **s),
             None => None,
         };
-        let stdin_owned = collect_stdin(activation, supplier_ref)?;
+        // Briefly hand the reporter's console to the supplier so the
+        // passphrase modal renders through the same backend as the
+        // surrounding boot-status screen. The reporter borrow is paused
+        // for the duration of the prompt and resumed after.
+        let stdin_owned = collect_stdin(activation, &mut *reporter.console, supplier_ref)?;
         let stdin_slice = stdin_owned.as_ref().map(|z| z.as_slice());
 
         let outcome = run(&activation.binary, &activation.argv, stdin_slice)
@@ -99,6 +111,7 @@ pub fn run_all_activations(
 /// append a newline so cryptsetup sees interactive-prompt termination.
 fn collect_stdin(
     activation: &Activation,
+    console: &mut dyn Console,
     supplier: Option<&mut dyn PasswordSupplier>,
 ) -> Result<Option<Zeroizing<Vec<u8>>>> {
     if activation.kind != ActivationKind::LuksPassword {
@@ -125,7 +138,7 @@ fn collect_stdin(
         .prompt_label
         .as_deref()
         .unwrap_or("Enter passphrase");
-    let secret = supplier.prompt(label)?;
+    let secret = supplier.prompt(console, label)?;
     let mut buf = Zeroizing::new(Vec::with_capacity(secret.len().saturating_add(1)));
     buf.extend_from_slice(secret.as_bytes());
     buf.push(b'\n');
@@ -261,9 +274,35 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
     }
 
     impl PasswordSupplier for MockSupplier {
-        fn prompt(&mut self, label: &str) -> Result<Zeroizing<String>> {
+        fn prompt(
+            &mut self,
+            _console: &mut dyn Console,
+            label: &str,
+        ) -> Result<Zeroizing<String>> {
             self.seen_label = Some(label.to_string());
             Ok(Zeroizing::new(self.canned.to_string()))
+        }
+    }
+
+    /// Minimal [`Console`] that ignores every call. Lets us exercise the
+    /// supplier trait without bringing up a real backend.
+    struct NoopConsole;
+
+    impl Console for NoopConsole {
+        fn render(&mut self, _app: &crate::ui::app::App<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn poll_key(
+            &mut self,
+            _timeout: Duration,
+        ) -> Result<Option<crossterm::event::KeyEvent>> {
+            Ok(None)
+        }
+        fn size(&self) -> (u16, u16) {
+            (80, 24)
+        }
+        fn kind(&self) -> crate::ui::console::ConsoleKind {
+            crate::ui::console::ConsoleKind::Tty
         }
     }
 
@@ -273,7 +312,10 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
             canned: "hunter2",
             seen_label: None,
         };
-        let got = sup.prompt("Unlock root").expect("mock never errors");
+        let mut console = NoopConsole;
+        let got = sup
+            .prompt(&mut console, "Unlock root")
+            .expect("mock never errors");
         assert_eq!(&**got, "hunter2");
         assert_eq!(sup.seen_label.as_deref(), Some("Unlock root"));
 

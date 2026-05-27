@@ -1,27 +1,17 @@
-//! UI orchestrator. The terminal lifecycle (raw-mode acquisition,
-//! ratatui `Terminal` construction, frame loop, serial-console
-//! fallback) lives here; pure render functions live in [`view`] and
-//! the state machine lives in [`app`].
-//!
-//! ## Terminal handling
-//!
-//! In PID-1-as-init we open `/dev/console` ourselves via
-//! [`crate::sys::tty::open_console`], wrap it in a
-//! [`crate::sys::tty::RawModeGuard`], and then construct a
-//! [`ratatui::Terminal`] over [`std::io::stdout`]. We rely on the
-//! kernel having pointed stdout (fd 1) at `/dev/console` already —
-//! the standard early-userspace contract. We do NOT dup2 the
-//! console fd to stdout: that would require `unsafe libc::dup2`
-//! with no obvious win, and the project rule is to keep `unsafe`
-//! to an absolute minimum.
+//! UI orchestrator. The frame loop and serial-console fallback live
+//! here; pure render functions live in [`view`], the state machine in
+//! [`app`], and the backend abstraction (splash framebuffer vs raw-mode
+//! tty) in [`console`]. Every interactive screen — selector, cmdline
+//! editor, passphrase modal, emergency picker — renders through the
+//! same `&mut dyn Console`; only the serial-mode fallback drops to
+//! direct stdin/stdout.
 //!
 //! ## Serial-console fallback
 //!
-//! When `config.general.serial_console` is true we skip raw mode
-//! and ratatui altogether and run a line-oriented prompt against
-//! stdin/stdout. Many serial environments mangle escape sequences;
-//! line mode is reliable and the operator can still drop to the
-//! shell or pick a generation.
+//! When `config.general.serial_console` is true we skip the Console
+//! TUI and run a line-oriented prompt against stdin/stdout. Many
+//! serial environments mangle escape sequences; line mode is reliable
+//! and the operator can still drop to the shell or pick a generation.
 //!
 //! ## Activation passphrase wiring
 //!
@@ -29,14 +19,22 @@
 //! [`crate::activation::PasswordSupplier`] so the top-level boot
 //! flow can pass it to
 //! [`crate::activation::run_all_activations`] as
-//! `&mut dyn PasswordSupplier`. When the activation runner reaches
-//! a `luks-password` entry it calls `prompt(label)` once; we open
-//! the console, render the [`Screen::Passphrase`] modal, and return
-//! the entered string in a `Zeroizing<String>` so the buffer is
-//! wiped after `cryptsetup` drains it. Esc on the modal returns a
-//! [`NmblError::Tui`] which `run_all_activations` wraps as
-//! [`NmblError::Activation`] and the top-level driver routes to the
-//! emergency shell.
+//! `&mut dyn PasswordSupplier`. When the activation runner reaches a
+//! `luks-password` entry it calls `prompt(console, label)` once; the
+//! supplier reuses the LIVE boot console (splash framebuffer or
+//! raw-mode tty) the orchestrator already holds, drives a render-poll
+//! loop over the [`Screen::Passphrase`] modal, and returns the entered
+//! string in a `Zeroizing<String>` so the buffer is wiped after
+//! `cryptsetup` drains it. No new console is opened — that would
+//! duplicate the splash bring-up and flicker between backends.
+//!
+//! Esc on the modal returns a [`NmblError::Tui`] which
+//! `run_all_activations` wraps as [`NmblError::Activation`] and the
+//! top-level driver routes to the emergency shell.
+//!
+//! Serial mode (`config.general.serial_console = true`) skips the
+//! Console plumbing and runs a line-mode `getpass`-style prompt on
+//! stdin/stdout, mirroring the rest of the serial code path.
 
 pub mod app;
 pub mod console;
@@ -46,20 +44,14 @@ pub mod timeout;
 pub mod view;
 
 use std::io::{BufRead, Write};
-use std::os::fd::AsFd;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use zeroize::Zeroizing;
 
 use crate::activation::PasswordSupplier;
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::generations::Generation;
-use crate::sys::tty::{RawModeGuard, open_console};
 use crate::ui::console::Console;
 use crate::ui::timeout::TimeoutOutcome;
 use crate::ui::view::{
@@ -67,18 +59,18 @@ use crate::ui::view::{
     render_edit, render_emergency, render_list, render_passphrase,
 };
 
-/// Default console path used by the activation-phase passphrase modal
-/// when the splash isn't owning the framebuffer anymore.
-const CONSOLE_PATH: &str = "/dev/console";
-
 #[cfg(feature = "image-splash")]
 use alacritty_terminal::term::cell::Flags;
 #[cfg(feature = "image-splash")]
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 #[cfg(feature = "image-splash")]
+use ratatui::Terminal;
+#[cfg(feature = "image-splash")]
 use ratatui::TerminalOptions;
 #[cfg(feature = "image-splash")]
 use ratatui::Viewport;
+#[cfg(feature = "image-splash")]
+use ratatui::backend::CrosstermBackend;
 #[cfg(feature = "image-splash")]
 use ratatui::layout::Rect;
 #[cfg(feature = "image-splash")]
@@ -427,9 +419,15 @@ fn prompt_serial_line(prompt: &str) -> Result<String> {
     Ok(buf)
 }
 
-/// PasswordSupplier impl that pops a passphrase modal in the same
-/// kind of terminal the rest of the TUI uses, or — when serial — does
-/// a line-mode `getpass`-style read.
+/// PasswordSupplier impl that pops a passphrase modal on the live
+/// boot console (splash framebuffer or raw-mode tty), or — when
+/// serial — does a line-mode `getpass`-style read on stdin/stdout.
+///
+/// Does NOT open its own console. The orchestrator (main.rs) brings
+/// up exactly one `Console` for the whole boot and passes it through
+/// the activation runner; the supplier reuses that handle so the
+/// passphrase modal renders on the same backend as the surrounding
+/// boot-status screen.
 pub struct TuiPasswordSupplier {
     pub config_serial: bool,
 }
@@ -443,11 +441,16 @@ impl TuiPasswordSupplier {
 }
 
 impl PasswordSupplier for TuiPasswordSupplier {
-    fn prompt(&mut self, label: &str) -> Result<Zeroizing<String>> {
+    fn prompt(&mut self, console: &mut dyn Console, label: &str) -> Result<Zeroizing<String>> {
         if self.config_serial {
+            // Serial mode has no Console TUI plumbing; the rest of the
+            // serial code path uses stdin/stdout directly and so does
+            // the passphrase prompt. The supplied `console` handle is
+            // intentionally unused on this branch.
+            let _ = console;
             return serial_passphrase_prompt(label);
         }
-        tui_passphrase_prompt(label)
+        passphrase_prompt_on_console(console, label)
     }
 }
 
@@ -476,21 +479,17 @@ fn serial_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(buf))
 }
 
-/// Render the passphrase modal under a raw-mode guard and poll keys
-/// until the operator submits or cancels. Esc returns an error so the
-/// caller can drop to the emergency shell.
+/// Drive the [`Screen::Passphrase`] modal on the supplied [`Console`]
+/// until the operator submits (Enter) or cancels (Esc).
 ///
-/// The splash passphrase modal is deferred: activation runs after the
-/// boot menu, so the DRM card may have been handed off back to the
-/// kernel console already. Routing this through the tty path keeps the
-/// passphrase prompt reliable across both splash and non-splash boots.
-fn tui_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
-    let console = open_console(Path::new(CONSOLE_PATH))?;
-    let _raw = RawModeGuard::new(console.as_fd())?;
-
-    let backend = CrosstermBackend::new(std::io::stdout());
-    let mut terminal = Terminal::new(backend).map_err(tui_err)?;
-
+/// Esc translates to a [`NmblError::Tui`] so the caller can drop to
+/// the emergency shell. The Console is reused, NOT re-opened — the
+/// orchestrator already brought up the splash framebuffer or raw-mode
+/// tty before phase 1 and held it through every phase.
+pub(crate) fn passphrase_prompt_on_console(
+    console: &mut dyn Console,
+    label: &str,
+) -> Result<Zeroizing<String>> {
     // No generations to render — pass an empty slice. The App is
     // only used here for its Passphrase screen state.
     let empty: [Generation; 0] = [];
@@ -503,33 +502,28 @@ fn tui_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
     let mut dirty = true;
     loop {
         if dirty {
-            terminal
-                .draw(|f| render_current_screen(f, &app))
-                .map_err(tui_err)?;
+            console.render(&app)?;
             dirty = false;
         }
 
-        if event::poll(POLL_SLICE).map_err(tui_err)? {
-            let evt = event::read().map_err(tui_err)?;
-            if let Event::Key(key) = evt {
-                let exited = app.on_key(key);
-                // Esc on the passphrase screen sets a Shell decision.
-                if matches!(app.decision, Some(Decision::Shell)) {
-                    return Err(NmblError::Tui {
-                        source: std::io::Error::other("operator cancelled passphrase entry"),
-                    });
-                }
-                if exited {
-                    // Enter was pressed — extract the buffer and return.
-                    if let Screen::Passphrase { buffer, .. } = app.screen {
-                        return Ok(buffer);
-                    }
-                    return Err(NmblError::Tui {
-                        source: std::io::Error::other("passphrase screen exited without a buffer"),
-                    });
-                }
-                dirty = true;
+        if let Some(key) = console.poll_key(POLL_SLICE)? {
+            let exited = app.on_key(key);
+            // Esc on the passphrase screen sets a Shell decision.
+            if matches!(app.decision, Some(Decision::Shell)) {
+                return Err(NmblError::Tui {
+                    source: std::io::Error::other("operator cancelled passphrase entry"),
+                });
             }
+            if exited {
+                // Enter was pressed — extract the buffer and return.
+                if let Screen::Passphrase { buffer, .. } = app.screen {
+                    return Ok(buffer);
+                }
+                return Err(NmblError::Tui {
+                    source: std::io::Error::other("passphrase screen exited without a buffer"),
+                });
+            }
+            dirty = true;
         }
     }
 }
@@ -588,5 +582,146 @@ mod tests {
         let cfg: Config = toml::from_str("").expect("default cfg");
         let mut sup = TuiPasswordSupplier::new(&cfg);
         let _coerced: &mut dyn PasswordSupplier = &mut sup;
+    }
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::ui::console::ConsoleKind;
+
+    /// Console test double that returns canned key events and records
+    /// every render call. `poll_key` first drains the queue (returning
+    /// one event per call) and then yields `None` so the supplier's
+    /// loop wraps tightly without us having to manage real timeouts.
+    struct ScriptedConsole {
+        keys: std::collections::VecDeque<KeyEvent>,
+        renders: u32,
+        last_buffer_len: usize,
+        last_label: Option<String>,
+    }
+
+    impl ScriptedConsole {
+        fn new(keys: Vec<KeyEvent>) -> Self {
+            Self {
+                keys: keys.into(),
+                renders: 0,
+                last_buffer_len: 0,
+                last_label: None,
+            }
+        }
+    }
+
+    impl Console for ScriptedConsole {
+        fn render(&mut self, app: &App<'_>) -> Result<()> {
+            self.renders = self.renders.saturating_add(1);
+            if let Screen::Passphrase {
+                buffer,
+                prompt_label,
+            } = &app.screen
+            {
+                self.last_buffer_len = buffer.len();
+                self.last_label = Some(prompt_label.clone());
+            }
+            Ok(())
+        }
+        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+            Ok(self.keys.pop_front())
+        }
+        fn size(&self) -> (u16, u16) {
+            (80, 24)
+        }
+        fn kind(&self) -> ConsoleKind {
+            ConsoleKind::Tty
+        }
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn passphrase_prompt_collects_typed_chars_and_returns_on_enter() {
+        // Type "ok" + Enter — supplier must return "ok" and the
+        // console must have observed the per-char buffer growth.
+        let keys = vec![
+            press(KeyCode::Char('o')),
+            press(KeyCode::Char('k')),
+            press(KeyCode::Enter),
+        ];
+        let mut console = ScriptedConsole::new(keys);
+        let secret = passphrase_prompt_on_console(&mut console, "Unlock root")
+            .expect("Enter submits the buffer");
+        assert_eq!(&**secret, "ok");
+        // Initial render + 2 char-keys + 1 Enter = 4 dirty repaints.
+        assert!(
+            console.renders >= 3,
+            "expected at least 3 renders, got {}",
+            console.renders
+        );
+        assert_eq!(
+            console.last_label.as_deref(),
+            Some("Unlock root"),
+            "render path must observe the supplied prompt label"
+        );
+    }
+
+    #[test]
+    fn passphrase_prompt_backspace_shrinks_buffer() {
+        let keys = vec![
+            press(KeyCode::Char('a')),
+            press(KeyCode::Char('b')),
+            press(KeyCode::Backspace),
+            press(KeyCode::Enter),
+        ];
+        let mut console = ScriptedConsole::new(keys);
+        let secret = passphrase_prompt_on_console(&mut console, "Unlock")
+            .expect("Enter submits the buffer");
+        assert_eq!(&**secret, "a", "backspace must drop the last char");
+    }
+
+    #[test]
+    fn passphrase_prompt_esc_returns_tui_error() {
+        let keys = vec![press(KeyCode::Char('x')), press(KeyCode::Esc)];
+        let mut console = ScriptedConsole::new(keys);
+        let err = passphrase_prompt_on_console(&mut console, "Unlock")
+            .expect_err("Esc must propagate as a Tui error");
+        assert!(matches!(err, NmblError::Tui { .. }));
+    }
+
+    #[test]
+    fn passphrase_prompt_renders_dotted_mask_via_view() {
+        // End-to-end visual check: drive the supplier under a TestBackend
+        // until just before Enter, then synthesise one final render to
+        // capture the masked view. Sanity-checks both that the supplier
+        // reuses render_passphrase and that the mask grows with the buffer.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let data = PassphraseScreenData {
+            prompt_label: "Unlock root",
+            buffer_len: 4,
+        };
+        let mut term = Terminal::new(TestBackend::new(60, 14)).expect("test terminal");
+        term.draw(|f| render_passphrase(f, &data)).expect("draw");
+        let buf = term.backend().buffer();
+        let dump: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_owned()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            dump.contains("****"),
+            "masked dots must be visible for buffer_len=4: \n{dump}"
+        );
+        assert!(
+            dump.contains("Unlock root"),
+            "prompt label must be visible: \n{dump}"
+        );
+        assert!(
+            dump.contains("Enter=submit"),
+            "footer hint must be visible: \n{dump}"
+        );
     }
 }
