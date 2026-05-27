@@ -45,6 +45,12 @@ pkgs.runCommand "nmbl-rescue.sfs"
     mkdir -p root
     cp -aL ${rescueRoot}/. root/
 
+    # `pivot_root(new_root, put_old)` needs `put_old` to exist inside the
+    # squashfs image (the Rust disk-rescue code uses `oldroot`). Create the
+    # empty directory here so the read-only squashfs already contains it at
+    # boot time — the Rust code cannot mkdir inside an RO filesystem.
+    mkdir -p root/oldroot
+
     # `-comp zstd -Xcompression-level 19` matches the plan: best ratio
     # at build time, page-by-page decompression at runtime so the boot
     # cost is amortised. `-noappend` makes the build deterministic by
