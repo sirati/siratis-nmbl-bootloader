@@ -59,9 +59,16 @@ pub struct SplashInput {
 impl SplashInput {
     /// Open the given tty path read/write, enter raw mode, return a
     /// reader. The saved termios is restored on drop.
+    ///
+    /// Also calls VT_ACTIVATE on the fd to force the VT into the
+    /// foreground. Without this the kernel routes PS/2 / VNC keypresses
+    /// to whichever VT is currently active (typically the same one the
+    /// fbcon attached to), which may not be the one we just opened.
+    /// With it, reads from this fd reliably surface every keystroke.
     pub fn open(path: &Path) -> Result<SplashInput> {
         let fd = open_console(path)?;
         let saved = enter_raw(fd.as_fd())?;
+        activate_vt(&fd);
         Ok(SplashInput {
             fd,
             saved_termios: Some(saved),
@@ -113,6 +120,30 @@ impl Drop for SplashInput {
                 self.fd.as_raw_fd()
             );
         }
+    }
+}
+
+/// Force the VT bound to `fd` into the foreground via `VT_ACTIVATE`.
+/// On x86 the constant is `0x5606` and the third arg is the 1-based
+/// VT number. Failure is non-fatal: log and continue. The single
+/// unsafe call is documented in docs/architecture.md alongside the
+/// other accepted ioctls (finit_module, kexec_file_load).
+fn activate_vt(fd: &OwnedFd) {
+    use std::os::fd::AsRawFd as _;
+    const VT_ACTIVATE: libc::Ioctl = 0x5606;
+    // /dev/tty1 → VT 1. We always open VT1 (see splash::INPUT_TTY_PATH)
+    // so the VT number is fixed.
+    let vt_number: libc::c_int = 1;
+    // SAFETY: VT_ACTIVATE takes an integer argument as the third ioctl
+    // parameter; the kernel reads `vt_number` by value. The fd is a
+    // live, open tty char device per the contract on this function.
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), VT_ACTIVATE, vt_number) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        nmbl_warn!(
+            "VT_ACTIVATE({vt_number}) on splash input fd failed: {err}; \
+             keystrokes may not reach the splash"
+        );
     }
 }
 
