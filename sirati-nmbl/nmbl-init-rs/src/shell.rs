@@ -1,72 +1,52 @@
-//! Emergency-shell exec site (PLAN.md §6.3 / §9).
+//! Emergency-shell entrypoint (PLAN.md §6.3 / §9).
 //!
-//! This module is one of the few crate sites permitted to replace the
-//! current process via `execve(2)` (see also `src/panic.rs` and
-//! `src/sys/activation.rs`). When any top-level phase returns `Err`,
-//! `main` routes the error through [`drop_to_emergency`], which prints
-//! an operator-facing banner including the full error chain and a
-//! variant-specific hint, then `execve`s the configured shell binary.
+//! When any top-level phase returns `Err`, `main` routes the error
+//! through [`drop_to_emergency`], which prints an operator-facing
+//! banner including the full error chain and a variant-specific hint,
+//! then hands off to [`crate::rescue::dispatch`]. The dispatcher
+//! decides whether to `execve(2)` the embedded busybox, loop-mount the
+//! external rescue squashfs, fetch one over HTTP, or halt — see
+//! `src/rescue/mod.rs`.
 //!
-//! On success the function does not return — the new shell process
+//! On success the function does not return — the chosen shell process
 //! inherits PID 1. The signature uses [`std::convert::Infallible`] to
 //! document that contract at the type level: a caller that does
 //! `let _: Infallible = drop_to_emergency(...);` will never proceed.
 //!
-//! Failure modes are themselves "no-return": if the `execve(2)` fails
-//! (shell binary missing, ENOEXEC, EACCES, …) we print one last
-//! diagnostic and halt the system via `reboot(RB_HALT_SYSTEM)` — a
-//! kernel panic is preferable to silently returning to a caller that
-//! expects `Infallible`.
+//! Failure modes are themselves "no-return": if `rescue::dispatch`
+//! returns `Err` (no rescue path reachable, embedded execve failed,
+//! …) we print one last diagnostic and halt the system via
+//! `reboot(RB_HALT_SYSTEM)` — a kernel panic is preferable to silently
+//! returning to a caller that expects `Infallible`.
 
 use std::convert::Infallible;
-use std::ffi::CString;
 
 use nix::sys::reboot::{RebootMode, reboot};
-use nix::unistd::execve;
 
 use crate::config::Config;
 use crate::error::{NmblError, format_chain};
+use crate::rescue;
 
-/// Print the operator-facing emergency banner and `execve(2)` the
-/// configured shell. Does not return on success; on `execve` failure
+/// Print the operator-facing emergency banner and hand off to the
+/// rescue dispatcher. Does not return on success; on dispatch failure
 /// halts the system rather than returning to the caller.
 pub fn drop_to_emergency(config: &Config, err: NmblError) -> Infallible {
     print_banner(config, &err);
 
-    let shell_path = config.paths.shell.as_path();
-    let argv0_bytes: Vec<u8> = shell_path
-        .file_name()
-        .map(|n| n.as_encoded_bytes().to_vec())
-        .unwrap_or_else(|| shell_path.as_os_str().as_encoded_bytes().to_vec());
-
-    // Any interior NUL here means the operator put a NUL in the config
-    // path — astronomically unlikely but still has to be handled. We
-    // synthesize a Shell error, log it, and halt.
-    let path_c = match CString::new(shell_path.as_os_str().as_encoded_bytes()) {
-        Ok(c) => c,
-        Err(_) => halt_with("shell path contains interior NUL"),
-    };
-    let argv0_c = match CString::new(argv0_bytes) {
-        Ok(c) => c,
-        Err(_) => halt_with("shell argv0 contains interior NUL"),
-    };
-
-    let argv: [&CString; 1] = [&argv0_c];
-    let env: [&CString; 0] = [];
-
-    // execve only returns on error.
-    let exec_err = execve(&path_c, &argv, &env).err();
-
-    // Surface the underlying errno (if any) before halting so the
-    // operator sees why their shell didn't come up.
-    if let Some(source) = exec_err {
-        let synthetic = NmblError::Shell { source };
-        eprintln!(
-            "[nmbl] EMERGENCY SHELL EXEC FAILED: {}",
-            format_chain(&synthetic as &dyn std::error::Error)
-        );
+    // rescue::dispatch returns Result<Infallible>: success is the
+    // noreturn path (process image is replaced), so the Ok arm matches
+    // against an uninhabited type. Any Err means no rescue strategy
+    // could complete — we log the failure chain and halt.
+    match rescue::dispatch(config, &err) {
+        Ok(infallible) => match infallible {},
+        Err(dispatch_err) => {
+            eprintln!(
+                "[nmbl] EMERGENCY RESCUE DISPATCH FAILED: {}",
+                format_chain(&dispatch_err as &dyn std::error::Error)
+            );
+            halt_with("rescue dispatch failed; halting")
+        }
     }
-    halt_with("emergency shell exec failed; halting")
 }
 
 /// Print the full operator-facing banner: header, suggested action,
