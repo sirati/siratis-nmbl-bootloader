@@ -69,6 +69,18 @@ fn default_panic_report_dir() -> PathBuf {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelModules {
+    /// Modules loaded BEFORE the boot console is brought up. Reserved
+    /// for graphics drivers (`virtio_gpu`, `simpledrm`, `i915`, …) so
+    /// `/dev/dri/card*` exists when `open_console` tries to attach the
+    /// splash backend. Loaded by `modules::load_modules(_,_,
+    /// ModuleSet::Early)` during phase 2a, immediately before
+    /// `open_console`.
+    #[serde(default)]
+    pub early: Vec<String>,
+
+    /// Storage / filesystem / activation modules loaded in phase 2b,
+    /// AFTER the boot console is up so the operator sees per-module
+    /// progress.
     #[serde(default)]
     pub explicit: Vec<String>,
 

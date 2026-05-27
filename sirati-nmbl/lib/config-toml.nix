@@ -36,6 +36,10 @@ let
     };
 
     kernel_modules = {
+      # Pre-console graphics drivers (phase 2a). Loaded before
+      # `open_console` so the splash backend has a DRM card to attach
+      # to in `qemu_kernel_invoke` mode (no kmod auto-load).
+      early = cfg.earlyExplicitKernelModules;
       explicit = cfg.explicitKernelModules ++ cfg.activation.extraKernelModules;
       blacklist = cfg.blacklistedKernelModules;
       modules_dir = "/lib/modules";
