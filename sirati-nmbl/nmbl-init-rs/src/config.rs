@@ -327,6 +327,15 @@ fn default_bootstrap_config_path() -> PathBuf {
     PathBuf::from("/nmbl/config.toml")
 }
 
+/// Resolve the absolute on-disk path of the full `Config` by joining the
+/// boot filesystem mountpoint with `config_path`. Any leading `/` on
+/// `config_path` is stripped so [`Path::join`] keeps the mountpoint
+/// instead of replacing it.
+pub fn resolve_full_config_path(mountpoint: &Path, config_path: &Path) -> PathBuf {
+    let stripped = config_path.strip_prefix("/").unwrap_or(config_path);
+    mountpoint.join(stripped)
+}
+
 impl BootstrapConfig {
     /// Reject contradictory rescue defaults: `default_url` and
     /// `default_sha256` are both stringly-typed sentinels (empty =
@@ -699,6 +708,36 @@ mountpoint = "/mnt/boot"
             },
         };
         cfg.validate().expect_err("sha without url must reject");
+    }
+
+    #[test]
+    fn resolve_full_config_path_strips_leading_slash() {
+        let mp = Path::new("/mnt/boot");
+        let cp = Path::new("/nmbl/config.toml");
+        assert_eq!(
+            resolve_full_config_path(mp, cp),
+            PathBuf::from("/mnt/boot/nmbl/config.toml"),
+        );
+    }
+
+    #[test]
+    fn resolve_full_config_path_joins_relative_path() {
+        let mp = Path::new("/mnt/boot");
+        let cp = Path::new("nmbl/config.toml");
+        assert_eq!(
+            resolve_full_config_path(mp, cp),
+            PathBuf::from("/mnt/boot/nmbl/config.toml"),
+        );
+    }
+
+    #[test]
+    fn resolve_full_config_path_handles_nested_mountpoint() {
+        let mp = Path::new("/run/nmbl/boot");
+        let cp = Path::new("/nmbl/config.toml");
+        assert_eq!(
+            resolve_full_config_path(mp, cp),
+            PathBuf::from("/run/nmbl/boot/nmbl/config.toml"),
+        );
     }
 
     #[test]

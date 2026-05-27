@@ -9,25 +9,27 @@
 //!   loads config best-effort, drops straight to the emergency shell
 //!   with [`NmblError::Panicked`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use nix::sys::reboot::{RebootMode, reboot};
 
 use nmbl_init::activation::{KeyInjection, run_all_activations};
 use nmbl_init::boot::kexec_into;
-use nmbl_init::config::Config;
+use nmbl_init::config::{BootstrapConfig, Config, resolve_full_config_path};
 use nmbl_init::devices::mount_system_filesystems;
 use nmbl_init::error::{NmblError, Result};
 use nmbl_init::generations::scan_generations;
-use nmbl_init::modules::load_explicit_modules;
+use nmbl_init::modules::{load_explicit_modules, load_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
 use nmbl_init::panic::install_panic_hook;
 use nmbl_init::shell::drop_to_emergency;
+use nmbl_init::sys::{blkid, mount as sys_mount};
 use nmbl_init::ui::{Decision, TuiPasswordSupplier, run_selector};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/nmbl/config.toml";
+const BOOTSTRAP_CONFIG_PATH: &str = "/etc/nmbl/bootstrap.toml";
 
 struct Args {
     config_path: PathBuf,
@@ -120,9 +122,6 @@ fn recover_from_panic(args: Args, report_path: PathBuf) -> std::convert::Infalli
 /// shell. Returns the LUKS-passphrase injections that the kexec phase
 /// must thread into the chained initrd.
 fn run_phases(config: &Config) -> Result<Vec<KeyInjection>> {
-    nmbl_info!("phase 1: mount pseudo-filesystems");
-    mount_pseudo_filesystems()?;
-
     nmbl_info!("phase 2: load explicit kernel modules");
     load_explicit_modules(config)?;
 
@@ -134,6 +133,77 @@ fn run_phases(config: &Config) -> Result<Vec<KeyInjection>> {
     mount_system_filesystems(config)?;
 
     Ok(injections)
+}
+
+/// Phase 0.5: two-tier bootstrap. Loads the embedded
+/// `/etc/nmbl/bootstrap.toml`, brings up the minimum kernel modules it
+/// names, sweeps blkid to populate `/dev/disk/by-*`, mounts the boot
+/// filesystem, and reads the full `Config` from there.
+///
+/// On any failure the returned `NmblError::Bootstrap` carries a `stage`
+/// string the emergency-shell banner surfaces. Once `boot_fs` is
+/// mounted we intentionally leave it mounted on the error path so the
+/// operator's shell still sees it under `bootstrap.boot_fs.mountpoint`.
+fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
+    nmbl_info!("phase 0.5: loading bootstrap config {}", bootstrap_path.display());
+    let bootstrap = BootstrapConfig::load(bootstrap_path)?;
+    let section = &bootstrap.bootstrap;
+
+    nmbl_info!(
+        "phase 0.5: loading {} bootstrap kernel modules",
+        section.kernel_modules.explicit.len()
+    );
+    load_modules(
+        Path::new("/lib/modules"),
+        &section.kernel_modules.explicit,
+        &[],
+    )
+    .map_err(|source| NmblError::Bootstrap {
+        stage: "load-modules",
+        source: Box::new(source),
+    })?;
+
+    nmbl_info!("phase 0.5: populating /dev/disk/by-* symlinks");
+    blkid::populate_disk_by_symlinks().map_err(|source| NmblError::Bootstrap {
+        stage: "blkid-sweep",
+        source: Box::new(source),
+    })?;
+
+    let boot_fs = &section.boot_fs;
+    nmbl_info!(
+        "phase 0.5: mounting boot fs {} at {} (type {})",
+        boot_fs.device,
+        boot_fs.mountpoint.display(),
+        boot_fs.fstype,
+    );
+    std::fs::create_dir_all(&boot_fs.mountpoint).map_err(|source| NmblError::Bootstrap {
+        stage: "mount-boot",
+        source: Box::new(NmblError::Io {
+            source,
+            context: format!("creating boot mountpoint {}", boot_fs.mountpoint.display()),
+        }),
+    })?;
+    sys_mount::mount_fs(
+        Some(Path::new(&boot_fs.device)),
+        &boot_fs.mountpoint,
+        &boot_fs.fstype,
+        &boot_fs.options,
+    )
+    .map_err(|source| NmblError::Bootstrap {
+        stage: "mount-boot",
+        source: Box::new(source),
+    })?;
+
+    // boot_fs is mounted; from here on, any failure must NOT unmount
+    // it — the operator's emergency shell needs to see it.
+    let full_path = resolve_full_config_path(&boot_fs.mountpoint, &section.config_path);
+    nmbl_info!("phase 0.5: loading full config from {}", full_path.display());
+    let config = Config::load(&full_path).map_err(|source| NmblError::Bootstrap {
+        stage: "read-config",
+        source: Box::new(source),
+    })?;
+
+    Ok(config)
 }
 
 /// Run phases 4→6 (generation discovery, UI, decision dispatch). Kept
@@ -212,12 +282,26 @@ fn main() -> ExitCode {
         match recover_from_panic(args, report_path) {}
     }
 
+    // Two-tier vs single-tier branch. The bootstrap.toml file is shipped
+    // inside the initramfs by the new Nix path; its absence means the
+    // image was built with the legacy single-tier flow and the real
+    // config lives at `args.config_path` (default `/etc/nmbl/config.toml`).
+    let bootstrap_path = Path::new(BOOTSTRAP_CONFIG_PATH);
+    let bootstrap_mode = bootstrap_path.exists();
+
     // Config load is the chicken-and-egg moment: if it fails we have
-    // no `shell` path, no verbosity, no nothing. Fall back to the
-    // recovery default and route the load error through the shell.
-    let (config, load_err): (Config, Option<NmblError>) = match Config::load(&args.config_path) {
-        Ok(c) => (c, None),
-        Err(err) => (Config::recovery_default(), Some(err)),
+    // no `shell` path, no verbosity, no nothing. In bootstrap mode the
+    // real config only becomes reachable after Phase 0.5 mounts the
+    // boot filesystem, so seed from `recovery_default` and replace
+    // later. In single-tier mode load from `args.config_path` with a
+    // recovery-default fallback as before.
+    let (mut config, load_err): (Config, Option<NmblError>) = if bootstrap_mode {
+        (Config::recovery_default(), None)
+    } else {
+        match Config::load(&args.config_path) {
+            Ok(c) => (c, None),
+            Err(err) => (Config::recovery_default(), Some(err)),
+        }
     };
 
     // Install the panic hook now that we know where to write reports.
@@ -231,6 +315,24 @@ fn main() -> ExitCode {
 
     if let Some(err) = load_err {
         match drop_to_emergency(&config, err) {}
+    }
+
+    // Phase 1 lives at the top level so Phase 0.5 (when active) sees
+    // /proc, /sys, /dev already mounted before it touches blkid or the
+    // boot filesystem.
+    nmbl_info!("phase 1: mount pseudo-filesystems");
+    if let Err(err) = mount_pseudo_filesystems() {
+        match drop_to_emergency(&config, err) {}
+    }
+
+    if bootstrap_mode {
+        match run_bootstrap_phase(bootstrap_path) {
+            Ok(loaded) => config = loaded,
+            // boot_fs may have been mounted before the failure — the
+            // emergency shell wants to see it, so we do NOT unmount on
+            // this path.
+            Err(err) => match drop_to_emergency(&config, err) {},
+        }
     }
 
     let outcome = run_phases(&config).and_then(|injections| select_and_act(&config, &injections));
