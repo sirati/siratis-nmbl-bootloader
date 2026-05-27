@@ -46,7 +46,7 @@ print_stdout     = "allow"
 # tree is `#[cfg]`d out and the optional deps are not compiled, so
 # enabling this feature is purely additive — the default build is
 # byte-for-byte identical to a feature-free build.
-network-rescue = ["dep:dhcproto", "dep:sha2"]
+network-rescue = ["dep:dhcproto", "dep:sha2", "dep:getrandom"]
 
 [dependencies]
 nix = { version = "0.29", default-features = false, features = ["mount", "fs", "process", "term", "user", "signal", "reboot", "feature", "net"] }
@@ -76,6 +76,9 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 # verify the rescue blob against the operator-pinned digest.
 dhcproto = { version = "0.13", optional = true, default-features = false }
 sha2     = { version = "0.10", optional = true, default-features = false }
+# Single 4-byte read for the DHCPv4 XID. We avoid pulling in a full RNG
+# crate (`rand`); `getrandom::fill` reads straight from `getrandom(2)`.
+getrandom = { version = "0.3", optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
