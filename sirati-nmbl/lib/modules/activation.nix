@@ -53,7 +53,12 @@ let
   # --- extraKernelModules ---------------------------------------------------
 
   extraKernelModules = lib.unique (
-    lib.optionals luksAny [ "dm_mod" "dm-crypt" "aes" ]
+    # encrypted_keys.ko's init calls alloc_cipher("ecb(aes)") which needs
+    # both an AES provider (aesni_intel) AND the ecb cipher mode module
+    # registered with the kernel crypto API. Load them here so they're
+    # live by the time the base list pulls in dm-crypt (whose dep walk
+    # pulls in encrypted_keys). xts is the LUKS2 data-encryption mode.
+    lib.optionals luksAny [ "dm_mod" "aesni_intel" "ecb" "xts" "sha256_generic" "dm-crypt" ]
     ++ lib.optionals luksTpm [ "tpm_crb" "tpm_tis" ]
     ++ lib.optional lvmOn "dm_mod"
     ++ lib.optionals mdOn [ "md_mod" "raid0" "raid1" "raid10" "raid456" ]
@@ -74,7 +79,7 @@ let
 
   # --- activationBlocks ([[activation]] TOML rows) --------------------------
 
-  luksBaseMods = [ "dm_mod" "dm-crypt" "aes" ];
+  luksBaseMods = [ "dm_mod" "dm-crypt" "aesni_intel" "xts" "sha256_generic" ];
   luksTpmMods = luksBaseMods ++ [ "tpm_crb" "tpm_tis" ];
 
   mkLuksBlock = l:
