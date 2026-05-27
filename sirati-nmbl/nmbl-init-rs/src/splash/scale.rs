@@ -20,12 +20,7 @@ use crate::splash::types::FramebufferDims;
 /// than `src_w * src_h * 4` bytes. The splash caller treats any empty
 /// return as "skip the background blit", which is the right fallback
 /// when assets are malformed.
-pub fn cover_scale_nearest(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst: FramebufferDims,
-) -> Vec<u8> {
+pub fn cover_scale_nearest(src: &[u8], src_w: u32, src_h: u32, dst: FramebufferDims) -> Vec<u8> {
     if src_w == 0 || src_h == 0 || dst.w == 0 || dst.h == 0 {
         return Vec::new();
     }
@@ -226,10 +221,7 @@ mod tests {
             for x in 0..8 {
                 let off = (y * 8 + x) * 4;
                 let pixel = &out[off..off + 4];
-                assert_eq!(
-                    pixel, want,
-                    "row {y} col {x}: got {pixel:?}, want {want:?}",
-                );
+                assert_eq!(pixel, want, "row {y} col {x}: got {pixel:?}, want {want:?}",);
             }
         }
     }

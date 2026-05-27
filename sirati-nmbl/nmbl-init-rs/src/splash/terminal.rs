@@ -156,7 +156,11 @@ mod tests {
             assert!(cell.flags.is_empty(), "fresh grid cell must have no flags");
             seen += 1;
         });
-        assert_eq!(seen, 10 * 3, "for_each_cell must visit every cell exactly once");
+        assert_eq!(
+            seen,
+            10 * 3,
+            "for_each_cell must visit every cell exactly once"
+        );
     }
 
     #[test]

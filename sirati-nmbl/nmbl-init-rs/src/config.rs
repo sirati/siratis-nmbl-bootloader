@@ -416,8 +416,8 @@ mod tests {
     #[test]
     fn config_rejects_unknown_splash_field() {
         let toml_text = "[splash]\nfoo = 1\n";
-        let err = toml::from_str::<Config>(toml_text)
-            .expect_err("unknown splash field must be rejected");
+        let err =
+            toml::from_str::<Config>(toml_text).expect_err("unknown splash field must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("foo") || msg.contains("unknown"),
