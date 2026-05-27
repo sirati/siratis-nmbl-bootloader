@@ -370,6 +370,11 @@ in
           ++ fsDerivedKernelModules
           ++ lib.optionals (cfg.rescue.network && cfg.rescue.mode == "external") (
             cfg.rescue.nicDrivers ++ nicDetectedKernelModules
+            # af_packet is the kernel module that enables AF_PACKET sockets.
+            # The DHCP client in rescue/net.rs opens socket(AF_PACKET, SOCK_DGRAM,
+            # ETH_P_IP) to send/receive raw DHCP frames; without this module the
+            # call fails with EAFNOSUPPORT before any packet leaves the NIC.
+            ++ [ "af_packet" ]
           )
         )
       );
