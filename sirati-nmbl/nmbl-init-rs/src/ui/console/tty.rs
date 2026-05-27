@@ -130,7 +130,14 @@ impl Console for TtyConsole {
             return Ok(None);
         }
         match event::read().map_err(tui_err)? {
-            Event::Key(k) => Ok(Some(k)),
+            Event::Key(k) => {
+                nmbl_warn!(
+                    "TtyConsole parsed: code={:?} mods={:?}",
+                    k.code,
+                    k.modifiers
+                );
+                Ok(Some(k))
+            }
             _ => Ok(None),
         }
     }
