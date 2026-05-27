@@ -945,24 +945,51 @@ mod tests {
         }
     }
 
+    // The boot-status setters use `debug_assert!(false, ...)` on the
+    // wrong-screen branch, so behaviour differs between profiles:
+    //   - debug builds: each setter panics with the assertion text.
+    //   - release builds: each setter is a silent no-op.
+    // We pin both profiles so a future edit that breaks either path
+    // (e.g. flipping `debug_assert!` to `assert!`, or swapping the
+    // branch to a state mutation) is caught by `cargo test`.
+
+    #[cfg(debug_assertions)]
     #[test]
-    fn boot_status_setters_are_noop_on_other_screens_in_release() {
-        // In release builds the setters are no-ops on non-BootStatus
-        // screens — debug_assert is stripped. We can't toggle the cfg
-        // mid-test, but we can drive the same path via a small helper
-        // that checks `let-else` branches don't panic when the
-        // assertion is *expected* to fire only in debug builds. To
-        // keep this test universally runnable, we run it only outside
-        // debug_assertions.
-        if cfg!(debug_assertions) {
-            return;
-        }
+    #[should_panic(expected = "set_boot_phase called on non-BootStatus screen")]
+    fn boot_status_set_phase_panics_on_wrong_screen_in_debug() {
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens); // Screen::List
+        app.set_boot_phase("ignored");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "set_boot_log_lines called on non-BootStatus screen")]
+    fn boot_status_set_log_lines_panics_on_wrong_screen_in_debug() {
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens); // Screen::List
+        app.set_boot_log_lines(vec!["ignored".into()]);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "tick_boot_spinner called on non-BootStatus screen")]
+    fn boot_status_tick_spinner_panics_on_wrong_screen_in_debug() {
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens); // Screen::List
+        app.tick_boot_spinner();
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn boot_status_setters_are_noop_on_wrong_screen_in_release() {
+        // debug_assert is stripped, so each setter must leave the App
+        // unchanged when invoked on a non-BootStatus screen.
         let gens: Vec<Generation> = vec![];
         let mut app = App::new(&gens); // Screen::List
         app.set_boot_phase("ignored");
         app.set_boot_log_lines(vec!["ignored".into()]);
         app.tick_boot_spinner();
-        // Screen must still be List, untouched.
         assert!(matches!(app.screen, Screen::List));
     }
 
