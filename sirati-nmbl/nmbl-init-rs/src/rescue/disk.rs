@@ -136,6 +136,23 @@ pub fn try_disk_rescue(config: &Config, cause: &NmblError) -> Result<Infallible>
         stage: "pivot-root",
         source: Box::new(source),
     })?;
+
+    // `pivot_root(2)` requires that the current root filesystem is a proper
+    // mount point, not the kernel's initial `rootfs` pseudo-filesystem. In
+    // an initramfs the root is always `rootfs`, so we bind-mount it over
+    // itself to promote it to a regular mount that `pivot_root` accepts.
+    // The kernel ignores the fstype for bind mounts.
+    mount_fs(
+        Some(Path::new("/")),
+        Path::new("/"),
+        "none",
+        "bind",
+    )
+    .map_err(|source| NmblError::Rescue {
+        stage: "pivot-root",
+        source: Box::new(source),
+    })?;
+
     pivot_root(rescue_dir, &oldroot).map_err(|source| NmblError::Rescue {
         stage: "pivot-root",
         source: Box::new(NmblError::Io {
