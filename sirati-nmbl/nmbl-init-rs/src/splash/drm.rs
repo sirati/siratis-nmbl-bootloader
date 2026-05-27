@@ -297,6 +297,39 @@ impl SplashDrm {
         self.flip_internal()
     }
 
+    /// Release the DRM master lock so the kernel VT (or another DRM
+    /// client) can reclaim the framebuffer. Used by
+    /// [`crate::ui::console::SplashConsole::suspend`] when the
+    /// operator opts to multiplex the emergency shell onto the same
+    /// console the splash backend is painting to.
+    ///
+    /// Best-effort by design: simpledrm refuses to release master in
+    /// some configurations (single-client driver, no master-lock
+    /// concept). We log and proceed — the worst case is that the
+    /// shell's output is rendered through our backend instead of
+    /// through the kernel VT, which is still legible.
+    pub fn drop_master(&self) {
+        if let Err(e) = self.card.release_master_lock() {
+            nmbl_warn!(
+                "splash::drm: release_master_lock failed: {e}; \
+                 framebuffer ownership remains with NMBL",
+            );
+        }
+    }
+
+    /// Re-acquire DRM master after [`drop_master`]. Best-effort: if
+    /// the kernel refuses (another client took ownership) the
+    /// subsequent `set_crtc` in [`render`] will fail and the splash
+    /// path can fall through to the tty console.
+    pub fn acquire_master(&self) {
+        if let Err(e) = self.card.acquire_master_lock() {
+            nmbl_warn!(
+                "splash::drm: acquire_master_lock failed: {e}; \
+                 next render may produce no visible output",
+            );
+        }
+    }
+
     /// Commit the current buffer contents to the connector.
     ///
     /// We re-issue `set_crtc` per frame: synchronous and trivially

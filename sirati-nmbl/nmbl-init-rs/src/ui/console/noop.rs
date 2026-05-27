@@ -90,6 +90,19 @@ impl Console for NoopConsole {
     fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
         Ok(())
     }
+
+    /// The sentinel owns no display, so suspending is a no-op. We
+    /// implement the trait method to keep the call sites unconditional;
+    /// the suspend/resume contract is "release the display if you have
+    /// one", and we don't.
+    fn suspend(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Counterpart to [`suspend`]; nothing to re-acquire.
+    fn resume(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ use crossterm::event::KeyEvent;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
+use crate::nmbl_warn;
 use crate::splash::drm::{SplashDrm, open_card_with_fallback};
 use crate::splash::glyph_cache::{self, GlyphCache};
 use crate::splash::input::SplashInput;
@@ -150,5 +151,37 @@ impl Console for SplashConsole {
             self.cell_dims,
             body,
         )
+    }
+
+    /// Hand the framebuffer back to the kernel-elected VT so the
+    /// kernel resumes painting printk + the active VT renders the
+    /// multiplexed shell output. We release DRM master and restore
+    /// the input tty's termios so the foreign writer can pass bytes
+    /// through `/dev/tty1` without our raw-mode flags eating them.
+    ///
+    /// The mode-set state is preserved — `resume` re-acquires master
+    /// and re-renders the splash composite without re-running the
+    /// font load / cover-scale pipeline.
+    fn suspend(&mut self) -> Result<()> {
+        // DRM master FIRST: doing it before termios restore minimises
+        // the window where the kernel could paint printk while
+        // userspace still has raw-mode termios.
+        self.drm.drop_master();
+        if let Err(e) = self.input.suspend() {
+            nmbl_warn!("SplashConsole::suspend: input suspend failed: {e}");
+        }
+        Ok(())
+    }
+
+    /// Re-acquire the framebuffer + raw-mode input tty. The render
+    /// pipeline is unchanged; the next [`render`] call will flush a
+    /// full frame because each splash frame redoes the composite +
+    /// page-flip from scratch (no incremental updates).
+    fn resume(&mut self) -> Result<()> {
+        if let Err(e) = self.input.resume() {
+            nmbl_warn!("SplashConsole::resume: input resume failed: {e}");
+        }
+        self.drm.acquire_master();
+        Ok(())
     }
 }

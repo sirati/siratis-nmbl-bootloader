@@ -112,6 +112,15 @@ let
         default_url = cfg.rescue.defaultUrl;
         default_sha256 = cfg.rescue.defaultSha256;
       };
+
+    # Operator-curated list of extra `/dev/<tty>` paths the picker
+    # dialog offers as multiplex targets for the emergency shell.
+    # Empty by default — only `/dev/console` (the kernel-elected
+    # primary interactive console) is offered. The Rust serde struct
+    # is `EmergencyShellConfig`.
+    emergency_shell = {
+      extra_consoles = cfg.emergencyShell.extraConsoles;
+    };
   }
   # Splash rendering. Emitted only when the graphical splash is enabled
   # so the validator (`deny_unknown_fields`) accepts the TOML on builds

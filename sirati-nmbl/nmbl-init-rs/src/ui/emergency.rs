@@ -258,6 +258,12 @@ mod tests {
         ) -> Result<()> {
             Ok(())
         }
+        fn suspend(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -358,6 +364,12 @@ mod tests {
                 Err(NmblError::Tui {
                     source: std::io::Error::other("backend dead"),
                 })
+            }
+            fn suspend(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn resume(&mut self) -> Result<()> {
+                Ok(())
             }
         }
 
