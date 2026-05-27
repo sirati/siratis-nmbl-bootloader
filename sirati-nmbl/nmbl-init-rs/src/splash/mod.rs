@@ -24,7 +24,7 @@ pub mod terminal;
 pub mod types;
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
@@ -42,8 +42,8 @@ use crate::splash::terminal::SplashTerminal;
 use crate::splash::types::CellDims;
 use crate::ui::POLL_SLICE;
 use crate::ui::render_current_screen;
-use crate::ui::timeout::{TimeoutOutcome, run_countdown};
-use crate::ui::{App, Decision};
+use crate::ui::timeout::TimeoutOutcome;
+use crate::ui::{App, Decision, Screen};
 
 /// Tty node opened to acquire raw-mode keyboard input alongside the
 /// DRM framebuffer output. `/dev/tty0` is the kernel's active VT, so
@@ -107,17 +107,22 @@ pub fn try_run_selector(config: &Config, generations: &[Generation]) -> Result<O
     let mut app = App::new(generations);
     app.show_kernel_params = config.tui.show_kernel_params;
 
-    // 6. Countdown phase: drive run_countdown; redraw on each tick.
-    //    Drawing errors during the countdown are intentionally
-    //    swallowed — the boot must continue even if one frame fails.
+    // 6. Countdown phase: replicates ui::timeout::run_countdown but
+    //    polls SplashInput rather than stdin. The shared run_countdown
+    //    uses crossterm::event which reads from the kernel's stdin —
+    //    on a serial-console boot that's the serial line, not the VT,
+    //    so VNC keypresses would never cancel the countdown. Drawing
+    //    errors are swallowed: the boot must continue even if one
+    //    frame fails.
     let countdown = Duration::from_secs(u64::from(config.general.timeout_secs));
-    let countdown_outcome = {
-        let mut on_tick = |secs: u64| {
+    let countdown_outcome = run_splash_countdown(
+        countdown,
+        &mut input,
+        &mut |secs| {
             app.countdown_remaining_secs = Some(secs);
             let _ = render_frame(&mut drm, &bg_scaled, &cache, cell_dims, &app);
-        };
-        run_countdown(countdown, &mut on_tick)?
-    };
+        },
+    )?;
     app.countdown_remaining_secs = None;
 
     if matches!(countdown_outcome, TimeoutOutcome::Expired) && app.decision.is_none() {
@@ -136,9 +141,15 @@ pub fn try_run_selector(config: &Config, generations: &[Generation]) -> Result<O
             dirty = false;
         }
         if let Some(key) = input.poll(POLL_SLICE)? {
-            // Intercept the `p` hotkey to demo the passphrase dialog
-            // before the App sees it (App maps `p` to toggle params).
-            if key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::NONE {
+            // Intercept Ctrl+P from the list screen to demo the
+            // passphrase dialog. Plain `p` is already a list-view
+            // hotkey (toggles show_kernel_params) and a literal in
+            // many kernel cmdline edits (loglevel, console=tty1,
+            // ip=), so we use the modifier and gate on screen state.
+            if matches!(app.screen, Screen::List)
+                && key.code == KeyCode::Char('p')
+                && key.modifiers == KeyModifiers::CONTROL
+            {
                 let outcome =
                     passphrase_demo::run(&mut drm, &bg_scaled, &cache, cell_dims, &mut input)?;
                 crate::nmbl_info!("passphrase demo returned: {outcome:?}");
@@ -227,6 +238,45 @@ fn render_frame(
 
 fn tui_err(source: std::io::Error) -> NmblError {
     NmblError::Tui { source }
+}
+
+/// Splash-side countdown loop. Mirrors [`crate::ui::timeout::run_countdown`]
+/// but polls [`input::SplashInput`] instead of stdin so cancel-on-keypress
+/// works on VT inputs even when the kernel's `console=` directive has
+/// pointed stdin at a serial line.
+fn run_splash_countdown(
+    duration: Duration,
+    input: &mut input::SplashInput,
+    on_tick: &mut dyn FnMut(u64),
+) -> Result<TimeoutOutcome> {
+    let start = Instant::now();
+    let deadline = start.checked_add(duration).unwrap_or(start);
+
+    let initial = duration.as_secs();
+    on_tick(initial);
+    let mut last_reported = initial;
+
+    loop {
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Ok(TimeoutOutcome::Expired);
+        };
+
+        let slice = remaining.min(POLL_SLICE);
+        if input.poll(slice)?.is_some() {
+            return Ok(TimeoutOutcome::Cancelled);
+        }
+
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Ok(TimeoutOutcome::Expired);
+        };
+        let secs = remaining.as_secs();
+        if secs != last_reported {
+            on_tick(secs);
+            last_reported = secs;
+        }
+    }
 }
 
 #[cfg(test)]
