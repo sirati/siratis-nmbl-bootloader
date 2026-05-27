@@ -167,8 +167,12 @@ pkgs.writeScript "install-nmbl-bootloader" ''
             [ -e "$blk/partition" ] && continue   # skip partitions
             dev="/dev/$(basename "$blk")"
             [ -b "$dev" ] || continue
+            # `sgdisk -p` puts the type code in column 5 *only* if the Size
+            # cell is unit-less; "1024.0 KiB" splits over two tokens and shifts
+            # EF02 to column 6. grep -w on the token is column-agnostic and
+            # EF02 only appears in the Code column of sgdisk output.
             if ${pkgs.gptfdisk}/bin/sgdisk -p "$dev" 2>/dev/null \
-                | awk 'NR>5 && $5=="EF02" {found=1} END {exit !found}'; then
+                | grep -qw "EF02"; then
               boot_disks+=("$dev")
             fi
           done
