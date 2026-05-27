@@ -93,6 +93,16 @@ let
           # virtio device path. vda1 is the FAT32 ESP under the hybrid
           # partition layout used by vm-config.nix.
           boot.nmbl.bootstrap.bootFs.device = "/dev/vda1";
+          # The default bootstrap kernel module list targets SATA/NVMe.
+          # VMs use VirtIO block devices, so replace it with the VirtIO
+          # drivers plus the FAT32 stack needed to read the boot partition.
+          boot.nmbl.bootstrap.kernelModules.explicit = [
+            "virtio_pci"
+            "virtio_blk"
+            "vfat"
+            "nls_cp437"
+            "nls_iso8859_1"
+          ];
         })
       ];
     };
