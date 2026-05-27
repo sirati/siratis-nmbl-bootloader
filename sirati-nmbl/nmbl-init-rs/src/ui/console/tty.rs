@@ -17,10 +17,28 @@
 //! restore); the only difference is that the lifetime invariant lives
 //! at construction time rather than in the type system.
 //!
-//! No new `unsafe` is introduced.
+//! ## VT graphics mode
+//!
+//! When `/dev/console` is bound to a kernel VT (the framebuffer case,
+//! not a serial line), the kernel keeps writing printk output to the
+//! same framebuffer the TUI is drawing to. The result is a screen full
+//! of kernel messages with stray TUI escape fragments (`[?25l`,
+//! colour resets) wedged between them — verifier BUG #2.
+//!
+//! The standard remedy is `ioctl(KDSETMODE, KD_GRAPHICS)`: this tells
+//! the VT subsystem that userspace is rendering directly to the
+//! framebuffer and suppresses printk to that VT until `KD_TEXT` is
+//! restored. We do this in [`TtyConsole::open_path`] and undo it in
+//! [`Drop`]. On non-VT lines (serial console) the ioctl returns
+//! `ENOTTY`; we tolerate that and proceed without changing the mode.
+//!
+//! rustix 0.38 does not expose a wrapper for the kd ioctls, so this
+//! file contains one tightly-scoped `unsafe { libc::ioctl(...) }` per
+//! direction, each documented with a SAFETY comment naming the kernel
+//! contract (linux/kd.h).
 
 use std::io::Stdout;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 use std::time::Duration;
 
@@ -40,6 +58,17 @@ use crate::ui::render_current_screen;
 /// Default tty path the orchestrator opens at boot.
 const CONSOLE_PATH: &str = "/dev/console";
 
+/// `linux/kd.h` ioctl numbers. Stable kernel ABI.
+const KDGETMODE: libc::Ioctl = 0x4B3B;
+const KDSETMODE: libc::Ioctl = 0x4B3A;
+/// VT in graphics mode: kernel stops painting printk to the framebuffer.
+const KD_GRAPHICS: libc::c_long = 0x01;
+/// VT in text mode (the default). Only referenced by tests; production
+/// code never hard-codes `KD_TEXT` — it always restores the mode value
+/// captured by `KDGETMODE` so we don't clobber a pre-graphics setup.
+#[cfg(test)]
+const KD_TEXT: libc::c_long = 0x00;
+
 /// Raw-mode tty backend. See module docs for the lifetime story.
 pub struct TtyConsole {
     /// Owns the `/dev/console` fd for the lifetime of the console; the
@@ -49,6 +78,11 @@ pub struct TtyConsole {
     /// Termios snapshot to restore on drop. `Option` so [`Drop`] can
     /// take it without leaving a dangling clone.
     saved_termios: Option<Termios>,
+    /// Previous KD VT mode, captured iff we successfully switched the
+    /// VT into `KD_GRAPHICS`. `None` means we never changed the mode
+    /// (e.g. the fd is a serial line and `KDGETMODE` returned ENOTTY),
+    /// so [`Drop`] must leave it alone.
+    previous_kd_mode: Option<libc::c_long>,
     /// Ratatui terminal over the crossterm backend wrapping stdout.
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -64,6 +98,7 @@ impl TtyConsole {
     pub fn open_path(path: &Path) -> Result<TtyConsole> {
         let fd = open_console_fd(path)?;
         let saved = enter_raw(fd.as_fd())?;
+        let previous_kd_mode = enter_kd_graphics(fd.as_fd());
 
         let backend = CrosstermBackend::new(std::io::stdout());
         let terminal = Terminal::new(backend).map_err(tui_err)?;
@@ -71,6 +106,7 @@ impl TtyConsole {
         Ok(TtyConsole {
             fd,
             saved_termios: Some(saved),
+            previous_kd_mode,
             terminal,
         })
     }
@@ -113,17 +149,95 @@ impl Console for TtyConsole {
 
 impl Drop for TtyConsole {
     fn drop(&mut self) {
+        // Restore VT text mode first so the kernel can resume printk to
+        // the framebuffer if the operator ends up in a recovery shell.
+        // Best-effort: a failure here just means the VT stays in
+        // graphics until the next mode-set, which is recoverable.
+        if let Some(previous) = self.previous_kd_mode.take() {
+            restore_kd_mode(self.fd.as_fd(), previous);
+        }
         if let Some(saved) = self.saved_termios.take()
             && let Err(e) = restore_termios(self.fd.as_fd(), &saved)
         {
             // Drop MUST NOT panic. Logging is all we can do; an
             // operator can `stty sane` to recover.
-            use std::os::fd::AsRawFd as _;
             nmbl_warn!(
                 "failed to restore termios on tty console fd {}: {e}",
                 self.fd.as_raw_fd()
             );
         }
+    }
+}
+
+/// Try to switch `fd`'s VT into `KD_GRAPHICS` so the kernel stops
+/// painting printk over the TUI. Returns the previous mode iff we
+/// actually changed it, so [`Drop`] knows whether and what to restore.
+///
+/// Failure is non-fatal in every direction: if `fd` is not a VT (serial
+/// console, ENOTTY) or the kernel refuses the mode change for any other
+/// reason, we log and proceed with the TUI exactly as before. The
+/// worst-case visual outcome is the pre-fix behaviour (printk
+/// fragments).
+fn enter_kd_graphics(fd: BorrowedFd<'_>) -> Option<libc::c_long> {
+    let mut mode: libc::c_long = 0;
+    // SAFETY: KDGETMODE (linux/kd.h) reads an `unsigned long` through
+    // the pointer in the third ioctl argument. `&mut mode` is a valid,
+    // properly-aligned pointer to a live `c_long` that outlives the
+    // call. The kernel writes at most `sizeof(unsigned long)` bytes.
+    // The fd is a live open file descriptor by the function contract.
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), KDGETMODE, &mut mode) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ENOTTY) {
+            nmbl_warn!(
+                "KDGETMODE on console fd {} failed: {err}; \
+                 leaving VT in current mode (printk may bleed into TUI)",
+                fd.as_raw_fd()
+            );
+        }
+        // ENOTTY just means this isn't a VT (e.g. serial), which is
+        // expected on non-framebuffer consoles. Silent skip.
+        return None;
+    }
+
+    if mode == KD_GRAPHICS {
+        // Already in graphics (something else got here first); don't
+        // claim ownership of the previous mode so Drop won't flip it.
+        return None;
+    }
+
+    // SAFETY: KDSETMODE (linux/kd.h) takes its third argument as an
+    // `unsigned long` value (not a pointer). The kernel validates the
+    // mode against {KD_TEXT, KD_GRAPHICS}. The fd is a live open VT
+    // (we just successfully read its mode above).
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), KDSETMODE, KD_GRAPHICS) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        nmbl_warn!(
+            "KDSETMODE(KD_GRAPHICS) on console fd {} failed: {err}; \
+             printk may bleed into TUI",
+            fd.as_raw_fd()
+        );
+        return None;
+    }
+    Some(mode)
+}
+
+/// Best-effort restore of the saved VT mode on drop. Never panics; a
+/// failure here at worst leaves the VT in graphics mode, which an
+/// operator can recover from with `chvt` or `kbd_mode`.
+fn restore_kd_mode(fd: BorrowedFd<'_>, previous: libc::c_long) {
+    // SAFETY: same contract as the KDSETMODE call in
+    // `enter_kd_graphics`: third arg is an `unsigned long` mode value,
+    // fd is a live VT char device for the lifetime of `TtyConsole`.
+    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), KDSETMODE, previous) };
+    if rc < 0 {
+        let err = std::io::Error::last_os_error();
+        nmbl_warn!(
+            "KDSETMODE restore on console fd {} failed: {err}; \
+             VT may remain in graphics mode (try `kbd_mode -a`)",
+            fd.as_raw_fd()
+        );
     }
 }
 
@@ -152,5 +266,46 @@ mod tests {
         }
         let res = TtyConsole::open_path(Path::new("/dev/null"));
         assert!(res.is_err(), "expected ENOTTY-style failure on /dev/null");
+    }
+
+    /// `enter_kd_graphics` must gracefully tolerate fds that aren't
+    /// VTs: the ioctl returns ENOTTY and the helper must return
+    /// `None` (no previous mode captured) without erroring out. This
+    /// is what protects serial-console boots from breaking when the
+    /// TUI tries to claim graphics mode.
+    #[test]
+    fn enter_kd_graphics_on_non_vt_returns_none() {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+        {
+            Ok(f) => f,
+            // No /dev/null available (extremely sandboxed env); skip.
+            Err(_) => return,
+        };
+        let result = enter_kd_graphics(file.as_fd());
+        assert!(
+            result.is_none(),
+            "expected None on non-VT fd (KDGETMODE→ENOTTY), got {result:?}"
+        );
+    }
+
+    /// `restore_kd_mode` must be a no-op-with-warning on a non-VT fd
+    /// and, critically, must not panic. This mirrors the Drop-time
+    /// safety contract: even if the fd has degraded between open and
+    /// drop, we walk away cleanly.
+    #[test]
+    fn restore_kd_mode_on_non_vt_does_not_panic() {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+        {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        // Should log a warning internally and return normally.
+        restore_kd_mode(file.as_fd(), KD_TEXT);
     }
 }
