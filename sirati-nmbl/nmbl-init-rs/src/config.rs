@@ -328,24 +328,52 @@ fn default_bootstrap_config_path() -> PathBuf {
 }
 
 impl BootstrapConfig {
+    /// Reject contradictory rescue defaults: `default_url` and
+    /// `default_sha256` are both stringly-typed sentinels (empty =
+    /// absent). The hash without a URL is unusable and the URL without
+    /// a hash is unsafe to fetch, so the only sensible states are
+    /// "both set" or "both empty".
+    pub fn validate(&self) -> Result<()> {
+        let url_set = !self.bootstrap.rescue.default_url.is_empty();
+        let sha_set = !self.bootstrap.rescue.default_sha256.is_empty();
+        if url_set ^ sha_set {
+            return Err(NmblError::ConfigInvalid {
+                reason: "bootstrap.rescue.default_url and bootstrap.rescue.default_sha256 must be \
+                     set together or both left empty"
+                    .to_string(),
+                context: "validating bootstrap rescue defaults".to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Read and parse `/etc/nmbl/bootstrap.toml` (or whichever embedded
-    /// path the caller passes). Mirrors [`Config::load`]: I/O errors are
-    /// wrapped in [`NmblError::Io`] and TOML errors in [`NmblError::Config`].
-    // NOTE: when a dedicated `NmblError::Bootstrap` variant lands, prefer
-    // wrapping with that — it would let callers distinguish bootstrap
-    // failure from user-config failure without string matching.
+    /// path the caller passes). Both the I/O and parse steps are wrapped
+    /// in [`NmblError::Bootstrap`] so callers can distinguish bootstrap
+    /// failure from user-config failure by variant rather than string
+    /// matching.
     pub fn load(path: &Path) -> Result<BootstrapConfig> {
-        let text = std::fs::read_to_string(path).map_err(|source| NmblError::Io {
-            source,
-            context: format!("reading bootstrap config {}", path.display()),
+        let text = std::fs::read_to_string(path).map_err(|source| NmblError::Bootstrap {
+            stage: "load-toml",
+            source: Box::new(NmblError::Io {
+                source,
+                context: format!("reading bootstrap config {}", path.display()),
+            }),
         })?;
 
         let config: BootstrapConfig =
-            toml::from_str(&text).map_err(|source| NmblError::Config {
-                source,
-                path: path.to_path_buf(),
+            toml::from_str(&text).map_err(|source| NmblError::Bootstrap {
+                stage: "parse-toml",
+                source: Box::new(NmblError::Config {
+                    source,
+                    path: path.to_path_buf(),
+                }),
             })?;
 
+        config.validate().map_err(|source| NmblError::Bootstrap {
+            stage: "validate",
+            source: Box::new(source),
+        })?;
         Ok(config)
     }
 }
@@ -581,13 +609,119 @@ mountpoint = "/mnt/boot"
     }
 
     #[test]
-    fn bootstrap_load_missing_file_is_io_error() {
+    fn bootstrap_load_missing_file_is_bootstrap_load_toml_error() {
+        use std::error::Error;
+
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nope.toml");
         let err = BootstrapConfig::load(&path).expect_err("missing file must error");
+        match &err {
+            NmblError::Bootstrap { stage, source } => {
+                assert_eq!(*stage, "load-toml", "stage should mark the failed step");
+                assert!(
+                    matches!(source.as_ref(), NmblError::Io { .. }),
+                    "Bootstrap should wrap an Io error, got: {source:?}",
+                );
+            }
+            other => panic!("expected Bootstrap variant, got: {other:?}"),
+        }
+        // The chained source must reach the inner Io variant so the
+        // emergency-shell banner's chain walker keeps working.
+        let inner = Error::source(&err).expect("Bootstrap must expose a source");
         assert!(
-            matches!(err, NmblError::Io { .. }),
-            "expected Io error, got: {err:?}",
+            inner.to_string().contains("reading bootstrap config"),
+            "inner source should describe the read step, got: {inner}",
         );
+    }
+
+    #[test]
+    fn bootstrap_load_parse_failure_is_bootstrap_parse_toml_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("bad.toml");
+        std::fs::write(&path, "this is = not valid = toml").expect("write");
+        let err = BootstrapConfig::load(&path).expect_err("bad toml must error");
+        match &err {
+            NmblError::Bootstrap { stage, source } => {
+                assert_eq!(*stage, "parse-toml", "stage should mark the failed step");
+                assert!(
+                    matches!(source.as_ref(), NmblError::Config { .. }),
+                    "Bootstrap should wrap a Config error, got: {source:?}",
+                );
+            }
+            other => panic!("expected Bootstrap variant, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_validate_rejects_url_without_sha() {
+        let cfg = BootstrapConfig {
+            bootstrap: BootstrapSection {
+                config_path: default_bootstrap_config_path(),
+                boot_fs: BootstrapBootFs {
+                    device: "/dev/sda1".to_string(),
+                    fstype: "vfat".to_string(),
+                    options: String::new(),
+                    mountpoint: PathBuf::from("/mnt/boot"),
+                },
+                kernel_modules: BootstrapKernelModules::default(),
+                rescue: BootstrapRescue {
+                    default_url: "https://example.invalid/rescue.cpio".to_string(),
+                    default_sha256: String::new(),
+                },
+            },
+        };
+        let err = cfg.validate().expect_err("url without sha must reject");
+        match err {
+            NmblError::ConfigInvalid { reason, .. } => {
+                assert!(reason.contains("default_url"), "{reason}");
+                assert!(reason.contains("default_sha256"), "{reason}");
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_validate_rejects_sha_without_url() {
+        let cfg = BootstrapConfig {
+            bootstrap: BootstrapSection {
+                config_path: default_bootstrap_config_path(),
+                boot_fs: BootstrapBootFs {
+                    device: "/dev/sda1".to_string(),
+                    fstype: "vfat".to_string(),
+                    options: String::new(),
+                    mountpoint: PathBuf::from("/mnt/boot"),
+                },
+                kernel_modules: BootstrapKernelModules::default(),
+                rescue: BootstrapRescue {
+                    default_url: String::new(),
+                    default_sha256: "deadbeef".to_string(),
+                },
+            },
+        };
+        cfg.validate().expect_err("sha without url must reject");
+    }
+
+    #[test]
+    fn bootstrap_validate_accepts_both_empty_and_both_set() {
+        let mk = |url: &str, sha: &str| BootstrapConfig {
+            bootstrap: BootstrapSection {
+                config_path: default_bootstrap_config_path(),
+                boot_fs: BootstrapBootFs {
+                    device: "/dev/sda1".to_string(),
+                    fstype: "vfat".to_string(),
+                    options: String::new(),
+                    mountpoint: PathBuf::from("/mnt/boot"),
+                },
+                kernel_modules: BootstrapKernelModules::default(),
+                rescue: BootstrapRescue {
+                    default_url: url.to_string(),
+                    default_sha256: sha.to_string(),
+                },
+            },
+        };
+        mk("", "").validate().expect("both empty must pass");
+        mk("https://example.invalid/r.cpio", "deadbeef")
+            .validate()
+            .expect("both set must pass");
     }
 }
