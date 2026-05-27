@@ -5,15 +5,25 @@
 //! backend entirely: operators on a VNC console saw nothing useful,
 //! and there was no way to choose between rebooting and dropping to
 //! the shell. This module replaces that behaviour with a proper TUI
-//! that runs over the splash backend when available and falls back
-//! to a tty-mode ratatui or a line-oriented serial prompt otherwise.
+//! that renders into the already-open boot [`Console`].
 //!
 //! Architectural rule: **all UI is TUI code**. The splash backend is
 //! only a render target. The state machine that drives the screen
 //! lives in [`crate::ui::app::Screen::Emergency`]; the renderer lives
 //! in [`crate::ui::view::render_emergency`]. This module wires the
-//! two together against either the splash console or a stdout
-//! ratatui backend, and applies a 30-second default-to-reboot timer.
+//! two together against the caller-supplied console and applies a
+//! 30-second default-to-reboot timer.
+//!
+//! ## Console ownership
+//!
+//! The boot orchestrator (main.rs) brings the [`Console`] up once at
+//! boot, hands it through every phase, and — on phase failure — passes
+//! the same handle into [`run_emergency_screen`]. The backend choice
+//! (splash vs tty, with panic-recovery skipping splash) is therefore
+//! already made by [`crate::ui::console::open_console`]; this module
+//! is purely a state-machine driver. The serial-console code path is
+//! the operator's existing tty console — `/dev/console` already routes
+//! to the serial line in that deployment.
 //!
 //! ## Timer
 //!
@@ -25,117 +35,30 @@
 //! The clock is injected as a `Fn() -> Instant` so unit tests can run
 //! the timer machinery without sleeping a real wall-clock second.
 
-use std::io::{BufRead, Write};
-use std::os::fd::AsFd;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-
-use crate::config::Config;
 use crate::error::{NmblError, Result, format_chain};
-use crate::sys::tty::{RawModeGuard, open_console};
 use crate::ui::POLL_SLICE;
 use crate::ui::app::{App, EmergencyChoice, EmergencyItem, Screen};
-
-/// Backend the emergency loop drives. Implementors paint a frame and
-/// poll for keys; the loop is otherwise backend-agnostic. Defining
-/// this as a trait (rather than two `FnMut` closures) sidesteps the
-/// borrow-checker conflict you'd hit holding two mut closures over
-/// the same backend handle.
-trait EmergencyBackend {
-    fn render(&mut self, app: &App<'_>) -> Result<()>;
-    fn poll(&mut self, timeout: Duration) -> Result<Option<crossterm::event::KeyEvent>>;
-}
-
-/// Default console path for the tty-mode fallback path.
-const CONSOLE_PATH: &str = "/dev/console";
+use crate::ui::console::Console;
 
 /// Default countdown to auto-reboot when the operator is not present.
 const EMERGENCY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Which backend the emergency screen should try first. Splash will
-/// still fall back to Tty on bring-up failure; this enum only encodes
-/// the *initial* choice, which is the thing we want to unit-test.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BackendKind {
-    Serial,
-    Tty,
-    #[cfg(feature = "image-splash")]
-    Splash,
-}
-
-/// Pure decision: given the config and the triggering error, which
-/// backend should drive the emergency screen? Extracted from
-/// [`run_emergency_screen`] so the policy is testable without DRM.
+/// Run the emergency screen on the supplied [`Console`] and return the
+/// operator's choice.
 ///
-/// Rules:
-///   - `serial_console` always wins; the splash console has no usable
-///     keyboard on a serial-only deployment.
-///   - If the trigger is a panic-recovery re-exec, *never* try splash
-///     — the panic may have come from the splash code path itself
-///     (DRM, font, compositor), and re-entering it would loop straight
-///     back into the offending code.
-///   - Otherwise prefer splash when the feature is built in and
-///     enabled; fall back to tty.
-fn choose_backend(config: &Config, err: &NmblError) -> BackendKind {
-    if config.general.serial_console {
-        return BackendKind::Serial;
-    }
-
-    // Panic may have come from splash; don't re-enter.
-    let force_tty = matches!(err, NmblError::Panicked { .. });
-
-    #[cfg(feature = "image-splash")]
-    if config.splash.enable && !force_tty {
-        return BackendKind::Splash;
-    }
-
-    let _ = force_tty; // suppress unused warning when image-splash is off
-    BackendKind::Tty
-}
-
-/// Run the emergency screen and return the operator's choice.
-///
-/// Tries, in order:
-///   1. Splash console (when `image-splash` feature is built in,
-///      `config.splash.enable` is true, the trigger isn't a panic
-///      re-exec, and DRM bring-up succeeds).
-///   2. Raw-mode ratatui over `/dev/console`.
-///   3. Line-oriented serial prompt on stdin/stdout when
-///      `config.general.serial_console` is set.
-///
-/// In every path a 30-second no-input timer defaults to
-/// [`EmergencyChoice::Reboot`].
-pub fn run_emergency_screen(config: &Config, err: &NmblError) -> EmergencyChoice {
+/// The caller (main.rs / shell.rs) owns the console lifecycle: this
+/// function only drives the TUI event loop. With no input for 30s the
+/// timer expires and the function returns [`EmergencyChoice::Reboot`].
+/// On a backend error mid-loop we also fall back to Reboot — the
+/// safest default when the operator can't see the screen anyway.
+pub fn run_emergency_screen(console: &mut dyn Console, err: &NmblError) -> EmergencyChoice {
     let message = build_message(err);
     let items = default_items();
-
-    match choose_backend(config, err) {
-        BackendKind::Serial => run_serial_emergency(&message, &items)
-            .unwrap_or(EmergencyChoice::Reboot),
-        #[cfg(feature = "image-splash")]
-        BackendKind::Splash => match run_splash_emergency(config, &message, &items) {
-            Ok(choice) => choice,
-            Err(e) => {
-                crate::nmbl_warn!(
-                    "emergency splash bring-up failed: {}; falling back to tty",
-                    format_chain(&e as &dyn std::error::Error)
-                );
-                // Tty fallback. If even raw-mode bring-up fails we have
-                // no UI to show, and the safest thing is to fall
-                // through to reboot — the caller (drop_to_emergency)
-                // will surface the original error via its
-                // banner-on-shell path anyway.
-                run_tty_emergency(&message, &items).unwrap_or(EmergencyChoice::Reboot)
-            }
-        },
-        BackendKind::Tty => {
-            run_tty_emergency(&message, &items).unwrap_or(EmergencyChoice::Reboot)
-        }
-    }
+    let mut app = build_emergency_app(&message, &items);
+    drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, Instant::now, console)
+        .unwrap_or(EmergencyChoice::Reboot)
 }
 
 /// Build the message string shown to the operator. Includes the
@@ -164,45 +87,9 @@ fn default_items() -> Vec<EmergencyItem> {
     ]
 }
 
-/// Splash-backed emergency picker.
-#[cfg(feature = "image-splash")]
-fn run_splash_emergency(
-    config: &Config,
-    message: &str,
-    items_template: &[EmergencyItem],
-) -> Result<EmergencyChoice> {
-    let Some(mut console) = crate::ui::open_splash_console(config)? else {
-        return Err(NmblError::Tui {
-            source: std::io::Error::other("splash console unavailable"),
-        });
-    };
-
-    let mut app = build_emergency_app(message, items_template);
-    let mut backend = SplashBackend {
-        console: &mut console,
-    };
-    drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, Instant::now, &mut backend)
-}
-
-/// Raw-mode tty emergency picker.
-fn run_tty_emergency(message: &str, items_template: &[EmergencyItem]) -> Result<EmergencyChoice> {
-    let console = open_console(Path::new(CONSOLE_PATH))?;
-    let _raw = RawModeGuard::new(console.as_fd())?;
-
-    let crossterm_backend = CrosstermBackend::new(std::io::stdout());
-    let terminal = Terminal::new(crossterm_backend).map_err(tui_err)?;
-    let mut backend = TtyBackend { terminal };
-
-    let mut app = build_emergency_app(message, items_template);
-    drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, Instant::now, &mut backend)
-}
-
 /// Build an `App` parked on the Emergency screen with the given
 /// message and items.
-fn build_emergency_app<'a>(
-    message: &str,
-    items_template: &[EmergencyItem],
-) -> App<'a> {
+fn build_emergency_app<'a>(message: &str, items_template: &[EmergencyItem]) -> App<'a> {
     // Items are tiny, no point fighting the borrow checker — clone
     // the template into the App's own Screen state.
     let items: Vec<EmergencyItem> = items_template
@@ -232,7 +119,7 @@ fn drive_emergency_loop<N>(
     app: &mut App<'_>,
     timeout: Duration,
     now: N,
-    backend: &mut dyn EmergencyBackend,
+    console: &mut dyn Console,
 ) -> Result<EmergencyChoice>
 where
     N: Fn() -> Instant,
@@ -246,7 +133,7 @@ where
     let mut dirty = true;
     loop {
         if dirty {
-            backend.render(app)?;
+            console.render(app)?;
             dirty = false;
         }
 
@@ -260,7 +147,7 @@ where
         };
         let slice = remaining.min(POLL_SLICE);
 
-        if let Some(key) = backend.poll(slice)? {
+        if let Some(key) = console.poll_key(slice)? {
             // Any keypress cancels the auto-reboot countdown so the
             // operator can take their time deciding once present.
             app.countdown_remaining_secs = None;
@@ -296,101 +183,6 @@ where
     }
 }
 
-/// Splash-console backend.
-#[cfg(feature = "image-splash")]
-struct SplashBackend<'c> {
-    console: &'c mut crate::ui::SplashConsole,
-}
-
-#[cfg(feature = "image-splash")]
-impl EmergencyBackend for SplashBackend<'_> {
-    fn render(&mut self, app: &App<'_>) -> Result<()> {
-        self.console.render(app)
-    }
-    fn poll(&mut self, timeout: Duration) -> Result<Option<crossterm::event::KeyEvent>> {
-        self.console.poll(timeout)
-    }
-}
-
-/// Raw-mode ratatui backend over `/dev/console`.
-struct TtyBackend<W: Write> {
-    terminal: Terminal<CrosstermBackend<W>>,
-}
-
-impl<W: Write> EmergencyBackend for TtyBackend<W> {
-    fn render(&mut self, app: &App<'_>) -> Result<()> {
-        self.terminal
-            .draw(|f| crate::ui::render_current_screen(f, app))
-            .map_err(tui_err)?;
-        Ok(())
-    }
-    fn poll(&mut self, timeout: Duration) -> Result<Option<crossterm::event::KeyEvent>> {
-        if event::poll(timeout).map_err(tui_err)? {
-            let evt = event::read().map_err(tui_err)?;
-            if let Event::Key(key) = evt {
-                return Ok(Some(key));
-            }
-        }
-        Ok(None)
-    }
-}
-
-/// Line-oriented serial fallback. Trivially scripted by hand on a
-/// broken serial line: prompt is `[r]eboot / [s]hell?` and the timer
-/// still defaults to Reboot, but we can't easily interrupt a blocking
-/// stdin read without OS-specific shenanigans — so the serial path
-/// just reads one line and dispatches.
-fn run_serial_emergency(
-    message: &str,
-    items: &[EmergencyItem],
-) -> Result<EmergencyChoice> {
-    let stdout = std::io::stdout();
-    let stdin = std::io::stdin();
-
-    {
-        let mut out = stdout.lock();
-        writeln!(out, "{}", "=".repeat(72)).map_err(tui_err)?;
-        writeln!(out, "NMBL: boot failed").map_err(tui_err)?;
-        writeln!(out, "{}", "=".repeat(72)).map_err(tui_err)?;
-        for line in message.lines() {
-            writeln!(out, "  {line}").map_err(tui_err)?;
-        }
-        writeln!(out).map_err(tui_err)?;
-        for item in items {
-            writeln!(out, "  [{}] {}", item_hotkey(item), item.label).map_err(tui_err)?;
-        }
-        writeln!(out, "Pick reboot (r) or shell (s) [r]:").map_err(tui_err)?;
-        out.flush().map_err(tui_err)?;
-    }
-
-    let mut line = String::new();
-    if stdin.lock().read_line(&mut line).is_err() {
-        // Treat a closed stdin as "no input" — default to Reboot.
-        return Ok(EmergencyChoice::Reboot);
-    }
-    let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("r") || trimmed.eq_ignore_ascii_case("reboot") {
-        return Ok(EmergencyChoice::Reboot);
-    }
-    if trimmed.eq_ignore_ascii_case("s") || trimmed.eq_ignore_ascii_case("shell") {
-        return Ok(EmergencyChoice::Shell);
-    }
-    // Unrecognised input: be conservative and reboot rather than
-    // dropping someone into a shell they didn't ask for.
-    Ok(EmergencyChoice::Reboot)
-}
-
-fn item_hotkey(item: &EmergencyItem) -> char {
-    match item.choice {
-        EmergencyChoice::Reboot => 'r',
-        EmergencyChoice::Shell => 's',
-    }
-}
-
-fn tui_err(source: std::io::Error) -> NmblError {
-    NmblError::Tui { source }
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -403,19 +195,22 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::cell::Cell;
 
+    use crate::ui::console::ConsoleKind;
+
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    /// In-process backend for unit-testing the emergency loop. Drives
-    /// a scripted sequence of key events on poll() and counts renders.
-    struct TestBackend {
+    /// In-process [`Console`] for unit-testing the emergency loop.
+    /// Drives a scripted sequence of key events on `poll_key()` and
+    /// counts renders.
+    struct TestConsole {
         events: Vec<Option<KeyEvent>>,
         cursor: usize,
         renders: u32,
     }
 
-    impl TestBackend {
+    impl TestConsole {
         fn new(events: Vec<Option<KeyEvent>>) -> Self {
             Self {
                 events,
@@ -425,15 +220,21 @@ mod tests {
         }
     }
 
-    impl EmergencyBackend for TestBackend {
+    impl Console for TestConsole {
         fn render(&mut self, _app: &App<'_>) -> Result<()> {
             self.renders = self.renders.saturating_add(1);
             Ok(())
         }
-        fn poll(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
             let v = self.events.get(self.cursor).copied().flatten();
             self.cursor = self.cursor.saturating_add(1);
             Ok(v)
+        }
+        fn size(&self) -> (u16, u16) {
+            (80, 24)
+        }
+        fn kind(&self) -> ConsoleKind {
+            ConsoleKind::Tty
         }
     }
 
@@ -467,12 +268,12 @@ mod tests {
         };
 
         let mut app = build_emergency_app("boot failed", &default_items());
-        let mut backend = TestBackend::new(vec![None; 16]);
+        let mut console = TestConsole::new(vec![None; 16]);
 
-        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, fake_now, &mut backend)
+        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, fake_now, &mut console)
             .expect("loop must not error on timeout path");
         assert_eq!(outcome, EmergencyChoice::Reboot);
-        assert!(backend.renders >= 1, "must render at least one frame");
+        assert!(console.renders >= 1, "must render at least one frame");
     }
 
     #[test]
@@ -483,10 +284,10 @@ mod tests {
         let frozen_now = move || start;
 
         let mut app = build_emergency_app("boot failed", &default_items());
-        let mut backend =
-            TestBackend::new(vec![Some(press(KeyCode::Down)), Some(press(KeyCode::Enter))]);
+        let mut console =
+            TestConsole::new(vec![Some(press(KeyCode::Down)), Some(press(KeyCode::Enter))]);
 
-        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut backend)
+        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
             .expect("loop must not error on the happy path");
         assert_eq!(outcome, EmergencyChoice::Shell);
     }
@@ -499,71 +300,44 @@ mod tests {
         let frozen_now = move || start;
 
         let mut app = build_emergency_app("boot failed", &default_items());
-        let mut backend = TestBackend::new(vec![Some(press(KeyCode::Char('r')))]);
+        let mut console = TestConsole::new(vec![Some(press(KeyCode::Char('r')))]);
 
-        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut backend)
+        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
             .expect("loop must succeed");
         assert_eq!(outcome, EmergencyChoice::Reboot);
         assert!(app.countdown_remaining_secs.is_none());
     }
 
-    fn panic_err() -> NmblError {
-        NmblError::Panicked {
-            report_path: std::path::PathBuf::from("/run/nmbl-panic.json"),
+    #[test]
+    fn run_emergency_screen_returns_reboot_when_render_errors() {
+        // Console that always errors on render. The public entry point
+        // must swallow the error and fall back to Reboot — the safest
+        // default when the operator can't see the screen.
+        struct BrokenConsole;
+        impl Console for BrokenConsole {
+            fn render(&mut self, _app: &App<'_>) -> Result<()> {
+                Err(NmblError::Tui {
+                    source: std::io::Error::other("backend dead"),
+                })
+            }
+            fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+                Ok(None)
+            }
+            fn size(&self) -> (u16, u16) {
+                (0, 0)
+            }
+            fn kind(&self) -> ConsoleKind {
+                ConsoleKind::Tty
+            }
         }
-    }
 
-    fn io_err() -> NmblError {
-        NmblError::Io {
+        let err = NmblError::Io {
             source: std::io::Error::other("kaboom"),
-            context: "mounting /tmp".to_string(),
-        }
-    }
-
-    #[test]
-    fn choose_backend_serial_console_always_wins() {
-        // Even on a panic re-exec with splash enabled, a serial-only
-        // deployment must take the serial path — the operator has no
-        // graphical console to look at.
-        let mut config = crate::config::Config::recovery_default();
-        config.general.serial_console = true;
-        #[cfg(feature = "image-splash")]
-        {
-            config.splash.enable = true;
-        }
-        assert_eq!(choose_backend(&config, &io_err()), BackendKind::Serial);
-        assert_eq!(choose_backend(&config, &panic_err()), BackendKind::Serial);
-    }
-
-    #[cfg(feature = "image-splash")]
-    #[test]
-    fn choose_backend_panic_skips_splash() {
-        // The whole point of this branch: if we're recovering from a
-        // panic, the panic may have come from the splash code path
-        // (DRM, font, compositor). Re-entering it would loop straight
-        // back into the offending code. Force tty.
-        let mut config = crate::config::Config::recovery_default();
-        config.splash.enable = true;
-        assert_eq!(choose_backend(&config, &panic_err()), BackendKind::Tty);
-    }
-
-    #[cfg(feature = "image-splash")]
-    #[test]
-    fn choose_backend_non_panic_with_splash_picks_splash() {
-        // Preserve the existing behaviour for non-panic errors: splash
-        // is preferred when built in and enabled.
-        let mut config = crate::config::Config::recovery_default();
-        config.splash.enable = true;
-        assert_eq!(choose_backend(&config, &io_err()), BackendKind::Splash);
-    }
-
-    #[test]
-    fn choose_backend_splash_disabled_picks_tty() {
-        // No splash configured (or feature disabled at compile time)
-        // and no serial console: tty is the only sensible target.
-        let config = crate::config::Config::recovery_default();
-        assert_eq!(choose_backend(&config, &io_err()), BackendKind::Tty);
-        assert_eq!(choose_backend(&config, &panic_err()), BackendKind::Tty);
+            context: "test".to_string(),
+        };
+        let mut console = BrokenConsole;
+        let choice = run_emergency_screen(&mut console, &err);
+        assert_eq!(choice, EmergencyChoice::Reboot);
     }
 
     #[test]

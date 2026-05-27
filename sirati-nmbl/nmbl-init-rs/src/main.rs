@@ -113,7 +113,7 @@ fn recover_from_panic(args: Args, report_path: PathBuf) -> std::convert::Infalli
     nmbl_warn!("panic recovery mode: report at {}", report_path.display());
     nmbl_warn!("panic report follows:\n{report}");
 
-    drop_to_emergency(&config, NmblError::Panicked { report_path })
+    drop_to_emergency(None, &config, NmblError::Panicked { report_path })
 }
 
 /// Execute the normal boot phases in order. Each phase that errors
@@ -260,26 +260,30 @@ fn main() -> ExitCode {
     nmbl_info!("nmbl-init starting");
 
     if let Some(err) = load_err {
-        match drop_to_emergency(&config, err) {}
+        // No console is open yet at this point — drop_to_emergency will
+        // open a tty console itself (panic_recovery=true so it skips the
+        // splash bring-up).
+        match drop_to_emergency(None, &config, err) {}
     }
 
     // Bring the boot console up BEFORE phase 1 so the operator sees a
     // populated BootStatus screen during the first mount, the module
     // loads, storage activations, and the generation scan. The same
-    // backend is reused all the way through the boot-menu selector;
-    // emergency fallback (when a phase errors) still re-opens its own
-    // console for now — that's a later subagent's refactor.
+    // backend is reused all the way through the boot-menu selector and
+    // the emergency screen on phase failure — `drop_to_emergency` takes
+    // the live console handle when one exists.
     //
     // If we cannot bring up ANY console at all, log it and route the
-    // bring-up error through the emergency shell. We never want a
-    // half-up TUI to block kexec; emergency.rs has its own backend
-    // fallback chain (splash → tty → serial) so the operator still gets
-    // a usable screen.
+    // bring-up error through the emergency shell; `drop_to_emergency`
+    // will open a fresh tty console itself (forced past splash via
+    // panic_recovery=true), so the operator still gets a screen.
     let mut console: Box<dyn Console> = match open_console(&config, false) {
         Ok(c) => c,
         Err(err) => {
             nmbl_warn!("boot console bring-up failed: {err}");
-            match drop_to_emergency(&config, err) {}
+            // No console available; drop_to_emergency opens a tty
+            // console itself (panic_recovery=true so it skips splash).
+            match drop_to_emergency(None, &config, err) {}
         }
     };
 
@@ -289,13 +293,10 @@ fn main() -> ExitCode {
     match outcome {
         Ok(()) => ExitCode::from(0),
         Err(err) => {
-            // Drop the boot console before handing control to the
-            // emergency screen. emergency.rs brings up its own backend
-            // (a B3 subagent will unify these); releasing the splash
-            // DRM card / raw-mode tty now keeps the two paths from
-            // fighting over /dev/tty1.
-            drop(console);
-            match drop_to_emergency(&config, err) {}
+            // Hand the live boot console down to the emergency screen so
+            // the operator keeps the same backend (splash or tty) they
+            // saw during phase progress — no DRM/tty re-grab, no flicker.
+            match drop_to_emergency(Some(&mut *console), &config, err) {}
         }
     }
 }
