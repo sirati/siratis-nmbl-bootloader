@@ -13,6 +13,13 @@
 //! returns ENOTTY because the block device's file_operations does not
 //! recognize BTRFS_IOC_SCAN_DEV.
 //!
+//! `/dev/btrfs-control` is a misc char device (major 10, minor 234)
+//! registered when `btrfs.ko` initialises. NMBL has no udev so the
+//! node may not exist yet even after the module loads. We create it
+//! on demand by reading the actual major:minor from
+//! `/sys/class/misc/btrfs-control/dev` so the code stays correct if
+//! the kernel ever reassigns the minor.
+//!
 //! BTRFS_IOC_SCAN_DEV = _IOW(BTRFS_IOCTL_MAGIC, 4, struct btrfs_ioctl_vol_args)
 //!   BTRFS_IOCTL_MAGIC = 0x94
 //!   struct btrfs_ioctl_vol_args: { __s64 fd; char name[BTRFS_PATH_NAME_MAX+1] }
@@ -52,10 +59,86 @@ const BTRFS_IOC_SCAN_DEV: u32 = {
     (1u32 << 30) | (size << 16) | ((BTRFS_IOCTL_MAGIC as u32) << 8) | 4u32
 };
 
-/// Path to the btrfs control device. Created by the kernel via
-/// devtmpfs when the btrfs module loads; NMBL pre-loads btrfs in
-/// phase 2 so this node exists by the time phase 3b runs.
+/// Path to the btrfs control device.
 const BTRFS_CONTROL_DEVICE: &str = "/dev/btrfs-control";
+
+/// sysfs path that exposes `major:minor` for the btrfs-control misc device.
+const BTRFS_CONTROL_SYSFS: &str = "/sys/class/misc/btrfs-control/dev";
+
+/// Ensure `/dev/btrfs-control` exists. NMBL has no udev, so the node
+/// may be absent even after `btrfs.ko` loads. We read the actual
+/// `major:minor` from sysfs (avoiding a hard-coded 10:234) and call
+/// `mknod(2)` to create the char-device node if it isn't already there.
+///
+/// Returns `Ok(())` if the node already exists or was created
+/// successfully. Returns `Ok(())` (with a warning) if the sysfs path
+/// is missing — that means btrfs.ko didn't load at all, so the open()
+/// that follows will also fail and log its own warning.
+fn ensure_btrfs_control() {
+    // If the node already exists (e.g. devtmpfs created it), skip mknod.
+    if std::path::Path::new(BTRFS_CONTROL_DEVICE).exists() {
+        return;
+    }
+
+    // Read "major:minor\n" from sysfs.
+    let raw = match std::fs::read_to_string(BTRFS_CONTROL_SYSFS) {
+        Ok(s) => s,
+        Err(e) => {
+            nmbl_warn!(
+                "btrfs: cannot read {} ({}); /dev/btrfs-control will be absent",
+                BTRFS_CONTROL_SYSFS,
+                e,
+            );
+            return;
+        }
+    };
+    let trimmed = raw.trim();
+    let (maj_str, min_str) = match trimmed.split_once(':') {
+        Some(pair) => pair,
+        None => {
+            nmbl_warn!(
+                "btrfs: unexpected format in {} ({:?}); skipping mknod",
+                BTRFS_CONTROL_SYSFS,
+                trimmed,
+            );
+            return;
+        }
+    };
+    let (major, minor) = match (maj_str.parse::<u32>(), min_str.parse::<u32>()) {
+        (Ok(ma), Ok(mi)) => (ma, mi),
+        _ => {
+            nmbl_warn!(
+                "btrfs: cannot parse major:minor from {:?}; skipping mknod",
+                trimmed,
+            );
+            return;
+        }
+    };
+
+    // S_IFCHR | 0o600
+    let mode: libc::mode_t = libc::S_IFCHR | 0o600;
+    let dev = libc::makedev(major, minor);
+    let path_cstr = match std::ffi::CString::new(BTRFS_CONTROL_DEVICE) {
+        Ok(c) => c,
+        Err(_) => {
+            nmbl_warn!("btrfs: BTRFS_CONTROL_DEVICE path contains NUL; skipping mknod");
+            return;
+        }
+    };
+    // SAFETY: mknod(2) with a char-device type. `path_cstr` is a valid
+    // NUL-terminated CString that outlives the call. `dev` is the
+    // numeric major:minor obtained from libc::makedev. The kernel creates
+    // or rejects the node; no user-space buffers are written by the
+    // syscall. No safe rustix wrapper for mknod exists in rustix 0.38.
+    let rc = unsafe { libc::mknod(path_cstr.as_ptr(), mode, dev) };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        // EEXIST is fine — another thread/path created it.
+        if e.raw_os_error() != Some(libc::EEXIST) {
+            nmbl_warn!("btrfs: mknod {} failed: {}", BTRFS_CONTROL_DEVICE, e);
+        }
+    }
+}
 
 /// Fill `args.name` with the device path (NUL-padded, truncated to
 /// `BTRFS_PATH_NAME_MAX`). Bounds-checked so the `indexing_slicing`
@@ -109,19 +192,22 @@ fn ioctl_scan(control_fd: libc::c_int, dev: &Path) -> i32 {
 }
 
 /// Scan every device in `devs` via `BTRFS_IOC_SCAN_DEV` on
-/// `/dev/btrfs-control`. Logs `[nmbl] btrfs: scanned N device(s)`
+/// `/dev/btrfs-control`. Logs `[nmbl] btrfs: registered N of M devices`
 /// on completion. Individual device errors are logged at warn level
 /// and do not abort the sweep.
 pub fn scan_devices(devs: &[std::path::PathBuf]) -> Result<()> {
-    if devs.is_empty() {
-        nmbl_info!("btrfs: scanned 0 device(s)");
+    let total = devs.len();
+    if total == 0 {
+        nmbl_info!("btrfs: registered 0 of 0 devices");
         return Ok(());
     }
 
+    // Create /dev/btrfs-control if absent (NMBL has no udev).
+    ensure_btrfs_control();
+
     // Open /dev/btrfs-control once and reuse it. If it is missing the
-    // btrfs module didn't load (or its devtmpfs entry hasn't appeared
-    // yet) — surface the underlying error so the operator sees why the
-    // scan was skipped.
+    // btrfs module didn't load — surface the underlying error so the
+    // operator sees why the scan was skipped.
     let control = match rustix::fs::open(
         BTRFS_CONTROL_DEVICE,
         rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
@@ -143,16 +229,16 @@ pub fn scan_devices(devs: &[std::path::PathBuf]) -> Result<()> {
         let errno = ioctl_scan(control.as_raw_fd(), dev);
         if errno == 0 {
             count = count.saturating_add(1);
-            nmbl_info!("btrfs: registered {} with kernel", dev.display());
+            nmbl_info!("btrfs: registered {}", dev.display());
         } else {
             nmbl_warn!(
-                "btrfs: BTRFS_IOC_SCAN_DEV on {} returned {} ({})",
+                "btrfs: BTRFS_IOC_SCAN_DEV on {} returned errno {} ({})",
                 dev.display(),
                 errno,
                 std::io::Error::from_raw_os_error(errno),
             );
         }
     }
-    nmbl_info!("btrfs: scanned {} device(s)", count);
+    nmbl_info!("btrfs: registered {} of {} devices", count, total);
     Ok(())
 }
