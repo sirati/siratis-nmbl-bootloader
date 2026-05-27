@@ -7,12 +7,28 @@
   pkgs,
   utils,
   nmblInit,
+  # Builder form supplied by flake.nix. When the network-rescue path is
+  # enabled we re-build the binary with `--features=network-rescue` so
+  # `src/net/` is compiled in. Defaults to ignoring features and
+  # returning the prebuilt `nmblInit` if the host flake is older.
+  mkNmblInit ? (_: nmblInit),
   ...
 }:
 
 let
   cfg = config.boot.nmbl;
   bootstrapper = cfg.bootstrapper;
+
+  # Cargo features to enable in the /init binary. Gated on rescue
+  # options so feature-free builds (default) stay byte-identical to
+  # today's binary.
+  nmblFeatures = lib.optional cfg.rescue.network "network-rescue";
+
+  # Resolved /init binary used by the initramfs builder. Identity-equal
+  # to the prebuilt `nmblInit` when no features are requested so Nix's
+  # store-path dedup keeps the existing CI cache hot.
+  resolvedNmblInit =
+    if nmblFeatures == [ ] then nmblInit else mkNmblInit { features = nmblFeatures; };
 
   # Activation options are contributed by ./modules/activation.nix. Read
   # defensively so this file still evaluates if that module hasn't been
@@ -52,6 +68,23 @@ let
   # Import storage validation module
   storageValidation = import ./modules/storage-validation.nix { inherit lib; };
 
+  # Auto-detected NIC drivers from hardware-configuration.nix
+  # (boot.initrd.{kernelModules,availableKernelModules}). Only consumed
+  # when the rescue network path is enabled; otherwise the list is
+  # built but never referenced.
+  detectedNicModules = import ./modules/nic-modules.nix {
+    inherit lib config;
+  };
+
+  # Modules NMBL must load + ship for the network rescue fallback. Empty
+  # unless rescue.network is on AND the rescue lives off-initramfs
+  # (external mode), so the default build stays byte-identical.
+  rescueNicModules =
+    if cfg.rescue.network && cfg.rescue.mode == "external" then
+      lib.unique (cfg.rescue.nicDrivers ++ detectedNicModules)
+    else
+      [ ];
+
   # Import kernel modules management module
   kernelModulesManager = import ./modules/kernel-modules.nix {
     inherit
@@ -60,6 +93,7 @@ let
       config
       cfg
       ;
+    extraExplicitModules = rescueNicModules;
   };
 
   # Import assertions module
@@ -205,7 +239,7 @@ in
 
         baseContents = [
           {
-            object = "${nmblInit}/bin/nmbl-init";
+            object = "${resolvedNmblInit}/bin/nmbl-init";
             symlink = "/init";
           }
         ] ++ configContents ++ [
