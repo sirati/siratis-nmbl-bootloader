@@ -75,13 +75,14 @@ fn build_message(err: &NmblError) -> String {
 /// default if the operator just presses Enter, and it's what the
 /// timeout rolls over to.
 ///
-/// `Pretty Shell` is appended after `Shell` only when the
-/// `image-splash` Cargo feature is compiled in — it depends on the
-/// `alacritty_terminal` parser which is only an optional dep of that
-/// feature. Builds without `image-splash` see the same two-row picker
-/// as before.
+/// `Pretty Shell` is inserted between `Shell` and the retry/verify
+/// items only when the `image-splash` Cargo feature is compiled in —
+/// it depends on the `alacritty_terminal` parser which is only an
+/// optional dep of that feature. The `Retry boot from config` and
+/// `Verify kexec readiness` actions are unconditional: they only need
+/// the existing phase 3/4/5 plumbing already in the binary.
 fn default_items() -> Vec<EmergencyItem> {
-    // `mut` is conditionally used (the `push` below is feature-gated);
+    // `mut` is conditionally used (the `insert` below is feature-gated);
     // suppress the unused_mut warning on no-feature builds without
     // duplicating the vec literal.
     #[cfg_attr(not(feature = "image-splash"), allow(unused_mut))]
@@ -99,6 +100,14 @@ fn default_items() -> Vec<EmergencyItem> {
     items.push(EmergencyItem {
         label: "Pretty Shell",
         choice: EmergencyChoice::PrettyShell,
+    });
+    items.push(EmergencyItem {
+        label: "Retry boot from config",
+        choice: EmergencyChoice::RetryBoot,
+    });
+    items.push(EmergencyItem {
+        label: "Verify kexec readiness",
+        choice: EmergencyChoice::VerifyKexecReadiness,
     });
     items
 }
@@ -379,5 +388,44 @@ mod tests {
         let items = default_items();
         assert_eq!(items[0].choice, EmergencyChoice::Reboot);
         assert_eq!(items[1].choice, EmergencyChoice::Shell);
+    }
+
+    #[test]
+    fn default_items_includes_retry_and_verify_in_order() {
+        // The dispatcher in `shell.rs` matches on these variants by
+        // name; the order pinned here is what the operator actually
+        // sees on the picker. Reboot and Shell come first (muscle-
+        // memory), then PrettyShell (feature-gated), then RetryBoot,
+        // then VerifyKexecReadiness — most-destructive to least-
+        // destructive, so a stray Enter on the default doesn't kick
+        // off an in-process retry the operator didn't want.
+        let items = default_items();
+        let choices: Vec<EmergencyChoice> = items.iter().map(|it| it.choice).collect();
+
+        let mut expected: Vec<EmergencyChoice> =
+            vec![EmergencyChoice::Reboot, EmergencyChoice::Shell];
+        #[cfg(feature = "image-splash")]
+        expected.push(EmergencyChoice::PrettyShell);
+        expected.push(EmergencyChoice::RetryBoot);
+        expected.push(EmergencyChoice::VerifyKexecReadiness);
+
+        assert_eq!(choices, expected, "default_items order has drifted");
+    }
+
+    #[test]
+    fn default_items_labels_match_spec() {
+        // The labels appear verbatim in the emergency picker; pin
+        // them so a relabel doesn't slip past review (the empirical
+        // verification step greps for these strings).
+        let items = default_items();
+        let labels: Vec<&str> = items.iter().map(|it| it.label).collect();
+        assert!(
+            labels.contains(&"Retry boot from config"),
+            "missing 'Retry boot from config' in {labels:?}"
+        );
+        assert!(
+            labels.contains(&"Verify kexec readiness"),
+            "missing 'Verify kexec readiness' in {labels:?}"
+        );
     }
 }

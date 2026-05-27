@@ -374,6 +374,96 @@ pub fn render_key_echo(frame: &mut Frame<'_>, data: &KeyEchoScreenData<'_>) {
     );
 }
 
+/// State needed to render a yes/no confirmation modal (used by the
+/// `[Verify kexec readiness]` emergency action to confirm "found N
+/// generations, boot one?" before handing off to the selector).
+///
+/// Two-button modal: the highlighted button is whatever
+/// `yes_selected == true` implies. The renderer paints both buttons
+/// bracketed; the driver loop in `crate::ui::mod::show_modal_confirm`
+/// toggles `yes_selected` on left/right/tab and commits on Enter.
+pub struct ModalConfirmScreenData<'a> {
+    /// Short title shown on the modal's title bar.
+    pub title: &'a str,
+    /// Pre-formatted body text; rendered with `Wrap { trim: false }`.
+    pub message: &'a str,
+    /// Label for the affirmative button (typically "Yes" or "Boot").
+    pub yes_label: &'a str,
+    /// Label for the negative button (typically "No" or "Back").
+    pub no_label: &'a str,
+    /// `true` when the yes button is currently highlighted.
+    pub yes_selected: bool,
+    /// Footer hint, typically "←/→ select  Enter confirm  Esc cancel".
+    pub hint: &'a str,
+}
+
+/// Render a centred yes/no confirmation modal over the body area. The
+/// bordered modal carries the body in default colour on a fresh
+/// `Clear` so the underlying emergency picker doesn't bleed through;
+/// the two buttons are painted on the bottom row of the modal with
+/// the selected one inverted.
+pub fn render_modal_confirm(frame: &mut Frame<'_>, data: &ModalConfirmScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    // Centred modal: 64 cols, ~half the body height (min 9 to give
+    // room for body + button row + borders).
+    let h = body.height.saturating_div(2).max(9);
+    let modal = centered_rect(body, 64, h);
+    frame.render_widget(Clear, modal);
+
+    // Reserve the last inner row for the button bar; the rest holds
+    // the wrapped message.
+    let block = Block::bordered().title(data.title.to_owned());
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    if inner.height == 0 {
+        // Pathological tiny terminal — the border consumed the whole
+        // modal. Nothing more to paint; the footer hint below still
+        // reaches the operator.
+        render_footer(frame, footer, data.hint);
+        return;
+    }
+
+    let button_row_h: u16 = 1;
+    let msg_h = inner.height.saturating_sub(button_row_h);
+    let msg_rect = Rect::new(inner.x, inner.y, inner.width, msg_h);
+    let btn_rect = Rect::new(
+        inner.x,
+        inner.y.saturating_add(msg_h),
+        inner.width,
+        button_row_h,
+    );
+
+    let msg_para = Paragraph::new(Text::from(data.message.to_owned()))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(msg_para, msg_rect);
+
+    // Button bar: "[Yes]  [Back]" with the highlighted one inverted.
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
+    let unselected_style = Style::default();
+    let (yes_style, no_style) = if data.yes_selected {
+        (selected_style, unselected_style)
+    } else {
+        (unselected_style, selected_style)
+    };
+    let yes_text = format!("[{}]", data.yes_label);
+    let no_text = format!("[{}]", data.no_label);
+    let line = Line::from(vec![
+        Span::styled(yes_text, yes_style),
+        Span::raw("  "),
+        Span::styled(no_text, no_style),
+    ]);
+    let buttons = Paragraph::new(line).alignment(Alignment::Center);
+    frame.render_widget(buttons, btn_rect);
+
+    render_footer(frame, footer, data.hint);
+}
+
 /// State needed to render a transient modal-error dialog (used by the
 /// pretty-shell path when openpty / fork / mount fails so the operator
 /// sees what happened instead of a stale "boot failed" panel underneath).
@@ -657,6 +747,52 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("*****|"), "wrong mask count in:\n{text}");
         assert!(text.contains("Unlock /dev/sda2"));
+    }
+
+    #[test]
+    fn test_render_modal_confirm_shows_title_buttons_and_hint() {
+        let data = ModalConfirmScreenData {
+            title: "Boot one?",
+            message: "Found 3 generations.",
+            yes_label: "Yes",
+            no_label: "Back",
+            yes_selected: true,
+            hint: "Left/Right select  Enter confirm  Esc cancel",
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_modal_confirm(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(text.contains("Boot one?"), "title missing in:\n{text}");
+        assert!(
+            text.contains("Found 3 generations"),
+            "message missing in:\n{text}"
+        );
+        assert!(text.contains("[Yes]"), "yes button missing in:\n{text}");
+        assert!(text.contains("[Back]"), "no button missing in:\n{text}");
+        assert!(
+            text.contains("Enter confirm"),
+            "hint missing in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_render_modal_confirm_renders_with_no_selected() {
+        // Pin the other branch of yes_selected: when false, the "No"
+        // button gets the highlight. The plain-text scan can't see
+        // colour but it can confirm both labels paint.
+        let data = ModalConfirmScreenData {
+            title: "Confirm",
+            message: "Proceed?",
+            yes_label: "Boot",
+            no_label: "Back",
+            yes_selected: false,
+            hint: "h",
+        };
+        let mut term = new_term(60, 16);
+        term.draw(|f| render_modal_confirm(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(text.contains("[Boot]"), "yes label missing in:\n{text}");
+        assert!(text.contains("[Back]"), "no label missing in:\n{text}");
     }
 
     #[test]
