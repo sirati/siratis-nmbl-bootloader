@@ -82,7 +82,7 @@ use ratatui::Viewport;
 #[cfg(feature = "image-splash")]
 use ratatui::layout::Rect;
 #[cfg(feature = "image-splash")]
-use crate::splash::{compositor, drm, glyph_cache, input, png, scale};
+use crate::splash::{compositor, drm, glyph_cache};
 #[cfg(feature = "image-splash")]
 use crate::splash::terminal::SplashTerminal;
 #[cfg(feature = "image-splash")]
@@ -96,19 +96,6 @@ pub use reporter::BootReporter;
 /// the countdown ticker so they have the same responsiveness profile
 /// and only one knob to tune.
 pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
-
-/// Tty node opened to acquire raw-mode keyboard input alongside the
-/// DRM framebuffer output. `/dev/tty0` is the kernel's "current VT" —
-/// write-only per the device docs — so reads return nothing. The
-/// kernel routes PS/2 (and VNC) keypresses to `/dev/tty1`, which we
-/// open directly so they land in our SplashInput buffer even when
-/// `console=` points stdin at a serial line.
-#[cfg(feature = "image-splash")]
-const INPUT_TTY_PATH: &str = "/dev/tty1";
-
-/// Font size, in pixels, used to rasterise the splash glyph cache.
-#[cfg(feature = "image-splash")]
-const SPLASH_FONT_PX: f32 = 16.0;
 
 /// Run the boot-selection TUI on the provided [`Console`] and return
 /// the operator's decision.
@@ -217,98 +204,6 @@ fn run_console_countdown(
             last_reported = secs;
         }
     }
-}
-
-/// Live splash-console handles. Holds everything `render_splash_frame`
-/// needs plus the input source; lets a caller paint a frame and poll
-/// for keys without owning the bring-up details.
-///
-/// Constructed via [`open_splash_console`]. Only
-/// [`emergency::run_emergency_screen`] still uses this path — the main
-/// boot flow goes through the [`Console`] trait (see
-/// `crate::ui::console::SplashConsole` for the trait-impl backend).
-/// A follow-up subagent will refactor `run_emergency_screen` to accept
-/// an existing [`Console`] handle, at which point this struct (and the
-/// associated `open_splash_console` + `render_splash_frame`) become dead
-/// code and can be removed.
-#[cfg(feature = "image-splash")]
-pub(crate) struct SplashConsole {
-    drm: drm::SplashDrm,
-    bg_scaled: Vec<u8>,
-    cache: glyph_cache::GlyphCache,
-    cell_dims: CellDims,
-    input: input::SplashInput,
-}
-
-#[cfg(feature = "image-splash")]
-impl SplashConsole {
-    /// Paint one frame of `app` to the splash framebuffer.
-    pub(crate) fn render(&mut self, app: &App<'_>) -> Result<()> {
-        render_splash_frame(
-            &mut self.drm,
-            &self.bg_scaled,
-            &self.cache,
-            self.cell_dims,
-            app,
-        )
-    }
-
-    /// Poll the splash input source for a key event.
-    pub(crate) fn poll(&mut self, timeout: Duration) -> Result<Option<crossterm::event::KeyEvent>> {
-        self.input.poll(timeout)
-    }
-}
-
-/// Bring up the splash backend so callers can render the TUI over it.
-///
-/// Returns `Ok(Some(console))` on a clean bring-up, `Ok(None)` when
-/// the splash backend is unavailable (no DRM device, no font, etc.),
-/// and `Err(_)` when bring-up failed mid-flight.
-#[cfg(feature = "image-splash")]
-pub(crate) fn open_splash_console(config: &Config) -> Result<Option<SplashConsole>> {
-    // 1. Open the DRM card. Missing / inaccessible nodes map to
-    //    `Ok(None)` inside `open_card_with_fallback`, so this
-    //    propagates only real bring-up errors.
-    let drm = match drm::open_card_with_fallback(&config.splash.dri_path)? {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-    let fb_dims = drm.dims();
-
-    // 2. Load the background PNG and cover-scale it to the framebuffer.
-    let bg_image = png::decode_rgba(&config.splash.background_image)?;
-    let bg_scaled =
-        scale::cover_scale_nearest(&bg_image.rgba, bg_image.width, bg_image.height, fb_dims);
-
-    // 3. Load the font and derive grid dimensions from the cell size.
-    let cache = glyph_cache::load(&config.splash.font_path, SPLASH_FONT_PX)?;
-    let cell_size = cache.cell_size();
-    let cell_w = cell_size.w.max(1);
-    let cell_h = cell_size.h.max(1);
-    let cols = (fb_dims.w / cell_w).min(u32::from(u16::MAX)) as u16;
-    let rows = (fb_dims.h / cell_h).min(u32::from(u16::MAX)) as u16;
-    if cols == 0 || rows == 0 {
-        return Err(NmblError::Tui {
-            source: std::io::Error::other("splash framebuffer too small for one cell"),
-        });
-    }
-    let cell_dims = CellDims {
-        cols,
-        rows,
-        cell_w,
-        cell_h,
-    };
-
-    // 4. Open /dev/tty1 for raw-mode keyboard input.
-    let input = input::SplashInput::open(Path::new(INPUT_TTY_PATH))?;
-
-    Ok(Some(SplashConsole {
-        drm,
-        bg_scaled,
-        cache,
-        cell_dims,
-        input,
-    }))
 }
 
 /// Render one frame: ratatui-draw → vte parse → cell-walk → blit.

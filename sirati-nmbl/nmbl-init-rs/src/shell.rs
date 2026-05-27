@@ -33,16 +33,42 @@ use nix::unistd::execve;
 
 use crate::config::Config;
 use crate::error::{NmblError, format_chain};
+use crate::nmbl_warn;
+use crate::ui::console::{Console, open_console};
 use crate::ui::{EmergencyChoice, run_emergency_screen};
 
 /// Print the operator-facing emergency banner and `execve(2)` the
 /// configured shell. Does not return on success; on `execve` failure
 /// halts the system rather than returning to the caller.
-pub fn drop_to_emergency(config: &Config, err: NmblError) -> Infallible {
-    // Ask the operator what to do via the TUI. The TUI runs over the
-    // splash backend when available and falls back to a tty / serial
-    // prompt otherwise; on a 30s no-input timeout it returns Reboot.
-    let choice = run_emergency_screen(config, &err);
+///
+/// `console` is the live boot console when the orchestrator still has
+/// one — phase-failure paths pass it down so the emergency TUI reuses
+/// the same backend the operator was already looking at. When `None`
+/// (panic-recovery re-exec, or initial console bring-up failed) we
+/// open a tty console as a last resort; that path forces
+/// `panic_recovery=true` so the splash code is never re-entered.
+pub fn drop_to_emergency(
+    console: Option<&mut dyn Console>,
+    config: &Config,
+    err: NmblError,
+) -> Infallible {
+    // Ask the operator what to do via the TUI. If the caller still has
+    // the live boot console, drive the emergency screen over it.
+    // Otherwise open a fresh tty console (panic_recovery=true skips
+    // splash bring-up entirely, mirroring the panic-handler contract).
+    let choice = match console {
+        Some(c) => run_emergency_screen(c, &err),
+        None => match open_console(config, true) {
+            Ok(mut c) => run_emergency_screen(&mut *c, &err),
+            Err(open_err) => {
+                nmbl_warn!(
+                    "emergency console bring-up failed: {}; defaulting to reboot",
+                    format_chain(&open_err as &dyn std::error::Error),
+                );
+                EmergencyChoice::Reboot
+            }
+        },
+    };
 
     match choice {
         EmergencyChoice::Reboot => {
