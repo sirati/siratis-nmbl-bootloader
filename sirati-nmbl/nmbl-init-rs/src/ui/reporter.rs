@@ -186,6 +186,12 @@ mod tests {
             // No "mock" variant exists; tests don't branch on kind.
             ConsoleKind::Tty
         }
+        fn draw_with(
+            &mut self,
+            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]

@@ -34,6 +34,7 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result, format_chain};
+use crate::ui::console::Console;
 
 /// Shell binary expected inside the rescue squashfs. The squashfs ships
 /// busybox under `/bin/sh`, so this path is the post-switch-root one.
@@ -73,10 +74,21 @@ pub enum RescueMode {
 /// Cargo feature is compiled in AND `config.rescue.network` is true.
 /// Anything else collapses to [`halt_with_banner`] so the operator
 /// sees a structured diagnostic instead of a silent reboot loop.
-pub fn dispatch(config: &Config, cause: &NmblError) -> Result<Infallible> {
+///
+/// `console` is the live boot console the orchestrator holds; the
+/// network-rescue screens render and poll through it (no parallel
+/// `/dev/console` session is opened) so the operator stays on the same
+/// splash or tty backend they were already looking at. Disk-rescue,
+/// embedded, and halt arms do not interact with the operator and so
+/// ignore the handle.
+pub fn dispatch(
+    config: &Config,
+    console: &mut dyn Console,
+    cause: &NmblError,
+) -> Result<Infallible> {
     match config.rescue.mode {
         RescueMode::Embedded => exec_embedded(config),
-        RescueMode::External => dispatch_external(config, cause),
+        RescueMode::External => dispatch_external(config, console, cause),
         RescueMode::None => halt_with_banner(cause),
     }
 }
@@ -84,7 +96,11 @@ pub fn dispatch(config: &Config, cause: &NmblError) -> Result<Infallible> {
 /// Internal helper: try disk-rescue, then network-rescue (when
 /// compiled in + enabled), then halt-with-banner. Split out so the
 /// `dispatch` match stays a single line per arm.
-fn dispatch_external(config: &Config, cause: &NmblError) -> Result<Infallible> {
+fn dispatch_external(
+    config: &Config,
+    console: &mut dyn Console,
+    cause: &NmblError,
+) -> Result<Infallible> {
     let disk_err = match disk::try_disk_rescue(config, cause) {
         Ok(infallible) => match infallible {},
         Err(e) => e,
@@ -97,13 +113,14 @@ fn dispatch_external(config: &Config, cause: &NmblError) -> Result<Infallible> {
             // ratatui screens assume a real terminal where escape
             // sequences and key codes round-trip cleanly.
             let net_err = if config.general.serial_console {
+                let _ = console;
                 let mut ui = net::ConsoleRescueUi;
                 match net::try_network_rescue(config, &mut ui, &disk_err.to_string()) {
                     Ok(infallible) => match infallible {},
                     Err(e) => e,
                 }
             } else {
-                let mut ui = crate::ui::rescue::make_rescue_ui();
+                let mut ui = crate::ui::rescue::make_rescue_ui(console);
                 match net::try_network_rescue(config, &mut ui, &disk_err.to_string()) {
                     Ok(infallible) => match infallible {},
                     Err(e) => e,
@@ -123,6 +140,8 @@ fn dispatch_external(config: &Config, cause: &NmblError) -> Result<Infallible> {
     // Either the feature was off or the operator disabled network
     // rescue — fall back to the structured halt with the disk-rescue
     // error surfaced.
+    #[cfg(not(feature = "network-rescue"))]
+    let _ = console; // unused when network-rescue is compiled out
     let _ = &disk_err; // silence unused warning when feature is off
     halt_with_banner(&NmblError::Rescue {
         stage: "disk-rescue-failed",
