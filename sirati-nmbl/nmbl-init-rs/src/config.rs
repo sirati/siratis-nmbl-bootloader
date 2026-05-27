@@ -113,6 +113,16 @@ pub struct Activation {
 
     #[serde(default)]
     pub prompt_label: Option<String>,
+
+    /// When set on a `luks-password` activation, NMBL captures the
+    /// typed passphrase and injects it into the kexec'd initrd as a
+    /// keyfile at this in-cpio path (e.g. `/etc/nmbl-luks/cryptroot`).
+    /// The next stage's NixOS config points
+    /// `boot.initrd.luks.devices.<name>.keyFile` at the same path so
+    /// the operator only types once. The path stays in memory only —
+    /// it lives in the initrd tmpfs, dropped at switch-root.
+    #[serde(default)]
+    pub pass_to_stage1: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Deserialize)]

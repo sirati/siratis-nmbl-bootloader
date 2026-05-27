@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use nix::sys::reboot::{RebootMode, reboot};
 
-use nmbl_init::activation::run_all_activations;
+use nmbl_init::activation::{KeyInjection, run_all_activations};
 use nmbl_init::boot::kexec_into;
 use nmbl_init::config::Config;
 use nmbl_init::devices::mount_system_filesystems;
@@ -117,8 +117,9 @@ fn recover_from_panic(args: Args, report_path: PathBuf) -> std::convert::Infalli
 
 /// Execute the normal boot phases in order. Each phase that errors
 /// short-circuits to the caller, which routes through the emergency
-/// shell.
-fn run_phases(config: &Config) -> Result<()> {
+/// shell. Returns the LUKS-passphrase injections that the kexec phase
+/// must thread into the chained initrd.
+fn run_phases(config: &Config) -> Result<Vec<KeyInjection>> {
     nmbl_info!("phase 1: mount pseudo-filesystems");
     mount_pseudo_filesystems()?;
 
@@ -127,17 +128,17 @@ fn run_phases(config: &Config) -> Result<()> {
 
     nmbl_info!("phase 3: storage activations");
     let mut supplier = TuiPasswordSupplier::new(config);
-    run_all_activations(config, Some(&mut supplier))?;
+    let injections = run_all_activations(config, Some(&mut supplier))?;
 
     nmbl_info!("phase 3b: mount system filesystems");
     mount_system_filesystems(config)?;
 
-    Ok(())
+    Ok(injections)
 }
 
 /// Run phases 4→6 (generation discovery, UI, decision dispatch). Kept
 /// separate so the call sites for `drop_to_emergency` stay obvious.
-fn select_and_act(config: &Config) -> Result<()> {
+fn select_and_act(config: &Config, key_injections: &[KeyInjection]) -> Result<()> {
     nmbl_info!("phase 4: scan generations");
     let generations = scan_generations(config)?;
 
@@ -162,7 +163,7 @@ fn select_and_act(config: &Config) -> Result<()> {
             // does not return. Match against the Infallible so a
             // future signature change becomes a compile error here
             // rather than a silently-ignored return value.
-            match kexec_into(config, target, cmdline_override.as_deref())? {}
+            match kexec_into(config, target, cmdline_override.as_deref(), key_injections)? {}
         }
         Decision::Shell => Err(NmblError::Io {
             source: std::io::Error::other("operator chose emergency shell"),
@@ -232,7 +233,7 @@ fn main() -> ExitCode {
         match drop_to_emergency(&config, err) {}
     }
 
-    let outcome = run_phases(&config).and_then(|()| select_and_act(&config));
+    let outcome = run_phases(&config).and_then(|injections| select_and_act(&config, &injections));
 
     match outcome {
         Ok(()) => ExitCode::from(0),

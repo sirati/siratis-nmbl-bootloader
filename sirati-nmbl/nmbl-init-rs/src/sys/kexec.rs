@@ -7,12 +7,13 @@
 
 use std::convert::Infallible;
 use std::ffi::CString;
+use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use nix::errno::Errno;
 use nix::sys::reboot::{RebootMode, reboot};
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{MemfdFlags, Mode, OFlags};
 
 use crate::error::{NmblError, Result};
 
@@ -52,31 +53,58 @@ fn build_cmdline_cstring(
 /// `flags` automatically and `-1` is passed as the initrd fd. Both file
 /// descriptors are opened `O_RDONLY | O_CLOEXEC` and closed at drop.
 pub fn load(kernel: &Path, initrd: Option<&Path>, cmdline: &str, flags: u32) -> Result<()> {
+    load_with_initrd_fd(kernel, initrd, None, cmdline, flags)
+}
+
+/// Like [`load`], but the initrd is supplied as a `memfd`-style
+/// in-memory file descriptor (anything `kexec_file_load(2)` will accept
+/// as an fd argument). `initrd_path_for_errors` is the path the
+/// `initrd` buffer was *derived from* — only used to enrich
+/// `NmblError::KexecLoad`'s context fields when the syscall fails, and
+/// passed through as-is so the operator sees the same path they'd see
+/// without injection.
+///
+/// Internal helper for [`load_with_extra_initrd_cpio`]. Prefer that
+/// for the common case.
+fn load_with_initrd_fd(
+    kernel: &Path,
+    initrd_path_for_errors: Option<&Path>,
+    initrd_fd: Option<&OwnedFd>,
+    cmdline: &str,
+    flags: u32,
+) -> Result<()> {
     let kernel_fd = rustix::fs::open(kernel, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
         .map_err(|e| NmblError::KexecLoad {
             kernel: kernel.to_path_buf(),
-            initrd: initrd.map(Path::to_path_buf),
+            initrd: initrd_path_for_errors.map(Path::to_path_buf),
             source: nix::Error::from_raw(e.raw_os_error()),
         })?;
 
-    let (initrd_fd_opt, effective_flags) = match initrd {
-        Some(path) => {
-            let fd = rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-                .map_err(|e| NmblError::KexecLoad {
-                    kernel: kernel.to_path_buf(),
-                    initrd: Some(path.to_path_buf()),
-                    source: nix::Error::from_raw(e.raw_os_error()),
-                })?;
-            (Some(fd), flags)
+    // Open the initrd file if no caller-supplied fd was provided.
+    let opened_initrd: Option<OwnedFd> = if initrd_fd.is_none() {
+        match initrd_path_for_errors {
+            Some(path) => Some(
+                rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).map_err(
+                    |e| NmblError::KexecLoad {
+                        kernel: kernel.to_path_buf(),
+                        initrd: Some(path.to_path_buf()),
+                        source: nix::Error::from_raw(e.raw_os_error()),
+                    },
+                )?,
+            ),
+            None => None,
         }
-        None => (None, flags | KEXEC_FILE_NO_INITRAMFS),
+    } else {
+        None
     };
 
-    let (cmdline_buf, cmdline_len) = build_cmdline_cstring(cmdline, kernel, initrd)?;
+    let (cmdline_buf, cmdline_len) =
+        build_cmdline_cstring(cmdline, kernel, initrd_path_for_errors)?;
 
-    let initrd_raw: libc::c_int = match initrd_fd_opt.as_ref() {
-        Some(fd) => fd.as_raw_fd(),
-        None => -1,
+    let (initrd_raw, effective_flags): (libc::c_int, u32) = match (initrd_fd, &opened_initrd) {
+        (Some(fd), _) => (fd.as_raw_fd(), flags),
+        (None, Some(fd)) => (fd.as_raw_fd(), flags),
+        (None, None) => (-1, flags | KEXEC_FILE_NO_INITRAMFS),
     };
 
     // SAFETY: Unavoidable raw syscall.
@@ -104,11 +132,77 @@ pub fn load(kernel: &Path, initrd: Option<&Path>, cmdline: &str, flags: u32) -> 
     if rc < 0 {
         return Err(NmblError::KexecLoad {
             kernel: kernel.to_path_buf(),
-            initrd: initrd.map(Path::to_path_buf),
+            initrd: initrd_path_for_errors.map(Path::to_path_buf),
             source: nix::Error::from(Errno::last()),
         });
     }
     Ok(())
+}
+
+/// Like [`load`], but appends `extra_cpio` (an uncompressed cpio
+/// fragment, see [`crate::sys::cpio`]) after the system initrd in
+/// memory and hands the combined buffer to `kexec_file_load(2)` via a
+/// `memfd_create`'d anonymous file descriptor. Used by the LUKS-
+/// passphrase pass-through path so the typed passphrase never touches
+/// disk: it lives in a `Zeroizing<Vec<u8>>` until written to the memfd
+/// (kernel-owned, anonymous memory backed by tmpfs that no path
+/// references), and the buffer drops + zeroes the moment we return.
+pub fn load_with_extra_initrd_cpio(
+    kernel: &Path,
+    initrd: &Path,
+    extra_cpio: &[u8],
+    cmdline: &str,
+    flags: u32,
+) -> Result<()> {
+    let mut combined: Vec<u8> =
+        std::fs::read(initrd).map_err(|e| NmblError::KexecLoad {
+            kernel: kernel.to_path_buf(),
+            initrd: Some(initrd.to_path_buf()),
+            source: nix::Error::from_raw(e.raw_os_error().unwrap_or(libc::EIO)),
+        })?;
+    // 4-byte align before the next concatenated archive — Linux's
+    // initrd unpacker accepts NUL padding between archives.
+    while !combined.len().is_multiple_of(4) {
+        combined.push(0);
+    }
+    combined.extend_from_slice(extra_cpio);
+
+    let memfd: OwnedFd =
+        rustix::fs::memfd_create("nmbl-initrd", MemfdFlags::CLOEXEC).map_err(|e| {
+            NmblError::KexecLoad {
+                kernel: kernel.to_path_buf(),
+                initrd: Some(initrd.to_path_buf()),
+                source: nix::Error::from_raw(e.raw_os_error()),
+            }
+        })?;
+    // Write the combined buffer to the memfd via rustix so we don't
+    // consume the OwnedFd into a `File` (we still need it for kexec).
+    let mut remaining = combined.as_slice();
+    while !remaining.is_empty() {
+        let n = rustix::io::write(&memfd, remaining).map_err(|e| NmblError::KexecLoad {
+            kernel: kernel.to_path_buf(),
+            initrd: Some(initrd.to_path_buf()),
+            source: nix::Error::from_raw(e.raw_os_error()),
+        })?;
+        if n == 0 {
+            return Err(NmblError::KexecLoad {
+                kernel: kernel.to_path_buf(),
+                initrd: Some(initrd.to_path_buf()),
+                source: nix::Error::from(Errno::EIO),
+            });
+        }
+        remaining = remaining.get(n..).unwrap_or(&[]);
+    }
+    // Rewind so `kexec_file_load` reads from offset 0.
+    rustix::fs::seek(&memfd, rustix::fs::SeekFrom::Start(0)).map_err(|e| {
+        NmblError::KexecLoad {
+            kernel: kernel.to_path_buf(),
+            initrd: Some(initrd.to_path_buf()),
+            source: nix::Error::from_raw(e.raw_os_error()),
+        }
+    })?;
+
+    load_with_initrd_fd(kernel, Some(initrd), Some(&memfd), cmdline, flags)
 }
 
 /// Execute the previously loaded kexec image.
