@@ -39,6 +39,7 @@
 //! emergency shell.
 
 pub mod app;
+pub mod console;
 pub mod emergency;
 pub mod timeout;
 pub mod view;
@@ -364,7 +365,7 @@ fn run_splash_countdown(
 /// fresh `SplashTerminal` per frame is the simplest way to guarantee
 /// the grid reflects only the current frame's bytes.
 #[cfg(feature = "image-splash")]
-fn render_splash_frame(
+pub(crate) fn render_splash_frame(
     drm: &mut drm::SplashDrm,
     bg_scaled: &[u8],
     cache: &glyph_cache::GlyphCache,
