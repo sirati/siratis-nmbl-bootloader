@@ -35,13 +35,15 @@ struct BtrfsIoctlVolArgs {
     name: [u8; BTRFS_PATH_NAME_MAX + 1],
 }
 
-/// Compute `BTRFS_IOC_SCAN_DEV` at compile time.
-/// `_IOW(magic, nr, T)` = `((_IOC_WRITE << 30) | ((size) << 16) | ((type) << 8) | (nr))`
-/// `_IOC_WRITE` = 1 (linux/ioctl.h), size = size_of::<BtrfsIoctlVolArgs>() = 4096.
-const BTRFS_IOC_SCAN_DEV: libc::c_ulong = {
-    let size = std::mem::size_of::<BtrfsIoctlVolArgs>();
-    ((1u64 << 30) | ((size as u64) << 16) | ((BTRFS_IOCTL_MAGIC as u64) << 8) | 4u64)
-        as libc::c_ulong
+/// `BTRFS_IOC_SCAN_DEV` ioctl request number.
+///
+/// `_IOW(BTRFS_IOCTL_MAGIC, 4, struct btrfs_ioctl_vol_args)` where
+/// `_IOW(type, nr, T)` = `((_IOC_WRITE << 30) | (sizeof(T) << 16) | ((type) << 8) | nr)`,
+/// `_IOC_WRITE` = 1, `sizeof(BtrfsIoctlVolArgs)` = 4096 = 0x1000.
+/// Stored as `u32` (the type libc::ioctl expects on Linux/musl as `Ioctl = c_int`).
+const BTRFS_IOC_SCAN_DEV: u32 = {
+    let size = std::mem::size_of::<BtrfsIoctlVolArgs>() as u32;
+    (1u32 << 30) | (size << 16) | ((BTRFS_IOCTL_MAGIC as u32) << 8) | 4u32
 };
 
 /// Issue `BTRFS_IOC_SCAN_DEV` on `dev`. The ioctl tells the kernel to
@@ -89,10 +91,13 @@ fn scan_one(dev: &Path) -> Result<()> {
     //   * `args` is stack-allocated, correctly sized, and zero-initialized;
     //     the kernel reads the `name` field and does not write to our buffer.
     //   * The ioctl number matches linux/btrfs.h BTRFS_IOC_SCAN_DEV.
+    // `libc::ioctl` on musl takes the request as `c_int`; casting a
+    // u32 ioctl code to i32 is safe — the kernel treats it as unsigned,
+    // and the bit pattern is preserved through the system-call argument.
     let rc = unsafe {
         libc::ioctl(
             fd.as_raw_fd(),
-            BTRFS_IOC_SCAN_DEV,
+            BTRFS_IOC_SCAN_DEV as libc::c_int,
             &mut args as *mut BtrfsIoctlVolArgs,
         )
     };
