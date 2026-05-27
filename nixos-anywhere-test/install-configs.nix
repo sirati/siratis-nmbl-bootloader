@@ -271,23 +271,18 @@ in
           boot.nmbl.serialConsole = lib.mkForce null;
           boot.nmbl.timeoutSeconds = lib.mkForce 600;
           # LUKS unlock executed by NMBL stage-0 before mounting /.
-          # The typed passphrase is injected into the kexec'd initrd so
-          # NixOS stage-1 doesn't re-prompt.
+          # passToStage1 hand-off isn't on this branch yet, so the
+          # post-kexec NixOS stage-1 will re-prompt for the same
+          # passphrase. For the demo we only need the splash-side
+          # prompt to render.
           boot.nmbl.activation.luks = [
             {
               name = "cryptroot";
               device = "/dev/vda3";
               unlock = "password";
               promptLabel = "Enter LUKS passphrase for cryptroot";
-              passToStage1 = "/etc/nmbl-luks/cryptroot";
             }
           ];
-          boot.initrd.luks.devices.cryptroot = lib.mkForce {
-            device = "/dev/disk/by-partlabel/disk-main-luks";
-            keyFile = "/etc/nmbl-luks/cryptroot";
-            fallbackToPassword = true;
-            allowDiscards = true;
-          };
         }
       )
     ];
