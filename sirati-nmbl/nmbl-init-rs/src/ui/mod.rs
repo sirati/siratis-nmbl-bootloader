@@ -39,6 +39,7 @@
 pub mod app;
 pub mod console;
 pub mod emergency;
+pub mod emergency_actions;
 pub mod key_echo;
 #[cfg(feature = "image-splash")]
 pub mod pretty_shell;
@@ -94,6 +95,97 @@ pub use reporter::{BootReporter, ProgressSink};
 /// the countdown ticker so they have the same responsiveness profile
 /// and only one knob to tune.
 pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
+
+/// Outcome of a yes/no modal confirmation prompt.
+///
+/// Kept as a dedicated enum (rather than `bool`) so call sites read
+/// at a glance and so a future "third option" (e.g. `Defer`) can be
+/// added without rippling through every match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmOutcome {
+    /// Operator picked the affirmative button (Yes / Boot / …) via
+    /// Enter, hotkey 'y', or Enter on the highlighted Yes button.
+    Yes,
+    /// Operator picked the negative button (Back / No / …) via Enter
+    /// on the highlighted No button or hotkey 'n'.
+    No,
+    /// Operator pressed Esc; treated as "go back without committing".
+    /// Production callers typically lump this into `No`, but keeping
+    /// it distinct lets tests assert on the exact key path that
+    /// dismissed the modal.
+    Cancelled,
+}
+
+/// Show a centred yes/no confirmation modal with `title` + `message`
+/// on the supplied console and block until the operator commits.
+///
+/// Returns:
+///   - `Ok(ConfirmOutcome::Yes)`       — Enter on Yes, or hotkey 'y'.
+///   - `Ok(ConfirmOutcome::No)`        — Enter on No, or hotkey 'n'.
+///   - `Ok(ConfirmOutcome::Cancelled)` — Esc.
+///
+/// `yes_default = true` highlights the Yes button on first paint;
+/// pass `false` for "are you sure?"-style prompts where the safer
+/// answer is No.
+///
+/// Falls back to `ConfirmOutcome::No` if rendering fails — same
+/// principle as [`show_modal_error`]: when the operator can't see the
+/// modal, default to the safer non-action.
+pub fn show_modal_confirm(
+    console: &mut dyn Console,
+    title: &str,
+    message: &str,
+    yes_label: &str,
+    no_label: &str,
+    yes_default: bool,
+) -> Result<ConfirmOutcome> {
+    use crossterm::event::KeyCode;
+
+    let hint = "Left/Right select  Enter confirm  Esc cancel";
+    let mut yes_selected = yes_default;
+
+    let mut dirty = true;
+    loop {
+        if dirty {
+            let data = view::ModalConfirmScreenData {
+                title,
+                message,
+                yes_label,
+                no_label,
+                yes_selected,
+                hint,
+            };
+            if let Err(e) = console.draw_with(&mut |frame| view::render_modal_confirm(frame, &data))
+            {
+                eprintln!("[nmbl] {title}: {message}");
+                crate::nmbl_warn!("modal-confirm render failed: {e}");
+                return Ok(ConfirmOutcome::No);
+            }
+            dirty = false;
+        }
+
+        let Some(key) = console.poll_key(POLL_SLICE)? else {
+            continue;
+        };
+        match key.code {
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                yes_selected = !yes_selected;
+                dirty = true;
+            }
+            KeyCode::Enter => {
+                return Ok(if yes_selected {
+                    ConfirmOutcome::Yes
+                } else {
+                    ConfirmOutcome::No
+                });
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(ConfirmOutcome::Yes),
+            KeyCode::Char('n') | KeyCode::Char('N') => return Ok(ConfirmOutcome::No),
+            KeyCode::Esc => return Ok(ConfirmOutcome::Cancelled),
+            _ => {}
+        }
+    }
+}
 
 /// Show a centred modal dialog with `title` + `message` on the supplied
 /// console and block until the operator presses any key (or
@@ -811,6 +903,104 @@ mod tests {
         assert!(
             dump.contains("Enter=submit"),
             "footer hint must be visible: \n{dump}"
+        );
+    }
+
+    #[test]
+    fn show_modal_confirm_returns_yes_on_enter_with_default_true() {
+        // yes_default = true highlights Yes; Enter immediately commits
+        // to Yes without needing arrow keys.
+        let keys = vec![press(KeyCode::Enter)];
+        let mut console = ScriptedConsole::new(keys);
+        let out = show_modal_confirm(
+            &mut console,
+            "Boot one?",
+            "Found 3 generations.",
+            "Yes",
+            "Back",
+            true,
+        )
+        .expect("modal must succeed on Enter");
+        assert_eq!(out, ConfirmOutcome::Yes);
+    }
+
+    #[test]
+    fn show_modal_confirm_returns_no_on_enter_with_default_false() {
+        // yes_default = false highlights Back; Enter commits to No.
+        let keys = vec![press(KeyCode::Enter)];
+        let mut console = ScriptedConsole::new(keys);
+        let out = show_modal_confirm(
+            &mut console,
+            "Are you sure?",
+            "This may destroy data.",
+            "Yes",
+            "No",
+            false,
+        )
+        .expect("modal must succeed");
+        assert_eq!(out, ConfirmOutcome::No);
+    }
+
+    #[test]
+    fn show_modal_confirm_arrow_keys_toggle_selection_then_enter_commits() {
+        // Default Yes, then Right toggles to No, Enter commits to No.
+        let keys = vec![press(KeyCode::Right), press(KeyCode::Enter)];
+        let mut console = ScriptedConsole::new(keys);
+        let out = show_modal_confirm(&mut console, "t", "b", "Yes", "No", true)
+            .expect("modal must succeed");
+        assert_eq!(out, ConfirmOutcome::No);
+
+        // Default No, then Left toggles to Yes, Enter commits to Yes.
+        let keys = vec![press(KeyCode::Left), press(KeyCode::Enter)];
+        let mut console = ScriptedConsole::new(keys);
+        let out = show_modal_confirm(&mut console, "t", "b", "Yes", "No", false)
+            .expect("modal must succeed");
+        assert_eq!(out, ConfirmOutcome::Yes);
+    }
+
+    #[test]
+    fn show_modal_confirm_hotkey_y_returns_yes() {
+        // 'y' hotkey commits to Yes regardless of which button is
+        // highlighted — matches the muscle-memory pattern of every
+        // other confirmation prompt in the binary.
+        let keys = vec![press(KeyCode::Char('y'))];
+        let mut console = ScriptedConsole::new(keys);
+        let out = show_modal_confirm(&mut console, "t", "b", "Yes", "No", false)
+            .expect("modal must succeed on 'y'");
+        assert_eq!(out, ConfirmOutcome::Yes);
+    }
+
+    #[test]
+    fn show_modal_confirm_hotkey_n_returns_no() {
+        let keys = vec![press(KeyCode::Char('n'))];
+        let mut console = ScriptedConsole::new(keys);
+        let out = show_modal_confirm(&mut console, "t", "b", "Yes", "No", true)
+            .expect("modal must succeed on 'n'");
+        assert_eq!(out, ConfirmOutcome::No);
+    }
+
+    #[test]
+    fn show_modal_confirm_esc_returns_cancelled() {
+        let keys = vec![press(KeyCode::Esc)];
+        let mut console = ScriptedConsole::new(keys);
+        let out = show_modal_confirm(&mut console, "t", "b", "Yes", "Back", true)
+            .expect("modal must succeed on Esc");
+        assert_eq!(out, ConfirmOutcome::Cancelled);
+    }
+
+    #[test]
+    fn show_modal_confirm_renders_at_least_once_before_polling() {
+        // Defence-in-depth: the operator must see the modal BEFORE we
+        // start blocking on input. If a future refactor reorders the
+        // draw and poll, the picker would block on a stale screen.
+        let keys = vec![press(KeyCode::Char('y'))];
+        let mut console = ScriptedConsole::new(keys);
+        let _ = show_modal_confirm(&mut console, "t", "b", "Yes", "No", true)
+            .expect("modal must succeed");
+        assert!(
+            console.renders >= 1,
+            "expected at least one render, got {}",
+            console.renders
         );
     }
 }

@@ -74,6 +74,21 @@ pub enum EmergencyChoice {
     /// degraded plain-text mode that defeats the purpose.
     #[cfg(feature = "image-splash")]
     PrettyShell,
+    /// Re-run the full normal boot path (phases 3, 3b, 4, 5) from the
+    /// emergency screen. Use case: a transient activation failure
+    /// (network mount times out, USB key not seated) that the operator
+    /// fixed at the shell and now wants to retry without rebooting.
+    /// On success returns a [`crate::terminal::TerminalAction::Kexec`]
+    /// (or `Reboot`); on failure shows a modal error and returns the
+    /// operator to the emergency screen.
+    RetryBoot,
+    /// Skip phases 3 and 3b (assume the operator already mounted the
+    /// system filesystem manually at the shell) and run only the
+    /// generation scan + selector. Confirms with a yes/no modal before
+    /// handing off to the boot dispatcher. Use case: kexec readiness
+    /// check during disaster recovery, where the disk layout is
+    /// non-standard and `run_all_activations` can't replicate it.
+    VerifyKexecReadiness,
 }
 
 /// One row on the emergency screen.
