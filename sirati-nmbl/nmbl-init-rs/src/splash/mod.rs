@@ -23,30 +23,10 @@ pub mod scale;
 pub mod terminal;
 pub mod types;
 
-#[cfg(test)]
-mod tests {
-    use crate::config::Config;
-    use crate::ui::run_selector;
-    use std::path::PathBuf;
-
-    #[test]
-    #[allow(
-        clippy::expect_used,
-        clippy::panic,
-        reason = "tests assert with panics on contract failure"
-    )]
-    fn run_selector_with_missing_dri_falls_back_cleanly() {
-        // When the configured DRI path is missing and the /dev/dri/card*
-        // scan finds nothing usable, run_selector falls back to the
-        // serial prompt. On dev hosts the scan may hit a real card
-        // whose bring-up requires DRM master we don't have — accept
-        // either path's outcome, since neither produces a working splash.
-        let mut config = Config::recovery_default();
-        config.splash.enable = true;
-        config.splash.dri_path = PathBuf::from("/dev/this/does/not/exist");
-        // The fallback path will try to read from stdin which the test
-        // harness doesn't have. We're satisfied as long as the call
-        // doesn't panic before that point.
-        let _ = run_selector(&config, &[]);
-    }
-}
+// `run_selector` no longer opens its own splash console — the
+// orchestrator brings up the boot console once (via
+// `crate::ui::console::open_console`) before phase 1 and passes the
+// resulting `&mut dyn Console` through every subsequent phase. The
+// "missing DRI falls back to serial" decision now lives in
+// `console::decide_backend` / `console::open_console`, both of which
+// have their own pure-decision tests under `src/ui/console/mod.rs`.
