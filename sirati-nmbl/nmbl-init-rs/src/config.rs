@@ -29,6 +29,13 @@ pub struct Config {
 
     #[serde(default)]
     pub rescue: RescueConfig,
+
+    /// Populated by Phase 0.5 with the runtime mountpoint of the boot
+    /// partition. `None` in legacy embedded-config mode. Never parsed
+    /// from TOML — `#[serde(skip)]` keeps it out of the wire schema and
+    /// makes [`Default for Config`] supply `None` automatically.
+    #[serde(skip)]
+    pub runtime_boot_mountpoint: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,12 +218,13 @@ pub struct RescueConfig {
     #[serde(default)]
     pub mode: RescueMode,
 
-    /// Override the on-disk location of `nmbl-rescue.sfs`. When `None`
-    /// the rescue dispatcher falls back to `/boot/nmbl-rescue.sfs`.
-    /// Bootstrap-mode installs set this to
-    /// `<boot_fs.mountpoint>/nmbl-rescue.sfs` because the operator's
-    /// boot partition is mounted under `bootstrap.boot_fs.mountpoint`
-    /// rather than `/boot`.
+    /// Path to `nmbl-rescue.sfs` RELATIVE TO THE BOOT PARTITION ROOT.
+    /// A leading `/` is tolerated and stripped at resolution time. When
+    /// `None` the rescue dispatcher uses the default
+    /// `"nmbl-rescue.sfs"`. The runtime mountpoint is supplied
+    /// out-of-band via [`Config::runtime_boot_mountpoint`] (populated by
+    /// Phase 0.5), so this value is always boot-partition-relative
+    /// regardless of where the operator's boot is mounted.
     #[serde(default)]
     pub sfs_path: Option<PathBuf>,
 }
@@ -282,6 +290,7 @@ impl Config {
             tui: Tui::default(),
             paths: Paths::default(),
             rescue: RescueConfig::default(),
+            runtime_boot_mountpoint: None,
         }
     }
 }
@@ -868,6 +877,25 @@ mystery = "boom"
         let cfg = RescueConfig::default();
         assert_eq!(cfg.mode, RescueMode::Embedded);
         assert!(cfg.sfs_path.is_none());
+    }
+
+    #[test]
+    fn recovery_default_has_no_runtime_boot_mountpoint() {
+        // Legacy embedded-config mode never mounts a boot partition, so
+        // the recovery-default Config must report None for the runtime
+        // mountpoint. `rescue::locate_sfs` keys off this to surface a
+        // clear diagnostic instead of fabricating a path.
+        let cfg = Config::recovery_default();
+        assert!(cfg.runtime_boot_mountpoint.is_none());
+    }
+
+    #[test]
+    fn runtime_boot_mountpoint_is_not_parsed_from_toml() {
+        // The field is `#[serde(skip)]` so even if the operator's TOML
+        // contains a stray top-level `runtime_boot_mountpoint = "…"` it
+        // must be rejected as an unknown field by `deny_unknown_fields`.
+        let toml = r#"runtime_boot_mountpoint = "/mnt/boot""#;
+        toml::from_str::<Config>(toml).expect_err("runtime_boot_mountpoint is runtime-only");
     }
 
     #[test]

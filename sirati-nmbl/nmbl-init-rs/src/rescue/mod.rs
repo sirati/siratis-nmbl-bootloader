@@ -24,7 +24,7 @@ pub mod disk;
 
 use std::convert::Infallible;
 use std::ffi::CString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use nix::sys::reboot::{RebootMode, reboot};
 use nix::unistd::execve;
@@ -32,6 +32,11 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result, format_chain};
+
+/// Default basename of the rescue squashfs on the boot partition. Used
+/// when `[rescue].sfs_path` is absent from the operator's runtime
+/// config.
+const DEFAULT_SFS_BASENAME: &str = "nmbl-rescue.sfs";
 
 /// How [`crate::shell::drop_to_emergency`] reaches the operator. Comes
 /// from the runtime [`Config`]'s `[rescue]` section; persists to TOML
@@ -157,19 +162,51 @@ pub fn halt_with_banner(cause: &NmblError) -> Result<Infallible> {
     unsafe { libc::_exit(1) };
 }
 
-/// Decide where to look for the external rescue squashfs. If the
-/// operator pinned an absolute path via `rescue.sfs_path`, use it;
-/// otherwise fall back to `/boot/nmbl-rescue.sfs`. The bootstrap
-/// flow's mountpoint is not visible in [`Config`] — operators running
-/// in bootstrap mode pass an explicit `sfs_path` pointing at
-/// `<boot_fs.mountpoint>/nmbl-rescue.sfs` via their Nix-emitted
-/// runtime config (Phase C.2).
-pub fn locate_sfs(config: &Config) -> PathBuf {
-    config
-        .rescue
-        .sfs_path
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("/boot/nmbl-rescue.sfs"))
+/// Resolve the on-disk path of the external rescue squashfs.
+///
+/// `rescue.sfs_path` is interpreted as a path RELATIVE TO THE BOOT
+/// PARTITION ROOT; a leading `/` is tolerated and stripped so the
+/// mountpoint join keeps the runtime mountpoint instead of replacing
+/// it. When `sfs_path` is absent the basename
+/// [`DEFAULT_SFS_BASENAME`] is used.
+///
+/// The runtime mountpoint comes from
+/// [`Config::runtime_boot_mountpoint`], which Phase 0.5 populates after
+/// `mount_boot` succeeds. In legacy embedded-config mode that field is
+/// `None` — there is no NMBL-mounted boot partition, so external rescue
+/// is not supported and this function surfaces a
+/// `NmblError::Rescue { stage: "locate-sfs", … }` instead of fabricating
+/// a path that would not resolve.
+pub fn locate_sfs(config: &Config) -> Result<PathBuf> {
+    let mountpoint =
+        config
+            .runtime_boot_mountpoint
+            .as_deref()
+            .ok_or_else(|| NmblError::Rescue {
+                stage: "locate-sfs",
+                source: Box::new(NmblError::ConfigInvalid {
+                    reason:
+                        "external rescue requires bootstrap mode: the runtime boot mountpoint is \
+                         only known after Phase 0.5 mounts the boot partition, but this NMBL \
+                         instance is running in legacy embedded-config mode"
+                            .to_string(),
+                    context: "resolving rescue.sfs_path against the runtime boot mountpoint"
+                        .to_string(),
+                }),
+            })?;
+
+    let relative: PathBuf = match config.rescue.sfs_path.as_deref() {
+        Some(p) => strip_leading_slash(p).to_path_buf(),
+        None => PathBuf::from(DEFAULT_SFS_BASENAME),
+    };
+    Ok(mountpoint.join(relative))
+}
+
+/// Strip a single leading `/` so [`Path::join`] keeps the mountpoint
+/// instead of replacing it. Mirrors the helper in
+/// [`crate::config::resolve_full_config_path`].
+fn strip_leading_slash(p: &Path) -> &Path {
+    p.strip_prefix("/").unwrap_or(p)
 }
 
 #[cfg(test)]
@@ -213,24 +250,85 @@ mod tests {
         toml::from_str::<W>(r#"mode = "bogus""#).expect_err("unknown mode must reject");
     }
 
-    fn cfg_with(rescue: RescueConfig) -> Config {
+    fn cfg_with(rescue: RescueConfig, mountpoint: Option<PathBuf>) -> Config {
         let mut c = Config::recovery_default();
         c.rescue = rescue;
+        c.runtime_boot_mountpoint = mountpoint;
         c
     }
 
     #[test]
-    fn locate_sfs_defaults_to_boot_path() {
-        let c = cfg_with(RescueConfig::default());
-        assert_eq!(locate_sfs(&c), Path::new("/boot/nmbl-rescue.sfs"));
+    fn locate_sfs_defaults_to_mountpoint_plus_basename() {
+        let c = cfg_with(RescueConfig::default(), Some(PathBuf::from("/mnt/boot")));
+        assert_eq!(
+            locate_sfs(&c).expect("default sfs path resolves"),
+            Path::new("/mnt/boot/nmbl-rescue.sfs"),
+        );
     }
 
     #[test]
-    fn locate_sfs_honours_override() {
-        let c = cfg_with(RescueConfig {
-            mode: RescueMode::External,
-            sfs_path: Some(PathBuf::from("/mnt/boot/nmbl-rescue.sfs")),
-        });
-        assert_eq!(locate_sfs(&c), Path::new("/mnt/boot/nmbl-rescue.sfs"));
+    fn locate_sfs_joins_relative_override() {
+        let c = cfg_with(
+            RescueConfig {
+                mode: RescueMode::External,
+                sfs_path: Some(PathBuf::from("foo.sfs")),
+            },
+            Some(PathBuf::from("/mnt/boot")),
+        );
+        assert_eq!(
+            locate_sfs(&c).expect("relative override resolves"),
+            Path::new("/mnt/boot/foo.sfs"),
+        );
+    }
+
+    #[test]
+    fn locate_sfs_strips_leading_slash_on_override() {
+        let c = cfg_with(
+            RescueConfig {
+                mode: RescueMode::External,
+                sfs_path: Some(PathBuf::from("/foo.sfs")),
+            },
+            Some(PathBuf::from("/mnt/boot")),
+        );
+        assert_eq!(
+            locate_sfs(&c).expect("leading-slash override resolves"),
+            Path::new("/mnt/boot/foo.sfs"),
+        );
+    }
+
+    #[test]
+    fn locate_sfs_joins_nested_override() {
+        let c = cfg_with(
+            RescueConfig {
+                mode: RescueMode::External,
+                sfs_path: Some(PathBuf::from("/custom/r.sfs")),
+            },
+            Some(PathBuf::from("/mnt/boot")),
+        );
+        assert_eq!(
+            locate_sfs(&c).expect("nested override resolves"),
+            Path::new("/mnt/boot/custom/r.sfs"),
+        );
+    }
+
+    #[test]
+    fn locate_sfs_without_mountpoint_is_locate_sfs_error() {
+        let c = cfg_with(RescueConfig::default(), None);
+        let err = locate_sfs(&c).expect_err("missing mountpoint must error");
+        match err {
+            NmblError::Rescue { stage, source } => {
+                assert_eq!(stage, "locate-sfs");
+                match *source {
+                    NmblError::ConfigInvalid { reason, .. } => {
+                        assert!(
+                            reason.contains("bootstrap mode") || reason.contains("embedded-config"),
+                            "diagnostic should explain the mode constraint, got: {reason}",
+                        );
+                    }
+                    other => panic!("expected ConfigInvalid inside Rescue, got {other:?}"),
+                }
+            }
+            other => panic!("expected Rescue variant, got {other:?}"),
+        }
     }
 }
