@@ -145,10 +145,19 @@ pub fn kexec_into(
     nix::unistd::sync();
     std::thread::sleep(POST_SYNC_FLUSH);
 
+    // Dedupe: the root filesystem's mountpoint resolves to system_root,
+    // so reverse_mount_targets already covers it. detaching twice gets
+    // EINVAL on the second call ("not a mount point").
+    let mut already: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for target in reverse_mount_targets(config) {
-        detach(&target);
+        if already.insert(target.clone()) {
+            detach(&target);
+        }
     }
-    detach(config.paths.system_root.as_path());
+    let system_root = config.paths.system_root.clone();
+    if already.insert(system_root.clone()) {
+        detach(&system_root);
+    }
     for pseudo in PSEUDO_FS.iter().rev() {
         detach(Path::new(pseudo));
     }
