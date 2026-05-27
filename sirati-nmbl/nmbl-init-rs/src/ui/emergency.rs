@@ -56,11 +56,53 @@ const CONSOLE_PATH: &str = "/dev/console";
 /// Default countdown to auto-reboot when the operator is not present.
 const EMERGENCY_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Which backend the emergency screen should try first. Splash will
+/// still fall back to Tty on bring-up failure; this enum only encodes
+/// the *initial* choice, which is the thing we want to unit-test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    Serial,
+    Tty,
+    #[cfg(feature = "image-splash")]
+    Splash,
+}
+
+/// Pure decision: given the config and the triggering error, which
+/// backend should drive the emergency screen? Extracted from
+/// [`run_emergency_screen`] so the policy is testable without DRM.
+///
+/// Rules:
+///   - `serial_console` always wins; the splash console has no usable
+///     keyboard on a serial-only deployment.
+///   - If the trigger is a panic-recovery re-exec, *never* try splash
+///     — the panic may have come from the splash code path itself
+///     (DRM, font, compositor), and re-entering it would loop straight
+///     back into the offending code.
+///   - Otherwise prefer splash when the feature is built in and
+///     enabled; fall back to tty.
+fn choose_backend(config: &Config, err: &NmblError) -> BackendKind {
+    if config.general.serial_console {
+        return BackendKind::Serial;
+    }
+
+    // Panic may have come from splash; don't re-enter.
+    let force_tty = matches!(err, NmblError::Panicked { .. });
+
+    #[cfg(feature = "image-splash")]
+    if config.splash.enable && !force_tty {
+        return BackendKind::Splash;
+    }
+
+    let _ = force_tty; // suppress unused warning when image-splash is off
+    BackendKind::Tty
+}
+
 /// Run the emergency screen and return the operator's choice.
 ///
 /// Tries, in order:
 ///   1. Splash console (when `image-splash` feature is built in,
-///      `config.splash.enable` is true, and DRM bring-up succeeds).
+///      `config.splash.enable` is true, the trigger isn't a panic
+///      re-exec, and DRM bring-up succeeds).
 ///   2. Raw-mode ratatui over `/dev/console`.
 ///   3. Line-oriented serial prompt on stdin/stdout when
 ///      `config.general.serial_console` is set.
@@ -71,32 +113,29 @@ pub fn run_emergency_screen(config: &Config, err: &NmblError) -> EmergencyChoice
     let message = build_message(err);
     let items = default_items();
 
-    // Serial console path: line-oriented; the splash console will not
-    // have a working keyboard on a serial-only deployment, and raw
-    // mode is unreliable on broken serial lines.
-    if config.general.serial_console {
-        return run_serial_emergency(&message, &items)
-            .unwrap_or(EmergencyChoice::Reboot);
-    }
-
-    #[cfg(feature = "image-splash")]
-    if config.splash.enable {
-        match run_splash_emergency(config, &message, &items) {
-            Ok(choice) => return choice,
+    match choose_backend(config, err) {
+        BackendKind::Serial => run_serial_emergency(&message, &items)
+            .unwrap_or(EmergencyChoice::Reboot),
+        #[cfg(feature = "image-splash")]
+        BackendKind::Splash => match run_splash_emergency(config, &message, &items) {
+            Ok(choice) => choice,
             Err(e) => {
                 crate::nmbl_warn!(
                     "emergency splash bring-up failed: {}; falling back to tty",
                     format_chain(&e as &dyn std::error::Error)
                 );
+                // Tty fallback. If even raw-mode bring-up fails we have
+                // no UI to show, and the safest thing is to fall
+                // through to reboot — the caller (drop_to_emergency)
+                // will surface the original error via its
+                // banner-on-shell path anyway.
+                run_tty_emergency(&message, &items).unwrap_or(EmergencyChoice::Reboot)
             }
+        },
+        BackendKind::Tty => {
+            run_tty_emergency(&message, &items).unwrap_or(EmergencyChoice::Reboot)
         }
     }
-
-    // Tty fallback. If even raw-mode bring-up fails we have no UI to
-    // show, and the safest thing is to fall through to reboot — the
-    // caller (drop_to_emergency) will surface the original error via
-    // its banner-on-shell path anyway.
-    run_tty_emergency(&message, &items).unwrap_or(EmergencyChoice::Reboot)
 }
 
 /// Build the message string shown to the operator. Includes the
@@ -466,6 +505,65 @@ mod tests {
             .expect("loop must succeed");
         assert_eq!(outcome, EmergencyChoice::Reboot);
         assert!(app.countdown_remaining_secs.is_none());
+    }
+
+    fn panic_err() -> NmblError {
+        NmblError::Panicked {
+            report_path: std::path::PathBuf::from("/run/nmbl-panic.json"),
+        }
+    }
+
+    fn io_err() -> NmblError {
+        NmblError::Io {
+            source: std::io::Error::other("kaboom"),
+            context: "mounting /tmp".to_string(),
+        }
+    }
+
+    #[test]
+    fn choose_backend_serial_console_always_wins() {
+        // Even on a panic re-exec with splash enabled, a serial-only
+        // deployment must take the serial path — the operator has no
+        // graphical console to look at.
+        let mut config = crate::config::Config::recovery_default();
+        config.general.serial_console = true;
+        #[cfg(feature = "image-splash")]
+        {
+            config.splash.enable = true;
+        }
+        assert_eq!(choose_backend(&config, &io_err()), BackendKind::Serial);
+        assert_eq!(choose_backend(&config, &panic_err()), BackendKind::Serial);
+    }
+
+    #[cfg(feature = "image-splash")]
+    #[test]
+    fn choose_backend_panic_skips_splash() {
+        // The whole point of this branch: if we're recovering from a
+        // panic, the panic may have come from the splash code path
+        // (DRM, font, compositor). Re-entering it would loop straight
+        // back into the offending code. Force tty.
+        let mut config = crate::config::Config::recovery_default();
+        config.splash.enable = true;
+        assert_eq!(choose_backend(&config, &panic_err()), BackendKind::Tty);
+    }
+
+    #[cfg(feature = "image-splash")]
+    #[test]
+    fn choose_backend_non_panic_with_splash_picks_splash() {
+        // Preserve the existing behaviour for non-panic errors: splash
+        // is preferred when built in and enabled.
+        let mut config = crate::config::Config::recovery_default();
+        config.splash.enable = true;
+        assert_eq!(choose_backend(&config, &io_err()), BackendKind::Splash);
+    }
+
+    #[test]
+    fn choose_backend_splash_disabled_picks_tty() {
+        // No splash configured (or feature disabled at compile time)
+        // and no serial console: tty is the only sensible target.
+        let config = crate::config::Config::recovery_default();
+        assert_eq!(choose_backend(&config, &io_err()), BackendKind::Tty);
+        assert_eq!(choose_backend(&config, &panic_err()), BackendKind::Tty);
     }
 
     #[test]
