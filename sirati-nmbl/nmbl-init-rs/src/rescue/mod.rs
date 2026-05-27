@@ -24,14 +24,20 @@ pub mod net;
 
 use std::convert::Infallible;
 use std::ffi::CString;
+use std::io;
 use std::path::{Path, PathBuf};
 
+use nix::mount::MsFlags;
 use nix::sys::reboot::{RebootMode, reboot};
-use nix::unistd::execve;
+use nix::unistd::{chdir, chroot, execve};
 use serde::Deserialize;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result, format_chain};
+
+/// Shell binary expected inside the rescue squashfs. The squashfs ships
+/// busybox under `/bin/sh`, so this path is the post-switch-root one.
+const RESCUE_SHELL: &str = "/bin/sh";
 
 /// Default basename of the rescue squashfs on the boot partition. Used
 /// when `[rescue].sfs_path` is absent from the operator's runtime
@@ -215,6 +221,122 @@ pub fn halt_with_banner(cause: &NmblError) -> Result<Infallible> {
     // terminates the process; no crate wraps it (rustix issue #844).
     // Matches the divergent halt path in `src/shell.rs`.
     unsafe { libc::_exit(1) };
+}
+
+/// Switch from the initramfs root into `new_root` and `execve` the
+/// rescue shell (`/bin/sh`).
+///
+/// Mirrors the busybox `switch_root(8)` dance: `chdir(new_root)` →
+/// `mount --move . /` (MS_MOVE) → `chroot(.)` → `chdir(/)` →
+/// `execve("/bin/sh", ...)` with a minimal `TERM`/`PATH` env.
+///
+/// Replaces `pivot_root(2)`, which always returns `EINVAL` when the
+/// outgoing root is the initramfs rootfs pseudo-filesystem. After
+/// MS_MOVE the initramfs is detached and no longer reachable via any
+/// path. On success this never returns — the process image is replaced
+/// by the rescue shell.
+pub(crate) fn switch_root_and_exec(new_root: &Path) -> Result<Infallible> {
+    // Step 1: cd into the new root (the mounted squashfs).
+    chdir(new_root).map_err(|source| NmblError::Rescue {
+        stage: "switch-root",
+        source: Box::new(NmblError::Io {
+            source: io::Error::from_raw_os_error(source as i32),
+            context: format!("chdir({})", new_root.display()),
+        }),
+    })?;
+
+    // Step 2: Move the new-root mount to /, replacing the initramfs
+    // rootfs. MS_MOVE reassigns the mount point atomically.
+    nix::mount::mount(
+        Some("."),
+        "/",
+        Option::<&str>::None,
+        MsFlags::MS_MOVE,
+        Option::<&str>::None,
+    )
+    .map_err(|source| NmblError::Rescue {
+        stage: "switch-root",
+        source: Box::new(NmblError::Io {
+            source: io::Error::from_raw_os_error(source as i32),
+            context: "mount --move . /".to_string(),
+        }),
+    })?;
+
+    // Step 3: chroot into the new `/` (the squashfs).
+    chroot(".").map_err(|source| NmblError::Rescue {
+        stage: "switch-root",
+        source: Box::new(NmblError::Io {
+            source: io::Error::from_raw_os_error(source as i32),
+            context: "chroot(.)".to_string(),
+        }),
+    })?;
+
+    // Step 4: Update the cwd to the new root.
+    chdir("/").map_err(|source| NmblError::Rescue {
+        stage: "switch-root",
+        source: Box::new(NmblError::Io {
+            source: io::Error::from_raw_os_error(source as i32),
+            context: "chdir(/) after chroot".to_string(),
+        }),
+    })?;
+
+    exec_rescue_shell()
+}
+
+/// `execve("/bin/sh", ...)` inside the freshly switched-root rescue
+/// root with a minimal `TERM=linux` + `PATH` environment. Shared by
+/// the disk and network rescue paths.
+fn exec_rescue_shell() -> Result<Infallible> {
+    let path_c = CString::new(RESCUE_SHELL).map_err(|_| NmblError::Rescue {
+        stage: "exec-shell",
+        source: Box::new(NmblError::ConfigInvalid {
+            reason: "rescue shell path contains interior NUL".to_string(),
+            context: format!("preparing execve of {RESCUE_SHELL}"),
+        }),
+    })?;
+    let argv0_c = CString::new("sh").map_err(|_| NmblError::Rescue {
+        stage: "exec-shell",
+        source: Box::new(NmblError::ConfigInvalid {
+            reason: "rescue argv0 contains interior NUL".to_string(),
+            context: format!("preparing execve of {RESCUE_SHELL}"),
+        }),
+    })?;
+    let term_c = CString::new("TERM=linux").map_err(|_| NmblError::Rescue {
+        stage: "exec-shell",
+        source: Box::new(NmblError::ConfigInvalid {
+            reason: "TERM environment string contains interior NUL".to_string(),
+            context: format!("preparing execve of {RESCUE_SHELL}"),
+        }),
+    })?;
+    let path_env_c =
+        CString::new("PATH=/bin:/sbin:/usr/bin:/usr/sbin").map_err(|_| NmblError::Rescue {
+            stage: "exec-shell",
+            source: Box::new(NmblError::ConfigInvalid {
+                reason: "PATH environment string contains interior NUL".to_string(),
+                context: format!("preparing execve of {RESCUE_SHELL}"),
+            }),
+        })?;
+    let argv: [&CString; 1] = [&argv0_c];
+    let env: [&CString; 2] = [&term_c, &path_env_c];
+
+    // execve only returns on error.
+    let exec_err = execve(&path_c, &argv, &env).err();
+    if let Some(source) = exec_err {
+        return Err(NmblError::Rescue {
+            stage: "exec-shell",
+            source: Box::new(NmblError::Shell { source }),
+        });
+    }
+    // execve returned Ok without replacing the process image. The
+    // kernel docs say this cannot happen; the type system demands a
+    // value, so surface it as an exec failure.
+    Err(NmblError::Rescue {
+        stage: "exec-shell",
+        source: Box::new(NmblError::ConfigInvalid {
+            reason: "execve returned Ok without replacing the process image".to_string(),
+            context: format!("execve {RESCUE_SHELL}"),
+        }),
+    })
 }
 
 /// Resolve the on-disk path of the external rescue squashfs.
