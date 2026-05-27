@@ -125,6 +125,12 @@ fn run_phases(config: &Config) -> Result<()> {
     nmbl_info!("phase 2: load explicit kernel modules");
     load_explicit_modules(config)?;
 
+    // Make VT1 the foreground virtual console. PS/2 (and VNC) keypresses
+    // follow the active VT; without this they sometimes land on whichever
+    // VT the kernel made foreground after framebuffer bring-up, so the
+    // text-mode passphrase prompt in phase 3 would silently get no input.
+    nmbl_init::sys::tty::activate_vt1();
+
     nmbl_info!("phase 3: storage activations");
     let mut supplier = TuiPasswordSupplier::new(config);
     run_all_activations(config, Some(&mut supplier))?;
