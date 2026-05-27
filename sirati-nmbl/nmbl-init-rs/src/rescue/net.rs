@@ -579,7 +579,20 @@ fn write_all_to_fd<F: rustix::fd::AsFd>(fd: F, mut buf: &[u8]) -> Result<()> {
                 }),
             });
         }
-        buf = buf.get(n..).unwrap_or(&[]);
+        // `rustix::io::write` must return n ≤ buf.len(); anything else is
+        // a contract violation we want to surface, not silently treat
+        // as "done".
+        let Some(rest) = buf.get(n..) else {
+            let buf_len = buf.len();
+            return Err(NmblError::Rescue {
+                stage: "net-memfd",
+                source: Box::new(NmblError::Io {
+                    source: io::Error::from(io::ErrorKind::InvalidData),
+                    context: format!("write(memfd) returned n={n} > buf.len()={buf_len}"),
+                }),
+            });
+        };
+        buf = rest;
     }
     Ok(())
 }
