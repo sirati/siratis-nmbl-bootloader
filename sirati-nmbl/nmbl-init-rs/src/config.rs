@@ -4,6 +4,7 @@ use serde::Deserialize;
 
 use crate::error::{NmblError, Result};
 use crate::log::Verbosity;
+use crate::rescue::RescueMode;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +26,9 @@ pub struct Config {
 
     #[serde(default)]
     pub paths: Paths,
+
+    #[serde(default)]
+    pub rescue: RescueConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +198,29 @@ fn default_shell() -> PathBuf {
     PathBuf::from("/bin/sh")
 }
 
+/// `[rescue]` section of the operator's runtime config. Selects the
+/// rescue mode (see [`RescueMode`]) and optionally pins the on-disk
+/// path of `nmbl-rescue.sfs`. Phase E will extend this with network
+/// fields (`network`, `default_url`, `default_sha256`, `nic_drivers`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RescueConfig {
+    /// Which rescue path [`crate::rescue::dispatch`] takes. Defaults to
+    /// [`RescueMode::Embedded`] to preserve the legacy behaviour for
+    /// installs that have not opted in to the external squashfs.
+    #[serde(default)]
+    pub mode: RescueMode,
+
+    /// Override the on-disk location of `nmbl-rescue.sfs`. When `None`
+    /// the rescue dispatcher falls back to `/boot/nmbl-rescue.sfs`.
+    /// Bootstrap-mode installs set this to
+    /// `<boot_fs.mountpoint>/nmbl-rescue.sfs` because the operator's
+    /// boot partition is mounted under `bootstrap.boot_fs.mountpoint`
+    /// rather than `/boot`.
+    #[serde(default)]
+    pub sfs_path: Option<PathBuf>,
+}
+
 impl Config {
     /// Reject device specifiers the mount layer cannot resolve.
     ///
@@ -254,6 +281,7 @@ impl Config {
             activations: Vec::new(),
             tui: Tui::default(),
             paths: Paths::default(),
+            rescue: RescueConfig::default(),
         }
     }
 }
@@ -780,6 +808,66 @@ mountpoint = "/mnt/boot"
             resolve_full_config_path(mp, cp),
             PathBuf::from("/run/nmbl/boot/nmbl/config.toml"),
         );
+    }
+
+    #[test]
+    fn rescue_section_defaults_when_absent() {
+        // Empty config — every section must default. The rescue section
+        // is `#[serde(default)]` so absence is the operator's signal
+        // that they want the legacy embedded shell behaviour.
+        let cfg: Config = toml::from_str("").expect("missing rescue section must default");
+        assert_eq!(cfg.rescue.mode, RescueMode::default());
+        assert!(cfg.rescue.sfs_path.is_none());
+    }
+
+    #[test]
+    fn rescue_section_parses_all_three_modes() {
+        for (raw, expected) in [
+            ("embedded", RescueMode::Embedded),
+            ("external", RescueMode::External),
+            ("none", RescueMode::None),
+        ] {
+            let toml = format!(
+                r#"
+[rescue]
+mode = "{raw}"
+"#
+            );
+            let cfg: Config = toml::from_str(&toml).expect("mode value must parse");
+            assert_eq!(cfg.rescue.mode, expected, "mode={raw}");
+        }
+    }
+
+    #[test]
+    fn rescue_section_parses_sfs_path_override() {
+        let toml = r#"
+[rescue]
+mode     = "external"
+sfs_path = "/mnt/boot/nmbl-rescue.sfs"
+"#;
+        let cfg: Config = toml::from_str(toml).expect("override must parse");
+        assert_eq!(cfg.rescue.mode, RescueMode::External);
+        assert_eq!(
+            cfg.rescue.sfs_path,
+            Some(PathBuf::from("/mnt/boot/nmbl-rescue.sfs")),
+        );
+    }
+
+    #[test]
+    fn rescue_section_rejects_unknown_field() {
+        let toml = r#"
+[rescue]
+mode    = "external"
+mystery = "boom"
+"#;
+        toml::from_str::<Config>(toml).expect_err("unknown field must reject");
+    }
+
+    #[test]
+    fn rescue_default_mode_is_embedded() {
+        let cfg = RescueConfig::default();
+        assert_eq!(cfg.mode, RescueMode::Embedded);
+        assert!(cfg.sfs_path.is_none());
     }
 
     #[test]
