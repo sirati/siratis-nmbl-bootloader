@@ -35,6 +35,7 @@ use rustix::io::Errno as RustixErrno;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
+use crate::modules::load_modules;
 use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
 use crate::sys::mount::mount_fs;
 
@@ -79,6 +80,18 @@ pub fn try_disk_rescue(config: &Config, cause: &NmblError) -> Result<Infallible>
             }),
         });
     }
+
+    // The loop and squashfs drivers may not be loaded yet (they are not
+    // in the normal boot path). Load them now so that /dev/loop-control
+    // exists and the squashfs filesystem type is registered before we
+    // call allocate_loop_device / mount_fs. Errors are non-fatal here:
+    // if the modules are already built into the kernel or were loaded
+    // earlier the insmod calls return EEXIST/ENODEV and we proceed.
+    let _ = load_modules(
+        &config.kernel_modules.modules_dir,
+        &["loop".to_string(), "squashfs".to_string()],
+        &[],
+    );
 
     let index = allocate_loop_device().map_err(|source| NmblError::Rescue {
         stage: "loop-alloc",
