@@ -225,20 +225,20 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn test_font() -> PathBuf {
-        // Manifest-relative path; works under both `cargo test` and the
-        // crane build because the fixture sits inside the crate root.
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let mut p = PathBuf::from(manifest);
-        p.push("tests");
-        p.push("data");
-        p.push("DejaVuSansMono.ttf");
-        p
+    /// Resolve the test font via the `NMBL_TEST_FONT` env var captured
+    /// at compile time. The dev shell sets it to a DejaVu Sans Mono
+    /// path from nixpkgs; outside the dev shell the variable is unset
+    /// and the test skips cleanly rather than panicking.
+    fn test_font() -> Option<PathBuf> {
+        option_env!("NMBL_TEST_FONT").map(PathBuf::from)
     }
 
     #[test]
     fn load_synthetic_font() {
-        let path = test_font();
+        let Some(path) = test_font() else {
+            eprintln!("skipping: NMBL_TEST_FONT not set (run inside `nix develop`)");
+            return;
+        };
         let cache = match load(&path, 16.0) {
             Ok(c) => c,
             Err(e) => panic!("load() failed: {e}"),
@@ -276,7 +276,10 @@ mod tests {
 
     #[test]
     fn rejects_invalid_size() {
-        let path = test_font();
+        let Some(path) = test_font() else {
+            eprintln!("skipping: NMBL_TEST_FONT not set (run inside `nix develop`)");
+            return;
+        };
         assert!(load(&path, 0.0).is_err());
         assert!(load(&path, -1.0).is_err());
         assert!(load(&path, f32::NAN).is_err());

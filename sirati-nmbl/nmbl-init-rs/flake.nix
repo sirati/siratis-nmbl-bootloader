@@ -135,6 +135,14 @@
           env = {
             CARGO_BUILD_TARGET = rustTarget;
           };
+
+          # Font path for splash::glyph_cache tests. Resolved at compile
+          # time via `option_env!`; tests skip cleanly if the variable is
+          # unset (e.g. when building outside the dev shell), so we never
+          # need to vendor the font itself into the repo.
+          shellHook = ''
+            export NMBL_TEST_FONT="${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf"
+          '';
         };
 
         checks = {
