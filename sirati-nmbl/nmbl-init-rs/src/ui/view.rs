@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::generations::Generation;
-use crate::ui::app::EmergencyItem;
+use crate::ui::app::{BootStatusData, EmergencyItem, SPINNER_FRAMES, SPINNER_GLYPHS};
 
 /// State needed to render the generation-picker screen.
 pub struct ListScreenData<'a> {
@@ -254,6 +254,61 @@ pub fn render_emergency(frame: &mut Frame<'_>, data: &EmergencyScreenData<'_>) {
     );
 }
 
+/// Render the early-boot status screen: project header, scrolling log
+/// panel, and a single status line with an animated spinner glyph.
+///
+/// Layout (top to bottom):
+///   1. Project header line (same style as the selector header).
+///   2. Bordered "log" panel showing the most recent log lines (most
+///      recent at the bottom). Lines exceeding the panel are clipped.
+///   3. Status line: " {spinner} {phase}".
+///
+/// The spinner uses a 4-frame ASCII rotor (`|/-\`) rather than the
+/// 10-frame braille sequence systemd uses, because the splash glyph
+/// cache only pre-rasterises ASCII printable plus a small box-drawing
+/// subset (see `src/splash/glyph_cache.rs`). Braille (U+2800 block) is
+/// not cached and would render as blank cells on the framebuffer
+/// backend. ASCII works on both crossterm and splash, so we trade
+/// fidelity for portability.
+pub fn render_boot_status(frame: &mut Frame<'_>, data: &BootStatusData<'_>) {
+    // Reuse the chrome split so the project header style matches the
+    // selector exactly. The footer slot is repurposed for the status
+    // line — same height (1 row), same alignment surface.
+    let [header, body, status] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    // Log panel. The bordered block subtracts 2 rows of chrome
+    // (top + bottom border), so we keep only the last `inner_rows`
+    // lines from the snapshot to avoid relying on ratatui's clipping.
+    let log_block = Block::bordered().title("log");
+    let inner = log_block.inner(body);
+    let inner_rows = inner.height as usize;
+
+    let start = data.log_lines.len().saturating_sub(inner_rows);
+    let visible_lines: Vec<Line<'_>> = data
+        .log_lines
+        .get(start..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| Line::raw(s.clone()))
+        .collect();
+
+    let log_para = Paragraph::new(Text::from(visible_lines))
+        .block(log_block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(log_para, body);
+
+    // Status line. SPINNER_FRAMES is non-zero (it's a const = 4), but
+    // we still defend against a degenerate config: an empty glyph
+    // array would underflow the modulo. `get` returns `None` for the
+    // pathological case and we fall back to a space — never panic.
+    let idx = (data.spinner_frame % SPINNER_FRAMES) as usize;
+    let glyph = SPINNER_GLYPHS.get(idx).copied().unwrap_or(' ');
+    let status_line = format!(" {glyph} {phase}", phase = data.phase);
+    let status_para = Paragraph::new(status_line).alignment(Alignment::Left);
+    frame.render_widget(status_para, status);
+}
+
 /// Render the passphrase modal over the body area.
 pub fn render_passphrase(frame: &mut Frame<'_>, data: &PassphraseScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
@@ -409,6 +464,103 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("*****|"), "wrong mask count in:\n{text}");
         assert!(text.contains("Unlock /dev/sda2"));
+    }
+
+    fn boot_status_data<'a>(
+        phase: &'a str,
+        lines: &[&str],
+        spinner_frame: u8,
+    ) -> BootStatusData<'a> {
+        BootStatusData {
+            phase: std::borrow::Cow::Borrowed(phase),
+            log_lines: lines.iter().map(|s| (*s).to_string()).collect(),
+            spinner_frame,
+        }
+    }
+
+    #[test]
+    fn test_render_boot_status_shows_header_lines_phase_and_spinner_frame0() {
+        // Layout assumes a 24-row terminal: 3-row header, body in the
+        // middle, 1-row status. Three log lines fit comfortably in the
+        // body so all three should be visible.
+        let data = boot_status_data(
+            "phase 1: udev coldplug",
+            &["mount /proc", "mount /sys", "starting udev"],
+            0,
+        );
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_boot_status(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+
+        assert!(text.contains("sirati's NMBL"), "missing header in:\n{text}");
+        assert!(
+            text.contains("phase 1: udev coldplug"),
+            "missing phase in:\n{text}"
+        );
+        for line in ["mount /proc", "mount /sys", "starting udev"] {
+            assert!(text.contains(line), "missing log line {line:?} in:\n{text}");
+        }
+        // Frame 0 -> '|'.
+        assert!(text.contains('|'), "missing spinner glyph '|' in:\n{text}");
+    }
+
+    #[test]
+    fn test_render_boot_status_spinner_advances_with_frame() {
+        // Render at frame 0 and frame 1 and assert the status row
+        // differs. Frame 1 must contain '/'; frame 0 must not (the
+        // header / log content is fixed in this fixture, so no other
+        // '/' appears in the buffer apart from the spinner cell).
+        let data0 = boot_status_data("waiting", &["a"], 0);
+        let data1 = boot_status_data("waiting", &["a"], 1);
+
+        let mut t0 = new_term(40, 10);
+        t0.draw(|f| render_boot_status(f, &data0)).expect("draw");
+        let mut t1 = new_term(40, 10);
+        t1.draw(|f| render_boot_status(f, &data1)).expect("draw");
+
+        let txt0 = buffer_text(&t0);
+        let txt1 = buffer_text(&t1);
+
+        assert!(txt0.contains('|'), "frame0 must contain |");
+        assert!(txt1.contains('/'), "frame1 must contain /");
+        assert_ne!(txt0, txt1, "spinner advance must change buffer");
+    }
+
+    #[test]
+    fn test_render_boot_status_clips_to_panel_height() {
+        // 50 lines into a 10-row terminal. The header eats 3 rows and
+        // the status line eats 1, leaving 6 rows for the bordered log
+        // panel; the panel borders eat 2 more, so only ~4 lines of
+        // content are visible. The exact panel height isn't load-
+        // bearing for this test — what matters is that *only* the
+        // most recent lines appear and *none* of the earliest ones
+        // do, regardless of clipping math.
+        //
+        // Zero-padded width-2 indices make each label uniquely
+        // identifiable as a substring (e.g. "log-00" is not a prefix
+        // of "log-49"), so `str::contains` is a safe substring check.
+        let lines: Vec<String> = (0..50).map(|i| format!("log-{i:02}")).collect();
+        let lines_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let data = boot_status_data("phase X", &lines_refs, 0);
+
+        let mut term = new_term(40, 10);
+        term.draw(|f| render_boot_status(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+
+        // The last line must appear; the first and one mid-range
+        // sample must not.
+        assert!(
+            text.contains("log-49"),
+            "most-recent line missing in:\n{text}"
+        );
+        assert!(
+            !text.contains("log-00"),
+            "earliest line leaked through clipping in:\n{text}"
+        );
+        assert!(
+            !text.contains("log-10"),
+            "mid-range line leaked through clipping in:\n{text}"
+        );
     }
 
     #[test]
