@@ -4,8 +4,8 @@
 # carries busybox + storage activation binaries; instead, those tools
 # are bundled into a single read-only squashfs (`nmbl-rescue.sfs`)
 # staged on the boot partition by install-bootloader.nix. The Rust
-# /init loop-mounts the blob and `pivot_root`s into it when the
-# emergency shell is requested.
+# /init loop-mounts the blob and switch_roots into it (MS_MOVE + chroot)
+# when the emergency shell is requested.
 #
 # Used as a pure function over `cfg.rescue.squashfsContents`: callers
 # `import` this file and apply it with `{ pkgs, lib, contents }` to
@@ -45,15 +45,9 @@ pkgs.runCommand "nmbl-rescue.sfs"
     mkdir -p root
     cp -aL ${rescueRoot}/. root/
     # `cp -aL` preserves source permissions which are read-only in a Nix
-    # buildEnv. Relax them so subsequent operations (mkdir, mksquashfs)
-    # can modify the staging tree.
+    # buildEnv. Relax them so subsequent operations (mksquashfs) can
+    # read the staging tree without permission errors.
     chmod -R u+w root/
-
-    # `pivot_root(new_root, put_old)` needs `put_old` to exist inside the
-    # squashfs image (the Rust disk-rescue code uses `oldroot`). Create the
-    # empty directory here so the read-only squashfs already contains it at
-    # boot time — the Rust code cannot mkdir inside an RO filesystem.
-    mkdir -p root/oldroot
 
     # `-comp zstd -Xcompression-level 19` matches the plan: best ratio
     # at build time, page-by-page decompression at runtime so the boot
