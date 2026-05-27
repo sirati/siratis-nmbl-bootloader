@@ -19,6 +19,8 @@
   cfg,
   bootstrapper,
   legacyBootMode,
+  configLocation,
+  nmblConfigToml,
 }:
 
 let
@@ -38,6 +40,14 @@ let
       null
     else
       { };
+
+  # In external-config mode, copy the full config.toml onto the boot
+  # partition at the path the embedded bootstrap.toml will look for it.
+  # Default mirrors the Rust bootstrap default in nmbl-init-rs/src/config.rs
+  # so the staging is correct even if B.2's option tree hasn't merged yet.
+  externalConfigPath =
+    let p = cfg.bootstrap.configPath or "/nmbl/config.toml";
+    in if lib.hasPrefix "/" p then lib.removePrefix "/" p else p;
 in
 
 pkgs.writeScript "install-nmbl-bootloader" ''
@@ -79,6 +89,16 @@ pkgs.writeScript "install-nmbl-bootloader" ''
   cp -f "$KERNEL" /boot/nmbl-kernel
   cp -f "$INITRD" /boot/nmbl-initrd
   echo "✓ Bootloader files installed: /boot/nmbl-kernel, /boot/nmbl-initrd"
+
+  ${lib.optionalString (configLocation == "external") ''
+    # External-config mode: stage the full config.toml on /boot at the
+    # path the embedded bootstrap.toml advertises. The initramfs itself
+    # carries only the bootstrap, so this file is what nmbl-init reads
+    # for filesystems / activations / TUI settings at boot time.
+    echo "Staging external NMBL config to /boot/${externalConfigPath}..."
+    install -D -m 0644 ${nmblConfigToml} /boot/${externalConfigPath}
+    echo "✓ External config installed: /boot/${externalConfigPath}"
+  ''}
 
   ${lib.optionalString (bootstrapper.bootMode == "bios" && actualLoader == "grub") ''
         echo "Configuring GPT+BIOS bootloader with GRUB..."
