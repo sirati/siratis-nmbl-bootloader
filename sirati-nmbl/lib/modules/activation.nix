@@ -213,6 +213,28 @@ let
     description = lib.mdDoc desc;
   };
 
+  # ---- post-stage-0 keyfile wipe -----------------------------------------
+  # For every passToStage1 entry we emit a stage-1 cleanup that overwrites
+  # the injected keyfile bytes in tmpfs before unlinking, then removes the
+  # parent directory. Overwriting before free is what actually scrubs the
+  # bytes: tmpfs pages live in RAM, and the kernel does not zero freed
+  # pages — only what we write in place is guaranteed-gone post-unlink.
+  injectedPaths = map (l: l.passToStage1)
+    (lib.filter (l: l.unlock == "password" && l.passToStage1 != null) act.luks);
+
+  wipeSnippet = path: ''
+    if [ -e ${path} ]; then
+      size=$(stat -c%s ${path} 2>/dev/null || echo 0)
+      if [ "$size" -gt 0 ]; then
+        dd if=/dev/zero of=${path} bs=1 count="$size" conv=notrunc 2>/dev/null || true
+      fi
+      rm -f ${path}
+      rmdir "$(dirname ${path})" 2>/dev/null || true
+    fi
+  '';
+
+  wipeShellScript = lib.concatMapStrings wipeSnippet injectedPaths;
+
 in
 {
   options.boot.nmbl.activation = {
@@ -270,5 +292,27 @@ in
     # Surface activation assertions through the standard NixOS mechanism so
     # they fail nixos-rebuild and our nmblAssertionCheck derivation alike.
     assertions = computedAssertions;
+
+    # Scripted stage-1 cleanup: runs after LUKS unlock, before pivot.
+    boot.initrd.postDeviceCommands = lib.mkIf (injectedPaths != [ ]) wipeShellScript;
+
+    # systemd-stage-1 cleanup: a oneshot that runs after cryptsetup
+    # targets have completed but before initrd-switch-root. The unit
+    # also Requires=cryptsetup.target so it definitely fires after the
+    # injected keyfile has done its job.
+    boot.initrd.systemd.services = lib.mkIf (injectedPaths != [ ]) {
+      nmbl-wipe-injected-keys = {
+        description = "Wipe NMBL-injected LUKS keyfiles from initrd tmpfs";
+        wantedBy = [ "initrd.target" ];
+        after = [ "cryptsetup.target" ];
+        before = [ "initrd-switch-root.target" "sysroot.mount" ];
+        unitConfig.DefaultDependencies = false;
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        script = wipeShellScript;
+      };
+    };
   };
 }
