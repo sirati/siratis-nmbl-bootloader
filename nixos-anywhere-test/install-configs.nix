@@ -256,6 +256,94 @@ in
     ];
   };
 
+  # Direct-kexec splash harness: NixOS config used purely to produce the
+  # NMBL kernel + initrd that we hand straight to qemu's -kernel/-initrd
+  # for sub-30-second iteration on the emergency TUI / splash UI. It
+  # uses bootMode = "qemu_kernel_invoke" so no /boot or installer payload
+  # is required, declares no real filesystems (NMBL will fail to find
+  # generations and land on the emergency TUI), and turns the splash on.
+  #
+  # No disko module is imported and `ignoreMissingDiskModules = true`
+  # because the VM is launched with no -drive at all.
+  nmbl-direct-splash = nixpkgs.lib.nixosSystem {
+    inherit system;
+    modules = [
+      siratiNmbl.nixosModules.default
+      "${nixpkgs}/nixos/modules/profiles/qemu-guest.nix"
+      (
+        { lib, modulesPath, ... }:
+        {
+          # NixOS evaluation insists on a root filesystem. Declare a
+          # tmpfs root that never gets touched at runtime (NMBL is /init;
+          # the kexec into the system never happens because no generations
+          # are found).
+          #
+          # /boot is also declared even though qemu_kernel_invoke bypasses
+          # the boot-partition assertion, because lib/config.nix
+          # unconditionally sets `fileSystems."/boot".neededForBoot = true`
+          # which materialises the entry and then NixOS demands device +
+          # fsType. The VM has no /dev/vda so this fs is never mounted
+          # at runtime; it only exists to satisfy module evaluation.
+          fileSystems."/" = {
+            device = "none";
+            fsType = "tmpfs";
+          };
+          fileSystems."/boot" = {
+            device = "none";
+            fsType = "tmpfs";
+            options = [ "nofail" ];
+          };
+
+          boot.nmbl = {
+            enable = true;
+            bootstrapper = {
+              partition_table = "gpt";
+              bootMode = "qemu_kernel_invoke";
+            };
+            kernelPackage = pkgs.linuxPackages_latest.kernel;
+            kernelModules = [ ];
+            mountPrefix = "/mnt";
+            kernelParams = [
+              "console=ttyS0,115200"
+              "earlyprintk=serial,ttyS0,115200"
+              "console=tty1"
+            ];
+            timeoutSeconds = 600;
+            # serialConsole stays null so the splash code path is reached
+            # (it is gated on serial_console being false).
+            serialConsole = null;
+            ignoreMissingDiskModules = true;
+            splash.enable = true;
+          };
+
+          boot.kernelParams = lib.mkForce [
+            "console=ttyS0,115200"
+            "earlyprintk=serial,ttyS0,115200"
+            "console=tty1"
+            "loglevel=7"
+          ];
+
+          # Minimal kernel-module set: just enough to bring up the
+          # framebuffer + DRI for the splash. No storage drivers needed
+          # since the VM has no -drive.
+          boot.initrd.availableKernelModules = [ ];
+          boot.initrd.kernelModules = [ ];
+
+          boot.loader.grub.enable = false;
+          boot.loader.systemd-boot.enable = false;
+
+          # Disable the entire NixOS toplevel-builder requirement chain
+          # we don't need: no users, no services, no networking. The
+          # only artifact we consume is system.build.nmblKernel + nmblInitramfs.
+          networking.hostName = "nmbl-direct";
+          services.openssh.enable = false;
+
+          system.stateVersion = "24.05";
+        }
+      )
+    ];
+  };
+
   # Splash + LUKS demo: same disko layout as the LUKS test (vda3 wrapped
   # in a luks container unlocked with passphrase "test"), but with the
   # splash enabled so the LUKS prompt renders through the graphical UI
