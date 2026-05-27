@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::generations::Generation;
+use crate::ui::app::EmergencyItem;
 
 /// State needed to render the generation-picker screen.
 pub struct ListScreenData<'a> {
@@ -30,6 +31,17 @@ pub struct EditScreenData<'a> {
 pub struct PassphraseScreenData<'a> {
     pub prompt_label: &'a str,
     pub buffer_len: usize,
+}
+
+/// State needed to render the emergency-on-boot-failure screen.
+pub struct EmergencyScreenData<'a> {
+    /// Pre-formatted error chain (line-wrapped by ratatui).
+    pub message: &'a str,
+    pub items: &'a [EmergencyItem],
+    /// Index into `items`; rendered clamped to `items.len() - 1`.
+    pub selected_index: usize,
+    /// `Some(n)` while the auto-reboot countdown is still running.
+    pub countdown_remaining_secs: Option<u64>,
 }
 
 /// Split frame into (header, body, footer). Small frames degrade gracefully.
@@ -171,6 +183,75 @@ pub fn render_edit(frame: &mut Frame<'_>, data: &EditScreenData<'_>) {
         .wrap(Wrap { trim: false });
     frame.render_widget(para, body);
     render_footer(frame, footer, "Enter=apply  Esc=cancel");
+}
+
+/// Render the emergency screen: a red "boot failed" header, a wrapped
+/// error message, and a list of [Reboot]/[Shell] items with selection
+/// highlight.
+///
+/// All chrome and colour is ratatui — the splash backend is purely a
+/// render target. This keeps every UI decision (layout, wrap, colour,
+/// hotkey hint) in one place.
+pub fn render_emergency(frame: &mut Frame<'_>, data: &EmergencyScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+
+    // Header: red bold "boot failed". Plus optional countdown.
+    let mut header_spans = vec![Span::styled(
+        "boot failed",
+        Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(secs) = data.countdown_remaining_secs {
+        header_spans.push(Span::raw("   "));
+        header_spans.push(Span::styled(
+            format!("auto-reboot in {secs}s"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    let header_para = Paragraph::new(Line::from(header_spans)).alignment(Alignment::Left);
+    frame.render_widget(header_para, header);
+
+    // Split the body horizontally: top area for the wrapped error
+    // message, bottom area (sized to the item list) for the picker.
+    let item_rows = u16::try_from(data.items.len().saturating_add(2)).unwrap_or(u16::MAX);
+    let [msg_area, list_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(item_rows)]).areas::<2>(body);
+
+    let msg_para = Paragraph::new(Text::from(data.message.to_owned()))
+        .block(Block::bordered().title("error"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(msg_para, msg_area);
+
+    // Picker. Build ListItems with bracketed labels so the operator
+    // immediately sees "[Reboot]" / "[Shell]" — the brackets reinforce
+    // that this is a discrete choice, not a free-form prompt.
+    let items: Vec<ListItem<'_>> = data
+        .items
+        .iter()
+        .map(|item| ListItem::new(Line::from(format!("[{}]", item.label))))
+        .collect();
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
+    let list = List::new(items)
+        .block(Block::bordered().title("action"))
+        .highlight_style(highlight)
+        .highlight_symbol("> ");
+
+    let mut state = ListState::default();
+    if !data.items.is_empty() {
+        let last_idx = data.items.len().saturating_sub(1);
+        state.select(Some(data.selected_index.min(last_idx)));
+    }
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    render_footer(
+        frame,
+        footer,
+        "up/down select  Enter confirm  r reboot  s shell",
+    );
 }
 
 /// Render the passphrase modal over the body area.

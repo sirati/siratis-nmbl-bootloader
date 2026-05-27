@@ -2,10 +2,11 @@
 //! and mutates [`App`]; the surrounding `ui::mod` is responsible for
 //! actually polling input and rendering frames via [`crate::ui::view`].
 //!
-//! The state machine has three screens:
+//! The state machine has four screens:
 //! - [`Screen::List`]    — generation picker, default landing page.
 //! - [`Screen::Editing`] — single-line kernel-cmdline editor.
 //! - [`Screen::Passphrase`] — modal LUKS prompt driven by activation.rs.
+//! - [`Screen::Emergency`] — boot-failed picker between Reboot and Shell.
 //!
 //! When the user makes a final decision the `decision` field is set
 //! and [`App::on_key`] returns `true`, signalling the run loop to exit.
@@ -34,6 +35,25 @@ pub enum Decision {
     Reboot,
 }
 
+/// Choice the operator can make on the emergency screen.
+///
+/// Kept separate from [`Decision`] because the boot-menu Decision
+/// machinery is geared around generations + cmdline overrides, which
+/// the emergency screen has no business expressing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmergencyChoice {
+    /// Reboot the machine via `reboot(RB_AUTOBOOT)`.
+    Reboot,
+    /// Drop to the configured emergency shell.
+    Shell,
+}
+
+/// One row on the emergency screen.
+pub struct EmergencyItem {
+    pub label: &'static str,
+    pub choice: EmergencyChoice,
+}
+
 /// Which screen the App is currently presenting.
 pub enum Screen {
     List,
@@ -48,6 +68,20 @@ pub enum Screen {
     Passphrase {
         prompt_label: String,
         buffer: Zeroizing<String>,
+    },
+    /// Boot has failed. Show the error and let the operator pick
+    /// between Reboot and Shell. Defaults are owned by the caller —
+    /// the screen just runs the picker.
+    Emergency {
+        /// Human-readable explanation (already formatted error chain).
+        message: String,
+        /// Items to display, in order. The screen renders them as a
+        /// list and lets the operator pick one.
+        items: Vec<EmergencyItem>,
+        /// Selected row index, clamped to `items.len() - 1` on render.
+        selected: usize,
+        /// Final choice the operator committed to; `None` until Enter.
+        chosen: Option<EmergencyChoice>,
     },
 }
 
@@ -100,6 +134,59 @@ impl<'a> App<'a> {
             Screen::Passphrase { .. } => {
                 Self::handle_passphrase_key(key.code, &mut self.screen, &mut self.decision)
             }
+            Screen::Emergency { .. } => Self::handle_emergency_key(key.code, &mut self.screen),
+        }
+    }
+
+    fn handle_emergency_key(code: KeyCode, screen: &mut Screen) -> bool {
+        let Screen::Emergency {
+            items,
+            selected,
+            chosen,
+            ..
+        } = screen
+        else {
+            return false;
+        };
+
+        let last_idx = items.len().saturating_sub(1);
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+                false
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected < last_idx {
+                    *selected = selected.saturating_add(1);
+                }
+                false
+            }
+            KeyCode::Enter => {
+                if let Some(item) = items.get(*selected) {
+                    *chosen = Some(item.choice);
+                    true
+                } else {
+                    false
+                }
+            }
+            // Hotkeys: 'r' for reboot, 's' for shell. Operators in a
+            // boot-failure scenario tend to be muscle-memory typing one
+            // of those two letters.
+            KeyCode::Char('r') => {
+                *chosen = Some(EmergencyChoice::Reboot);
+                true
+            }
+            KeyCode::Char('s') => {
+                *chosen = Some(EmergencyChoice::Shell);
+                true
+            }
+            KeyCode::Esc => {
+                // Esc is a no-op: it preserves the prior selection so a
+                // stray keypress doesn't commit. The caller can decide
+                // separately to fall through to the default on timeout.
+                false
+            }
+            _ => false,
         }
     }
 
@@ -601,6 +688,102 @@ mod tests {
         };
         assert!(app.on_key(press(KeyCode::Enter)));
         assert!(app.decision.is_none(), "Enter must not set a Decision");
+    }
+
+    fn emergency_app() -> App<'static> {
+        let mut app = App::new(&[]);
+        app.screen = Screen::Emergency {
+            message: "boot failed: test".to_string(),
+            items: vec![
+                EmergencyItem {
+                    label: "Reboot",
+                    choice: EmergencyChoice::Reboot,
+                },
+                EmergencyItem {
+                    label: "Shell",
+                    choice: EmergencyChoice::Shell,
+                },
+            ],
+            selected: 0,
+            chosen: None,
+        };
+        app
+    }
+
+    fn emergency_state(app: &App<'_>) -> (usize, Option<EmergencyChoice>) {
+        match &app.screen {
+            Screen::Emergency {
+                selected, chosen, ..
+            } => (*selected, *chosen),
+            _ => panic!("expected Emergency screen"),
+        }
+    }
+
+    #[test]
+    fn emergency_arrow_keys_move_selection_within_bounds() {
+        let mut app = emergency_app();
+        assert_eq!(emergency_state(&app).0, 0);
+
+        // Up at index 0 stays at 0.
+        assert!(!app.on_key(press(KeyCode::Up)));
+        assert_eq!(emergency_state(&app).0, 0);
+
+        // Down advances.
+        assert!(!app.on_key(press(KeyCode::Down)));
+        assert_eq!(emergency_state(&app).0, 1);
+
+        // Down at end stays at end.
+        assert!(!app.on_key(press(KeyCode::Down)));
+        assert_eq!(emergency_state(&app).0, 1);
+
+        // Up walks back.
+        assert!(!app.on_key(press(KeyCode::Up)));
+        assert_eq!(emergency_state(&app).0, 0);
+
+        // vi-keys also work.
+        assert!(!app.on_key(press(KeyCode::Char('j'))));
+        assert_eq!(emergency_state(&app).0, 1);
+        assert!(!app.on_key(press(KeyCode::Char('k'))));
+        assert_eq!(emergency_state(&app).0, 0);
+    }
+
+    #[test]
+    fn emergency_enter_returns_selected_variant() {
+        // selected=0 -> Reboot.
+        let mut app = emergency_app();
+        assert!(app.on_key(press(KeyCode::Enter)));
+        assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::Reboot));
+
+        // selected=1 -> Shell.
+        let mut app = emergency_app();
+        assert!(!app.on_key(press(KeyCode::Down)));
+        assert!(app.on_key(press(KeyCode::Enter)));
+        assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::Shell));
+    }
+
+    #[test]
+    fn emergency_esc_preserves_selection_without_committing() {
+        let mut app = emergency_app();
+        // Move to Shell.
+        assert!(!app.on_key(press(KeyCode::Down)));
+        assert_eq!(emergency_state(&app).0, 1);
+
+        // Esc must not commit and must not move.
+        assert!(!app.on_key(press(KeyCode::Esc)));
+        let (sel, chosen) = emergency_state(&app);
+        assert_eq!(sel, 1, "selection must be preserved across Esc");
+        assert!(chosen.is_none(), "Esc must not commit a choice");
+    }
+
+    #[test]
+    fn emergency_hotkeys_r_and_s_commit_directly() {
+        let mut app = emergency_app();
+        assert!(app.on_key(press(KeyCode::Char('r'))));
+        assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::Reboot));
+
+        let mut app = emergency_app();
+        assert!(app.on_key(press(KeyCode::Char('s'))));
+        assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::Shell));
     }
 
     #[test]
