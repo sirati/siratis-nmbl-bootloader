@@ -437,7 +437,10 @@ in
 
     bootstrap = {
       configPath = lib.mkOption {
-        type = lib.types.path;
+        # `types.str`, not `types.path`: this is a target-filesystem
+        # path interpreted by the NMBL runtime, not a build-host path
+        # Nix should resolve to the store.
+        type = lib.types.str;
         default = "/nmbl/config.toml";
         description = lib.mdDoc ''
           Path to the full runtime `config.toml`, relative to
@@ -477,7 +480,10 @@ in
         };
 
         mountpoint = lib.mkOption {
-          type = lib.types.path;
+          # `types.str`, not `types.path`: this is a target-filesystem
+          # path interpreted by the NMBL runtime, not a build-host path
+          # Nix should resolve to the store.
+          type = lib.types.str;
           default = "/mnt/boot";
           description = lib.mdDoc ''
             Mountpoint inside the NMBL initramfs where the boot
@@ -496,6 +502,19 @@ in
             boot partition. Must cover the boot filesystem driver and
             the storage controller drivers needed to expose its block
             device.
+          '';
+        };
+
+        modulesDir = lib.mkOption {
+          # `types.str`: target-fs path interpreted by the NMBL runtime,
+          # not a build-host path Nix should resolve to the store.
+          type = lib.types.str;
+          default = "/lib/modules";
+          description = lib.mdDoc ''
+            Directory inside the NMBL initramfs that contains
+            `modules.dep` for the bootstrap stage's module loader. Mirrors
+            the analogous knob the full-config stage respects via the
+            runtime `kernel_modules.modules_dir` key.
           '';
         };
       };
