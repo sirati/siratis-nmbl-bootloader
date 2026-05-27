@@ -90,7 +90,7 @@ use crate::splash::types::CellDims;
 
 pub use app::{App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, Screen};
 pub use emergency::run_emergency_screen;
-pub use reporter::BootReporter;
+pub use reporter::{BootReporter, ProgressSink};
 
 /// Slice we wait on input per iteration. Shared by the event loop and
 /// the countdown ticker so they have the same responsiveness profile

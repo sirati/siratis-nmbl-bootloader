@@ -17,7 +17,7 @@ use crate::config::{Activation, ActivationKind, Config};
 use crate::devices::wait_for;
 use crate::error::{NmblError, Result};
 use crate::sys::activation::{ProcessOutcome, run};
-use crate::ui::BootReporter;
+use crate::ui::{BootReporter, ProgressSink};
 use crate::{nmbl_info, nmbl_warn};
 
 const PROC_MODULES: &str = "/proc/modules";
@@ -73,8 +73,16 @@ pub fn run_all_activations(
         }
 
         let device_count = activation.produces_devices.len();
+        let wait_operation = format!("phase 3: {} waiting for", kind_label(activation.kind));
         for device in &activation.produces_devices {
-            wait_for(device, DEVICE_WAIT_TIMEOUT)?;
+            // Drive the spinner / status line while we wait so a slow
+            // activation (LUKS unlock, LVM scan) doesn't look frozen.
+            wait_for(
+                device,
+                DEVICE_WAIT_TIMEOUT,
+                &wait_operation,
+                Some(reporter as &mut dyn ProgressSink),
+            )?;
         }
 
         nmbl_info!(

@@ -13,7 +13,7 @@ use rustix::fs::{FileType, stat};
 use crate::config::{Config, FilesystemEntry};
 use crate::error::{NmblError, Result};
 use crate::nmbl_info;
-use crate::ui::BootReporter;
+use crate::ui::{BootReporter, ProgressSink};
 
 /// Default per-device readiness deadline used by
 /// [`mount_system_filesystems`]. Held here (not in `Config`) until the
@@ -31,10 +31,25 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// "not yet" and we keep polling. Returns [`NmblError::DeviceTimeout`]
 /// once the deadline passes. Exposed `pub` so `src/activation.rs` can
 /// call it after LVM/cryptsetup produces a new device.
-pub fn wait_for(device: &Path, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now()
+///
+/// `operation` is a short verb plus phase context like
+/// `"phase 3b: waiting for"` that gets joined with the device path to
+/// build the boot-status phase string when `progress` is `Some`. The
+/// spinner advances on every poll iteration so the operator sees the
+/// boot is alive alongside the `Ns / Ms` countdown. Pass `progress =
+/// None` to poll without driving a UI (tests, headless contexts).
+pub fn wait_for(
+    device: &Path,
+    timeout: Duration,
+    operation: &str,
+    progress: Option<&mut dyn ProgressSink>,
+) -> Result<()> {
+    let start = Instant::now();
+    let deadline = start
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
+
+    let mut progress = progress;
 
     loop {
         if device_ready(device) {
@@ -48,8 +63,34 @@ pub fn wait_for(device: &Path, timeout: Duration) -> Result<()> {
             });
         }
 
+        if let Some(sink) = progress.as_deref_mut() {
+            let elapsed = start.elapsed();
+            let phase = format_wait_phase(operation, &device.display(), elapsed, timeout);
+            sink.tick(&phase);
+        }
+
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Build the canonical wait-status string used by every blocking wait
+/// loop. Single source of truth so device-wait, activation-wait, and any
+/// future polling loop produce the same `"<op> <target> (Ns / Ms)"`
+/// shape — operators can grep one format instead of three.
+///
+/// The duration argument is rendered as whole seconds; sub-second
+/// precision is noise on a 100 ms poll cadence.
+pub fn format_wait_phase(
+    operation: &str,
+    target: &dyn std::fmt::Display,
+    elapsed: Duration,
+    timeout: Duration,
+) -> String {
+    format!(
+        "{operation} {target} ({}s / {}s)",
+        elapsed.as_secs(),
+        timeout.as_secs(),
+    )
 }
 
 /// `true` if `device` exists and is a block- or char-device node.
@@ -142,7 +183,14 @@ pub fn mount_system_filesystems(
             dev.display(),
             entry.mountpoint.display(),
         ));
-        wait_for(dev, DEFAULT_DEVICE_TIMEOUT)?;
+        // Animate the wait so the operator sees the boot is alive (and an
+        // "elapsed / timeout" countdown) instead of a frozen phase label.
+        wait_for(
+            dev,
+            DEFAULT_DEVICE_TIMEOUT,
+            "phase 3b: waiting for",
+            Some(reporter as &mut dyn ProgressSink),
+        )?;
 
         let target = resolve_mountpoint(system_root, entry);
         ensure_dir(&target)?;
@@ -180,11 +228,35 @@ mod tests {
         }
     }
 
+    /// Counting ProgressSink for tests. Records every call and the most
+    /// recent phase string so we can assert both the cadence (~N ticks
+    /// per second of wait) and the format of the status line.
+    struct CountingSink {
+        ticks: u32,
+        last_phase: Option<String>,
+    }
+
+    impl CountingSink {
+        fn new() -> Self {
+            Self {
+                ticks: 0,
+                last_phase: None,
+            }
+        }
+    }
+
+    impl ProgressSink for CountingSink {
+        fn tick(&mut self, phase: &str) {
+            self.ticks = self.ticks.saturating_add(1);
+            self.last_phase = Some(phase.to_string());
+        }
+    }
+
     #[test]
     fn wait_for_missing_path_times_out() {
         let missing = Path::new("/nonexistent/path/nmbl-devices-test");
-        let err =
-            wait_for(missing, Duration::from_millis(200)).expect_err("missing path must time out");
+        let err = wait_for(missing, Duration::from_millis(200), "waiting for", None)
+            .expect_err("missing path must time out");
         match err {
             NmblError::DeviceTimeout { device, timeout_ms } => {
                 assert_eq!(device, missing.to_path_buf());
@@ -202,11 +274,86 @@ mod tests {
             return;
         }
         let start = Instant::now();
-        wait_for(dev_null, Duration::from_secs(1)).expect("/dev/null should be ready");
+        wait_for(dev_null, Duration::from_secs(1), "waiting for", None)
+            .expect("/dev/null should be ready");
         let elapsed = start.elapsed();
         assert!(
             elapsed < Duration::from_secs(1),
             "wait_for(/dev/null) took {elapsed:?}, expected <1s",
+        );
+    }
+
+    #[test]
+    fn wait_for_ticks_progress_sink_during_wait() {
+        // A 500 ms timeout on a 100 ms poll cadence should fire ~5 ticks
+        // (give or take one for scheduler jitter). The exact bound is
+        // intentionally loose — CI VMs run hot.
+        let missing = Path::new("/nonexistent/nmbl-devices-tick-test");
+        let mut sink = CountingSink::new();
+        let _ = wait_for(
+            missing,
+            Duration::from_millis(500),
+            "waiting for",
+            Some(&mut sink),
+        )
+        .expect_err("missing path must time out");
+        assert!(
+            sink.ticks >= 2,
+            "expected at least 2 ticks during a 500 ms wait, got {}",
+            sink.ticks
+        );
+        assert!(
+            sink.ticks <= 15,
+            "expected at most 15 ticks during a 500 ms wait (defensive upper bound), got {}",
+            sink.ticks
+        );
+    }
+
+    #[test]
+    fn wait_for_phase_string_includes_target_elapsed_and_timeout() {
+        // Wait long enough for at least one whole-second tick to fire so
+        // the elapsed counter increments off zero.
+        let missing = Path::new("/nonexistent/nmbl-devices-phase-test");
+        let mut sink = CountingSink::new();
+        let _ = wait_for(
+            missing,
+            Duration::from_millis(1100),
+            "phase 3b: waiting for",
+            Some(&mut sink),
+        )
+        .expect_err("missing path must time out");
+
+        let phase = sink
+            .last_phase
+            .as_deref()
+            .expect("at least one tick must fire during a 1.1 s wait");
+        assert!(
+            phase.starts_with("phase 3b: waiting for"),
+            "phase string must lead with the operation verb + phase context: {phase:?}"
+        );
+        assert!(
+            phase.contains("nmbl-devices-phase-test"),
+            "phase string must name the target device: {phase:?}"
+        );
+        assert!(
+            phase.contains("/ 1s)"),
+            "phase string must include timeout in seconds: {phase:?}"
+        );
+    }
+
+    #[test]
+    fn format_wait_phase_renders_canonical_shape() {
+        // Lock the visible format so a downstream activation-wait caller
+        // can rely on the exact string the operator greps for.
+        let phase = format_wait_phase(
+            "phase 3b: waiting for",
+            &"/dev/disk/by-uuid/abc",
+            Duration::from_secs(12),
+            Duration::from_secs(30),
+        );
+        assert_eq!(
+            phase,
+            "phase 3b: waiting for /dev/disk/by-uuid/abc (12s / 30s)"
         );
     }
 

@@ -4,24 +4,22 @@
 //! code calls `reporter.set_phase(...)` and `reporter.tick()` without
 //! needing to know about [`Console::render`] directly.
 //!
+//! ## Spinner plumbing for blocking waits
+//!
+//! Long-running device-wait and activation-wait loops should not look
+//! frozen on the splash. The [`ProgressSink`] trait gives those loops a
+//! one-method handle they can call every poll iteration to:
+//!
+//! * advance the spinner one frame,
+//! * replace the phase label with a "waiting for X (Ns / Ms)" string,
+//! * pull the latest log snapshot from the global ring,
+//! * push a fresh frame to the underlying [`Console`].
+//!
+//! [`BootReporter`] implements [`ProgressSink`] so the same handle that
+//! drives phase transitions also drives the spinner. Tests use a counting
+//! mock that doesn't open a console.
+//!
 //! ## Sibling-subagent contract
-//!
-//! The shape of [`BootReporter`] is the API that the devices/activation
-//! spinner work plugs into. Phase code only ever sees this struct; the
-//! underlying [`Console`] trait is an implementation detail.
-//!
-//! ```ignore
-//! pub struct BootReporter<'c, 'a> {
-//!     pub console: &'c mut dyn Console,
-//!     pub app: App<'a>,
-//! }
-//!
-//! impl<'c, 'a> BootReporter<'c, 'a> {
-//!     pub fn set_phase(&mut self, phase: impl Into<Cow<'a, str>>) -> Result<()>;
-//!     pub fn refresh_log(&mut self) -> Result<()>;
-//!     pub fn tick(&mut self) -> Result<()>;
-//! }
-//! ```
 //!
 //! The screen the reporter mutates is [`crate::ui::app::Screen::BootStatus`],
 //! which the renderer in [`crate::ui::view::render_boot_status`] already
@@ -33,6 +31,27 @@ use crate::error::Result;
 use crate::log;
 use crate::ui::app::App;
 use crate::ui::console::Console;
+
+/// Animated progress sink for blocking wait loops.
+///
+/// Implementors advance whatever spinner / status the operator sees and
+/// re-render the underlying surface. Phase code passes
+/// `Option<&mut dyn ProgressSink>` down through the wait helpers so tests
+/// and headless contexts can skip the UI cost; production wires a
+/// [`BootReporter`] through.
+///
+/// Implementations should be cheap enough to call every ~100 ms (the
+/// existing poll cadence in `devices::wait_for`); skipping a render when
+/// the phase string is unchanged is allowed but not required.
+pub trait ProgressSink {
+    /// Update the visible phase label, advance the spinner one frame,
+    /// refresh the log snapshot, and push a frame to the backend.
+    ///
+    /// The implementation is expected to swallow non-fatal render errors
+    /// (e.g. transient DRM hiccups) rather than abort the wait — the
+    /// boot must not fail because the spinner couldn't repaint.
+    fn tick(&mut self, phase: &str);
+}
 
 /// Number of log lines pulled from the ring on every refresh.
 ///
@@ -87,6 +106,23 @@ impl<'c, 'a> BootReporter<'c, 'a> {
     pub fn tick(&mut self) -> Result<()> {
         self.app.tick_boot_spinner();
         self.console.render(&self.app)
+    }
+}
+
+impl ProgressSink for BootReporter<'_, '_> {
+    /// Update the phase label, refresh the log snapshot, advance the
+    /// spinner, and render. Errors from the backend are deliberately
+    /// dropped: a flaky DRM ioctl shouldn't abort a 30 s device wait —
+    /// the next iteration will retry. Phase code still sees a
+    /// fatal error if the underlying wait itself fails.
+    fn tick(&mut self, phase: &str) {
+        // Reborrow into an owned Cow so the App's lifetime is satisfied
+        // (BootStatusData::phase is `Cow<'a, str>`; `phase` is borrowed
+        // for `tick`'s scope only).
+        self.app.set_boot_phase(Cow::<'_, str>::Owned(phase.to_string()));
+        self.app.set_boot_log_lines(log::snapshot(LOG_SNAPSHOT_LINES));
+        self.app.tick_boot_spinner();
+        let _ = self.console.render(&self.app);
     }
 }
 
@@ -192,6 +228,27 @@ mod tests {
         let mut reporter = BootReporter::new(&mut console, "phase X");
         reporter.refresh_log().expect("refresh_log must succeed");
         assert_eq!(console.renders, 1, "refresh_log must call render once");
+    }
+
+    #[test]
+    fn progress_sink_tick_updates_phase_advances_spinner_and_renders() {
+        // ProgressSink::tick is the one-call helper device-wait loops use:
+        // it must set the phase string, advance the spinner, and push a
+        // frame to the backend — all in a single call.
+        let mut console = MockConsole::new();
+        let mut reporter = BootReporter::new(&mut console, "starting");
+        ProgressSink::tick(&mut reporter, "phase 3b: waiting for /dev/sda1 (5s / 30s)");
+        ProgressSink::tick(&mut reporter, "phase 3b: waiting for /dev/sda1 (6s / 30s)");
+        assert_eq!(
+            console.renders, 2,
+            "each ProgressSink::tick must call render once"
+        );
+        assert_eq!(
+            console.last_phase.as_deref(),
+            Some("phase 3b: waiting for /dev/sda1 (6s / 30s)"),
+            "render must observe the most recent phase string"
+        );
+        assert_eq!(console.last_spinner, 2, "two ticks land on frame 2");
     }
 
     #[test]
