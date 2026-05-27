@@ -10,11 +10,13 @@ use std::time::Duration;
 
 use nix::mount::MntFlags;
 
+use crate::activation::KeyInjection;
 use crate::config::Config;
 use crate::devices::resolve_mountpoint;
 use crate::error::Result;
 use crate::generations::Generation;
 use crate::sys;
+use crate::sys::cpio::{InjectionEntry, build_fragment};
 use crate::{nmbl_info, nmbl_warn};
 
 /// Pseudo-filesystems from phase 1, mount order. Reversed for teardown.
@@ -96,10 +98,16 @@ fn detach(target: &Path) {
 /// settle, lazy-unmount config fs (reverse) + system_root + pseudo-fs
 /// (reverse), then `reboot(LINUX_REBOOT_CMD_KEXEC)`. `Infallible`
 /// encodes that success is the noreturn path.
+///
+/// When `key_injections` is non-empty, an in-memory cpio fragment
+/// containing those files is appended to the system initrd via
+/// `memfd_create(2)` before `kexec_file_load(2)` — the typed
+/// passphrases never touch disk.
 pub fn kexec_into(
     config: &Config,
     generation: &Generation,
     cmdline_override: Option<&str>,
+    key_injections: &[KeyInjection],
 ) -> Result<Infallible> {
     let cmdline = build_cmdline(generation, cmdline_override, &config.paths.system_root);
     nmbl_info!(
@@ -108,7 +116,30 @@ pub fn kexec_into(
         generation.kernel.display(),
         generation.initrd.display()
     );
-    sys::kexec::load(&generation.kernel, Some(&generation.initrd), &cmdline, 0)?;
+    if key_injections.is_empty() {
+        sys::kexec::load(&generation.kernel, Some(&generation.initrd), &cmdline, 0)?;
+    } else {
+        let entries: Vec<InjectionEntry<'_>> = key_injections
+            .iter()
+            .map(|inj| InjectionEntry {
+                path: inj.path.as_path(),
+                content: inj.secret.as_slice(),
+            })
+            .collect();
+        let fragment = build_fragment(&entries);
+        nmbl_info!(
+            "kexec: injecting {} keyfile(s) into initrd via memfd ({} bytes)",
+            key_injections.len(),
+            fragment.len()
+        );
+        sys::kexec::load_with_extra_initrd_cpio(
+            &generation.kernel,
+            &generation.initrd,
+            fragment.as_slice(),
+            &cmdline,
+            0,
+        )?;
+    }
     nmbl_info!("kexec: image loaded ({} bytes cmdline)", cmdline.len());
 
     nix::unistd::sync();
