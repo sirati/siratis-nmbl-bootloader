@@ -103,6 +103,15 @@ let
     inherit pkgs lib config;
   };
 
+  # Build the external rescue squashfs from `cfg.rescue.squashfsContents`.
+  # The derivation is always evaluated (cheap when nothing references it)
+  # but only staged onto the boot partition when `cfg.rescue.mode ==
+  # "external"`. Embedded / none modes keep today's behaviour.
+  nmblRescueSquashfs = import ./rescue-sfs.nix {
+    inherit pkgs lib;
+    contents = cfg.rescue.squashfsContents;
+  };
+
   # Where the runtime config TOML lives at boot. In embedded mode it
   # ships inside the initramfs; in external mode the initramfs only
   # carries the bootstrap TOML and the full config is staged onto the
@@ -237,6 +246,18 @@ in
     # Build the bootloader kernel
     system.build.nmblKernel = cfg.kernelPackage;
 
+    # Expose the rendered runtime config TOML so it can be inspected
+    # (and validated) independently of the initramfs build. Used by
+    # the C.2 validation step (`nix eval ... --raw`) and by the
+    # external-config staging path inside install-bootloader.nix.
+    system.build.nmblConfigToml = nmblConfigToml;
+
+    # Expose the external rescue squashfs derivation. Always evaluable
+    # (the underlying derivation is built from `cfg.rescue.squashfsContents`
+    # regardless of mode), but only staged onto the boot partition when
+    # `cfg.rescue.mode == "external"` — see install-bootloader.nix.
+    system.build.nmblRescueSquashfs = nmblRescueSquashfs;
+
     # Debug output to verify module configuration
     system.build.nmblDebugInfo = pkgs.writeText "nmbl-debug-info" ''
       NMBL Bootloader Configuration Debug Info
@@ -325,6 +346,7 @@ in
         legacyBootMode
         configLocation
         nmblConfigToml
+        nmblRescueSquashfs
         ;
     };
 

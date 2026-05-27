@@ -543,6 +543,49 @@ in
       };
     };
 
+    # --- Rescue mode (Option 2: external rescue squashfs) ---------------
+    # When `rescue.mode = "external"`, the initramfs no longer ships
+    # busybox + storage activation tools. Instead, they live in a
+    # squashfs blob (`nmbl-rescue.sfs`) on the boot partition, which
+    # the Rust /init loop-mounts and `pivot_root`s into when the
+    # emergency shell is requested. The default `"embedded"` keeps the
+    # legacy v1 behaviour so existing setups don't silently lose their
+    # rescue path.
+    rescue = {
+      mode = lib.mkOption {
+        type = lib.types.enum [ "embedded" "external" "none" ];
+        default = "embedded";
+        description = lib.mdDoc ''
+          - `embedded`: busybox + activation tools live in the initramfs (legacy v1 behaviour).
+          - `external`: tools live in `nmbl-rescue.sfs` on the boot partition; loop-mounted on demand.
+          - `none`: no rescue tools shipped; PID 1 halts on the emergency path.
+        '';
+      };
+
+      squashfsContents = lib.mkOption {
+        type = lib.types.listOf lib.types.package;
+        default = with pkgs; [ busybox cryptsetup lvm2 mdadm ];
+        defaultText = lib.literalExpression "with pkgs; [ busybox cryptsetup lvm2 mdadm ]";
+        description = lib.mdDoc ''
+          Packages bundled into `nmbl-rescue.sfs` when
+          `rescue.mode = "external"`. The Rust loader expects
+          `/bin/sh` to exist in the resulting tree (provided by
+          busybox).
+        '';
+      };
+
+      sfsPath = lib.mkOption {
+        type = lib.types.str;
+        default = "/nmbl-rescue.sfs";
+        description = lib.mdDoc ''
+          Path on the boot partition (relative to the boot
+          mountpoint) where the rescue squashfs is staged when
+          `rescue.mode = "external"`. The Rust disk-rescue path
+          reads from this location.
+        '';
+      };
+    };
+
     paths = {
       nixProfilesDir = lib.mkOption {
         type = lib.types.path;
