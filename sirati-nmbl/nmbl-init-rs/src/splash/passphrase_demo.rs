@@ -42,7 +42,7 @@ const PROMPT_LABEL: &str = "Unlock encrypted root (demo)";
 #[derive(Debug, PartialEq, Eq)]
 enum DemoState {
     Entering { buffer: String, attempts: u8 },
-    Emergency { selected: u8 },
+    Emergency { selected: u8, attempts: u8 },
 }
 
 /// Outcome of the demo loop. The splash orchestrator logs this and
@@ -112,17 +112,23 @@ fn step(state: &mut DemoState, key: KeyEvent) -> StepResult {
                     *attempts = attempts.saturating_add(1);
                     buffer.clear();
                     if *attempts >= MAX_ATTEMPTS {
-                        *state = DemoState::Emergency { selected: 0 };
+                        *state = DemoState::Emergency {
+                            selected: 0,
+                            attempts: *attempts,
+                        };
                     }
                 }
                 KeyCode::Esc => {
-                    *state = DemoState::Emergency { selected: 0 };
+                    *state = DemoState::Emergency {
+                        selected: 0,
+                        attempts: *attempts,
+                    };
                 }
                 _ => {}
             }
             StepResult::Continue
         }
-        DemoState::Emergency { selected } => match key.code {
+        DemoState::Emergency { selected, attempts } => match key.code {
             KeyCode::Up => {
                 *selected = (*selected).saturating_sub(1);
                 StepResult::Continue
@@ -146,13 +152,10 @@ fn step(state: &mut DemoState, key: KeyEvent) -> StepResult {
             },
             KeyCode::Esc => {
                 // Esc from the emergency menu returns to the entry
-                // screen. Per the spec we preserve the existing
-                // attempt counter, but since we discard it at the
-                // Entering→Emergency transition we restart at
-                // MAX_ATTEMPTS so the next Enter bounces straight back.
+                // screen preserving the current attempt counter.
                 *state = DemoState::Entering {
                     buffer: String::new(),
-                    attempts: MAX_ATTEMPTS,
+                    attempts: *attempts,
                 };
                 StepResult::Continue
             }
@@ -256,7 +259,7 @@ fn render_frame(
                     let attempt_one_based = attempts.saturating_add(1).min(MAX_ATTEMPTS);
                     render_entering(f, buffer.len(), attempt_one_based);
                 }
-                DemoState::Emergency { selected } => render_emergency(f, *selected),
+                DemoState::Emergency { selected, .. } => render_emergency(f, *selected),
             })
             .map_err(tui_err)?;
     }
@@ -384,7 +387,13 @@ mod tests {
             &mut state,
             &[KeyCode::Enter, KeyCode::Enter, KeyCode::Enter],
         );
-        assert!(matches!(state, DemoState::Emergency { selected: 0 }));
+        assert!(matches!(
+            state,
+            DemoState::Emergency {
+                selected: 0,
+                attempts: 3,
+            }
+        ));
     }
 
     #[test]
@@ -394,27 +403,39 @@ mod tests {
             attempts: 1,
         };
         drive(&mut state, &[KeyCode::Esc]);
-        assert!(matches!(state, DemoState::Emergency { selected: 0 }));
+        assert!(matches!(
+            state,
+            DemoState::Emergency {
+                selected: 0,
+                attempts: 1,
+            }
+        ));
     }
 
     #[test]
     fn emergency_arrow_keys_navigate_within_bounds() {
-        let mut state = DemoState::Emergency { selected: 0 };
+        let mut state = DemoState::Emergency {
+            selected: 0,
+            attempts: MAX_ATTEMPTS,
+        };
         drive(&mut state, &[KeyCode::Up]);
-        assert!(matches!(state, DemoState::Emergency { selected: 0 }));
+        assert!(matches!(state, DemoState::Emergency { selected: 0, .. }));
         drive(&mut state, &[KeyCode::Down]);
-        assert!(matches!(state, DemoState::Emergency { selected: 1 }));
+        assert!(matches!(state, DemoState::Emergency { selected: 1, .. }));
         drive(&mut state, &[KeyCode::Down]);
-        assert!(matches!(state, DemoState::Emergency { selected: 2 }));
+        assert!(matches!(state, DemoState::Emergency { selected: 2, .. }));
         drive(&mut state, &[KeyCode::Down]);
-        assert!(matches!(state, DemoState::Emergency { selected: 2 }));
+        assert!(matches!(state, DemoState::Emergency { selected: 2, .. }));
         drive(&mut state, &[KeyCode::Up]);
-        assert!(matches!(state, DemoState::Emergency { selected: 1 }));
+        assert!(matches!(state, DemoState::Emergency { selected: 1, .. }));
     }
 
     #[test]
     fn emergency_enter_on_retry_resets_to_entering() {
-        let mut state = DemoState::Emergency { selected: 0 };
+        let mut state = DemoState::Emergency {
+            selected: 0,
+            attempts: MAX_ATTEMPTS,
+        };
         let out = drive(&mut state, &[KeyCode::Enter]);
         assert!(out.is_none());
         match &state {
@@ -428,25 +449,34 @@ mod tests {
 
     #[test]
     fn emergency_enter_on_shell_returns_dropped_to_shell() {
-        let mut state = DemoState::Emergency { selected: 1 };
+        let mut state = DemoState::Emergency {
+            selected: 1,
+            attempts: MAX_ATTEMPTS,
+        };
         let out = drive(&mut state, &[KeyCode::Enter]);
         assert_eq!(out, Some(DemoOutcome::DroppedToShell));
     }
 
     #[test]
     fn emergency_enter_on_reboot_returns_reboot_requested() {
-        let mut state = DemoState::Emergency { selected: 2 };
+        let mut state = DemoState::Emergency {
+            selected: 2,
+            attempts: MAX_ATTEMPTS,
+        };
         let out = drive(&mut state, &[KeyCode::Enter]);
         assert_eq!(out, Some(DemoOutcome::RebootRequested));
     }
 
     #[test]
-    fn emergency_esc_returns_to_entering_at_max_attempts() {
-        let mut state = DemoState::Emergency { selected: 1 };
+    fn emergency_esc_preserves_attempts_when_returning_to_entering() {
+        let mut state = DemoState::Emergency {
+            selected: 1,
+            attempts: 1,
+        };
         drive(&mut state, &[KeyCode::Esc]);
         match &state {
             DemoState::Entering { attempts, buffer } => {
-                assert_eq!(*attempts, MAX_ATTEMPTS);
+                assert_eq!(*attempts, 1);
                 assert!(buffer.is_empty());
             }
             _ => panic!("expected Entering"),
