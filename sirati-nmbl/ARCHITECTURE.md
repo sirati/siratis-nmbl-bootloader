@@ -41,6 +41,15 @@ a kernel panic.
         |
    +----+----------------------------------------------------+
    | 1. mount pseudo-fs (/proc, /sys, /dev, /run, /tmp)      |
+   |                                                         |
+   | 0.5. bootstrap (ONLY when configLocation = "external"): |
+   |       - load /etc/nmbl/bootstrap.toml                   |
+   |       - load bootstrap kernel modules (finit_module)    |
+   |       - blkid sweep -> populate /dev/disk/by-*          |
+   |       - mount boot partition under boot_fs.mountpoint   |
+   |       - load full Config from <mount>/<config_path>     |
+   |       - hand runtime mountpoint to rescue dispatcher    |
+   |                                                         |
    | 2. load explicit kernel modules (finit_module)          |
    | 3. run storage activations (LVM / LUKS / mdraid / ZFS)  |
    | 3b. wait for + mount system filesystems under /mnt/system|
@@ -56,8 +65,119 @@ a kernel panic.
  normal NixOS stage-1 / systemd
 ```
 
+Phase 0.5 is numbered out of order on purpose: it sits between
+pseudo-fs mount (Phase 1) and explicit module load (Phase 2) so the
+bootstrap stage has `/proc`, `/sys`, and `/dev` available, but it
+does NOT run when the build embedded the full config inline
+(`configLocation = "embedded"`, the default). In that case the
+runtime config comes from `/etc/nmbl/config.toml` inside the
+initramfs and Phase 2 starts immediately. The probe is a
+`try_exists()` on `/etc/nmbl/bootstrap.toml`; presence means
+two-tier mode, absence means single-tier.
+
+Phase 0.5 leaves the boot mount in place on the error path so the
+operator's emergency shell can inspect (and fix) the on-disk
+config. Failures are wrapped in
+`NmblError::Bootstrap { stage, source }`, with `stage` strings
+(`probe`, `load-modules`, `blkid-sweep`, `mount-boot`,
+`read-config`) that the banner surfaces verbatim.
+
 Any phase that returns `Err` routes to `shell::drop_to_emergency`,
-which `execve`s `/bin/sh` (busybox) with PID 1 preserved.
+which dispatches based on `boot.nmbl.rescue.mode` (see
+**Rescue dispatch** below) — for `embedded` the legacy `execve` of
+`/bin/sh` from the initramfs runs, for `external` the squashfs is
+loop-mounted and switch_rooted into, for `none` the system halts
+with a structured banner.
+
+### Rescue dispatch
+
+```
+ any phase returns Err
+        |
+        v
+ shell::drop_to_emergency(config, err)
+        |
+        v
+ rescue::dispatch(config, &err)            (Result<Infallible>)
+        |
+        +-- mode = "embedded" -----------+
+        |                                |
+        |                                v
+        |                       execve(cfg.paths.shell)        // /bin/sh from initramfs
+        |
+        +-- mode = "external"
+        |        |
+        |        v
+        |   rescue::disk::try_disk_rescue
+        |     locate_sfs(config)                                // <runtime_boot_mountpoint>/<sfs_path>
+        |     allocate_loop_device   (LOOP_CTL_GET_FREE)
+        |     open_loop_device       (/dev/loopN, O_RDWR)
+        |     open(sfs, O_RDONLY)
+        |     configure_loop_device  (LOOP_CONFIGURE, RO)
+        |     mount(/dev/loopN, /rescue, squashfs, ro)
+        |     switch_root_and_exec(/rescue)
+        |        |
+        |        +-- success --> execve("/bin/sh", TERM=linux PATH=...)
+        |        |
+        |        +-- failure
+        |              |
+        |              +-- rescue.network = false --> halt_with_banner
+        |              |
+        |              +-- rescue.network = true (network-rescue feature)
+        |                    |
+        |                    v
+        |              rescue::net::try_network_rescue
+        |                ui::pick_source                         // ratatui (or console fallback)
+        |                  [Network]/[Reboot]/[Halt]
+        |                iface::enumerate + bring_up + wait_for_link
+        |                dhcp::acquire   (DISCOVER/OFFER/REQUEST/ACK)
+        |                apply_lease     (SIOCSIFADDR/SIOCSIFNETMASK/SIOCADDRT)
+        |                ui::prompt_url  (pre-filled from rescue.defaultUrl)
+        |                http::get  +  Sha256::update  -->  memfd_create
+        |                ui::confirm_hash (pre-filled from rescue.defaultSha256)
+        |                allocate + configure loop, mount, switch_root_and_exec
+        |                  on hash mismatch / operator abort: loop back to source picker
+        |                  on any fatal error: halt_with_banner
+        |
+        +-- mode = "none" ---------------> halt_with_banner
+                                                  |
+                                                  v
+                                  banner + reboot(RB_HALT_SYSTEM)
+                                  fallback: libc::_exit(1)
+```
+
+The source-picker UI only appears in the network branch — disk
+rescue is tried unconditionally first when `mode = "external"`. If
+the disk path fails AND `rescue.network = true`, the network arm
+shows the picker with the disk-failure reason embedded so the
+operator knows why they were promoted to the network flow.
+
+`switch_root_and_exec` is shared by both rescue paths (disk and
+network) and lives in `src/rescue/mod.rs`. Its sequence is:
+
+```rust
+chdir(new_root)                                  // step 1
+mount(Some("."), "/", None, MS_MOVE, None)       // step 2
+chroot(".")                                      // step 3
+chdir("/")                                       // step 4
+execve("/bin/sh", ["sh"], [TERM=linux, PATH=...])// step 5
+```
+
+This replaces `pivot_root(2)`, which always returns `EINVAL` when
+the outgoing root is the initramfs rootfs pseudo-filesystem (which
+it always is in NMBL). `MS_MOVE` reassigns the new-root mount onto
+`/` atomically, detaching the initramfs; the `chroot(".")` then
+re-anchors the process's root at the squashfs's `/`. After
+`chdir("/")` resets the cwd, `execve` replaces the process image
+with the rescue shell.
+
+A subtlety: NMBL's rescue squashfs uses `pkgs.busybox-sandbox-shell`
+(a statically-linked busybox) rather than `pkgs.busybox`. The
+dynamically-linked default would carry an ELF interpreter path like
+`/nix/store/<hash>/lib/ld-musl-x86_64.so.1` that the `execve` after
+`chroot` cannot resolve — the squashfs is rooted at `/` and has no
+`/nix/store` tree. A static binary has no interpreter, so `execve`
+succeeds.
 
 ## Source layout
 
@@ -448,16 +568,36 @@ Rust path inside these end-to-end runs is still being expanded.
 - Emergency shell with chained error display + variant-specific hints.
 - `nmbl-init-no-exec` flake check enforcing the exec allowlist.
 
+### Implemented post-v1
+
+- **External configuration on the boot partition.**
+  `boot.nmbl.configLocation = "external"` ships a tiny
+  `/etc/nmbl/bootstrap.toml` inside the initramfs and reads the full
+  `config.toml` from the boot partition at Phase 0.5. Operators can
+  edit `/boot/nmbl/config.toml` directly and reboot to apply changes.
+- **External rescue squashfs.**
+  `boot.nmbl.rescue.mode = "external"` builds `nmbl-rescue.sfs` at
+  install time from `rescue.squashfsContents` (default:
+  `busybox-sandbox-shell`, `cryptsetup`, `lvm2`, `mdadm`) and stages
+  it on the boot partition. The Rust /init loop-mounts it on demand
+  via `LOOP_CTL_GET_FREE` + `LOOP_CONFIGURE`, then `switch_root`s
+  into it and execs its `/bin/sh`. `rescue.mode = "none"` halts with
+  a structured banner instead.
+- **Network rescue fallback.** `boot.nmbl.rescue.network = true`
+  enables the `network-rescue` Cargo feature, bundles NIC drivers +
+  DHCP + an HTTP/1.0 client, and offers an in-band download flow
+  (with operator-confirmed SHA-256) when the disk copy of
+  `nmbl-rescue.sfs` is unavailable.
+
 ### Deferred
 
-- `LABEL=` / `UUID=` / `PARTUUID=` device specifiers (currently
-  rejected by `Config::validate`; would need either udev or a
-  blkid-style scanner in PID 1).
-- External configuration on `/boot` (today the TOML is baked into the
-  initramfs; an `/etc/nmbl/config.toml` override on the boot partition
-  would let operators tweak timeouts without a rebuild).
-- A pre-built squashfs rescue image as an additional emergency target
-  when `/bin/sh` itself is broken.
+- `LABEL=` / `UUID=` / `PARTUUID=` device specifiers in the operator's
+  full config (currently rejected by `Config::validate`; the Phase 0.5
+  blkid sweep populates `/dev/disk/by-*` only for the bootstrap stage's
+  own boot device).
+- A GUI menu in graphical-console environments. The current TUI
+  (`ratatui` over `/dev/console`) covers VT and serial, which spans
+  every supported bootstrapper config.
 - Broader VM-level smoke coverage of the Rust path in the
   `testing/` harness; the existing scaffolding works but only a subset
   of configurations exercise activation and panic-recovery.
