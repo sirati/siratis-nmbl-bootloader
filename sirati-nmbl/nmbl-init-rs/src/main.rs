@@ -18,7 +18,7 @@ use nmbl_init::activation::{KeyInjection, run_all_activations};
 use nmbl_init::boot::kexec_into;
 use nmbl_init::config::{BootstrapConfig, Config, resolve_full_config_path};
 use nmbl_init::devices::mount_system_filesystems;
-use nmbl_init::error::{NmblError, Result};
+use nmbl_init::error::{NmblError, Result, format_chain};
 use nmbl_init::generations::scan_generations;
 use nmbl_init::modules::{load_early_modules, load_explicit_modules, load_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
@@ -26,11 +26,31 @@ use nmbl_init::panic::install_panic_hook;
 use nmbl_init::shell::drop_to_emergency;
 use nmbl_init::sys::{blkid, mount as sys_mount};
 use nmbl_init::ui::console::{Console, NoopConsole, open_console};
+use nmbl_init::ui::key_echo::run_key_echo_loop;
 use nmbl_init::ui::{BootReporter, Decision, TuiPasswordSupplier, run_selector};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/nmbl/config.toml";
 const BOOTSTRAP_CONFIG_PATH: &str = "/etc/nmbl/bootstrap.toml";
+
+/// Kernel cmdline token that opts into the key-echo diagnostic screen.
+/// Must appear as a whitespace-delimited token (e.g.
+/// `... loglevel=7 nmbl.key_echo=1`); we don't accept arbitrary `=...`
+/// values beyond `1` to keep the gate cheap and unambiguous.
+const KEY_ECHO_CMDLINE_TOKEN: &str = "nmbl.key_echo=1";
+
+/// `true` if `/proc/cmdline` contains [`KEY_ECHO_CMDLINE_TOKEN`] as a
+/// whitespace-delimited token. False on every read error so a missing
+/// or unreadable `/proc/cmdline` (e.g. mid-bootstrap before phase 1)
+/// can never silently force the diagnostic screen on a production boot.
+fn cmdline_has_key_echo_flag() -> bool {
+    let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") else {
+        return false;
+    };
+    cmdline
+        .split_whitespace()
+        .any(|tok| tok == KEY_ECHO_CMDLINE_TOKEN)
+}
 
 struct Args {
     config_path: PathBuf,
@@ -485,6 +505,27 @@ fn main() -> ExitCode {
             match drop_to_emergency(None, &config, err) {}
         }
     };
+
+    // Diagnostic harness: `nmbl.key_echo=1` on the kernel cmdline
+    // routes us into the key-echo screen instead of the normal boot
+    // flow. The screen never returns a Decision; on Ctrl+C we fall
+    // through to `drop_to_emergency` so the operator still gets a
+    // shell. This branch is gated and unreachable in production
+    // boots (cmdline tokens are operator-set, not config-set).
+    if cmdline_has_key_echo_flag() {
+        nmbl_info!("nmbl.key_echo=1 in cmdline: entering key-echo diagnostic screen");
+        if let Err(e) = run_key_echo_loop(&mut *console) {
+            nmbl_warn!(
+                "key-echo loop error: {}",
+                format_chain(&e as &dyn std::error::Error)
+            );
+        }
+        let err = NmblError::Io {
+            source: std::io::Error::other("key-echo diagnostic mode terminated"),
+            context: "key-echo".to_string(),
+        };
+        match drop_to_emergency(Some(&mut *console), &config, err) {}
+    }
 
     let outcome = run_phases_post_console(&config, &mut *console)
         .and_then(|injections| select_and_act(&config, &mut *console, &injections));

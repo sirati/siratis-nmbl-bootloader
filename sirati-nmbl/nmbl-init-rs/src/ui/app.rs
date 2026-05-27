@@ -2,13 +2,17 @@
 //! and mutates [`App`]; the surrounding `ui::mod` is responsible for
 //! actually polling input and rendering frames via [`crate::ui::view`].
 //!
-//! The state machine has five screens:
+//! The state machine has six screens:
 //! - [`Screen::List`]    — generation picker, default landing page.
 //! - [`Screen::Editing`] — single-line kernel-cmdline editor.
 //! - [`Screen::Passphrase`] — modal LUKS prompt driven by activation.rs.
 //! - [`Screen::Emergency`] — boot-failed picker between Reboot and Shell.
 //! - [`Screen::BootStatus`] — non-interactive progress + log view shown
 //!   during early boot phases (before the selector / activation).
+//! - [`Screen::KeyEcho`] — diagnostic test screen that echoes every key
+//!   event and raw byte sequence to two panels. Inaccessible from
+//!   normal boot; only reached when `nmbl.key_echo=1` appears on the
+//!   kernel cmdline. Used to debug VNC/PS-2 → splash input plumbing.
 //!
 //! When the user makes a final decision the `decision` field is set
 //! and [`App::on_key`] returns `true`, signalling the run loop to exit.
@@ -18,10 +22,17 @@
 //! returns it without exiting the App), and only Esc on the passphrase
 //! modal sets a [`Decision::Shell`] exit.
 
+use std::collections::VecDeque;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use zeroize::Zeroizing;
 
 use crate::generations::Generation;
+
+/// Maximum number of entries retained in each [`Screen::KeyEcho`] ring
+/// buffer. Old entries are evicted from the front when full. ~20 keeps
+/// the panels readable on an 80×24 console with room for header/footer.
+pub const KEY_ECHO_RING_CAP: usize = 20;
 
 /// Top-level user choice returned when the TUI exits.
 #[derive(Debug)]
@@ -107,6 +118,21 @@ pub enum Screen<'a> {
     /// caller drives the phase label, log snapshot, and spinner tick;
     /// key events are absorbed but never produce a [`Decision`].
     BootStatus(BootStatusData<'a>),
+    /// Diagnostic test screen — gated behind `nmbl.key_echo=1` on the
+    /// kernel cmdline so it is unreachable in normal boots. Renders
+    /// two ring buffers side-by-side: parsed `KeyEvent`s on the left,
+    /// raw byte sequences on the right. The driver loop pushes a new
+    /// entry per keypress and the renderer in [`crate::ui::view`]
+    /// shows the most-recent at the bottom. The loop exits on Ctrl+C.
+    KeyEcho {
+        /// Human-readable rendering of each parsed `KeyEvent`, most
+        /// recent last. Bounded at [`KEY_ECHO_RING_CAP`].
+        events: VecDeque<String>,
+        /// Raw bytes captured from the underlying input reader,
+        /// hex-printed (e.g. `"1b 5b 41"` for arrow-up CSI). Most
+        /// recent last. Bounded at [`KEY_ECHO_RING_CAP`].
+        byte_log: VecDeque<String>,
+    },
 }
 
 /// Top-level TUI app state.
@@ -166,6 +192,52 @@ impl<'a> App<'a> {
             show_kernel_params: false,
             countdown_remaining_secs: None,
             decision: None,
+        }
+    }
+
+    /// Construct an App parked on [`Screen::KeyEcho`] with empty ring
+    /// buffers. The diagnostic loop in [`crate::ui::key_echo`] drives
+    /// further mutations via [`App::push_key_echo_event`] and
+    /// [`App::push_key_echo_bytes`].
+    pub fn key_echo() -> App<'a> {
+        App {
+            generations: &[],
+            selected_index: 0,
+            screen: Screen::KeyEcho {
+                events: VecDeque::new(),
+                byte_log: VecDeque::new(),
+            },
+            show_kernel_params: false,
+            countdown_remaining_secs: None,
+            decision: None,
+        }
+    }
+
+    /// Append a human-readable parsed-event string to the key-echo
+    /// events ring, evicting the oldest entry when full. No-op when
+    /// the App is on any other screen.
+    pub fn push_key_echo_event(&mut self, line: impl Into<String>) {
+        if let Screen::KeyEcho { events, .. } = &mut self.screen {
+            if events.len() >= KEY_ECHO_RING_CAP {
+                events.pop_front();
+            }
+            events.push_back(line.into());
+        } else {
+            debug_assert!(false, "push_key_echo_event called on non-KeyEcho screen");
+        }
+    }
+
+    /// Append a hex-printed raw-byte string to the key-echo byte-log
+    /// ring, evicting the oldest entry when full. No-op when the App
+    /// is on any other screen.
+    pub fn push_key_echo_bytes(&mut self, line: impl Into<String>) {
+        if let Screen::KeyEcho { byte_log, .. } = &mut self.screen {
+            if byte_log.len() >= KEY_ECHO_RING_CAP {
+                byte_log.pop_front();
+            }
+            byte_log.push_back(line.into());
+        } else {
+            debug_assert!(false, "push_key_echo_bytes called on non-KeyEcho screen");
         }
     }
 
@@ -233,6 +305,13 @@ impl<'a> App<'a> {
             // The boot-status screen is non-interactive: it shows progress
             // until the caller flips the App to a different screen.
             Screen::BootStatus(_) => false,
+            // KeyEcho is driven directly by the diagnostic loop in
+            // `crate::ui::key_echo`, which appends to the ring buffers
+            // *before* invoking `on_key` for any state mutations. We
+            // intentionally never produce a [`Decision`] from this
+            // screen: the loop exits on Ctrl+C / Ctrl+Esc detected at
+            // the loop level, not via `Decision`.
+            Screen::KeyEcho { .. } => false,
         }
     }
 
