@@ -418,6 +418,112 @@ in
       };
     };
 
+    # --- Bootstrap (Option 1: external config on the boot partition) ----
+    # When `configLocation = "external"`, the initramfs only carries the
+    # tiny bootstrap.toml emitted by `lib/bootstrap-toml.nix`; the full
+    # runtime config lives on the boot partition and is loaded via Phase
+    # 0.5 of the Rust /init. The default `"embedded"` keeps today's
+    # behaviour (full config.toml embedded in the initramfs).
+    configLocation = lib.mkOption {
+      type = lib.types.enum [ "embedded" "external" ];
+      default = "embedded";
+      description = lib.mdDoc ''
+        Where the NMBL runtime config lives: `"embedded"` ships the full
+        `config.toml` inside the initramfs; `"external"` embeds only the
+        bootstrap.toml descriptor and reads `config.toml` from the boot
+        partition at runtime.
+      '';
+    };
+
+    bootstrap = {
+      configPath = lib.mkOption {
+        type = lib.types.path;
+        default = "/nmbl/config.toml";
+        description = lib.mdDoc ''
+          Path to the full runtime `config.toml`, relative to
+          `boot.nmbl.bootstrap.bootFs.mountpoint`, used when
+          `configLocation = "external"`.
+        '';
+      };
+
+      bootFs = {
+        device = lib.mkOption {
+          type = lib.types.str;
+          default = "/dev/disk/by-partlabel/disk-main-ESP";
+          example = "/dev/disk/by-partlabel/disk-main-ESP";
+          description = lib.mdDoc ''
+            Block device holding the boot partition that contains the
+            external `config.toml`. Must be a `/dev/disk/by-*` symlink or
+            a raw `/dev/...` path; short forms (`LABEL=`, `UUID=`,
+            `PARTUUID=`) are rejected by the Rust loader.
+          '';
+        };
+
+        fstype = lib.mkOption {
+          type = lib.types.str;
+          default = "vfat";
+          description = lib.mdDoc ''
+            Filesystem type of the boot partition (e.g. `vfat`, `ext4`).
+          '';
+        };
+
+        options = lib.mkOption {
+          type = lib.types.str;
+          default = "ro";
+          description = lib.mdDoc ''
+            Comma-joined `mount(2)` options applied when the bootstrap
+            stage mounts the boot partition. Defaults to read-only.
+          '';
+        };
+
+        mountpoint = lib.mkOption {
+          type = lib.types.path;
+          default = "/mnt/boot";
+          description = lib.mdDoc ''
+            Mountpoint inside the NMBL initramfs where the boot
+            partition is mounted by the bootstrap stage.
+          '';
+        };
+      };
+
+      kernelModules = {
+        explicit = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ "vfat" "nls_cp437" "nls_iso8859_1" "ahci" "nvme" ];
+          example = [ "vfat" "nls_cp437" "nls_iso8859_1" "ahci" "nvme" ];
+          description = lib.mdDoc ''
+            Kernel modules the bootstrap stage loads before mounting the
+            boot partition. Must cover the boot filesystem driver and
+            the storage controller drivers needed to expose its block
+            device.
+          '';
+        };
+      };
+
+      rescue = {
+        defaultUrl = lib.mkOption {
+          type = lib.types.str;
+          default = "";
+          example = "https://example.invalid/rescue.cpio";
+          description = lib.mdDoc ''
+            Pre-filled URL for the rescue prompt (Option 2). Leave empty
+            to omit; if set, `defaultSha256` must also be set — the Rust
+            validator rejects half-configured rescue defaults.
+          '';
+        };
+
+        defaultSha256 = lib.mkOption {
+          type = lib.types.str;
+          default = "";
+          example = "deadbeef";
+          description = lib.mdDoc ''
+            Pre-filled SHA-256 for the rescue prompt (Option 2). Leave
+            empty to omit; if set, `defaultUrl` must also be set.
+          '';
+        };
+      };
+    };
+
     paths = {
       nixProfilesDir = lib.mkOption {
         type = lib.types.path;
