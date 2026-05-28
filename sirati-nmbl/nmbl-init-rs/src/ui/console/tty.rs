@@ -69,6 +69,12 @@ use crate::ui::render_current_screen;
 /// Default tty path the orchestrator opens at boot.
 const CONSOLE_PATH: &str = "/dev/console";
 
+/// Fallback grid geometry used when the line reports no winsize
+/// (`TIOCGWINSZ` → 0x0, the serial-console case). The host's
+/// `CSI 8;rows;cols t` report corrects this on the first resize.
+const DEFAULT_COLS: u16 = 80;
+const DEFAULT_ROWS: u16 = 24;
+
 /// `linux/kd.h` ioctl numbers. Stable kernel ABI.
 const KDGETMODE: libc::Ioctl = 0x4B3B;
 const KDSETMODE: libc::Ioctl = 0x4B3A;
@@ -143,7 +149,35 @@ impl TtyConsole {
         // when `$TERM` is unset (NMBL boots with no environment).
         let caps = caps_from_env_with_fallback()?;
         let unix_term = UnixTerminal::new_with(caps, &fd, &fd).map_err(tw_err)?;
-        let buf = BufferedTerminal::new(unix_term).map_err(tw_err)?;
+        let mut buf = BufferedTerminal::new(unix_term).map_err(tw_err)?;
+
+        // `UnixTerminal::new_with` `dup()`s our fd and, during
+        // construction, calls `set_blocking(Wait)` on the read dup.
+        // `O_NONBLOCK` lives on the shared open-file-description, so
+        // that clears the flag we set above for *every* fd pointing at
+        // this OFD — including the one our rustix read loop polls.
+        // Re-assert it so `poll_event`'s reads never block.
+        if let Err(e) = fcntl_setfl(fd.as_fd(), OFlags::NONBLOCK) {
+            nmbl_warn!(
+                "TtyConsole: re-asserting O_NONBLOCK on console fd {} after termwiz \
+                 construction failed: {e}; reads may briefly block on partial sequences",
+                fd.as_raw_fd()
+            );
+        }
+
+        // `BufferedTerminal::new` seeds its `Surface` from
+        // `TIOCGWINSZ`. A serial line reports no winsize (0x0), so the
+        // surface would have zero area: ratatui's `draw()` autoresizes
+        // to the backend's 0x0, renders into an empty frame, the diff
+        // is empty, and *nothing* is ever written to the line — the
+        // empty-pane regression. Seed a sane default so the very first
+        // frame paints; the host's `CSI 8;rows;cols t` report later
+        // corrects the geometry via `apply_resize`.
+        let (cols0, rows0) = buf.dimensions();
+        if cols0 == 0 || rows0 == 0 {
+            buf.resize(usize::from(DEFAULT_COLS), usize::from(DEFAULT_ROWS));
+        }
+
         let backend = TermwizBackend::with_buffered_terminal(buf);
         let terminal = Terminal::new(backend).map_err(tui_err)?;
 
@@ -464,6 +498,16 @@ impl TtyConsole {
             return;
         };
         self.last_resize = Some((cols, rows));
+        // Resize the termwiz `Surface` first. `backend.size()` reads
+        // the surface dimensions, and ratatui's `draw()` calls
+        // `autoresize()` which snaps `last_known_area` back to whatever
+        // `backend.size()` reports. If we only resized the ratatui
+        // terminal, the next `draw()` would immediately revert it to
+        // the stale surface size, so the surface is the source of truth.
+        self.terminal
+            .backend_mut()
+            .buffered_terminal_mut()
+            .resize(usize::from(cols), usize::from(rows));
         if let Err(e) = self
             .terminal
             .resize(ratatui::layout::Rect::new(0, 0, cols, rows))
