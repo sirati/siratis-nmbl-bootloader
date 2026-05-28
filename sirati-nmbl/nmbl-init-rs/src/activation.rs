@@ -402,19 +402,37 @@ fn handle_wrong_password(
             Ok(WrongPasswordHandled::ShellExited)
         }
         WrongPasswordOutcome::RawShell => {
-            // Console-picker + multiplexed busybox PTY. Errors are
-            // surfaced via a modal-error so the wrong-password flow
-            // doesn't crash the boot — we still want the operator to
-            // be able to retry.
-            if let Err(e) = crate::ui::console_picker::run_picker_session(console, config) {
-                let chain = crate::error::format_chain(&e as &dyn std::error::Error);
-                crate::nmbl_warn!("wrong-password shell-picker session failed: {chain}");
-                let _ = crate::ui::show_modal_error(
-                    console,
-                    "Emergency shell failed",
-                    &chain,
-                    std::time::Duration::from_secs(10),
-                );
+            // Console-picker + multiplexed busybox PTY (overlap) or
+            // fire-and-forget (no overlap). Errors are surfaced via a
+            // modal-error so the wrong-password flow doesn't crash the
+            // boot — we still want the operator to be able to retry.
+            match crate::ui::console_picker::run_picker_session(console, config) {
+                Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached {
+                    targets,
+                }) => {
+                    let joined = targets
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = crate::ui::show_modal_error(
+                        console,
+                        "Shell spawned",
+                        &format!("Shell spawned on {joined}"),
+                        std::time::Duration::from_secs(5),
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let chain = crate::error::format_chain(&e as &dyn std::error::Error);
+                    crate::nmbl_warn!("wrong-password shell-picker session failed: {chain}");
+                    let _ = crate::ui::show_modal_error(
+                        console,
+                        "Emergency shell failed",
+                        &chain,
+                        std::time::Duration::from_secs(10),
+                    );
+                }
             }
             Ok(WrongPasswordHandled::ShellExited)
         }
