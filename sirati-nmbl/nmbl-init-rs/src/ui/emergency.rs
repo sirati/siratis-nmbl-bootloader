@@ -53,17 +53,42 @@ const EMERGENCY_TIMEOUT: Duration = Duration::from_secs(30);
 /// timer expires and the function returns [`EmergencyChoice::Reboot`].
 /// On a backend error mid-loop we also fall back to Reboot — the
 /// safest default when the operator can't see the screen anyway.
+///
+/// One-shot convenience used by tests and any caller that hasn't yet
+/// adopted the persistent-App overlay model. The auto-reboot countdown
+/// starts fresh on every call. Production code uses
+/// [`run_emergency_screen_with_app`] instead so re-entries don't
+/// restart the timer.
 pub fn run_emergency_screen(console: &mut dyn Console, err: &NmblError) -> EmergencyChoice {
     let message = build_message(err);
     let items = default_items();
     let mut app = build_emergency_app(&message, &items);
-    drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, Instant::now, console)
+    run_emergency_screen_with_app(console, &mut app)
+}
+
+/// Same as [`run_emergency_screen`] but reuses an externally-owned
+/// `App` so the auto-reboot countdown deadline (held in
+/// `app.error_countdown_deadline`) survives a re-entry after the
+/// operator dismisses a modal and lands back on the error screen.
+///
+/// On first call the helper latches the deadline at `now + 30s`; on
+/// re-entry the existing deadline is preserved. If the deadline has
+/// already elapsed on re-entry the loop reboots immediately.
+pub fn run_emergency_screen_with_app(
+    console: &mut dyn Console,
+    app: &mut App<'_>,
+) -> EmergencyChoice {
+    // Latch on first entry — subsequent calls find Some(_) and keep
+    // the original deadline. Re-entry after an elapsed deadline trips
+    // the "remaining = None" branch below and returns Reboot at once.
+    app.latch_error_countdown(EMERGENCY_TIMEOUT);
+    drive_emergency_loop(app, EMERGENCY_TIMEOUT, Instant::now, console)
         .unwrap_or(EmergencyChoice::Reboot)
 }
 
 /// Build the message string shown to the operator. Includes the
 /// suggested-action hint plus the formatted error chain.
-fn build_message(err: &NmblError) -> String {
+pub(crate) fn build_message(err: &NmblError) -> String {
     let mut s = String::new();
     s.push_str("Boot failed. The chain of errors is:\n\n");
     s.push_str(&format_chain(err as &dyn std::error::Error));
@@ -83,7 +108,7 @@ fn build_message(err: &NmblError) -> String {
 /// fallback. The `Retry boot from config` and `Verify kexec readiness`
 /// actions are unconditional: they only need the existing phase 3/4/5
 /// plumbing already in the binary.
-fn default_items() -> Vec<EmergencyItem> {
+pub(crate) fn default_items() -> Vec<EmergencyItem> {
     // `mut` is conditionally used (the `insert` below is feature-gated);
     // suppress the unused_mut warning on no-feature builds without
     // duplicating the vec literal.
@@ -114,7 +139,10 @@ fn default_items() -> Vec<EmergencyItem> {
 
 /// Build an `App` parked on the Emergency screen with the given
 /// message and items.
-fn build_emergency_app<'a>(message: &str, items_template: &[EmergencyItem]) -> App<'a> {
+pub(crate) fn build_emergency_app<'a>(
+    message: &str,
+    items_template: &[EmergencyItem],
+) -> App<'a> {
     // Items are tiny, no point fighting the borrow checker — clone
     // the template into the App's own Screen state.
     let items: Vec<EmergencyItem> = items_template

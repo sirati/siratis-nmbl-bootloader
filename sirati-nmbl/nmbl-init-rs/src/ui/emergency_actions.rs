@@ -31,9 +31,11 @@ use crate::error::{NmblError, Result, format_chain};
 use crate::generations::scan_generations;
 use crate::nmbl_info;
 use crate::terminal::TerminalAction;
+use crate::ui::app::App;
 use crate::ui::console::Console;
 use crate::ui::{
-    BootReporter, ConfirmOutcome, Decision, run_selector, show_modal_confirm, show_modal_error,
+    BootReporter, ConfirmOutcome, Decision, run_selector, show_modal_confirm_over,
+    show_modal_error_over,
 };
 
 /// Re-run phases 3 → 5 from the emergency screen and return whatever
@@ -65,24 +67,28 @@ use crate::ui::{
 pub fn retry_boot(
     config: &Config,
     console: &mut dyn Console,
+    app: &mut App<'static>,
     supplier: &mut dyn PasswordSupplier,
 ) -> Result<TerminalAction> {
     nmbl_info!("emergency action: retry boot from config");
 
-    // Phase 3: activations.
+    // Phase 3: activations. The reporter overlays the emergency menu
+    // App so the menu remains visible behind the progress indicator;
+    // the reporter's Drop impl clears `app.modal` on scope exit.
     let injections = {
-        let mut reporter = BootReporter::new(console, "phase 3: storage activations (retry)");
+        let mut reporter =
+            BootReporter::overlay(console, app, "phase 3: storage activations (retry)");
         run_all_activations(config, &mut reporter, Some(supplier))?
-        // reporter drops, releasing the &mut Console borrow.
     };
 
     // Phase 3b: mount system filesystems.
     {
-        let mut reporter = BootReporter::new(console, "phase 3b: mount system filesystems (retry)");
+        let mut reporter =
+            BootReporter::overlay(console, app, "phase 3b: mount system filesystems (retry)");
         mount_system_filesystems(config, &mut reporter)?;
     }
 
-    run_selector_and_dispatch(config, console, &injections)
+    run_selector_and_dispatch(config, console, app, &injections)
 }
 
 /// Skip phases 3 and 3b — trust the operator's manual mount — and run
@@ -107,11 +113,13 @@ pub fn retry_boot(
 pub fn verify_kexec_readiness(
     config: &Config,
     console: &mut dyn Console,
+    app: &mut App<'static>,
 ) -> Result<Option<TerminalAction>> {
     nmbl_info!("emergency action: verify kexec readiness");
 
     let generations = {
-        let mut reporter = BootReporter::new(console, "phase 4: scan generations (verify)");
+        let mut reporter =
+            BootReporter::overlay(console, app, "phase 4: scan generations (verify)");
         scan_generations(config, &mut reporter)?
     };
 
@@ -121,8 +129,15 @@ pub fn verify_kexec_readiness(
         plural = if count == 1 { "" } else { "s" },
         root = config.paths.system_root.display(),
     );
-    let outcome =
-        show_modal_confirm(console, "Verify kexec readiness", &body, "Yes", "Back", true)?;
+    let outcome = show_modal_confirm_over(
+        console,
+        app,
+        "Verify kexec readiness",
+        &body,
+        "Yes",
+        "Back",
+        true,
+    )?;
     match outcome {
         ConfirmOutcome::Yes => {
             // No passphrase injection: the operator skipped phase 3.
@@ -140,10 +155,12 @@ pub fn verify_kexec_readiness(
 fn run_selector_and_dispatch(
     config: &Config,
     console: &mut dyn Console,
+    app: &mut App<'static>,
     injections: &[KeyInjection],
 ) -> Result<TerminalAction> {
     let generations = {
-        let mut reporter = BootReporter::new(console, "phase 4: scan generations (retry)");
+        let mut reporter =
+            BootReporter::overlay(console, app, "phase 4: scan generations (retry)");
         scan_generations(config, &mut reporter)?
     };
     let decision = run_selector(config, &generations, console)?;
@@ -197,9 +214,14 @@ fn decision_to_action(
 /// presses any key (or 10 s elapse). Errors from the modal itself
 /// are swallowed — by the time we're showing a modal error the
 /// console is already in a degraded state.
-pub fn surface_action_failure(console: &mut dyn Console, title: &str, err: &NmblError) {
+pub fn surface_action_failure(
+    console: &mut dyn Console,
+    app: &mut App<'static>,
+    title: &str,
+    err: &NmblError,
+) {
     let chain = format_chain(err as &dyn std::error::Error);
-    let _ = show_modal_error(console, title, &chain, Duration::from_secs(10));
+    let _ = show_modal_error_over(console, app, title, &chain, Duration::from_secs(10));
 }
 
 #[cfg(test)]

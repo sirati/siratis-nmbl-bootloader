@@ -158,7 +158,7 @@ fn recover_from_panic(args: Args, report_path: PathBuf) -> (TerminalAction, Conf
 /// optional bootstrap phase (0.5) can see those pseudo-filesystems
 /// before it touches blkid or mounts the boot partition. Uses a
 /// [`NoopConsole`] sentinel because the real console is not open yet.
-fn run_phase_1(reporter: &mut BootReporter<'_>) -> Result<()> {
+fn run_phase_1(reporter: &mut BootReporter<'_, '_>) -> Result<()> {
     nmbl_info!("phase 1: mount pseudo-filesystems");
     mount_pseudo_filesystems(reporter)
 }
@@ -168,7 +168,7 @@ fn run_phase_1(reporter: &mut BootReporter<'_>) -> Result<()> {
 /// `config.kernel_modules.early`. The reporter wraps a [`NoopConsole`];
 /// status pushes do nothing visible, but the underlying log ring is
 /// still populated for the post-console reporter to surface.
-fn run_phase_2a(config: &Config, reporter: &mut BootReporter<'_>) -> Result<()> {
+fn run_phase_2a(config: &Config, reporter: &mut BootReporter<'_, '_>) -> Result<()> {
     let _ = reporter.set_phase("phase 2a: load early kernel modules");
     nmbl_info!("phase 2a: load early kernel modules");
     load_early_modules(config, reporter)
