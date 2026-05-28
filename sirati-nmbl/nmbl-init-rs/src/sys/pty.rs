@@ -135,6 +135,28 @@ impl PtyChild {
         }
     }
 
+    /// Push a new window size onto the PTY master so the slave (and thus
+    /// the child shell + any full-screen program running on it) sees the
+    /// new geometry and receives `SIGWINCH`.
+    ///
+    /// `TIOCSWINSZ` on the master propagates to the slave's terminal and
+    /// raises `SIGWINCH` in the foreground process group, exactly as a
+    /// real terminal emulator does when its window is resized.
+    /// Best-effort: a failure here only means the child keeps the stale
+    /// `$LINES`/`$COLUMNS`; the in-process grid still reflows.
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {
+        let winsize = rustix::termios::Winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // rustix exposes the `TIOCSWINSZ` ioctl without raw `unsafe`.
+        rustix::termios::tcsetwinsize(&self.master, winsize).map_err(|e| NmblError::Tui {
+            source: std::io::Error::from(e),
+        })
+    }
+
     /// Send `SIGTERM` to the child and reap it. Best-effort; logs but
     /// does not propagate errors so the caller's cleanup path can always
     /// proceed.
