@@ -111,6 +111,16 @@ pub enum NmblError {
         #[source]
         source: nix::Error,
     },
+
+    /// The operator pressed Esc on the boot-status screen while a
+    /// blocking wait (device readiness, activation poll, …) was in
+    /// flight. Surfaced by [`crate::ui::ProgressSink::tick`] returning
+    /// [`crate::ui::TickOutcome::Aborted`]; the caller of the wait
+    /// helper wraps the abort with a short `context` string ("waiting
+    /// for /dev/sda1", "activation foo", …) so the emergency menu can
+    /// tell the operator exactly which step they cut short.
+    #[error("operator aborted: {context}")]
+    OperatorAborted { context: String },
 }
 
 pub type Result<T> = std::result::Result<T, NmblError>;
@@ -194,6 +204,40 @@ mod tests {
         };
         let src = Error::source(&e).expect("Rescue should expose a source");
         assert_eq!(src.to_string(), inner_msg);
+    }
+
+    #[test]
+    fn operator_aborted_display_mentions_context() {
+        // The user-facing emergency banner reads this string verbatim,
+        // so the exact "operator aborted: <context>" shape is a
+        // contract. Pin it.
+        let e = NmblError::OperatorAborted {
+            context: "waiting for /dev/sda1".to_string(),
+        };
+        let s = e.to_string();
+        assert_eq!(s, "operator aborted: waiting for /dev/sda1");
+    }
+
+    #[test]
+    fn format_chain_renders_operator_aborted_single_line() {
+        // OperatorAborted has no inner source — format_chain must emit
+        // just the head error with no trailing "caused by:" line.
+        let e = NmblError::OperatorAborted {
+            context: "phase 3b: waiting for /dev/nvme0n1p2".to_string(),
+        };
+        let formatted = format_chain(&e as &dyn Error);
+        assert!(
+            formatted.contains("operator aborted"),
+            "format_chain must lead with the variant prefix: {formatted}"
+        );
+        assert!(
+            formatted.contains("/dev/nvme0n1p2"),
+            "format_chain must surface the abort context: {formatted}"
+        );
+        assert!(
+            !formatted.contains("caused by"),
+            "OperatorAborted has no source — no caused-by line expected: {formatted}"
+        );
     }
 
     #[test]
