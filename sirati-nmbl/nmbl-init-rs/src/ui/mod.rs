@@ -43,6 +43,7 @@ pub mod console_relay;
 pub mod emergency;
 pub mod emergency_actions;
 pub mod key_echo;
+pub mod modal_layout;
 #[cfg(feature = "image-splash")]
 pub mod pretty_shell;
 pub mod reporter;
@@ -144,6 +145,63 @@ pub enum WrongPasswordOutcome {
     RawShell,
 }
 
+/// Inspect a [`KeyEvent`] for the modal-scroll bindings
+/// (Ctrl+Shift+Up/Down/PgUp/PgDn). Returns `Some(new_offset)` when the
+/// key matched and was consumed, `None` when the key should fall
+/// through to the caller's regular key dispatch.
+///
+/// `console.size()` is sampled here so the helper can compute the
+/// visible-line count from the same layout the renderer uses. Empty
+/// or pathologically small consoles fall back to a 1-line viewport so
+/// the offset still advances by one per keypress.
+fn handle_modal_scroll_key(
+    key: crossterm::event::KeyEvent,
+    message: &str,
+    has_buttons: bool,
+    btn_count: u16,
+    console: &mut dyn Console,
+    scroll_offset: u16,
+) -> Option<u16> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    if !(ctrl && shift) {
+        return None;
+    }
+    // Re-derive the current layout from the console's reported size.
+    // Mirrors `view::split_chrome`: 3-row header + body + 1-row footer.
+    let (cols, rows) = console.size();
+    let body_h = rows.saturating_sub(4);
+    let body = ratatui::layout::Rect::new(0, 3, cols, body_h);
+    let layout = modal_layout::compute_modal_layout(message, has_buttons, btn_count, body);
+    if !layout.scrollable {
+        // Even when not scrollable we still consume the key combo so
+        // a stray Ctrl+Shift+arrow doesn't leak through to whatever
+        // dispatch would have run otherwise. Returning the unchanged
+        // offset keeps the renderer's clamping clean.
+        match key.code {
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                return Some(scroll_offset);
+            }
+            _ => return None,
+        }
+    }
+    let visible = layout.inner_text_rect.height.max(1);
+    let total = u16::try_from(layout.wrapped_lines.len()).unwrap_or(u16::MAX);
+    let max_off = total.saturating_sub(visible);
+    let page = visible.saturating_sub(1).max(1);
+    let new_off = match key.code {
+        KeyCode::Up => scroll_offset.saturating_sub(1),
+        KeyCode::Down => scroll_offset.saturating_add(1).min(max_off),
+        KeyCode::PageUp => scroll_offset.saturating_sub(page),
+        KeyCode::PageDown => scroll_offset.saturating_add(page).min(max_off),
+        KeyCode::Home => 0,
+        KeyCode::End => max_off,
+        _ => return None,
+    };
+    Some(new_off)
+}
+
 /// Show a centred yes/no confirmation modal with `title` + `message`
 /// on the supplied console and block until the operator commits.
 ///
@@ -177,6 +235,7 @@ pub fn show_modal_confirm(
 
     let hint = "Left/Right select  Enter confirm  Esc cancel";
     let mut yes_selected = yes_default;
+    let mut scroll_offset: u16 = 0;
 
     let mut dirty = true;
     loop {
@@ -188,6 +247,7 @@ pub fn show_modal_confirm(
                 no_label,
                 yes_selected,
                 hint,
+                scroll_offset,
             };
             if let Err(e) = console.draw_with(&mut |frame| view::render_modal_confirm(frame, &data))
             {
@@ -201,6 +261,11 @@ pub fn show_modal_confirm(
         let Some(key) = console.poll_key(POLL_SLICE)? else {
             continue;
         };
+        if let Some(new_off) = handle_modal_scroll_key(key, message, true, 2, console, scroll_offset) {
+            scroll_offset = new_off;
+            dirty = true;
+            continue;
+        }
         match key.code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                 yes_selected = !yes_selected;
@@ -238,6 +303,7 @@ pub fn show_modal_confirm_over(
     use crossterm::event::KeyCode;
 
     let hint = "Left/Right select  Enter confirm  Esc cancel";
+    app.modal_scroll_reset();
     let outcome = (|| -> Result<ConfirmOutcome> {
         app.modal = Some(ModalKind::Confirm {
             title: title.to_owned(),
@@ -262,6 +328,26 @@ pub fn show_modal_confirm_over(
             let Some(key) = console.poll_key(POLL_SLICE)? else {
                 continue;
             };
+            // Pull the modal's message out for the scroll helper. We
+            // need an immutable read here BEFORE the mutable borrow on
+            // app.modal for `yes_selected` below; otherwise borrowck
+            // rejects the second access.
+            let modal_message = match &app.modal {
+                Some(ModalKind::Confirm { message, .. }) => message.clone(),
+                _ => return Ok(ConfirmOutcome::No),
+            };
+            if let Some(new_off) = handle_modal_scroll_key(
+                key,
+                &modal_message,
+                true,
+                2,
+                console,
+                app.modal_scroll_offset,
+            ) {
+                app.modal_scroll_offset = new_off;
+                dirty = true;
+                continue;
+            }
             let Some(ModalKind::Confirm { yes_selected, .. }) = &mut app.modal else {
                 return Ok(ConfirmOutcome::No);
             };
@@ -285,6 +371,7 @@ pub fn show_modal_confirm_over(
         }
     })();
     app.modal = None;
+    app.modal_scroll_reset();
     outcome
 }
 
@@ -304,23 +391,25 @@ pub fn show_modal_error(
     timeout: Duration,
 ) -> Result<()> {
     let hint = "press any key to continue";
-    let data = view::ModalErrorScreenData {
-        title,
-        message,
-        hint,
-    };
-    // Render once. If the backend itself is broken we still want the
-    // operator to see the failure — print to stderr as a fallback so
-    // the modal isn't the only chance.
-    if let Err(e) = console.draw_with(&mut |frame| view::render_modal_error(frame, &data)) {
-        eprintln!("[nmbl] {title}: {message}");
-        // Surfaced as a warning so the boot transcript shows we tried.
-        crate::nmbl_warn!("modal-error render failed: {e}");
-        return Ok(());
-    }
-
+    let mut scroll_offset: u16 = 0;
+    let mut dirty = true;
     let deadline = Instant::now().checked_add(timeout);
     loop {
+        if dirty {
+            let data = view::ModalErrorScreenData {
+                title,
+                message,
+                hint,
+                scroll_offset,
+            };
+            if let Err(e) = console.draw_with(&mut |frame| view::render_modal_error(frame, &data))
+            {
+                eprintln!("[nmbl] {title}: {message}");
+                crate::nmbl_warn!("modal-error render failed: {e}");
+                return Ok(());
+            }
+            dirty = false;
+        }
         let slice = match deadline {
             Some(d) => match d.checked_duration_since(Instant::now()) {
                 Some(remaining) => remaining.min(POLL_SLICE),
@@ -328,10 +417,17 @@ pub fn show_modal_error(
             },
             None => POLL_SLICE,
         };
-        match console.poll_key(slice)? {
-            Some(_) => return Ok(()),
-            None => continue,
+        let Some(key) = console.poll_key(slice)? else {
+            continue;
+        };
+        // Scroll keys advance the viewport instead of dismissing; any
+        // other key dismisses the modal.
+        if let Some(new_off) = handle_modal_scroll_key(key, message, false, 0, console, scroll_offset) {
+            scroll_offset = new_off;
+            dirty = true;
+            continue;
         }
+        return Ok(());
     }
 }
 
@@ -346,20 +442,23 @@ pub fn show_modal_error_over(
     timeout: Duration,
 ) -> Result<()> {
     let hint = "press any key to continue";
+    app.modal_scroll_reset();
     app.modal = Some(ModalKind::Error {
         title: title.to_owned(),
         message: message.to_owned(),
         hint: hint.to_owned(),
     });
-    if let Err(e) = console.render(app) {
-        eprintln!("[nmbl] {title}: {message}");
-        crate::nmbl_warn!("modal-error render failed: {e}");
-        app.modal = None;
-        return Ok(());
-    }
-
     let deadline = Instant::now().checked_add(timeout);
+    let mut dirty = true;
     let res = loop {
+        if dirty {
+            if let Err(e) = console.render(app) {
+                eprintln!("[nmbl] {title}: {message}");
+                crate::nmbl_warn!("modal-error render failed: {e}");
+                break Ok(());
+            }
+            dirty = false;
+        }
         let slice = match deadline {
             Some(d) => match d.checked_duration_since(Instant::now()) {
                 Some(remaining) => remaining.min(POLL_SLICE),
@@ -367,12 +466,20 @@ pub fn show_modal_error_over(
             },
             None => POLL_SLICE,
         };
-        match console.poll_key(slice)? {
-            Some(_) => break Ok(()),
-            None => continue,
+        let Some(key) = console.poll_key(slice)? else {
+            continue;
+        };
+        if let Some(new_off) =
+            handle_modal_scroll_key(key, message, false, 0, console, app.modal_scroll_offset)
+        {
+            app.modal_scroll_offset = new_off;
+            dirty = true;
+            continue;
         }
+        break Ok(());
     };
     app.modal = None;
+    app.modal_scroll_reset();
     res
 }
 
@@ -411,6 +518,7 @@ pub fn show_wrong_password_modal(
     let labels: &[&str] = &["Try again", "Reboot", "Raw Shell"];
     let n = labels.len();
     let mut selected: usize = 0;
+    let mut scroll_offset: u16 = 0;
 
     let mut dirty = true;
     loop {
@@ -421,6 +529,7 @@ pub fn show_wrong_password_modal(
                 labels,
                 selected,
                 hint,
+                scroll_offset,
             };
             if let Err(e) =
                 console.draw_with(&mut |frame| view::render_modal_buttons(frame, &data))
@@ -435,6 +544,14 @@ pub fn show_wrong_password_modal(
         let Some(key) = console.poll_key(POLL_SLICE)? else {
             continue;
         };
+        let btn_count = u16::try_from(n).unwrap_or(u16::MAX);
+        if let Some(new_off) =
+            handle_modal_scroll_key(key, message, true, btn_count, console, scroll_offset)
+        {
+            scroll_offset = new_off;
+            dirty = true;
+            continue;
+        }
         match key.code {
             KeyCode::Left | KeyCode::BackTab => {
                 selected = if selected == 0 {
@@ -463,6 +580,79 @@ pub fn show_wrong_password_modal(
                 return Ok(WrongPasswordOutcome::RawShell);
             }
             KeyCode::Esc => return Ok(WrongPasswordOutcome::TryAgain),
+            _ => {}
+        }
+    }
+}
+
+/// Show a generic N-button modal and return the committed button
+/// index. Used by callers that don't fit the wrong-password layout
+/// (the only specialised driver today) but want the same look-and-feel:
+/// bordered modal, wrapped message, right-aligned button row.
+///
+/// Esc returns the LAST button index (caller convention: rightmost is
+/// "Cancel" / "Back"). Empty `labels` returns 0 immediately so the
+/// caller's caller never indexes off the end.
+pub fn show_modal_buttons(
+    console: &mut dyn Console,
+    title: &str,
+    message: &str,
+    labels: &[&str],
+    hint: &str,
+) -> Result<usize> {
+    use crossterm::event::KeyCode;
+    let n = labels.len();
+    if n == 0 {
+        return Ok(0);
+    }
+    let mut selected: usize = 0;
+    let mut scroll_offset: u16 = 0;
+    let mut dirty = true;
+    loop {
+        if dirty {
+            let data = view::ModalButtonsScreenData {
+                title,
+                message,
+                labels,
+                selected,
+                hint,
+                scroll_offset,
+            };
+            if let Err(e) =
+                console.draw_with(&mut |frame| view::render_modal_buttons(frame, &data))
+            {
+                eprintln!("[nmbl] {title}: {message}");
+                crate::nmbl_warn!("modal-buttons render failed: {e}");
+                return Ok(n.saturating_sub(1));
+            }
+            dirty = false;
+        }
+        let Some(key) = console.poll_key(POLL_SLICE)? else {
+            continue;
+        };
+        let btn_count = u16::try_from(n).unwrap_or(u16::MAX);
+        if let Some(new_off) =
+            handle_modal_scroll_key(key, message, true, btn_count, console, scroll_offset)
+        {
+            scroll_offset = new_off;
+            dirty = true;
+            continue;
+        }
+        match key.code {
+            KeyCode::Left | KeyCode::BackTab => {
+                selected = if selected == 0 {
+                    n.saturating_sub(1)
+                } else {
+                    selected.saturating_sub(1)
+                };
+                dirty = true;
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                selected = selected.saturating_add(1) % n;
+                dirty = true;
+            }
+            KeyCode::Enter => return Ok(selected),
+            KeyCode::Esc => return Ok(n.saturating_sub(1)),
             _ => {}
         }
     }
@@ -685,11 +875,11 @@ pub(crate) fn render_splash_frame_with(
 pub(crate) fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
     render_screen_body(frame, app);
     if let Some(modal) = &app.modal {
-        render_modal_overlay(frame, modal);
+        render_modal_overlay(frame, modal, app.modal_scroll_offset);
     }
 }
 
-fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind) {
+fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind, scroll_offset: u16) {
     match modal {
         ModalKind::Confirm {
             title,
@@ -706,6 +896,7 @@ fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind) {
                 no_label,
                 yes_selected: *yes_selected,
                 hint,
+                scroll_offset,
             };
             view::render_modal_confirm(frame, &data);
         }
@@ -714,6 +905,7 @@ fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind) {
                 title,
                 message,
                 hint,
+                scroll_offset,
             };
             view::render_modal_error(frame, &data);
         }
@@ -733,6 +925,7 @@ fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind) {
                 labels: &label_refs,
                 selected: *selected,
                 hint,
+                scroll_offset,
             };
             view::render_modal_buttons(frame, &data);
         }
@@ -1514,6 +1707,7 @@ mod tests {
             labels,
             selected: 0,
             hint: "Left/Right select  Enter confirm  Esc = Try again",
+            scroll_offset: 0,
         };
         let mut term = Terminal::new(TestBackend::new(80, 16)).expect("test terminal");
         term.draw(|f| view::render_modal_buttons(f, &data)).expect("draw");
