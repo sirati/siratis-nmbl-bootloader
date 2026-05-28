@@ -84,10 +84,17 @@ fn default_known_good() -> [Option<NonMaxU32>; 20] {
 
 impl Default for State {
     fn default() -> Self {
+        // `last_boot_succeeded` starts `true` so "no failure has been
+        // recorded yet" is the semantic of a fresh state.bin. A `false`
+        // value means we positively know the previous boot did not reach
+        // its success target. Without this, the installer's
+        // `--init-state` would write a file that the next boot reads as
+        // "failed boot, no rollback target" and routes straight to the
+        // emergency screen.
         Self {
             state_format_version: KNOWN_VERSION,
             last_attempted_generation: None,
-            last_boot_succeeded: false,
+            last_boot_succeeded: true,
             recovery_attempt: 0,
             known_good_generations: [None; 20],
         }
@@ -405,6 +412,16 @@ pub fn decide(
             }
         }
         state.recovery_attempt = 0;
+        return StatefulDecision::HonourTui;
+    }
+
+    // First boot with a fresh state.bin: no prior attempt was recorded,
+    // so there is nothing to roll back from. Honour the TUI/timeout pick
+    // rather than spending a recovery slot before any failure happens.
+    // Belt-and-braces with the `Default::default()` change that sets
+    // `last_boot_succeeded = true`; this also covers hand-rolled or
+    // version-skewed States that arrive with both fields cleared.
+    if state.last_attempted_generation.is_none() {
         return StatefulDecision::HonourTui;
     }
 
@@ -827,6 +844,9 @@ mod tests {
     fn decide_failure_first_pick_from_known_good_slot_zero() {
         let mut state = State::default();
         state.last_boot_succeeded = false;
+        // A prior attempt must be recorded to exercise the failure path
+        // — without it the fresh-state guard short-circuits to HonourTui.
+        state.last_attempted_generation = nm(100);
         state.recovery_attempt = 0;
         state.known_good_generations[0] = nm(50);
         let gs = gens(&[100, 50, 10]);
@@ -841,6 +861,10 @@ mod tests {
     fn decide_failure_first_pick_missing_falls_back_to_older() {
         let mut state = State::default();
         state.last_boot_succeeded = false;
+        // A prior attempt must be recorded to bypass the fresh-state
+        // guard; pin it at 100 (the active gen) so the fallback walk
+        // still finds 50 below it.
+        state.last_attempted_generation = nm(100);
         state.recovery_attempt = 0;
         // Slot 0 is empty — must walk strictly OLDER gens. Active is
         // the newest (idx 0); fallback picks the next-older (idx 1).
@@ -855,6 +879,9 @@ mod tests {
     fn decide_failure_known_good_gc_falls_back_to_older() {
         let mut state = State::default();
         state.last_boot_succeeded = false;
+        // A prior attempt must be recorded to bypass the fresh-state
+        // guard — pin it at the active gen so the fallback still hits.
+        state.last_attempted_generation = nm(100);
         state.recovery_attempt = 0;
         // Points at gen 999 which is no longer on disk — first pick
         // misses, fallback walks older gens past `active_index`.
@@ -870,6 +897,8 @@ mod tests {
     fn decide_failure_fallback_skips_known_good_entries() {
         let mut state = State::default();
         state.last_boot_succeeded = false;
+        // A prior attempt must be recorded to bypass the fresh-state guard.
+        state.last_attempted_generation = nm(100);
         state.recovery_attempt = 0;
         // First pick miss — slot 0 absent.
         state.known_good_generations[0] = None;
@@ -923,6 +952,9 @@ mod tests {
     fn decide_failure_no_candidate_returns_exhausted() {
         let mut state = State::default();
         state.last_boot_succeeded = false;
+        // A prior attempt must be recorded — otherwise the fresh-state
+        // guard short-circuits before the budget check.
+        state.last_attempted_generation = nm(100);
         state.recovery_attempt = 0;
         state.known_good_generations[0] = None;
         // active_index = 0 means no strictly older candidate; first
@@ -938,6 +970,8 @@ mod tests {
     fn decide_failure_empty_generations_returns_exhausted() {
         let mut state = State::default();
         state.last_boot_succeeded = false;
+        // A prior attempt must be recorded to bypass the fresh-state guard.
+        state.last_attempted_generation = nm(50);
         state.recovery_attempt = 0;
         state.known_good_generations[0] = nm(50);
         let gs: Vec<Generation> = Vec::new();
@@ -955,6 +989,8 @@ mod tests {
         // convention against accidental sign flips in the walk.
         let mut state = State::default();
         state.last_boot_succeeded = false;
+        // A prior attempt must be recorded to bypass the fresh-state guard.
+        state.last_attempted_generation = nm(100);
         state.recovery_attempt = 0;
         state.known_good_generations[0] = None;
         let gs = gens(&[100, 50]);
@@ -970,6 +1006,8 @@ mod tests {
         // result is Exhausted with no mutation.
         let mut state = State::default();
         state.last_boot_succeeded = false;
+        // A prior attempt must be recorded to bypass the fresh-state guard.
+        state.last_attempted_generation = nm(10);
         state.recovery_attempt = 0;
         state.known_good_generations[0] = None;
         let gs = gens(&[100, 50, 10]);
@@ -978,5 +1016,41 @@ mod tests {
         let d = decide(&mut state, &gs, active_index, 3);
         assert_eq!(d, StatefulDecision::Exhausted);
         assert_eq!(state.recovery_attempt, 0);
+    }
+
+    #[test]
+    fn decide_first_boot_with_fresh_state_honours_tui() {
+        // Regression: a freshly-initialised state.bin
+        // (last_attempted_generation = None) on a single-generation
+        // install must HonourTui rather than dropping to Exhausted.
+        // Pre-fix this case routed straight to the emergency screen.
+        let mut state = State::default();
+        // Pin the failure branch explicitly: even with
+        // `last_boot_succeeded = false`, the absence of a prior attempt
+        // means there is nothing to roll back from.
+        state.last_boot_succeeded = false;
+        state.last_attempted_generation = None;
+        let gs = gens(&[42]);
+        let active_index = 0;
+        let max_attempts = 5;
+
+        let decision = decide(&mut state, &gs, active_index, max_attempts);
+        assert_eq!(decision, StatefulDecision::HonourTui);
+        // The fresh-state guard must not spend a recovery slot.
+        assert_eq!(state.recovery_attempt, 0);
+    }
+
+    #[test]
+    fn decide_first_boot_default_state_honours_tui() {
+        // The other half of the regression: `State::default()` now
+        // initialises `last_boot_succeeded = true` (the "no failure
+        // recorded yet" semantic). This pins that default so a future
+        // refactor can't silently flip it back to `false` and resurrect
+        // the emergency-screen loop.
+        let mut state = State::default();
+        let gs = gens(&[42]);
+        let decision = decide(&mut state, &gs, 0, 5);
+        assert_eq!(decision, StatefulDecision::HonourTui);
+        assert!(state.last_boot_succeeded);
     }
 }
