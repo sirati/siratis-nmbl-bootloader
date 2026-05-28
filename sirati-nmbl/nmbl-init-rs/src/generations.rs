@@ -483,7 +483,8 @@ mod tests {
             make_profile(&backing, *n, "quiet");
             link_profile_relative(&profiles, *n, &format!("../backing/profile-{n}"));
         }
-        let gens = scan_generations(&config_for(&profiles, tmp)).expect("scan ok");
+        let gens = with_reporter(|r| scan_generations(&config_for(&profiles, tmp), r))
+            .expect("scan ok");
         (profiles, gens)
     }
 
@@ -535,7 +536,8 @@ mod tests {
         link_profile_relative(&profiles, 9, "../backing/profile-9");
         symlink("system-9-link", profiles.join("system")).expect("system symlink");
 
-        let gens = scan_generations(&config_for(&profiles, tmp.path())).expect("scan ok");
+        let gens = with_reporter(|r| scan_generations(&config_for(&profiles, tmp.path()), r))
+            .expect("scan ok");
         // Gen 9 was filtered (missing init); only gen 7 remains.
         assert_eq!(gens.len(), 1);
         assert_eq!(active_generation_index(&gens, &profiles), 0);
