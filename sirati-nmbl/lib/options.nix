@@ -39,6 +39,7 @@ in
   imports = [
     ./modules/activation.nix
     ./modules/log-import.nix
+    ./modules/stateful.nix
   ];
 
   options.boot.nmbl = {
