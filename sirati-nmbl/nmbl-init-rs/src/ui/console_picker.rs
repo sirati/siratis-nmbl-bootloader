@@ -854,7 +854,7 @@ mod tests {
 
     use crate::error::NmblError;
     use crate::ui::app::App;
-    use crate::ui::console::{Console, ConsoleKind};
+    use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
     use crate::ui::tty_enum::{EnumeratedTty, TtyKind};
 
     /// Fake [`Console`] for driving the picker loop in tests.
@@ -888,8 +888,8 @@ mod tests {
             self.renders = self.renders.saturating_add(1);
             Ok(())
         }
-        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
-            Ok(self.events.pop_front().flatten())
+        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+            Ok(self.events.pop_front().flatten().map(ConsoleEvent::Key))
         }
         fn size(&self) -> (u16, u16) {
             (80, 24)

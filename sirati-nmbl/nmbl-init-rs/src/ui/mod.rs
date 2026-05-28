@@ -1198,7 +1198,7 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::ui::console::ConsoleKind;
+    use crate::ui::console::{ConsoleEvent, ConsoleKind};
 
     /// Console test double that returns canned key events and records
     /// every render call. `poll_key` first drains the queue (returning
@@ -1236,8 +1236,8 @@ mod tests {
             }
             Ok(())
         }
-        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
-            Ok(self.keys.pop_front())
+        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+            Ok(self.keys.pop_front().map(ConsoleEvent::Key))
         }
         fn size(&self) -> (u16, u16) {
             (80, 24)

@@ -346,7 +346,7 @@ mod tests {
 
     use super::*;
     use crate::ui::app::Screen;
-    use crate::ui::console::ConsoleKind;
+    use crate::ui::console::{ConsoleEvent, ConsoleKind};
 
     /// Test double for [`Console`]. Records every render call so we can
     /// assert the reporter actually drives the backend on each API call.
@@ -392,10 +392,10 @@ mod tests {
             }
             Ok(())
         }
-        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
             let v = self.scripted_keys.get(self.key_cursor).copied().flatten();
             self.key_cursor = self.key_cursor.saturating_add(1);
-            Ok(v)
+            Ok(v.map(ConsoleEvent::Key))
         }
         fn size(&self) -> (u16, u16) {
             (80, 24)

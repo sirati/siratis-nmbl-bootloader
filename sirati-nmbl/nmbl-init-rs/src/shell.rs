@@ -424,7 +424,7 @@ mod tests {
     use crate::rescue::RescueMode;
     use crate::terminal::TerminalAction;
     use crate::ui::app::App;
-    use crate::ui::console::ConsoleKind;
+    use crate::ui::console::{ConsoleEvent, ConsoleKind};
 
     fn io_err(ctx: &str) -> NmblError {
         NmblError::Io {
@@ -456,10 +456,10 @@ mod tests {
         fn render(&mut self, _app: &App<'_>) -> Result<()> {
             Ok(())
         }
-        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
             let v = self.events.get(self.cursor).copied().flatten();
             self.cursor = self.cursor.saturating_add(1);
-            Ok(v)
+            Ok(v.map(ConsoleEvent::Key))
         }
         fn size(&self) -> (u16, u16) {
             (80, 24)

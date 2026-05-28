@@ -227,12 +227,11 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::time::Duration;
 
-    use crossterm::event::KeyEvent;
     use tempfile::TempDir;
 
     use super::*;
     use crate::ui::app::App;
-    use crate::ui::console::{Console, ConsoleKind};
+    use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
 
     fn config_for(profiles: &Path, system_root: &Path) -> Config {
         let text = format!(
@@ -251,7 +250,7 @@ mod tests {
         fn render(&mut self, _app: &App<'_>) -> Result<()> {
             Ok(())
         }
-        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
             Ok(None)
         }
         fn size(&self) -> (u16, u16) {
