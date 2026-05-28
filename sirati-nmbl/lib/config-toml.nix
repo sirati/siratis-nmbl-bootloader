@@ -28,6 +28,7 @@ let
     general = {
       verbosity = cfg.verbosity;
       timeout_secs = cfg.timeoutSecs;
+      device_timeout_secs = cfg.deviceTimeoutSecs;
       panic_report_dir = toString cfg.panicReportDir;
       # cfg.serialConsole is the legacy nullable string ("ttyS0,115200" or
       # null); the Rust struct wants a plain bool. Coerce here so users
