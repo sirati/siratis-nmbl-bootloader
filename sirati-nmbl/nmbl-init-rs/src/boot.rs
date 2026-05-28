@@ -14,6 +14,7 @@ use crate::config::Config;
 use crate::devices::resolve_mountpoint;
 use crate::error::Result;
 use crate::generations::Generation;
+use crate::log;
 use crate::sys;
 use crate::sys::cpio::{InjectionEntry, build_fragment};
 use crate::terminal::TerminalAction;
@@ -21,6 +22,14 @@ use crate::{nmbl_info, nmbl_warn};
 
 /// Pseudo-filesystems from phase 1, mount order. Reversed for teardown.
 const PSEUDO_FS: &[&str] = &["/proc", "/sys", "/dev", "/run", "/tmp"];
+
+/// Tmpfs path the NMBL byte-ring is flushed to before kexec. The same
+/// path is recreated in the next kernel's initramfs by the cpio
+/// fragment we splice into `kexec_file_load(2)` below, so a stage-1
+/// helper (e.g. `nmbl-log-import`) can pick the transcript up. Must
+/// match the `NMBL_LOG_PATH` const in `main.rs`; the two sites are
+/// independent so the const is duplicated rather than re-exported.
+const NMBL_LOG_PATH: &str = "/nmbl-log/nmbl.log";
 
 /// Post-`sync(2)` settle window. `sync` only schedules writeback; real
 /// hardware needs a beat to commit before we cut the mounts out.
@@ -87,6 +96,39 @@ fn reverse_mount_targets(config: &Config) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Persist the byte-ring transcript to NMBL_LOG_PATH and return the
+/// resulting bytes for cpio injection. Failures degrade to an empty
+/// transcript: we still want the kexec to fire, and the absence of an
+/// `/nmbl-log/nmbl.log` entry in the next kernel's initramfs is a
+/// recoverable diagnostic, not a boot-blocker. The `mkdir -p` of the
+/// parent matches the same step in `execute_terminal_action`'s flush
+/// so the file is reachable here even when the dispatcher flush in
+/// `main` hasn't run yet (it runs after `kexec_into` returns).
+fn stage_log_for_kexec() -> Vec<u8> {
+    let log_path = Path::new(NMBL_LOG_PATH);
+    if let Some(parent) = log_path.parent() {
+        // EEXIST is benign; any harder failure surfaces through flush_to.
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = log::flush_to(log_path) {
+        nmbl_warn!(
+            "kexec: failed to flush log to {} for staging: {err}",
+            log_path.display()
+        );
+        return Vec::new();
+    }
+    match std::fs::read(log_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            nmbl_warn!(
+                "kexec: failed to read flushed log at {} for staging: {err}",
+                log_path.display()
+            );
+            Vec::new()
+        }
+    }
+}
+
 /// Lazy-unmount `target`; log + swallow any failure.
 fn detach(target: &Path) {
     if let Err(err) = sys::mount::umount(target, MntFlags::MNT_DETACH) {
@@ -122,30 +164,50 @@ pub fn kexec_into(
         generation.kernel.display(),
         generation.initrd.display()
     );
-    if key_injections.is_empty() {
-        sys::kexec::load(&generation.kernel, Some(&generation.initrd), &cmdline, 0)?;
-    } else {
-        let entries: Vec<InjectionEntry<'_>> = key_injections
-            .iter()
-            .map(|inj| InjectionEntry {
-                path: inj.path.as_path(),
-                content: inj.secret.as_slice(),
-            })
-            .collect();
-        let fragment = build_fragment(&entries);
+
+    // Stage the NMBL log transcript into the next kernel's initramfs.
+    // The byte ring lives in RAM and the current tmpfs at NMBL_LOG_PATH
+    // does not survive `reboot(LINUX_REBOOT_CMD_KEXEC)` — only what we
+    // splice into the cpio fragment kexec_file_load(2) consumes reaches
+    // the next kernel. We flush the ring to NMBL_LOG_PATH first (so the
+    // helper that reads it back gets a header-aware snapshot identical
+    // to the non-kexec terminal-action paths) and then read it back to
+    // append as a cpio entry. Read failures degrade silently — the log
+    // is best-effort and must never block the boot handoff.
+    let log_bytes: Vec<u8> = stage_log_for_kexec();
+    let log_path = Path::new(NMBL_LOG_PATH);
+
+    let mut entries: Vec<InjectionEntry<'_>> = key_injections
+        .iter()
+        .map(|inj| InjectionEntry {
+            path: inj.path.as_path(),
+            content: inj.secret.as_slice(),
+        })
+        .collect();
+    entries.push(InjectionEntry {
+        path: log_path,
+        content: log_bytes.as_slice(),
+    });
+    let fragment = build_fragment(&entries);
+    if !key_injections.is_empty() {
         nmbl_info!(
-            "kexec: injecting {} keyfile(s) into initrd via memfd ({} bytes)",
+            "kexec: injecting {} keyfile(s) + log into initrd via memfd ({} bytes)",
             key_injections.len(),
             fragment.len()
         );
-        sys::kexec::load_with_extra_initrd_cpio(
-            &generation.kernel,
-            &generation.initrd,
-            fragment.as_slice(),
-            &cmdline,
-            0,
-        )?;
+    } else {
+        nmbl_info!(
+            "kexec: injecting log into initrd via memfd ({} bytes)",
+            fragment.len()
+        );
     }
+    sys::kexec::load_with_extra_initrd_cpio(
+        &generation.kernel,
+        &generation.initrd,
+        fragment.as_slice(),
+        &cmdline,
+        0,
+    )?;
     nmbl_info!("kexec: image loaded ({} bytes cmdline)", cmdline.len());
 
     nix::unistd::sync();
