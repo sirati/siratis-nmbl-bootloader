@@ -16,6 +16,10 @@
 //! - `modal-buttons <title> <body> <label1> [label2 …]`
 //! - `wrong-password <attempt>`
 //! - `boot-status <phase> [log_line …]`
+//! - `passphrase [label]` — drives the ratatui passphrase modal end-to-end
+//!   (the same code path the LUKS activation flow uses). Stderr surfaces
+//!   the entered string with single quotes so a test harness can scrape
+//!   it; Esc-cancel surfaces "cancelled".
 //!
 //! Each scenario blocks until the operator closes the modal (Enter /
 //! Esc / hotkey) at which point the harness prints the outcome on
@@ -43,7 +47,8 @@ use crate::ui::app::App;
 use crate::ui::console::{Console, ConsoleKind};
 use crate::ui::render_current_screen;
 use crate::ui::{
-    show_modal_buttons, show_modal_confirm, show_modal_error, show_wrong_password_modal,
+    passphrase_prompt_on_console, show_modal_buttons, show_modal_confirm, show_modal_error,
+    show_wrong_password_modal,
 };
 
 /// Parsed `--debug-tui -- <scenario> [args...]` invocation.
@@ -95,6 +100,7 @@ pub fn run(args: DebugTuiArgs) -> Result<()> {
             "modal-buttons" => run_modal_buttons(&mut console, &args.args),
             "wrong-password" => run_wrong_password(&mut console, &args.args),
             "boot-status" => run_boot_status(&mut console, &args.args),
+            "passphrase" => run_passphrase(&mut console, &args.args),
             other => Err(NmblError::Io {
                 source: std::io::Error::other(format!("unknown --debug-tui scenario {other:?}")),
                 context: "mocking harness dispatch".to_string(),
@@ -160,6 +166,28 @@ fn run_wrong_password(console: &mut MockConsole, args: &[String]) -> Result<()> 
     let outcome = show_wrong_password_modal(console, attempt)?;
     eprintln!("[mocking] wrong-password outcome={outcome:?}");
     Ok(())
+}
+
+/// Drive the production passphrase modal on the harness console. Same
+/// `passphrase_prompt_on_console` entry point the LUKS activation path
+/// calls, so a tmux-driven smoke test exercises the exact code that
+/// runs at boot. On Enter the entered string is reported on stderr (in
+/// quotes so leading/trailing whitespace is visible); on Esc-cancel the
+/// supplier returns `NmblError::Tui`, which we surface as
+/// `[mocking] passphrase cancelled` on stderr and exit cleanly so the
+/// test harness can distinguish the two outcomes from the exit code.
+fn run_passphrase(console: &mut MockConsole, args: &[String]) -> Result<()> {
+    let label = arg_or_default(args, 0, "Unlock root");
+    match passphrase_prompt_on_console(console, &label) {
+        Ok(secret) => {
+            eprintln!("[mocking] passphrase entered='{}'", &**secret);
+            Ok(())
+        }
+        Err(_) => {
+            eprintln!("[mocking] passphrase cancelled");
+            Ok(())
+        }
+    }
 }
 
 fn run_boot_status(console: &mut MockConsole, args: &[String]) -> Result<()> {
