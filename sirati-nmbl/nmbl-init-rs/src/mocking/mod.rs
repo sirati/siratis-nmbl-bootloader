@@ -20,6 +20,12 @@
 //!   (the same code path the LUKS activation flow uses). Stderr surfaces
 //!   the entered string with single quotes so a test harness can scrape
 //!   it; Esc-cancel surfaces "cancelled".
+//! - `resize [r1 c1 r2 c2]` — fires two synthetic
+//!   [`ConsoleEvent::Resize`] events on the mock console at the
+//!   supplied sizes (defaults 40x100, 20x60), repainting between each,
+//!   then blocks on a real key press for tmux capture. Exercises the
+//!   end-to-end resize-redraw plumbing without needing a parent
+//!   terminal that actually emits CSI 8;rows;cols t.
 //!
 //! Each scenario blocks until the operator closes the modal (Enter /
 //! Esc / hotkey) at which point the harness prints the outcome on
@@ -33,18 +39,25 @@
 //! - Touch `KDSETMODE` / `KDGETMODE` (we're on an emulator pane).
 //! - Run any of the boot phases — only the requested screen flow.
 
-use std::io::stdout;
+use std::collections::VecDeque;
+use std::io::{stdin, stdout};
+use std::os::fd::AsFd;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyEvent};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::event::KeyEvent;
 use ratatui::Terminal;
-use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::backend::{Backend, TermwizBackend};
+use rustix::termios::Termios;
+use termwiz::caps::Capabilities;
+use termwiz::terminal::buffered::BufferedTerminal;
+use termwiz::terminal::unix::UnixTerminal;
 
 use crate::error::{NmblError, Result};
+use crate::sys::tty::{enter_raw, restore_termios, save_termios};
 use crate::ui::POLL_SLICE;
 use crate::ui::app::App;
-use crate::ui::console::{Console, ConsoleKind};
+use crate::ui::console::parser::TermwizToCrossterm;
+use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
 use crate::ui::render_current_screen;
 use crate::ui::{
     passphrase_prompt_on_console, show_modal_buttons, show_modal_confirm, show_modal_error,
@@ -91,7 +104,14 @@ where
 /// console. The harness wires up raw mode itself; on return the raw
 /// mode is restored regardless of outcome.
 pub fn run(args: DebugTuiArgs) -> Result<()> {
-    enable_raw_mode().map_err(io_err)?;
+    // Snapshot the stdin termios so we can restore it ourselves on
+    // return; termwiz's UnixTerminal does its own snapshot too, but
+    // its drop runs after `MockConsole` drops, which is after the
+    // scenario returns — so we need an outer guard to restore raw
+    // mode on the panic-unwind / early-return paths.
+    let stdin_fd = stdin();
+    let saved = save_termios(stdin_fd.as_fd())?;
+    let _ = enter_raw(stdin_fd.as_fd())?;
     let res = (|| -> Result<()> {
         let mut console = MockConsole::new()?;
         match args.scenario.as_str() {
@@ -101,6 +121,7 @@ pub fn run(args: DebugTuiArgs) -> Result<()> {
             "wrong-password" => run_wrong_password(&mut console, &args.args),
             "boot-status" => run_boot_status(&mut console, &args.args),
             "passphrase" => run_passphrase(&mut console, &args.args),
+            "resize" => run_resize(&mut console, &args.args),
             other => Err(NmblError::Io {
                 source: std::io::Error::other(format!("unknown --debug-tui scenario {other:?}")),
                 context: "mocking harness dispatch".to_string(),
@@ -108,7 +129,7 @@ pub fn run(args: DebugTuiArgs) -> Result<()> {
         }
     })();
     // Always restore the terminal, even on error.
-    let _ = disable_raw_mode();
+    let _ = restore_termios(stdin_fd.as_fd(), &saved);
     res
 }
 
@@ -190,6 +211,102 @@ fn run_passphrase(console: &mut MockConsole, args: &[String]) -> Result<()> {
     }
 }
 
+/// Drive the resize-event plumbing end-to-end on the harness console.
+///
+/// Scripts two synthetic [`ConsoleEvent::Resize`] events at different
+/// sizes and a final key press. Between each event the modal repaints
+/// against the new size so a tmux harness can `capture-pane` the
+/// before / after dimensions and confirm the layout actually changed.
+///
+/// The exact sizes can be overridden on the command line:
+/// `--debug-tui resize <r1> <c1> <r2> <c2>` — defaults are
+/// `40x100`, `20x60`, then any key to dismiss.
+fn run_resize(console: &mut MockConsole, args: &[String]) -> Result<()> {
+    let rows1: u16 = parse_u16_arg(args, 0).unwrap_or(40);
+    let cols1: u16 = parse_u16_arg(args, 1).unwrap_or(100);
+    let rows2: u16 = parse_u16_arg(args, 2).unwrap_or(20);
+    let cols2: u16 = parse_u16_arg(args, 3).unwrap_or(60);
+
+    let title = "Resize harness";
+    let body = format!(
+        "Stage 1: waiting for resize to {cols1}x{rows1}.\n\
+         Then resize to {cols2}x{rows2}.\n\
+         Then press any key to exit."
+    );
+    let hint = "drives two synthetic ConsoleEvent::Resize events, then a key";
+    let labels = ["OK"];
+
+    // Stage 1: paint at the harness's current size.
+    paint_resize_stage(console, title, &body, &labels, hint)?;
+    eprintln!(
+        "[mocking] resize stage=0 size={:?}",
+        Console::size(console)
+    );
+
+    // Stage 2: fire the first synthetic resize then re-paint.
+    console.script(ConsoleEvent::Resize { rows: rows1, cols: cols1 });
+    drain_one_event(console)?;
+    paint_resize_stage(console, title, &body, &labels, hint)?;
+    eprintln!(
+        "[mocking] resize stage=1 size={:?}",
+        Console::size(console)
+    );
+
+    // Stage 3: second resize.
+    console.script(ConsoleEvent::Resize { rows: rows2, cols: cols2 });
+    drain_one_event(console)?;
+    paint_resize_stage(console, title, &body, &labels, hint)?;
+    eprintln!(
+        "[mocking] resize stage=2 size={:?}",
+        Console::size(console)
+    );
+
+    // Stage 4: wait for a real key press so tmux captures can land.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3600);
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        let slice = remaining.min(POLL_SLICE);
+        match console.poll_event(slice)? {
+            Some(ConsoleEvent::Key(_)) => break,
+            // Any further resize / no event: re-paint and wait again.
+            Some(ConsoleEvent::Resize { .. }) | None => continue,
+        }
+    }
+    eprintln!("[mocking] resize dismissed");
+    Ok(())
+}
+
+fn paint_resize_stage(
+    console: &mut MockConsole,
+    title: &str,
+    body: &str,
+    labels: &[&str],
+    hint: &str,
+) -> Result<()> {
+    let (cols, rows) = Console::size(console);
+    let resized_body = format!("{body}\n\nObserved size: cols={cols} rows={rows}");
+    let data = crate::ui::view::ModalButtonsScreenData {
+        title,
+        message: &resized_body,
+        labels,
+        selected: 0,
+        hint,
+        scroll_offset: 0,
+    };
+    console.draw_with(&mut |frame| crate::ui::view::render_modal_buttons(frame, &data))
+}
+
+/// Drain a single event from the harness queue, ignoring whatever it
+/// is. Used after `script()` to ensure the synthetic event has been
+/// applied to `last_resize` before the next paint.
+fn drain_one_event(console: &mut MockConsole) -> Result<()> {
+    let _ = console.poll_event(Duration::from_millis(0))?;
+    Ok(())
+}
+
+fn parse_u16_arg(args: &[String], idx: usize) -> Option<u16> {
+    args.get(idx).and_then(|s| s.parse().ok())
+}
+
 fn run_boot_status(console: &mut MockConsole, args: &[String]) -> Result<()> {
     use crate::ui::app::Screen;
     let phase = arg_or_default(args, 0, "phase X");
@@ -216,20 +333,103 @@ fn arg_or_default(args: &[String], idx: usize, default: &str) -> String {
     args.get(idx).cloned().unwrap_or_else(|| default.to_string())
 }
 
-/// Console backend for the mocking harness: a crossterm terminal over
-/// `stdout()` paired with crossterm's stdin event reader. No
-/// `/dev/console`, no KD ioctls, no termios snapshot — the raw-mode
-/// state lives at the `run()` boundary so this struct can be used
-/// from multiple scenarios within one run without re-entering raw mode.
+/// Console backend for the mocking harness. termwiz drives both
+/// reads (from stdin) and writes (to stdout); no `/dev/console`, no
+/// KD ioctls. Raw mode is owned by `run()` so the harness can host
+/// multiple scenarios in one process.
 struct MockConsole {
-    terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
+    terminal: Terminal<TermwizBackend>,
+    /// Termwiz parser → crossterm `KeyEvent` translator.
+    parser: TermwizToCrossterm,
+    /// Keys produced by the parser, not yet drained.
+    pending_keys: VecDeque<KeyEvent>,
+    /// Scripted events injected by scenarios (e.g. `resize`).
+    /// Drained ahead of stdin reads on the next `poll_event`.
+    scripted: VecDeque<ConsoleEvent>,
+    /// Latest grid size set by a `ConsoleEvent::Resize`. Overrides
+    /// the backend's reported size so the next render lays out
+    /// against the simulated geometry, mirroring `TtyConsole`.
+    last_resize: Option<(u16, u16)>,
+    /// Saved stdin termios so we can revert to blocking mode when
+    /// the harness exits.
+    saved_stdin_termios: Option<Termios>,
 }
 
 impl MockConsole {
     fn new() -> Result<Self> {
-        let backend = CrosstermBackend::new(stdout());
+        let stdin_fd = stdin();
+        let stdout_fd = stdout();
+        let saved = save_termios(stdin_fd.as_fd())?;
+
+        let caps = caps_with_fallback()?;
+        let unix_term =
+            UnixTerminal::new_with(caps, &stdin_fd, &stdout_fd).map_err(tw_err)?;
+        let buf = BufferedTerminal::new(unix_term).map_err(tw_err)?;
+        let backend = TermwizBackend::with_buffered_terminal(buf);
         let terminal = Terminal::new(backend).map_err(io_err)?;
-        Ok(Self { terminal })
+        Ok(Self {
+            terminal,
+            parser: TermwizToCrossterm::new(),
+            pending_keys: VecDeque::new(),
+            scripted: VecDeque::new(),
+            last_resize: None,
+            saved_stdin_termios: Some(saved),
+        })
+    }
+
+    /// Inject a synthetic event into the queue. Drained ahead of any
+    /// real input on the next `poll_event`. Used by the `resize`
+    /// scenario.
+    fn script(&mut self, ev: ConsoleEvent) {
+        self.scripted.push_back(ev);
+    }
+
+    fn apply_resize(&mut self, ev: &ConsoleEvent) {
+        let ConsoleEvent::Resize { rows, cols } = *ev else {
+            return;
+        };
+        self.last_resize = Some((cols, rows));
+        let _ = self
+            .terminal
+            .resize(ratatui::layout::Rect::new(0, 0, cols, rows));
+    }
+
+    /// Drain whatever stdin has ready and feed it through the
+    /// termwiz parser. Bytes are read non-blockingly via a single
+    /// `rustix::io::read` against the stdin fd; partial sequences
+    /// stay buffered inside `self.parser` for the next call.
+    fn refill_from_stdin(&mut self, timeout: Duration) -> Result<()> {
+        use rustix::event::{PollFd, PollFlags, poll};
+        let stdin_fd = stdin();
+        let timeout_ms = duration_to_ms(timeout);
+        let mut pfd = [PollFd::new(&stdin_fd, PollFlags::IN)];
+        let ready = poll(&mut pfd, timeout_ms).map_err(rustix_err)?;
+        if ready == 0 {
+            // No new bytes — flush termwiz so a dangling ESC commits.
+            let mut out = Vec::new();
+            self.parser.feed(&[], false, &mut out);
+            for k in out {
+                self.pending_keys.push_back(k);
+            }
+            return Ok(());
+        }
+        let mut chunk = [0u8; 256];
+        match rustix::io::read(&stdin_fd, &mut chunk) {
+            Ok(0) => Ok(()),
+            Ok(n) => {
+                let mut out = Vec::new();
+                self.parser
+                    .feed(chunk.get(..n).unwrap_or(&[]), false, &mut out);
+                for k in out {
+                    self.pending_keys.push_back(k);
+                }
+                Ok(())
+            }
+            Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::WOULDBLOCK => {
+                Ok(())
+            }
+            Err(e) => Err(rustix_err(e)),
+        }
     }
 }
 
@@ -241,18 +441,23 @@ impl Console for MockConsole {
             .map_err(io_err)
     }
 
-    fn poll_key(&mut self, timeout: Duration) -> Result<Option<KeyEvent>> {
+    fn poll_event(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>> {
+        if let Some(ev) = self.scripted.pop_front() {
+            self.apply_resize(&ev);
+            return Ok(Some(ev));
+        }
+        if let Some(k) = self.pending_keys.pop_front() {
+            return Ok(Some(ConsoleEvent::Key(k)));
+        }
         let slice = timeout.min(POLL_SLICE);
-        if !event::poll(slice).map_err(io_err)? {
-            return Ok(None);
-        }
-        match event::read().map_err(io_err)? {
-            Event::Key(k) => Ok(Some(k)),
-            _ => Ok(None),
-        }
+        self.refill_from_stdin(slice)?;
+        Ok(self.pending_keys.pop_front().map(ConsoleEvent::Key))
     }
 
     fn size(&self) -> (u16, u16) {
+        if let Some((cols, rows)) = self.last_resize {
+            return (cols, rows);
+        }
         match self.terminal.backend().size() {
             Ok(s) => (s.width, s.height),
             Err(_) => (0, 0),
@@ -278,6 +483,52 @@ impl Console for MockConsole {
     fn resume(&mut self) -> Result<()> {
         // Force a full repaint so the next render produces a clean frame.
         self.terminal.clear().map_err(io_err)
+    }
+}
+
+impl Drop for MockConsole {
+    fn drop(&mut self) {
+        // Best-effort: restore the stdin termios we snapshotted at
+        // construction. The outer `run()` guard does this too — both
+        // paths are idempotent because `enter_raw` accepts being
+        // applied to an already-cooked tty.
+        if let Some(saved) = self.saved_stdin_termios.take() {
+            let _ = restore_termios(stdin().as_fd(), &saved);
+        }
+    }
+}
+
+fn caps_with_fallback() -> Result<Capabilities> {
+    if let Ok(c) = Capabilities::new_from_env() {
+        return Ok(c);
+    }
+    let hints = termwiz::caps::ProbeHints::new_from_env().term(Some("xterm-256color".to_owned()));
+    if let Ok(c) = Capabilities::new_with_hints(hints) {
+        return Ok(c);
+    }
+    Capabilities::new_with_hints(termwiz::caps::ProbeHints::new_from_env()).map_err(tw_err)
+}
+
+fn tw_err(e: termwiz::Error) -> NmblError {
+    NmblError::Io {
+        source: std::io::Error::other(format!("termwiz: {e}")),
+        context: "mocking harness".to_string(),
+    }
+}
+
+fn rustix_err(e: rustix::io::Errno) -> NmblError {
+    NmblError::Io {
+        source: std::io::Error::from(e),
+        context: "mocking harness".to_string(),
+    }
+}
+
+fn duration_to_ms(d: Duration) -> i32 {
+    let ms = d.as_millis();
+    if ms > i32::MAX as u128 {
+        i32::MAX
+    } else {
+        i32::try_from(ms).unwrap_or(i32::MAX)
     }
 }
 
