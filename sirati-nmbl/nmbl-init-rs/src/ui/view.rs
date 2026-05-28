@@ -422,9 +422,11 @@ pub fn render_modal_confirm(frame: &mut Frame<'_>, data: &ModalConfirmScreenData
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
 
-    // Centred modal: 64 cols, ~half the body height (min 9 to give
-    // room for body + button row + borders).
-    let h = body.height.saturating_div(2).max(9);
+    // Centred modal: 64 cols, fills the body height minus a small
+    // top/bottom gutter so a long wrapped message has room without
+    // crowding the chrome (min 9 to keep body + button row + borders
+    // fitting on a degraded 80x24 console).
+    let h = body.height.saturating_sub(2).max(9);
     let modal = centered_rect(body, 64, h);
     frame.render_widget(Clear, modal);
 
@@ -505,9 +507,10 @@ pub fn render_modal_buttons(frame: &mut Frame<'_>, data: &ModalButtonsScreenData
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
 
-    // 64 cols matches `render_modal_confirm`; height bumped to 10 to
-    // leave room for the longer "Wrong password (attempt N)" body.
-    let h = body.height.saturating_div(2).max(10);
+    // 64 cols matches `render_modal_confirm`; fills the body height
+    // minus a small top/bottom gutter (min 10 to leave room for the
+    // longer "Wrong password (attempt N)" body on a degraded 80x24).
+    let h = body.height.saturating_sub(2).max(10);
     let modal = centered_rect(body, 64, h);
     frame.render_widget(Clear, modal);
 
@@ -580,8 +583,11 @@ pub fn render_modal_error(frame: &mut Frame<'_>, data: &ModalErrorScreenData<'_>
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
 
-    // Centred modal: 70 cols wide, half the body height (min 8).
-    let h = body.height.saturating_div(2).max(8);
+    // Centred modal: 70 cols wide, fills the body height minus a
+    // small top/bottom gutter so a multi-line error chain has room
+    // (min 8 to keep title + a few message lines + border fitting
+    // on a degraded 80x24 console).
+    let h = body.height.saturating_sub(2).max(8);
     let modal = centered_rect(body, 70, h);
     frame.render_widget(Clear, modal);
 
@@ -625,14 +631,15 @@ pub struct PtyShellScreenData<'a> {
 
 /// Render the pretty-shell screen: header, bordered "Shell" box
 /// containing the alacritty grid snapshot, and a footer showing the
-/// scroll hint.
+/// combined exit + scroll hint.
 ///
-/// The bottom-right of the bordered box hosts the dim scroll hint
-/// (`Ctrl+Shift+Up/Dn scroll`); the bottom-left shows a scrollback
-/// indicator when `scroll_offset > 0`. ASCII glyphs only — the splash
-/// glyph cache rasterises ASCII printable plus a box-drawing subset
-/// (see `src/splash/glyph_cache.rs`), so Unicode arrows (U+2191 /
-/// U+2193) would render as blank cells on the framebuffer backend.
+/// The bordered block's inner area is given over entirely to the
+/// alacritty terminal — no overlay text — so the operator sees an
+/// unobstructed shell. All hints live in the outer footer row.
+/// ASCII glyphs only — the splash glyph cache rasterises ASCII
+/// printable plus a box-drawing subset (see
+/// `src/splash/glyph_cache.rs`), so Unicode arrows (U+2191 / U+2193)
+/// would render as blank cells on the framebuffer backend.
 pub fn render_pty_shell(frame: &mut Frame<'_>, data: &PtyShellScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
@@ -656,37 +663,19 @@ pub fn render_pty_shell(frame: &mut Frame<'_>, data: &PtyShellScreenData<'_>) {
     let para = Paragraph::new(Text::from(lines));
     frame.render_widget(para, inner);
 
-    // Bottom-of-box hint. We paint two overlay rows on the last row of
-    // the bordered area: the scrollback indicator on the left, the
-    // scroll-hint on the right. Both use dim styling.
-    if inner.height > 0 {
-        let hint_row = inner.y.saturating_add(inner.height.saturating_sub(1));
-        let hint_rect = Rect::new(inner.x, hint_row, inner.width, 1);
-        // Left side: scroll indicator (only when scrolled).
-        if data.scroll_offset > 0 {
-            let indicator = format!("[scrolled {} lines]", data.scroll_offset);
-            let left = Paragraph::new(Span::styled(
-                indicator,
-                Style::default().add_modifier(Modifier::DIM),
-            ))
-            .alignment(Alignment::Left);
-            frame.render_widget(left, hint_rect);
-        }
-        // Right side: scroll hint.
-        let right_hint = "Ctrl+Shift+Up/Dn scroll  Ctrl+Shift+Q exit";
-        let right = Paragraph::new(Span::styled(
-            right_hint,
-            Style::default().add_modifier(Modifier::DIM),
-        ))
-        .alignment(Alignment::Right);
-        frame.render_widget(right, hint_rect);
+    // Footer hint covers both the exit shortcut and the scrollback
+    // bindings; when the operator has scrolled back, prefix a "[scrolled
+    // N]" tag so the indicator the inner overlay used to carry still
+    // reaches them.
+    let mut hint = String::new();
+    if data.scroll_offset > 0 {
+        hint.push_str(&format!("[scrolled {} lines]  ", data.scroll_offset));
     }
-
-    render_footer(
-        frame,
-        footer,
-        "exit shell or Ctrl+Shift+Q to return to emergency",
+    hint.push_str(
+        "exit shell or Ctrl+Shift+Q to return to emergency  \
+         Ctrl+Shift+Up/Dn scroll",
     );
+    render_footer(frame, footer, &hint);
 }
 
 /// Render the passphrase modal over the body area.
