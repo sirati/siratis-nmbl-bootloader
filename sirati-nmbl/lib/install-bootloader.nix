@@ -83,6 +83,15 @@ pkgs.writeScript "install-nmbl-bootloader" ''
   cp -f "$INITRD" /boot/nmbl-initrd
   echo "✓ Bootloader files installed: /boot/nmbl-kernel, /boot/nmbl-initrd"
 
+  ${lib.optionalString cfg.stateful.enable ''
+    # Stateful mode: initialise (or upgrade) the persistent state.bin
+    # under cfg.stateful.stateDir on /boot so the Rust /init has a
+    # known-good slot to track boot attempts against on the next boot.
+    echo "Initializing NMBL state at ${cfg.stateful.stateDir}/state.bin..."
+    ${config.system.build.nmblInit}/bin/nmbl-init --init-state ${cfg.stateful.stateDir}
+    echo "✓ State file initialised"
+  ''}
+
   ${lib.optionalString (configLocation == "external") (
     let
       # In external-config mode, copy the full config.toml onto the boot
