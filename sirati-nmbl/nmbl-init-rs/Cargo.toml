@@ -68,8 +68,24 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 thiserror = "1"
-ratatui = { version = "0.28", default-features = false, features = ["crossterm"] }
+ratatui = { version = "0.28", default-features = false, features = ["termwiz", "crossterm"] }
+# termwiz drives all terminal IO. Its `InputParser` is a pure
+# byte-stream parser that doesn't open any fds (unlike crossterm,
+# which lazily opens stdin or `/dev/tty` inside a `OnceLock` of
+# global state). NMBL owns the `/dev/console` fd directly and feeds
+# bytes to termwiz; ratatui's in-tree `TermwizBackend` writes through
+# the same termwiz `BufferedTerminal`, so crossterm's input
+# `OnceLock` is never touched.
+#
+# `crossterm` itself stays as a leaf data-type dep: KeyEvent /
+# KeyCode / KeyModifiers / KeyEventKind are the well-known shapes
+# the App state machine and modal handlers match against. We
+# translate termwiz's InputEvent into these at the boundary in
+# `ui::console::parser` and never call any of crossterm's runtime
+# entry points (no `event::poll`, no `event::read`, no
+# `enable_raw_mode`).
 crossterm = "0.28"
+termwiz = { version = "0.22", default-features = false }
 zeroize = { version = "1", features = ["derive"] }
 # rustix is already pulled in transitively via crossterm; promote it to an
 # explicit dependency so its safe wrappers for open(2) / termios are visible
