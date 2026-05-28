@@ -72,14 +72,14 @@ impl ModuleSet {
 /// The pre-console reporter wraps a [`crate::ui::console::NoopConsole`];
 /// status pushes do nothing visible, but the underlying log-ring is
 /// still populated for the post-console reporter to surface.
-pub fn load_early_modules(config: &Config, reporter: &mut BootReporter<'_>) -> Result<()> {
+pub fn load_early_modules(config: &Config, reporter: &mut BootReporter<'_, '_>) -> Result<()> {
     load_module_set(config, reporter, ModuleSet::Early)
 }
 
 /// Load the [`ModuleSet::Explicit`] subset — storage, filesystem,
 /// activation drivers. Called in phase 2b after `open_console` so the
 /// operator sees per-module progress on the live boot console.
-pub fn load_explicit_modules(config: &Config, reporter: &mut BootReporter<'_>) -> Result<()> {
+pub fn load_explicit_modules(config: &Config, reporter: &mut BootReporter<'_, '_>) -> Result<()> {
     load_module_set(config, reporter, ModuleSet::Explicit)
 }
 
@@ -93,7 +93,7 @@ pub fn load_explicit_modules(config: &Config, reporter: &mut BootReporter<'_>) -
 /// in both phases — only the visible side-effect differs.
 pub fn load_module_set(
     config: &Config,
-    reporter: &mut BootReporter<'_>,
+    reporter: &mut BootReporter<'_, '_>,
     which: ModuleSet,
 ) -> Result<()> {
     let _ = reporter.set_phase(which.phase_label());
@@ -133,7 +133,7 @@ fn load_modules_inner(
     modules_dir: &Path,
     explicit: &[String],
     blacklist: &[String],
-    mut reporter_ctx: Option<(&mut BootReporter<'_>, &'static str)>,
+    mut reporter_ctx: Option<(&mut BootReporter<'_, '_>, &'static str)>,
 ) -> Result<()> {
     let release = crate::sys::uname::kernel_release()?;
     let entries = module::load_modules_dep(modules_dir, &release)?;

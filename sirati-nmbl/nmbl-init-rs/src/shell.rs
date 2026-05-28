@@ -67,7 +67,11 @@ use crate::nmbl_warn;
 use crate::terminal::{EmergencyBanner, TerminalAction};
 use crate::ui::console::{Console, open_console};
 use crate::ui::emergency_actions::{retry_boot, surface_action_failure, verify_kexec_readiness};
-use crate::ui::{EmergencyChoice, TuiPasswordSupplier, run_emergency_screen};
+use crate::ui::app::App;
+use crate::ui::{
+    EmergencyChoice, TuiPasswordSupplier, build_emergency_app, build_message, default_items,
+    run_emergency_screen_with_app,
+};
 
 /// Print the operator-facing emergency banner and drive the
 /// re-entrant emergency picker. Returns the [`TerminalAction`] the
@@ -95,6 +99,28 @@ pub fn drop_to_emergency(
 ) -> TerminalAction {
     let mut console = console;
 
+    // Build the emergency App once and reuse it across every iteration
+    // of the picker loop so:
+    //   1. The auto-reboot countdown deadline (latched on the first
+    //      call to `run_emergency_screen_with_app`) survives a return
+    //      from a modal / sub-flow — re-entering the error screen
+    //      does NOT restart the 30s timer. If the timer already
+    //      elapsed during another screen, the next visit reboots
+    //      immediately.
+    //   2. The selection / scroll state on the menu survives a return
+    //      from a modal — the operator lands back where they were.
+    //   3. Sub-flows (retry, verify) can overlay a status / modal on
+    //      top of the menu via `app.modal` so the menu remains visible
+    //      behind the dialog.
+    let message = build_message(&err);
+    let items = default_items();
+    // `App<'static>` so the emergency-action sub-flows can pass `app`
+    // to `BootReporter::overlay`, which requires an inner-`'static`
+    // bound. `build_emergency_app(&[])` uses an empty generations
+    // slice which is `'static`, so the inferred lifetime here is
+    // already `'static` — the explicit annotation merely pins it.
+    let mut app: App<'static> = build_emergency_app(&message, &items);
+
     // Re-entrant picker. The Raw Shell, Pretty Shell, Retry boot, and
     // Verify kexec readiness branches all return control to this loop
     // on exit (sub-shell ended, retry failed, operator picked Back).
@@ -106,7 +132,11 @@ pub fn drop_to_emergency(
     // it never produces a `TerminalAction::Execve`. NMBL stays at
     // PID 1 across the shell session.
     loop {
-        let choice = run_emergency_screen(&mut *console, &err);
+        // Modal state from the prior iteration (if any) must be
+        // cleared before re-entering the picker; otherwise a stale
+        // overlay would obscure the menu.
+        app.modal = None;
+        let choice = run_emergency_screen_with_app(&mut *console, &mut app);
 
         match choice {
             EmergencyChoice::Reboot => {
@@ -119,8 +149,9 @@ pub fn drop_to_emergency(
                 {
                     let chain = format_chain(&e as &dyn std::error::Error);
                     nmbl_warn!("emergency-shell picker session failed: {chain}");
-                    let _ = crate::ui::show_modal_error(
+                    let _ = crate::ui::show_modal_error_over(
                         &mut *console,
+                        &mut app,
                         "Emergency shell failed",
                         &chain,
                         std::time::Duration::from_secs(10),
@@ -135,8 +166,9 @@ pub fn drop_to_emergency(
                 if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(&mut *console, config) {
                     let chain = format_chain(&e as &dyn std::error::Error);
                     nmbl_warn!("pretty-shell session failed: {chain}");
-                    let _ = crate::ui::show_modal_error(
+                    let _ = crate::ui::show_modal_error_over(
                         &mut *console,
+                        &mut app,
                         "Pretty Shell failed to start",
                         &chain,
                         std::time::Duration::from_secs(10),
@@ -146,7 +178,7 @@ pub fn drop_to_emergency(
             }
             EmergencyChoice::RetryBoot => {
                 let mut supplier = TuiPasswordSupplier::new(config);
-                match retry_boot(config, &mut *console, &mut supplier) {
+                match retry_boot(config, &mut *console, &mut app, &mut supplier) {
                     Ok(action) => return action,
                     Err(e) => {
                         nmbl_warn!(
@@ -155,6 +187,7 @@ pub fn drop_to_emergency(
                         );
                         surface_action_failure(
                             &mut *console,
+                            &mut app,
                             abort_aware_title(&e, "Retry boot failed"),
                             &e,
                         );
@@ -163,7 +196,7 @@ pub fn drop_to_emergency(
                 }
             }
             EmergencyChoice::VerifyKexecReadiness => {
-                match verify_kexec_readiness(config, &mut *console) {
+                match verify_kexec_readiness(config, &mut *console, &mut app) {
                     Ok(Some(action)) => return action,
                     Ok(None) => continue,
                     Err(e) => {
@@ -173,6 +206,7 @@ pub fn drop_to_emergency(
                         );
                         surface_action_failure(
                             &mut *console,
+                            &mut app,
                             abort_aware_title(&e, "Kexec readiness check failed"),
                             &e,
                         );

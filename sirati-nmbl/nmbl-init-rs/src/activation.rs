@@ -64,7 +64,7 @@ pub trait PasswordSupplier {
 /// sets `pass_to_stage1`). The vec is empty when no activation opts in.
 pub fn run_all_activations(
     config: &Config,
-    reporter: &mut BootReporter<'_>,
+    reporter: &mut BootReporter<'_, '_>,
     mut password_supplier: Option<&mut dyn PasswordSupplier>,
 ) -> Result<Vec<KeyInjection>> {
     let mut injections: Vec<KeyInjection> = Vec::new();
