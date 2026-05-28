@@ -193,6 +193,36 @@ fn handle_modal_scroll_key(
     Some(new_off)
 }
 
+/// Outcome of polling a long-running render loop's input slice. Wraps
+/// the trichotomy "key arrived / host terminal reported a new size /
+/// nothing this tick" into a single value the caller pattern-matches on
+/// so every modal loop redraws on resize without duplicating the
+/// `match` boilerplate.
+enum ModalPollOutcome {
+    /// A key event the caller should dispatch.
+    Key(crossterm::event::KeyEvent),
+    /// Host terminal reported a new grid. Caller should set its
+    /// `dirty` flag so the next iteration repaints against the new
+    /// layout.
+    Resized,
+    /// No event this slice. Caller may continue ticking countdowns
+    /// or re-poll.
+    Idle,
+}
+
+/// Poll once via [`Console::poll_event`] and classify the outcome for a
+/// modal render loop. Shared by every long-running interactive modal
+/// (passphrase, generations picker, rescue menu, console picker,
+/// confirm / error / buttons) so they all react to host-reported
+/// resize events uniformly.
+fn modal_poll(console: &mut dyn Console, timeout: Duration) -> Result<ModalPollOutcome> {
+    match console.poll_event(timeout)? {
+        Some(crate::ui::console::ConsoleEvent::Key(k)) => Ok(ModalPollOutcome::Key(k)),
+        Some(crate::ui::console::ConsoleEvent::Resize { .. }) => Ok(ModalPollOutcome::Resized),
+        None => Ok(ModalPollOutcome::Idle),
+    }
+}
+
 /// Show a centred yes/no confirmation modal with `title` + `message`
 /// on the supplied console and block until the operator commits.
 ///
@@ -249,8 +279,13 @@ pub fn show_modal_confirm(
             dirty = false;
         }
 
-        let Some(key) = console.poll_key(POLL_SLICE)? else {
-            continue;
+        let key = match modal_poll(console, POLL_SLICE)? {
+            ModalPollOutcome::Key(k) => k,
+            ModalPollOutcome::Resized => {
+                dirty = true;
+                continue;
+            }
+            ModalPollOutcome::Idle => continue,
         };
         if let Some(new_off) = handle_modal_scroll_key(key, message, true, 2, console, scroll_offset) {
             scroll_offset = new_off;
@@ -316,8 +351,13 @@ pub fn show_modal_confirm_over(
                 dirty = false;
             }
 
-            let Some(key) = console.poll_key(POLL_SLICE)? else {
-                continue;
+            let key = match modal_poll(console, POLL_SLICE)? {
+                ModalPollOutcome::Key(k) => k,
+                ModalPollOutcome::Resized => {
+                    dirty = true;
+                    continue;
+                }
+                ModalPollOutcome::Idle => continue,
             };
             // Pull the modal's message out for the scroll helper. We
             // need an immutable read here BEFORE the mutable borrow on
@@ -408,8 +448,13 @@ pub fn show_modal_error(
             },
             None => POLL_SLICE,
         };
-        let Some(key) = console.poll_key(slice)? else {
-            continue;
+        let key = match modal_poll(console, slice)? {
+            ModalPollOutcome::Key(k) => k,
+            ModalPollOutcome::Resized => {
+                dirty = true;
+                continue;
+            }
+            ModalPollOutcome::Idle => continue,
         };
         // Scroll keys advance the viewport instead of dismissing; any
         // other key dismisses the modal.
@@ -457,8 +502,13 @@ pub fn show_modal_error_over(
             },
             None => POLL_SLICE,
         };
-        let Some(key) = console.poll_key(slice)? else {
-            continue;
+        let key = match modal_poll(console, slice)? {
+            ModalPollOutcome::Key(k) => k,
+            ModalPollOutcome::Resized => {
+                dirty = true;
+                continue;
+            }
+            ModalPollOutcome::Idle => continue,
         };
         if let Some(new_off) =
             handle_modal_scroll_key(key, message, false, 0, console, app.modal_scroll_offset)
@@ -532,8 +582,13 @@ pub fn show_wrong_password_modal(
             dirty = false;
         }
 
-        let Some(key) = console.poll_key(POLL_SLICE)? else {
-            continue;
+        let key = match modal_poll(console, POLL_SLICE)? {
+            ModalPollOutcome::Key(k) => k,
+            ModalPollOutcome::Resized => {
+                dirty = true;
+                continue;
+            }
+            ModalPollOutcome::Idle => continue,
         };
         let btn_count = u16::try_from(n).unwrap_or(u16::MAX);
         if let Some(new_off) =
@@ -618,8 +673,13 @@ pub fn show_modal_buttons(
             }
             dirty = false;
         }
-        let Some(key) = console.poll_key(POLL_SLICE)? else {
-            continue;
+        let key = match modal_poll(console, POLL_SLICE)? {
+            ModalPollOutcome::Key(k) => k,
+            ModalPollOutcome::Resized => {
+                dirty = true;
+                continue;
+            }
+            ModalPollOutcome::Idle => continue,
         };
         let btn_count = u16::try_from(n).unwrap_or(u16::MAX);
         if let Some(new_off) =
@@ -715,18 +775,26 @@ fn run_selector_on_console(
 
     // 2. Event loop. Renders on dirty, polls in short slices so future
     //    callers that need to drive an animation can plug in without
-    //    rewriting the loop.
+    //    rewriting the loop. Driven via `poll_event` so a host-reported
+    //    `CSI 8;rows;cols t` resize redraws the picker against the new
+    //    grid instead of stranding the old layout.
     let mut dirty = true;
     loop {
         if dirty {
             console.render(&app)?;
             dirty = false;
         }
-        if let Some(key) = console.poll_key(POLL_SLICE)? {
-            if app.on_key(key) {
-                break;
+        match console.poll_event(POLL_SLICE)? {
+            Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
+                dirty = true;
             }
-            dirty = true;
+            Some(crate::ui::console::ConsoleEvent::Key(key)) => {
+                if app.on_key(key) {
+                    break;
+                }
+                dirty = true;
+            }
+            None => {}
         }
         if app.decision.is_some() {
             break;
@@ -1063,31 +1131,41 @@ pub(crate) fn passphrase_prompt_on_console(
             dirty = false;
         }
 
-        if let Some(key) = console.poll_key(POLL_SLICE)? {
-            let exited = app.on_key(key);
-            // Esc on the passphrase screen sets a Shell decision.
-            if matches!(app.decision, Some(Decision::Shell)) {
-                return Err(NmblError::Tui {
-                    source: std::io::Error::other("operator cancelled passphrase entry"),
-                });
+        // Drive `poll_event` so host-reported `CSI 8;rows;cols t`
+        // resizes redraw the modal at the new dimensions instead of
+        // smearing the old layout until the next keypress.
+        match console.poll_event(POLL_SLICE)? {
+            Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
+                dirty = true;
             }
-            if exited {
-                // Enter was pressed — extract the buffer and return.
-                // Silently ignore Enter while the buffer is empty so an
-                // accidental keystroke doesn't submit "" to cryptsetup.
-                if let Screen::Passphrase { ref buffer, .. } = app.screen
-                    && buffer.is_empty()
-                {
-                    continue;
+            Some(crate::ui::console::ConsoleEvent::Key(key)) => {
+                let exited = app.on_key(key);
+                // Esc on the passphrase screen sets a Shell decision.
+                if matches!(app.decision, Some(Decision::Shell)) {
+                    return Err(NmblError::Tui {
+                        source: std::io::Error::other("operator cancelled passphrase entry"),
+                    });
                 }
-                if let Screen::Passphrase { buffer, .. } = app.screen {
-                    return Ok(buffer);
+                if exited {
+                    // Enter was pressed — extract the buffer and return.
+                    // Silently ignore Enter while the buffer is empty so
+                    // an accidental keystroke doesn't submit "" to
+                    // cryptsetup.
+                    if let Screen::Passphrase { ref buffer, .. } = app.screen
+                        && buffer.is_empty()
+                    {
+                        continue;
+                    }
+                    if let Screen::Passphrase { buffer, .. } = app.screen {
+                        return Ok(buffer);
+                    }
+                    return Err(NmblError::Tui {
+                        source: std::io::Error::other("passphrase screen exited without a buffer"),
+                    });
                 }
-                return Err(NmblError::Tui {
-                    source: std::io::Error::other("passphrase screen exited without a buffer"),
-                });
+                dirty = true;
             }
-            dirty = true;
+            None => {}
         }
     }
 }
