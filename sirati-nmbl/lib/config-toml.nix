@@ -135,6 +135,14 @@ let
       font_path        = "/etc/splash/font.ttf";
       dri_path         = "/dev/dri/card0";
     };
+  }
+  # Stateful boot tracking. Emitted only when enabled so builds without
+  # the Rust-side `stateful` feature still pass `deny_unknown_fields`.
+  // lib.optionalAttrs cfg.stateful.enable {
+    stateful = {
+      max_recovery_attempts = cfg.stateful.maxRecoveryAttempts;
+      success_target = cfg.stateful.successTarget;
+    };
   };
 
   rawToml = tomlFormat.generate "nmbl-config.toml" tomlValue;
