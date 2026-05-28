@@ -46,6 +46,14 @@ use nmbl_init::{log, nmbl_info, nmbl_warn};
 const DEFAULT_CONFIG_PATH: &str = "/etc/nmbl/config.toml";
 const BOOTSTRAP_CONFIG_PATH: &str = "/etc/nmbl/bootstrap.toml";
 
+/// Tmpfs path the byte-ring is flushed to right before every terminal
+/// action. Kept here (next to the dispatcher) and in `boot::kexec_into`
+/// (where the same file is staged into the next kernel's initramfs)
+/// so the two sites cannot drift. The parent dir is `mkdir -p`'d on
+/// every call — EEXIST is benign, anything else means tmpfs is broken
+/// and we surface a warning but still proceed with the terminal action.
+const NMBL_LOG_PATH: &str = "/nmbl-log/nmbl.log";
+
 /// Kernel cmdline token that opts into the key-echo diagnostic screen.
 /// Must appear as a whitespace-delimited token (e.g.
 /// `... loglevel=7 nmbl.key_echo=1`); we don't accept arbitrary `=...`
@@ -362,6 +370,23 @@ fn select_and_act(
               taking by value makes the move explicit"
 )]
 fn execute_terminal_action(action: TerminalAction) -> ! {
+    // Persist the byte-ring transcript before the no-return syscall.
+    // The byte ring lives in RAM only; once we kexec / reboot / execve
+    // it is gone. Disk-flushing here means the operator's emergency
+    // shell (Execve path), and the kexec-staging step in `kexec_into`
+    // (Kexec path), both have a fresh on-disk snapshot to work with.
+    // Failures must not block the terminal action — a missing log is
+    // strictly less bad than failing to reboot a wedged system.
+    let log_path = Path::new(NMBL_LOG_PATH);
+    if let Some(parent) = log_path.parent() {
+        // EEXIST is the expected case after the first call; any other
+        // error gets surfaced by the flush_to attempt below.
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = log::flush_to(log_path) {
+        nmbl_warn!("failed to flush log to {}: {err}", log_path.display());
+    }
+
     match action {
         TerminalAction::Reboot => {
             eprintln!("[nmbl] operator (or timeout) chose reboot");
