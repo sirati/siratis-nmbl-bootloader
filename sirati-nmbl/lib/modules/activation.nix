@@ -155,7 +155,7 @@ let
 
   # --- option types ---------------------------------------------------------
 
-  luksSubmodule = lib.types.submodule {
+  luksSubmodule = lib.types.submodule ({ config, ... }: {
     options = {
       name = lib.mkOption {
         type = lib.types.str;
@@ -191,20 +191,45 @@ let
       };
       passToStage1 = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
-        default = null;
+        # Per-instance default is computed in the submodule's `config`
+        # block below via `lib.mkOptionDefault`, so it can depend on
+        # this entry's own `unlock` and `name`. We deliberately do NOT
+        # set `default = null` here: a top-level `default` and a
+        # `config.passToStage1 = mkOptionDefault ...` collide in the
+        # module merger when both are present.
+        defaultText = lib.literalMD ''
+          `"/etc/nmbl-luks/''${name}"` when `unlock = "password"` (and
+          any future passphrase-style unlock such as `"tpm+pin"`),
+          `null` otherwise. Operators opt out by explicitly setting
+          `passToStage1 = null`, which also suppresses the
+          auto-wired `boot.initrd.luks.devices.<name>.keyFile`.
+        '';
         example = "/etc/nmbl-luks/cryptroot";
         description = lib.mdDoc ''
           When non-null, NMBL captures the typed passphrase after a
           successful unlock and injects it into the kexec'd initrd at
           this path as a cryptsetup-compatible keyfile (memory only,
-          never written to disk). The post-kexec NixOS stage-1 should
-          carry `boot.initrd.luks.devices.<name>.keyFile = "<this path>"`
-          so the operator types the passphrase exactly once. Only
-          meaningful when unlock = "password".
+          never written to disk). NMBL also auto-sets
+          `boot.initrd.luks.devices.<name>.keyFile` and
+          `fallbackToPassword = true` (both via `lib.mkDefault`) so
+          the post-kexec NixOS stage-1 picks up the injected secret
+          and the operator types the passphrase exactly once. Only
+          meaningful for passphrase-style unlocks (currently
+          `unlock = "password"`; future `"tpm+pin"` will behave the
+          same).
         '';
       };
     };
-  };
+    # Per-entry default. `mkOptionDefault` sits below the priority of
+    # any explicit operator value, so writing `passToStage1 = null`
+    # opts out cleanly. For non-password unlocks we default to `null`:
+    # there's no operator-typed secret to hand through.
+    # NOTE: when a future `unlock = "tpm+pin"` variant lands, add it
+    # to the passphrase-style branch so it gets the same auto-wiring.
+    config.passToStage1 = lib.mkOptionDefault (
+      if config.unlock == "password" then "/etc/nmbl-luks/${config.name}" else null
+    );
+  });
 
   mkComputed = type: desc: lib.mkOption {
     inherit type;
@@ -219,8 +244,15 @@ let
   # parent directory. Overwriting before free is what actually scrubs the
   # bytes: tmpfs pages live in RAM, and the kernel does not zero freed
   # pages — only what we write in place is guaranteed-gone post-unlink.
-  injectedPaths = map (l: l.passToStage1)
-    (lib.filter (l: l.unlock == "password" && l.passToStage1 != null) act.luks);
+  #
+  # `injectedLuks` is the set of entries that opted in to the stage-0 ->
+  # stage-1 passphrase hand-off. Default-on for `unlock = "password"`; an
+  # explicit `passToStage1 = null` opts out (and suppresses the auto-wired
+  # `boot.initrd.luks.devices.<name>` below). Future `unlock = "tpm+pin"`
+  # should land here too.
+  injectedLuks =
+    lib.filter (l: l.unlock == "password" && l.passToStage1 != null) act.luks;
+  injectedPaths = map (l: l.passToStage1) injectedLuks;
 
   wipeSnippet = path: ''
     if [ -e ${path} ]; then
@@ -293,8 +325,31 @@ in
     # they fail nixos-rebuild and our nmblAssertionCheck derivation alike.
     assertions = computedAssertions;
 
+    # Auto-wire the post-kexec NixOS stage-1 to consume NMBL's injected
+    # passphrase. `mkDefault` lets operators override either value
+    # explicitly without conflict. Setting `passToStage1 = null` on the
+    # activation entry skips it from `injectedLuks`, so no auto-wiring
+    # is emitted for that device.
+    #
+    # `fallbackToPassword` is only meaningful under scripted stage 1
+    # (systemd stage 1 implies it and rejects an explicit setting via
+    # an assertion in nixpkgs' luksroot.nix), so we only set it when
+    # systemd stage 1 is disabled.
+    boot.initrd.luks.devices = lib.mkMerge (map (l: {
+      ${l.name} = {
+        keyFile = lib.mkDefault l.passToStage1;
+      } // lib.optionalAttrs (!config.boot.initrd.systemd.enable) {
+        fallbackToPassword = lib.mkDefault true;
+      };
+    }) injectedLuks);
+
     # Scripted stage-1 cleanup: runs after LUKS unlock, before pivot.
-    boot.initrd.postDeviceCommands = lib.mkIf (injectedPaths != [ ]) wipeShellScript;
+    # systemd stage 1 rejects any non-empty `postDeviceCommands` via a
+    # fatal assertion in nixpkgs' stage-1 module, so gate this on the
+    # scripted-stage-1 path only.
+    boot.initrd.postDeviceCommands = lib.mkIf
+      (injectedPaths != [ ] && !config.boot.initrd.systemd.enable)
+      wipeShellScript;
 
     # systemd-stage-1 cleanup: a oneshot that runs after cryptsetup
     # targets have completed but before initrd-switch-root. The unit
