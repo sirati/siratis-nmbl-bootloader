@@ -46,18 +46,26 @@ use crate::ui::POLL_SLICE;
 use crate::ui::console::Console;
 use crate::ui::view::{PtyShellScreenData, render_pty_shell};
 
-/// Grid dimensions used by the pretty-shell box. Chosen so the visible
-/// portion of the bordered widget can hold a small but useful 78x18
-/// region on a typical 80x24 console (header eats 3 rows, footer eats
-/// 1, borders eat 2 rows + 2 cols).
+/// Minimum grid dimensions used by the pretty-shell box. The runtime
+/// size is derived from [`Console::size`] minus the chrome the
+/// renderer paints (3-row header, 1-row footer, 2-row + 2-col bordered
+/// block), so a 1920x1080 splash gets a much larger PTY than the
+/// 80x24-derived floor below.
 ///
-/// We construct the alacritty `Term` once at this size and never resize
-/// it: the bordered Block on screen is fixed, so cheating the grid into
-/// matching the actual frame would require a wrapping ratatui Layout
-/// round-trip. The simpler invariant — a fixed inner area — keeps the
-/// alacritty terminal model and the renderer in lockstep.
-const PRETTY_SHELL_COLS: u16 = 78;
-const PRETTY_SHELL_ROWS: u16 = 18;
+/// The floor exists for tiny consoles (degraded VGA, recovery serial
+/// shim) so the alacritty grid never collapses to zero cells. On those
+/// hosts the renderer still clips to the actual frame; the larger grid
+/// just keeps the VT parser happy.
+const PRETTY_SHELL_MIN_COLS: u16 = 40;
+const PRETTY_SHELL_MIN_ROWS: u16 = 10;
+
+/// Chrome rows the renderer consumes around the pretty-shell grid:
+/// 3-row header, 1-row footer, and the bordered block eats 1 row on
+/// top + 1 row on bottom (= 2). Total = 6.
+const CHROME_ROWS: u16 = 6;
+/// Chrome columns the bordered block consumes: 1 col left + 1 col
+/// right (= 2). The header/footer don't add side chrome.
+const CHROME_COLS: u16 = 2;
 
 /// Single read budget per loop iteration. Bounded so the driver loop
 /// always falls back to render-and-poll-key on time. `alacritty`'s VTE
@@ -99,10 +107,10 @@ pub struct PtyShellState {
 }
 
 impl PtyShellState {
-    fn new(child: PtyChild) -> Self {
+    fn new(child: PtyChild, cols: u16, rows: u16) -> Self {
         let size = GridSize {
-            columns: PRETTY_SHELL_COLS as usize,
-            screen_lines: PRETTY_SHELL_ROWS as usize,
+            columns: cols as usize,
+            screen_lines: rows as usize,
         };
         let term = Term::new(TermConfig::default(), &size, VoidListener);
         Self {
@@ -110,8 +118,8 @@ impl PtyShellState {
             parser: Processor::new(),
             child,
             child_exited: false,
-            cols: PRETTY_SHELL_COLS,
-            rows: PRETTY_SHELL_ROWS,
+            cols,
+            rows,
         }
     }
 
@@ -131,8 +139,20 @@ impl PtyShellState {
 /// terminal backend write). The caller in `src/shell.rs` treats both
 /// outcomes the same way: re-display the emergency menu.
 pub fn run_pretty_shell(console: &mut dyn Console, config: &Config) -> Result<()> {
-    let child = spawn_shell(&config.paths.shell, PRETTY_SHELL_COLS, PRETTY_SHELL_ROWS)?;
-    let mut state = PtyShellState::new(child);
+    // Derive the PTY grid size from the live console dimensions so the
+    // alacritty terminal fills the bordered block. The renderer paints
+    // a 3-row header + 1-row footer + bordered block (2 rows of border
+    // + 2 cols of border); see [`CHROME_ROWS`] / [`CHROME_COLS`].
+    let (frame_cols, frame_rows) = console.size();
+    let cols = frame_cols
+        .saturating_sub(CHROME_COLS)
+        .max(PRETTY_SHELL_MIN_COLS);
+    let rows = frame_rows
+        .saturating_sub(CHROME_ROWS)
+        .max(PRETTY_SHELL_MIN_ROWS);
+
+    let child = spawn_shell(&config.paths.shell, cols, rows)?;
+    let mut state = PtyShellState::new(child, cols, rows);
 
     let outcome = drive(&mut state, console);
 
