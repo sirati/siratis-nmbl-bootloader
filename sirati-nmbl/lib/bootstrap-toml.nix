@@ -52,6 +52,10 @@ let
         default_url = bootstrap.rescue.defaultUrl;
         default_sha256 = bootstrap.rescue.defaultSha256;
       };
+    } // lib.optionalAttrs cfg.stateful.enable {
+      state = {
+        mountpoint = toString cfg.stateful.rwMountpoint;
+      };
     };
   };
 in
