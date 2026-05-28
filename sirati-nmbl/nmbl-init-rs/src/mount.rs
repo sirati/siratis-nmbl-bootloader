@@ -59,7 +59,7 @@ const PSEUDO_FILESYSTEMS: &[PseudoFs] = &[
 /// `reporter` carries the live boot console; we surface the current
 /// pseudo-fs being mounted as the boot-status phase label so the
 /// operator sees what we're working on.
-pub fn mount_pseudo_filesystems(reporter: &mut BootReporter<'_>) -> Result<()> {
+pub fn mount_pseudo_filesystems(reporter: &mut BootReporter<'_, '_>) -> Result<()> {
     for fs in PSEUDO_FILESYSTEMS {
         let target = Path::new(fs.target);
         // We swallow render errors here because pseudo-fs mounts are

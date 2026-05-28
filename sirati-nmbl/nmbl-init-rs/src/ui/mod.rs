@@ -90,8 +90,9 @@ use crate::splash::terminal::SplashTerminal;
 #[cfg(feature = "image-splash")]
 use crate::splash::types::CellDims;
 
-pub use app::{App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, Screen};
-pub use emergency::run_emergency_screen;
+pub use app::{App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, ModalKind, Screen};
+pub use emergency::{run_emergency_screen, run_emergency_screen_with_app};
+pub(crate) use emergency::{build_emergency_app, build_message, default_items};
 pub use reporter::{BootReporter, ProgressSink, TickOutcome};
 
 /// Slice we wait on input per iteration. Shared by the event loop and
@@ -145,6 +146,12 @@ pub enum WrongPasswordOutcome {
 
 /// Show a centred yes/no confirmation modal with `title` + `message`
 /// on the supplied console and block until the operator commits.
+///
+/// This is the standalone variant: it draws onto a fresh frame with no
+/// underlying screen. Used by call sites that have no persistent App
+/// (e.g. early-boot activation). Emergency-menu actions should use
+/// [`show_modal_confirm_over`] instead so the menu remains visible
+/// behind the modal.
 ///
 /// Returns:
 ///   - `Ok(ConfirmOutcome::Yes)`       — Enter on Yes, or hotkey 'y'.
@@ -214,6 +221,73 @@ pub fn show_modal_confirm(
     }
 }
 
+/// Overlay variant of [`show_modal_confirm`] that paints the modal ON
+/// TOP of `app.screen` so the underlying menu (typically the
+/// emergency picker) stays visible behind. Closing the modal restores
+/// `app.modal` to `None` and the next render returns to the same
+/// selection / scroll state.
+pub fn show_modal_confirm_over(
+    console: &mut dyn Console,
+    app: &mut App<'_>,
+    title: &str,
+    message: &str,
+    yes_label: &str,
+    no_label: &str,
+    yes_default: bool,
+) -> Result<ConfirmOutcome> {
+    use crossterm::event::KeyCode;
+
+    let hint = "Left/Right select  Enter confirm  Esc cancel";
+    let outcome = (|| -> Result<ConfirmOutcome> {
+        app.modal = Some(ModalKind::Confirm {
+            title: title.to_owned(),
+            message: message.to_owned(),
+            yes_label: yes_label.to_owned(),
+            no_label: no_label.to_owned(),
+            yes_selected: yes_default,
+            hint: hint.to_owned(),
+        });
+
+        let mut dirty = true;
+        loop {
+            if dirty {
+                if let Err(e) = console.render(app) {
+                    eprintln!("[nmbl] {title}: {message}");
+                    crate::nmbl_warn!("modal-confirm render failed: {e}");
+                    return Ok(ConfirmOutcome::No);
+                }
+                dirty = false;
+            }
+
+            let Some(key) = console.poll_key(POLL_SLICE)? else {
+                continue;
+            };
+            let Some(ModalKind::Confirm { yes_selected, .. }) = &mut app.modal else {
+                return Ok(ConfirmOutcome::No);
+            };
+            match key.code {
+                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                    *yes_selected = !*yes_selected;
+                    dirty = true;
+                }
+                KeyCode::Enter => {
+                    return Ok(if *yes_selected {
+                        ConfirmOutcome::Yes
+                    } else {
+                        ConfirmOutcome::No
+                    });
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(ConfirmOutcome::Yes),
+                KeyCode::Char('n') | KeyCode::Char('N') => return Ok(ConfirmOutcome::No),
+                KeyCode::Esc => return Ok(ConfirmOutcome::Cancelled),
+                _ => {}
+            }
+        }
+    })();
+    app.modal = None;
+    outcome
+}
+
 /// Show a centred modal dialog with `title` + `message` on the supplied
 /// console and block until the operator presses any key (or
 /// `timeout_secs` elapses, whichever comes first). Use this for
@@ -259,6 +333,47 @@ pub fn show_modal_error(
             None => continue,
         }
     }
+}
+
+/// Overlay variant of [`show_modal_error`] that paints the modal ON
+/// TOP of `app.screen` so the menu underneath stays visible. Closing
+/// the modal restores `app.modal` to `None`.
+pub fn show_modal_error_over(
+    console: &mut dyn Console,
+    app: &mut App<'_>,
+    title: &str,
+    message: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let hint = "press any key to continue";
+    app.modal = Some(ModalKind::Error {
+        title: title.to_owned(),
+        message: message.to_owned(),
+        hint: hint.to_owned(),
+    });
+    if let Err(e) = console.render(app) {
+        eprintln!("[nmbl] {title}: {message}");
+        crate::nmbl_warn!("modal-error render failed: {e}");
+        app.modal = None;
+        return Ok(());
+    }
+
+    let deadline = Instant::now().checked_add(timeout);
+    let res = loop {
+        let slice = match deadline {
+            Some(d) => match d.checked_duration_since(Instant::now()) {
+                Some(remaining) => remaining.min(POLL_SLICE),
+                None => break Ok(()),
+            },
+            None => POLL_SLICE,
+        };
+        match console.poll_key(slice)? {
+            Some(_) => break Ok(()),
+            None => continue,
+        }
+    };
+    app.modal = None;
+    res
 }
 
 /// Show the wrong-password modal after a `luks-password` activation
@@ -557,11 +672,90 @@ pub(crate) fn render_splash_frame_with(
     })
 }
 
-/// Dispatch render based on which screen the App is currently on.
+/// Dispatch render based on which screen the App is currently on,
+/// then paint the modal overlay on top when `app.modal` is `Some`.
+///
+/// The underlying screen renders first so the operator sees "where
+/// they were" behind a confirmation / error / progress dialog. The
+/// modal renderers use ratatui's `Clear` widget on their rect, so
+/// they punch a hole without bleeding the menu into the modal body.
 ///
 /// `pub(crate)` so the splash orchestrator can reuse the same dispatch
 /// without forking the per-screen branching.
 pub(crate) fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
+    render_screen_body(frame, app);
+    if let Some(modal) = &app.modal {
+        render_modal_overlay(frame, modal);
+    }
+}
+
+fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind) {
+    match modal {
+        ModalKind::Confirm {
+            title,
+            message,
+            yes_label,
+            no_label,
+            yes_selected,
+            hint,
+        } => {
+            let data = view::ModalConfirmScreenData {
+                title,
+                message,
+                yes_label,
+                no_label,
+                yes_selected: *yes_selected,
+                hint,
+            };
+            view::render_modal_confirm(frame, &data);
+        }
+        ModalKind::Error { title, message, hint } => {
+            let data = view::ModalErrorScreenData {
+                title,
+                message,
+                hint,
+            };
+            view::render_modal_error(frame, &data);
+        }
+        ModalKind::Buttons {
+            title,
+            message,
+            labels,
+            selected,
+            hint,
+        } => {
+            // ModalButtonsScreenData borrows &[&str]; rebuild a slice
+            // of borrowed views into the owned `labels` Vec.
+            let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let data = view::ModalButtonsScreenData {
+                title,
+                message,
+                labels: &label_refs,
+                selected: *selected,
+                hint,
+            };
+            view::render_modal_buttons(frame, &data);
+        }
+        ModalKind::Status {
+            phase,
+            log_lines,
+            spinner_frame,
+        } => {
+            let data = BootStatusData {
+                phase: std::borrow::Cow::Borrowed(phase),
+                // Clone is unavoidable: BootStatusData wants Vec<String>
+                // and the renderer iterates over the slice. The status
+                // overlay only paints a handful of log lines so the
+                // clone is cheap.
+                log_lines: log_lines.clone(),
+                spinner_frame: *spinner_frame,
+            };
+            view::render_boot_status(frame, &data);
+        }
+    }
+}
+
+fn render_screen_body(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
     match &app.screen {
         Screen::List => render_list(frame, &list_data(app)),
         Screen::Editing {
@@ -1343,6 +1537,156 @@ mod tests {
         assert!(
             dump.contains("[Pretty Shell]"),
             "Pretty Shell button visible:\n{dump}"
+        );
+    }
+
+    // ---- Overlay variants -------------------------------------------
+
+    #[test]
+    fn show_modal_confirm_over_sets_and_clears_modal_on_app() {
+        // The overlay variant must install a `ModalKind::Confirm` on
+        // entry and clear it back to `None` on exit so a re-entry into
+        // the picker doesn't paint a stale dialog.
+        use crate::ui::app::ModalKind;
+        let gens = [];
+        let mut app = App::new(&gens);
+        // Seed a benign screen state that should survive the modal.
+        app.selected_index = 4;
+        let keys = vec![press(KeyCode::Char('y'))];
+        let mut console = ScriptedConsole::new(keys);
+        let out = show_modal_confirm_over(
+            &mut console,
+            &mut app,
+            "title",
+            "body",
+            "Yes",
+            "No",
+            true,
+        )
+        .expect("overlay modal must succeed on 'y'");
+        assert_eq!(out, ConfirmOutcome::Yes);
+        assert!(app.modal.is_none(), "modal must be cleared on exit");
+        assert_eq!(
+            app.selected_index, 4,
+            "underlying selection must survive the modal"
+        );
+        // No leftover Confirm variant.
+        let _: () = match &app.modal {
+            None => (),
+            Some(ModalKind::Confirm { .. }) => panic!("modal Confirm leaked"),
+            Some(_) => panic!("unexpected modal variant"),
+        };
+    }
+
+    #[test]
+    fn show_modal_confirm_over_returns_to_same_screen_on_close() {
+        // Close the modal via Esc (Cancelled) and confirm the
+        // underlying screen variant is unchanged. Operators expect the
+        // menu to be exactly where it was; this pins that behaviour.
+        let gens = [];
+        let mut app = App::new(&gens);
+        // Park on a known emergency-menu screen with selection=2.
+        app.screen = Screen::Emergency {
+            message: "boot failed".into(),
+            items: vec![
+                crate::ui::app::EmergencyItem {
+                    label: "Reboot",
+                    choice: crate::ui::app::EmergencyChoice::Reboot,
+                },
+                crate::ui::app::EmergencyItem {
+                    label: "Raw Shell",
+                    choice: crate::ui::app::EmergencyChoice::RawShell,
+                },
+                crate::ui::app::EmergencyItem {
+                    label: "Retry",
+                    choice: crate::ui::app::EmergencyChoice::RetryBoot,
+                },
+            ],
+            selected: 2,
+            chosen: None,
+        };
+        let keys = vec![press(KeyCode::Esc)];
+        let mut console = ScriptedConsole::new(keys);
+        let out = show_modal_confirm_over(
+            &mut console,
+            &mut app,
+            "t",
+            "b",
+            "Yes",
+            "Back",
+            true,
+        )
+        .expect("modal must succeed on Esc");
+        assert_eq!(out, ConfirmOutcome::Cancelled);
+        assert!(app.modal.is_none());
+        match &app.screen {
+            Screen::Emergency { selected, .. } => {
+                assert_eq!(*selected, 2, "selection must survive the modal");
+            }
+            _ => panic!("underlying screen must remain Emergency"),
+        }
+    }
+
+    #[test]
+    fn show_modal_confirm_over_renders_modal_atop_underlying_screen() {
+        // End-to-end visual check via the splash render path: the
+        // dispatcher in `render_current_screen` must paint the menu
+        // first and then the modal on top. Both must be visible in
+        // the rendered buffer (modal punches a Clear into its rect,
+        // but the menu header / footer survive).
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let gens = [];
+        let mut app = App::new(&gens);
+        app.screen = Screen::Emergency {
+            message: "boot failed: synthetic".into(),
+            items: vec![crate::ui::app::EmergencyItem {
+                label: "RebootMenuItem",
+                choice: crate::ui::app::EmergencyChoice::Reboot,
+            }],
+            selected: 0,
+            chosen: None,
+        };
+        app.modal = Some(crate::ui::app::ModalKind::Confirm {
+            title: "ConfirmTitleX".into(),
+            message: "modal body".into(),
+            yes_label: "Yes".into(),
+            no_label: "No".into(),
+            yes_selected: true,
+            hint: "hint".into(),
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| render_current_screen(f, &app)).expect("draw");
+        let buf = term.backend().buffer();
+        let dump: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_owned()))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            dump.contains("ConfirmTitleX"),
+            "modal title must paint on top:\n{dump}"
+        );
+        // The underlying emergency screen must paint BEHIND the modal.
+        // The centred modal punches a Clear into its rect (rows ~1..16,
+        // cols ~8..72 on an 80x24 backend), but the project header in
+        // row 0, the "[Rebo…" menu fragment peeking from below the
+        // modal's right edge, the "action" border at the bottom, AND
+        // the footer hint must all survive.
+        assert!(
+            dump.contains("sirati's NMBL"),
+            "project header (row 0) must remain visible above the modal:\n{dump}"
+        );
+        assert!(
+            dump.contains("[Rebo"),
+            "underlying picker item must peek from behind the modal:\n{dump}"
+        );
+        assert!(
+            dump.contains("up/down select"),
+            "underlying footer hint must remain visible:\n{dump}"
         );
     }
 }

@@ -179,7 +179,7 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// boot partition at its expected location without remounting the device.
 pub fn mount_system_filesystems(
     config: &Config,
-    reporter: &mut BootReporter<'_>,
+    reporter: &mut BootReporter<'_, '_>,
 ) -> Result<()> {
     let system_root = config.paths.system_root.as_path();
     ensure_dir(system_root)?;
