@@ -50,13 +50,12 @@ use nmbl_init::{log, nmbl_info, nmbl_warn};
 const DEFAULT_CONFIG_PATH: &str = "/etc/nmbl/config.toml";
 const BOOTSTRAP_CONFIG_PATH: &str = "/etc/nmbl/bootstrap.toml";
 
-/// Tmpfs path the byte-ring is flushed to right before every terminal
-/// action. Kept here (next to the dispatcher) and in `boot::kexec_into`
-/// (where the same file is staged into the next kernel's initramfs)
-/// so the two sites cannot drift. The parent dir is `mkdir -p`'d on
-/// every call — EEXIST is benign, anything else means tmpfs is broken
-/// and we surface a warning but still proceed with the terminal action.
-const NMBL_LOG_PATH: &str = "/nmbl-log/nmbl.log";
+// Tmpfs path the byte-ring is flushed to right before every terminal
+// action — defined once in `log::NMBL_LOG_PATH`. The parent dir is
+// `mkdir -p`'d on every call; EEXIST is benign, anything else means
+// tmpfs is broken and we surface a warning but still proceed with the
+// terminal action.
+use log::NMBL_LOG_PATH;
 
 /// Kernel cmdline token that opts into the key-echo diagnostic screen.
 /// Must appear as a whitespace-delimited token (e.g.
