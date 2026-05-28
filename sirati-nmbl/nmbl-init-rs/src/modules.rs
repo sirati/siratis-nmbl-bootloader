@@ -19,7 +19,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::sys::module::{self, LoadOutcome, ModuleEntry};
+use crate::sys::module::{self, LoadOutcome, ModuleEntry, canonical_module_name};
 use crate::ui::BootReporter;
 use crate::{nmbl_info, nmbl_verbose, nmbl_warn};
 
@@ -138,14 +138,25 @@ fn load_modules_inner(
     let release = crate::sys::uname::kernel_release()?;
     let entries = module::load_modules_dep(modules_dir, &release)?;
     let by_name: HashMap<String, &ModuleEntry> = module::index_by_name(&entries);
-    let blacklist: HashSet<&str> = blacklist.iter().map(String::as_str).collect();
+    // Canonicalize the blacklist so a config entry `dm-crypt` and a
+    // request for `dm_crypt` (or vice versa) match consistently.
+    let blacklist_canonical: HashSet<String> =
+        blacklist.iter().map(|b| canonical_module_name(b)).collect();
+    let blacklist: HashSet<&str> =
+        blacklist_canonical.iter().map(String::as_str).collect();
 
     let mut loaded: usize = 0;
     for name in explicit {
         if let Some((reporter, prefix)) = reporter_ctx.as_mut() {
             let _ = reporter.set_phase(format!("{prefix}: modprobe {name}"));
         }
-        if blacklist.contains(name.as_str()) {
+        // Operator-supplied names may use hyphens (`dm-crypt`), but the
+        // modules tree is keyed in canonical underscore form
+        // (`dm_crypt`); both the blacklist and the by-name index live in
+        // the canonical namespace, so fold the lookup key before either
+        // membership check or the load order resolves a stale negative.
+        let canonical = canonical_module_name(name);
+        if blacklist.contains(canonical.as_str()) {
             nmbl_verbose!("skipping blacklisted module {}", name);
             continue;
         }
@@ -155,7 +166,7 @@ fn load_modules_inner(
         // simply absent. A missing top-level entry is not an error — if
         // a downstream phase genuinely needs the module the kernel will
         // surface that with a clearer failure.
-        if !by_name.contains_key(name.as_str()) {
+        if !by_name.contains_key(canonical.as_str()) {
             nmbl_verbose!(
                 "module {} not in modules tree; assuming built-in",
                 name
