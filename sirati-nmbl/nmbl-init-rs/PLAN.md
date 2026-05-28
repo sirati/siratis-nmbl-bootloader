@@ -625,6 +625,116 @@ made:
 
 ---
 
+## 12a. Implemented post-v1
+
+Items originally deferred in v1 that have since shipped. Each ships
+under a `boot.nmbl` Nix option and is independently togglable.
+
+### External configuration on the boot partition (implemented)
+
+`boot.nmbl.configLocation = "external"` splits the runtime TOML into
+two tiers:
+
+- **`/etc/nmbl/bootstrap.toml`** is embedded in the initramfs. It
+  carries only what Phase 0.5 needs to reach the boot partition:
+  the boot device path, filesystem type, mount options, the modules
+  required to bring up that device, and the relative path to the
+  full config inside the boot partition.
+- **`/boot/nmbl/config.toml`** is staged onto the boot partition at
+  install time and read at boot. Operators can edit this file
+  directly and reboot to apply changes; no `nixos-rebuild` is needed
+  for the common knobs (timeout, verbosity, fstab tweaks).
+
+Phase 0.5 of `nmbl-init` (new — runs between pseudo-fs mount and the
+explicit module load) loads the bootstrap config, brings up its
+module list, populates `/dev/disk/by-*` via a `blkid` sweep, mounts
+the boot partition, and loads the full `Config` from there. The
+boot mountpoint is then handed to the rescue dispatcher via
+`Config::runtime_boot_mountpoint` so the rescue path can find
+`nmbl-rescue.sfs` against the same mount. Failures inside Phase 0.5
+surface as `NmblError::Bootstrap { stage, source }`; when the boot
+filesystem is already mounted the emergency shell sees it under the
+configured mountpoint so the operator can fix the config in place.
+
+Backwards compat: the default is `configLocation = "embedded"`,
+which ships the full config inside the initramfs exactly as v1 did.
+The Rust binary probes for `/etc/nmbl/bootstrap.toml` at startup and
+falls through to the legacy single-tier path when it is absent.
+
+### External rescue squashfs (implemented)
+
+`boot.nmbl.rescue.mode` is a three-way enum:
+
+- **`embedded`** (default) — busybox + storage activation tools live
+  in the initramfs. Legacy v1 behaviour preserved.
+- **`external`** — `nmbl-rescue.sfs` is built at install time from
+  `boot.nmbl.rescue.squashfsContents` (default: `busybox-sandbox-shell`,
+  `cryptsetup`, `lvm2`, `mdadm`) via `pkgs.squashfsTools` (`mksquashfs`) with
+  zstd-19 compression. The blob is staged onto the boot partition.
+  `/init` loop-mounts it on demand via `LOOP_CTL_GET_FREE` +
+  `LOOP_CONFIGURE`, then `switch_root`s into it (chdir →
+  `mount --move . /` → chroot . → chdir /) and `execve`s
+  `/bin/sh`. The initramfs ships no in-band shell in this mode, so
+  the size win is real (see §13).
+- **`none`** — no rescue tools at all. The emergency-shell path
+  prints a structured banner and halts via `reboot(RB_HALT_SYSTEM)`.
+
+The choice of `switch_root` over `pivot_root(2)` was driven by
+`pivot_root` returning `EINVAL` whenever the outgoing root is the
+initramfs rootfs pseudo-filesystem (which it always is in NMBL).
+`MS_MOVE`-style switch_root detaches the initramfs cleanly and the
+process image is replaced by the rescue shell in the squashfs.
+
+### Network rescue fallback (implemented, feature-gated)
+
+`boot.nmbl.rescue.network = true` opts into an HTTP fallback for
+the rescue squashfs. It bundles the operator-configured NIC
+drivers plus the NIC drivers already declared by
+`hardware-configuration.nix`, and enables the `network-rescue`
+Cargo feature in `nmbl-init`. That feature activates the optional
+deps `dep:dhcproto`, `dep:sha2`, and `dep:getrandom`, and pulls in:
+
+- `src/net/iface.rs` — NETLINK enumerate + bring-up + carrier wait.
+- `src/net/dhcp.rs` — one-shot DHCPv4 client (DISCOVER → OFFER →
+  REQUEST → ACK) using `dhcproto` over `AF_PACKET`.
+- `src/net/http.rs` — hand-rolled HTTP/1.0 GET client over
+  `std::net::TcpStream`, with streaming body reader.
+- `src/rescue/net.rs` — orchestrator that brings up the first
+  link, runs DHCP, applies the lease via `SIOCSIFADDR`/
+  `SIOCSIFNETMASK`/`SIOCADDRT`, prompts the operator for the
+  rescue URL (pre-filled from `boot.nmbl.rescue.defaultUrl`),
+  streams the body through `sha2::Sha256` into a `memfd_create`
+  fd, lets the operator confirm the computed hash against the
+  pre-filled expected one (`boot.nmbl.rescue.defaultSha256`), then
+  loop-mounts the memfd and `switch_root`s into it.
+- `src/ui/rescue.rs` — ratatui screens for source picker, URL
+  entry, download progress, and hash confirm.
+
+The whole feature is conditionally compiled. With
+`rescue.network = false` (the default) none of `sha2`, `dhcproto`,
+`getrandom`, or the network modules ship — store-path dedup keeps the
+binary byte-identical with the embedded-rescue case.
+
+Operator-confirmed SHA-256 substitutes for transport integrity, so
+the implementation stays HTTP-only — no TLS, no `rustls`, no
+`openssl`. HTTPS, IPv6, Wi-Fi, and PXE are intentionally out of
+scope.
+
+### Deferred (still)
+
+- A GUI menu for generation selection in graphical-console
+  environments. The current TUI (`ratatui` over `/dev/console`)
+  works on both VT and serial, which covers every supported
+  bootstrapper config; a GUI would only land if a user surfaces
+  a concrete need.
+- `LABEL=` / `UUID=` / `PARTUUID=` device specifiers in the
+  runtime config. NMBL still rejects them up front; the blkid
+  sweep in Phase 0.5 populates `/dev/disk/by-*` only for the
+  bootstrap stage and is not surfaced to the operator's full
+  config.
+
+---
+
 ## 13. Size deltas
 
 Measured against the four meaningful runtime configurations from
