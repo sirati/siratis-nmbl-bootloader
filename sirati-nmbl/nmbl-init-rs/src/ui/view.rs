@@ -9,6 +9,30 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 
 use crate::generations::Generation;
 use crate::ui::app::{BootStatusData, EmergencyItem, SPINNER_FRAMES, SPINNER_GLYPHS};
+use crate::ui::modal_layout::{
+    ModalLayout, SCROLL_HINT, compute_modal_layout_with_button_width,
+};
+
+/// Char-width of the rendered button row: sum of `[Label]` cells plus
+/// the 2-col gutters between buttons. Used as a width floor by the
+/// layout pass so a short message can't shrink the box past where the
+/// buttons fit.
+fn button_row_width(labels: &[&str]) -> u16 {
+    if labels.is_empty() {
+        return 0;
+    }
+    let mut total: usize = 0;
+    for (i, label) in labels.iter().enumerate() {
+        if i > 0 {
+            total = total.saturating_add(2);
+        }
+        // "[<label>]" is label_chars + 2 brackets.
+        total = total
+            .saturating_add(label.chars().count())
+            .saturating_add(2);
+    }
+    u16::try_from(total).unwrap_or(u16::MAX)
+}
 
 /// State needed to render the generation-picker screen.
 pub struct ListScreenData<'a> {
@@ -67,6 +91,68 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let x = area.x.saturating_add(area.width.saturating_sub(w) / 2);
     let y = area.y.saturating_add(area.height.saturating_sub(h) / 2);
     Rect::new(x, y, w, h)
+}
+
+/// Paint the wrapped text region of a modal at `layout.inner_text_rect`.
+/// When `layout.scrollable` is true the offset selects which slice of
+/// `layout.wrapped_lines` is visible; otherwise the slice starts at 0.
+fn paint_modal_text(frame: &mut Frame<'_>, layout: &ModalLayout, scroll_offset: u16) {
+    let total = u16::try_from(layout.wrapped_lines.len()).unwrap_or(u16::MAX);
+    let visible = layout.inner_text_rect.height;
+    let offset = if layout.scrollable {
+        let max_off = total.saturating_sub(visible);
+        scroll_offset.min(max_off)
+    } else {
+        0
+    };
+    let start = offset as usize;
+    let end = start.saturating_add(visible as usize).min(layout.wrapped_lines.len());
+    let lines: Vec<Line<'_>> = layout
+        .wrapped_lines
+        .get(start..end)
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| Line::raw(s.clone()))
+        .collect();
+    let para = Paragraph::new(Text::from(lines));
+    frame.render_widget(para, layout.inner_text_rect);
+}
+
+/// Paint the `- - -` separator row across the inner width.
+fn paint_separator(frame: &mut Frame<'_>, layout: &ModalLayout) {
+    let inner_w = layout.inner_text_rect.width as usize;
+    // Each "dash space" pair takes 2 cols. Final col can be either a
+    // dash or a space, whichever fills the row.
+    let mut sep = String::with_capacity(inner_w);
+    let mut want_dash = true;
+    for _ in 0..inner_w {
+        sep.push(if want_dash { '-' } else { ' ' });
+        want_dash = !want_dash;
+    }
+    let sep_rect = Rect::new(
+        layout.inner_text_rect.x,
+        layout.separator_y,
+        layout.inner_text_rect.width,
+        1,
+    );
+    let para = Paragraph::new(sep)
+        .alignment(Alignment::Center)
+        .style(Style::default().add_modifier(Modifier::DIM));
+    frame.render_widget(para, sep_rect);
+}
+
+/// Paint the right-aligned scroll hint below the box when stage H4
+/// triggered. No-op when the layout fits without scrolling.
+fn paint_scroll_hint(frame: &mut Frame<'_>, layout: &ModalLayout) {
+    let Some(rect) = layout.scroll_hint else {
+        return;
+    };
+    let hint = Paragraph::new(Span::styled(
+        SCROLL_HINT,
+        Style::default().add_modifier(Modifier::DIM),
+    ))
+    .alignment(Alignment::Right);
+    frame.render_widget(hint, rect);
 }
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, countdown: Option<u64>) {
@@ -418,6 +504,9 @@ pub struct ModalConfirmScreenData<'a> {
     pub yes_selected: bool,
     /// Footer hint, typically "←/→ select  Enter confirm  Esc cancel".
     pub hint: &'a str,
+    /// Scroll viewport offset. Ignored when the layout decides the
+    /// content fits without scrolling.
+    pub scroll_offset: u16,
 }
 
 /// Render a centred yes/no confirmation modal over the body area. The
@@ -425,45 +514,22 @@ pub struct ModalConfirmScreenData<'a> {
 /// `Clear` so the underlying emergency picker doesn't bleed through;
 /// the two buttons are painted on the bottom row of the modal with
 /// the selected one inverted.
+///
+/// Sizing goes through [`compute_modal_layout`] so every modal in the
+/// crate shares the same "hug the text, degrade in steps" shape.
 pub fn render_modal_confirm(frame: &mut Frame<'_>, data: &ModalConfirmScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
 
-    // Centred modal: 64 cols, fills the body height minus a small
-    // top/bottom gutter so a long wrapped message has room without
-    // crowding the chrome (min 9 to keep body + button row + borders
-    // fitting on a degraded 80x24 console).
-    let h = body.height.saturating_sub(2).max(9);
-    let modal = centered_rect(body, 64, h);
-    frame.render_widget(Clear, modal);
-
-    // Reserve the last inner row for the button bar; the rest holds
-    // the wrapped message.
+    let labels = [data.yes_label, data.no_label];
+    let btn_w = button_row_width(&labels);
+    let layout = compute_modal_layout_with_button_width(data.message, true, 2, btn_w, body);
+    frame.render_widget(Clear, layout.box_rect);
     let block = Block::bordered().title(data.title.to_owned());
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
+    frame.render_widget(block, layout.box_rect);
 
-    if inner.height == 0 {
-        // Pathological tiny terminal — the border consumed the whole
-        // modal. Nothing more to paint; the footer hint below still
-        // reaches the operator.
-        render_footer(frame, footer, data.hint);
-        return;
-    }
-
-    let button_row_h: u16 = 1;
-    let msg_h = inner.height.saturating_sub(button_row_h);
-    let msg_rect = Rect::new(inner.x, inner.y, inner.width, msg_h);
-    let btn_rect = Rect::new(
-        inner.x,
-        inner.y.saturating_add(msg_h),
-        inner.width,
-        button_row_h,
-    );
-
-    let msg_para = Paragraph::new(Text::from(data.message.to_owned()))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(msg_para, msg_rect);
+    paint_modal_text(frame, &layout, data.scroll_offset);
+    paint_separator(frame, &layout);
 
     // Button bar: "[Yes]  [Back]" with the highlighted one inverted.
     let selected_style = Style::default()
@@ -483,9 +549,16 @@ pub fn render_modal_confirm(frame: &mut Frame<'_>, data: &ModalConfirmScreenData
         Span::raw("  "),
         Span::styled(no_text, no_style),
     ]);
-    let buttons = Paragraph::new(line).alignment(Alignment::Center);
+    let btn_rect = Rect::new(
+        layout.inner_text_rect.x,
+        layout.button_row_y,
+        layout.inner_text_rect.width,
+        1,
+    );
+    let buttons = Paragraph::new(line).alignment(Alignment::Right);
     frame.render_widget(buttons, btn_rect);
 
+    paint_scroll_hint(frame, &layout);
     render_footer(frame, footer, data.hint);
 }
 
@@ -505,44 +578,31 @@ pub struct ModalButtonsScreenData<'a> {
     pub selected: usize,
     /// Footer hint, typically "Left/Right select  Enter confirm  Esc …".
     pub hint: &'a str,
+    /// Scroll viewport offset. Ignored when the layout decides the
+    /// content fits without scrolling.
+    pub scroll_offset: u16,
 }
 
 /// Render a centred N-button modal over the body area. Mirrors the
 /// layout of [`render_modal_confirm`]: bordered modal on a fresh
 /// `Clear`, wrapped message above a button bar, footer hint underneath.
+///
+/// Sizing goes through [`compute_modal_layout`] so every modal in the
+/// crate shares the same "hug the text, degrade in steps" shape.
 pub fn render_modal_buttons(frame: &mut Frame<'_>, data: &ModalButtonsScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
 
-    // 64 cols matches `render_modal_confirm`; fills the body height
-    // minus a small top/bottom gutter (min 10 to leave room for the
-    // longer "Wrong password (attempt N)" body on a degraded 80x24).
-    let h = body.height.saturating_sub(2).max(10);
-    let modal = centered_rect(body, 64, h);
-    frame.render_widget(Clear, modal);
-
+    let btn_count = u16::try_from(data.labels.len()).unwrap_or(u16::MAX);
+    let btn_w = button_row_width(data.labels);
+    let layout =
+        compute_modal_layout_with_button_width(data.message, true, btn_count, btn_w, body);
+    frame.render_widget(Clear, layout.box_rect);
     let block = Block::bordered().title(data.title.to_owned());
-    let inner = block.inner(modal);
-    frame.render_widget(block, modal);
+    frame.render_widget(block, layout.box_rect);
 
-    if inner.height == 0 {
-        render_footer(frame, footer, data.hint);
-        return;
-    }
-
-    let button_row_h: u16 = 1;
-    let msg_h = inner.height.saturating_sub(button_row_h);
-    let msg_rect = Rect::new(inner.x, inner.y, inner.width, msg_h);
-    let btn_rect = Rect::new(
-        inner.x,
-        inner.y.saturating_add(msg_h),
-        inner.width,
-        button_row_h,
-    );
-
-    let msg_para =
-        Paragraph::new(Text::from(data.message.to_owned())).wrap(Wrap { trim: false });
-    frame.render_widget(msg_para, msg_rect);
+    paint_modal_text(frame, &layout, data.scroll_offset);
+    paint_separator(frame, &layout);
 
     let selected_style = Style::default()
         .fg(Color::Black)
@@ -565,9 +625,21 @@ pub fn render_modal_buttons(frame: &mut Frame<'_>, data: &ModalButtonsScreenData
         }
         spans.push(Span::styled(format!("[{label}]"), style_for(i)));
     }
-    let buttons = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
+    let btn_rect = Rect::new(
+        layout.inner_text_rect.x,
+        layout.button_row_y,
+        layout.inner_text_rect.width,
+        1,
+    );
+    let alignment = if data.labels.len() == 1 {
+        Alignment::Center
+    } else {
+        Alignment::Right
+    };
+    let buttons = Paragraph::new(Line::from(spans)).alignment(alignment);
     frame.render_widget(buttons, btn_rect);
 
+    paint_scroll_hint(frame, &layout);
     render_footer(frame, footer, data.hint);
 }
 
@@ -581,33 +653,34 @@ pub struct ModalErrorScreenData<'a> {
     pub message: &'a str,
     /// Footer hint, typically "press any key to continue".
     pub hint: &'a str,
+    /// Scroll viewport offset. Ignored when the layout decides the
+    /// content fits without scrolling.
+    pub scroll_offset: u16,
 }
 
 /// Render a centred modal dialog over the body area. The bordered
 /// modal carries the error chain in red on a fresh `Clear` so the
 /// stale emergency-screen content does not bleed through.
+///
+/// Sizing goes through [`compute_modal_layout`] so every modal in the
+/// crate shares the same "hug the text, degrade in steps" shape. The
+/// error modal has no buttons (any keystroke dismisses), so the
+/// layout skips the separator + button rows.
 pub fn render_modal_error(frame: &mut Frame<'_>, data: &ModalErrorScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
 
-    // Centred modal: 70 cols wide, fills the body height minus a
-    // small top/bottom gutter so a multi-line error chain has room
-    // (min 8 to keep title + a few message lines + border fitting
-    // on a degraded 80x24 console).
-    let h = body.height.saturating_sub(2).max(8);
-    let modal = centered_rect(body, 70, h);
-    frame.render_widget(Clear, modal);
-
+    let layout = compute_modal_layout_with_button_width(data.message, false, 0, 0, body);
+    frame.render_widget(Clear, layout.box_rect);
     let block = Block::bordered().title(Span::styled(
         data.title.to_owned(),
         Style::default()
             .fg(Color::Red)
             .add_modifier(Modifier::BOLD),
     ));
-    let para = Paragraph::new(Text::from(data.message.to_owned()))
-        .block(block)
-        .wrap(Wrap { trim: false });
-    frame.render_widget(para, modal);
+    frame.render_widget(block, layout.box_rect);
+    paint_modal_text(frame, &layout, data.scroll_offset);
+    paint_scroll_hint(frame, &layout);
 
     render_footer(frame, footer, data.hint);
 }
@@ -1018,6 +1091,7 @@ mod tests {
             no_label: "Back",
             yes_selected: true,
             hint: "Left/Right select  Enter confirm  Esc cancel",
+            scroll_offset: 0,
         };
         let mut term = new_term(80, 24);
         term.draw(|f| render_modal_confirm(f, &data)).expect("draw");
@@ -1047,12 +1121,64 @@ mod tests {
             no_label: "Back",
             yes_selected: false,
             hint: "h",
+            scroll_offset: 0,
         };
         let mut term = new_term(60, 16);
         term.draw(|f| render_modal_confirm(f, &data)).expect("draw");
         let text = buffer_text(&term);
         assert!(text.contains("[Boot]"), "yes label missing in:\n{text}");
         assert!(text.contains("[Back]"), "no label missing in:\n{text}");
+    }
+
+    #[test]
+    fn test_render_modal_confirm_separator_row_dash_space_filling_inner_width() {
+        // Pin the spec's separator row: `- ` repeated across the inner
+        // text width. Cell scan finds the dash pattern on the
+        // separator row.
+        let data = ModalConfirmScreenData {
+            title: "T",
+            message: "hello world",
+            yes_label: "Yes",
+            no_label: "No",
+            yes_selected: true,
+            hint: "h",
+            scroll_offset: 0,
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_modal_confirm(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        // The dash-space pattern must appear at least once.
+        assert!(text.contains("- - -"), "separator missing: \n{text}");
+    }
+
+    #[test]
+    fn test_render_modal_confirm_short_msg_box_hugs_message_not_padded_to_min() {
+        // 11-char "hello world" message: the box must not pad out to 40
+        // — `min(MIN_TEXT_WIDTH, max_line_length(msg)) = 11`, so the
+        // floor is 11 and the box hugs the message + buttons.
+        let data = ModalConfirmScreenData {
+            title: "T",
+            message: "hello world",
+            yes_label: "Yes",
+            no_label: "No",
+            yes_selected: true,
+            hint: "h",
+            scroll_offset: 0,
+        };
+        let mut term = new_term(120, 30);
+        term.draw(|f| render_modal_confirm(f, &data)).expect("draw");
+        let lines = buffer_lines(&term);
+        // Find the title row and measure the box width.
+        let row = lines.iter().find(|l| l.contains("┌T")).expect("title row");
+        // Box width = sum of chars between the corners; quick proxy:
+        // the row's leading spaces + box span + trailing spaces.
+        let lead = row.chars().take_while(|c| *c == ' ').count();
+        let trail = row.chars().rev().take_while(|c| *c == ' ').count();
+        // Symmetry check: roughly equal left/right margins.
+        assert!(
+            lead.abs_diff(trail) <= 1,
+            "box must be centred: lead={lead} trail={trail}, row={row:?}"
+        );
     }
 
     #[test]
@@ -1065,6 +1191,7 @@ mod tests {
             title: "Pretty Shell failed to start",
             message: "openpty failed: ENOENT: No such file or directory",
             hint: "press any key to continue",
+            scroll_offset: 0,
         };
         let mut term = new_term(80, 24);
         term.draw(|f| render_modal_error(f, &data)).expect("draw");
@@ -1075,6 +1202,57 @@ mod tests {
         );
         assert!(text.contains("openpty failed"), "message missing in:\n{text}");
         assert!(text.contains("press any key"), "hint missing in:\n{text}");
+    }
+
+    #[test]
+    fn test_render_modal_error_tall_message_shows_scroll_hint_outside_box() {
+        // 50 short lines on a 24-row screen: the layout MUST enter
+        // scroll mode (stage H4) and paint "Ctrl+Shift+Up/Dn scroll"
+        // on the row just BELOW the box.
+        let msg = (0..50)
+            .map(|i| format!("line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let data = ModalErrorScreenData {
+            title: "Tall",
+            message: &msg,
+            hint: "press any key to continue",
+            scroll_offset: 0,
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_modal_error(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Ctrl+Shift+Up/Dn scroll"),
+            "scroll hint missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_render_modal_error_tall_message_respects_scroll_offset() {
+        // With offset 5 the first visible line must be "line 05",
+        // not "line 00".
+        let msg = (0..50)
+            .map(|i| format!("line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let data = ModalErrorScreenData {
+            title: "Tall",
+            message: &msg,
+            hint: "press any key to continue",
+            scroll_offset: 5,
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_modal_error(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("line 05"),
+            "offset 5 should show line 05:\n{text}"
+        );
+        assert!(
+            !text.contains("line 00"),
+            "offset 5 should hide line 00:\n{text}"
+        );
     }
 
     fn boot_status_data<'a>(

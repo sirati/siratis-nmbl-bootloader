@@ -438,6 +438,24 @@ fn halt_final(reason: &str) -> ! {
 /// [`execute_terminal_action`] (which diverges) or returns
 /// `ExitCode::SUCCESS` after a normal `Ok(())` outcome.
 fn main() -> ExitCode {
+    // `--debug-tui -- <scenario> [args...]` entrypoint (feature `mocking`).
+    // Runs a single modal flow on the current terminal and exits.
+    // Compiled out of release builds so the production initramfs cannot
+    // be tricked into the mocking flow by stray cmdline.
+    #[cfg(feature = "mocking")]
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        if let Some(debug_args) = nmbl_init::mocking::parse_debug_tui_args(argv) {
+            return match nmbl_init::mocking::run(debug_args) {
+                Ok(()) => ExitCode::from(0),
+                Err(err) => {
+                    eprintln!("[nmbl] --debug-tui: {err}");
+                    ExitCode::from(1)
+                }
+            };
+        }
+    }
+
     let args = parse_args();
 
     // Build-time validation hook: load and validate the given config
