@@ -98,7 +98,26 @@ nix run .#test-gpt-bios                  # legacy BIOS via GRUB
 nix run .#test-gpt-uefi-systemd          # systemd-boot bootstrap
 nix run .#test-gpt-qemu-kernel-invoke    # QEMU -kernel direct boot
 nix run .#test-gpt-qemu-kernel-invoke -- --debug-shell
+nix run .#test-external-config           # config.toml on /boot
+nix run .#test-external-rescue           # rescue squashfs on /boot
+nix run .#test-external-rescue-network   # rescue + HTTP fallback
 ```
+
+## Recommended setups
+
+The two post-v1 features (external config, external rescue) are
+independently togglable. Pick the combination that matches the
+operator's recovery story:
+
+| Profile         | `configLocation` | `rescue.mode` | `rescue.network` | When to pick |
+|-----------------|------------------|---------------|------------------|--------------|
+| **Default install** | `embedded`   | `embedded`    | `false`          | Single-user desktop or laptop. Smallest moving-parts surface; everything ships in the initramfs. |
+| **Power user**  | `external`       | `external`    | `false`          | Workstation where the operator wants edit-and-reboot config changes and a richer rescue toolbox without bloating the initramfs. |
+| **Servers**     | `external`       | `external`    | `true`           | Headless / remote machines. The HTTP fallback recovers an unbootable system over the network when the boot partition's rescue blob is missing or stale. |
+| **Air-gapped / tiny** | `embedded` | `none`        | `false`          | Appliances and air-gapped systems where rescue is handled out-of-band (e.g. yank the disk into another machine). NMBL halts cleanly with a banner instead of dropping to a shell. |
+
+All four profiles boot the same `nmbl-init` binary; only the
+initramfs contents and the on-boot-partition staging differ.
 
 All VMs are wired through `vm-serial-man`, which exposes a serial
 console you can drive from another shell:
@@ -164,6 +183,156 @@ Notable points:
   the TUI passphrase modal).
 - `verbose` defaults to inheriting `boot.initrd.verbose`.
 
+## External configuration
+
+By default the runtime TOML is baked into the initramfs at build
+time, so any change to a NMBL knob — even a timeout tweak — requires
+`nixos-rebuild`. Setting `boot.nmbl.configLocation = "external"`
+splits the config into two tiers:
+
+- **`/etc/nmbl/bootstrap.toml`** — embedded in the initramfs. Tiny.
+  Carries only what `nmbl-init` needs to reach the boot partition:
+  the boot device path, filesystem type, mount options, the kernel
+  modules required to expose that device, and the relative path to
+  the full config inside the boot partition.
+- **`/boot/nmbl/config.toml`** — staged onto the boot partition by
+  the install hook. Hand-editable. The full runtime schema
+  (filesystems, activations, modules, TUI, paths, ...).
+
+The Rust /init runs a new **Phase 0.5** between pseudo-fs mount and
+the explicit module load: it loads the bootstrap config, brings up
+its module list, populates `/dev/disk/by-*` via a `blkid` sweep,
+mounts the boot partition, and loads the full `Config` from there.
+The boot mountpoint is then visible to the rescue dispatcher so the
+disk-rescue path can find `nmbl-rescue.sfs` against the same mount.
+
+Operator workflow:
+
+```bash
+# edit anything in the runtime config
+sudo vi /boot/nmbl/config.toml
+
+# reboot, changes apply, no rebuild needed
+sudo reboot
+```
+
+Failure handling: each Phase 0.5 failure leaves the boot mount in
+place (when it got that far) so the emergency shell can fix the
+on-disk config without re-flashing:
+
+| Failure                            | Emergency shell sees |
+|------------------------------------|----------------------|
+| `bootstrap.toml` parse fails       | nothing mounted (build bug — needs rebuild) |
+| bootstrap module load fails        | pseudo-fs only |
+| boot device never appears          | pseudo-fs + diagnostic |
+| boot partition mount fails         | pseudo-fs + diagnostic |
+| `config.toml` missing on partition | `/mnt/boot` mounted, can `cat` directory |
+| `config.toml` parse fails          | `/mnt/boot` mounted, error names the line |
+
+Minimal example:
+
+```nix
+{
+  boot.nmbl = {
+    configLocation = "external";
+    bootstrap = {
+      configPath = "/nmbl/config.toml";
+      bootFs = {
+        device     = "/dev/disk/by-partlabel/disk-main-ESP";
+        fstype     = "vfat";
+        options    = "ro";
+        mountpoint = "/mnt/boot";
+      };
+      kernelModules.explicit = [
+        "vfat" "nls_cp437" "nls_iso8859_1" "ahci" "nvme"
+      ];
+    };
+  };
+}
+```
+
+The default `configLocation = "embedded"` keeps v1 behaviour
+(full config inside the initramfs); `nmbl-init` probes for
+`/etc/nmbl/bootstrap.toml` at startup and falls through to the
+single-tier path when it is absent.
+
+## External rescue
+
+`boot.nmbl.rescue.mode` is a three-way enum:
+
+- **`embedded`** (default) — busybox + storage activation tools live
+  in the initramfs at `/bin/sh`. Legacy v1 behaviour. The emergency
+  path is a bare `execve(/bin/sh, …)`.
+- **`external`** — `nmbl-rescue.sfs` is built at install time from
+  `boot.nmbl.rescue.squashfsContents` (default:
+  `busybox-sandbox-shell`, `cryptsetup`, `lvm2`, `mdadm`) via
+  `pkgs.squashfsTools` (`mksquashfs`) with zstd-19 compression. The blob is
+  staged on the boot partition. The Rust /init loop-mounts it on
+  demand via `LOOP_CTL_GET_FREE` + `LOOP_CONFIGURE`, then
+  `switch_root`s into it (chdir → `mount --move . /` → chroot . →
+  chdir /) and `execve`s `/bin/sh` from the squashfs. The initramfs
+  ships no in-band shell in this mode, so the size win is real (see
+  `nmbl-init-rs/PLAN.md` §13 for measured deltas).
+- **`none`** — no rescue tools at all. The emergency-shell path
+  prints a structured banner and halts via `reboot(RB_HALT_SYSTEM)`.
+
+Example: external rescue with extra debug tooling.
+
+```nix
+{
+  boot.nmbl.rescue = {
+    mode = "external";
+    squashfsContents = with pkgs; [
+      busybox-sandbox-shell
+      cryptsetup lvm2 mdadm
+      pkgsStatic.strace
+      pkgsStatic.tmux
+    ];
+  };
+}
+```
+
+### Network fallback
+
+`boot.nmbl.rescue.network = true` adds an HTTP/1.0 fallback for the
+rescue squashfs. It bundles the configured NIC drivers
+(`rescue.nicDrivers`, plus any NIC modules already required by
+`hardware-configuration.nix`), enables the `network-rescue` Cargo
+feature in `nmbl-init`, and turns on a ratatui flow that:
+
+1. Brings up the first link-up interface and runs a one-shot DHCPv4
+   exchange (DISCOVER → OFFER → REQUEST → ACK).
+2. Applies the lease via `SIOCSIFADDR` / `SIOCSIFNETMASK` /
+   `SIOCADDRT`.
+3. Prompts the operator for a rescue URL (pre-filled from
+   `rescue.defaultUrl`), streams the body through `Sha256` into a
+   `memfd_create(2)` fd, then lets the operator confirm the
+   computed hex digest against `rescue.defaultSha256`.
+4. Loop-mounts the memfd and `switch_root`s into it just like the
+   disk path.
+
+Operator-confirmed SHA-256 substitutes for transport integrity, so
+the implementation stays HTTP-only — no TLS / `rustls` / `openssl`.
+HTTPS, IPv6, Wi-Fi, and PXE are intentionally out of scope.
+
+```nix
+{
+  boot.nmbl.rescue = {
+    mode    = "external";
+    network = true;
+    defaultUrl    = "http://rescue.lan/nmbl-rescue.sfs";
+    defaultSha256 = "deadbeefcafe...";
+    nicDrivers    = [ "virtio_net" "e1000e" "igb" "r8169" ];
+  };
+}
+```
+
+The whole network surface is conditionally compiled. With
+`rescue.network = false` (the default) none of `sha2`, `dhcproto`,
+or the network modules ship — the Nix store dedup keeps the
+`nmbl-init` binary byte-identical between the embedded-rescue and
+external-rescue-without-network configurations.
+
 ## Where to find things
 
 | Path | What it is |
@@ -195,17 +364,34 @@ Working:
 - `kexec_file_load(2)` handover into the selected generation.
 - Panic hook with `--errored` recovery re-exec.
 - Bootstrapper installation via GRUB or systemd-boot on GPT for BIOS or UEFI, plus QEMU `-kernel` direct invocation.
+- **External configuration** on the boot partition
+  (`boot.nmbl.configLocation = "external"`): tiny bootstrap.toml
+  embedded in the initramfs, full config.toml staged on /boot and
+  edit-and-reboot at runtime.
+- **External rescue squashfs** (`boot.nmbl.rescue.mode = "external"`):
+  loop-mount + switch_root into a zstd-compressed `nmbl-rescue.sfs`
+  on the boot partition, with `none` as a halt-only alternative.
+- **Network rescue fallback** (`boot.nmbl.rescue.network = true`):
+  HTTP/1.0 download of the rescue squashfs into a `memfd`, with
+  operator-confirmed SHA-256, behind the `network-rescue` Cargo
+  feature.
 
 Not supported in v1:
 
-- `LABEL=`, `UUID=`, `PARTUUID=` filesystem specifiers — `nmbl-init` has no udev, so only raw `/dev/*` paths are resolved. The config loader rejects the others up front.
+- `LABEL=`, `UUID=`, `PARTUUID=` filesystem specifiers in the
+  operator's full config — `nmbl-init` has no udev for the runtime
+  phase, so only raw `/dev/*` paths are resolved. The config loader
+  rejects the others up front. (Phase 0.5's `blkid` sweep populates
+  `/dev/disk/by-*` only for the bootstrap stage's own boot device.)
 - LUKS unlock via FIDO2 / YubiKey / smartcard.
 - MBR partition tables (only GPT is supported by the bootstrapper).
 
 Deferred:
 
-- Reading `/etc/nmbl/config.toml` from the boot partition instead of the initramfs, so config edits don't require rebuilding the initramfs.
-- A squashfs rescue blob mounted on demand from the emergency shell.
+- A GUI menu for generation selection in graphical-console
+  environments. The current TUI (`ratatui` over `/dev/console`)
+  covers VT and serial, which spans every supported bootstrapper
+  config.
 
 ## License
 
