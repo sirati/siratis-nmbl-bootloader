@@ -80,25 +80,67 @@ pub fn run_all_activations(
         ));
         check_required_modules(activation, &loaded);
 
-        // Per-iteration reborrow; without it the compiler keeps the
-        // mutable borrow live across loop turns and rejects iter #2.
-        let supplier_ref: Option<&mut dyn PasswordSupplier> = match password_supplier {
-            Some(ref mut s) => Some(&mut **s),
-            None => None,
-        };
-        // Briefly hand the reporter's console to the supplier so the
-        // passphrase modal renders through the same backend as the
-        // surrounding boot-status screen. The reporter borrow is paused
-        // for the duration of the prompt and resumed after.
-        let stdin_owned = collect_stdin(activation, &mut *reporter.console, supplier_ref)?;
-        let stdin_slice = stdin_owned.as_ref().map(|z| z.as_slice());
+        // 1-indexed attempt counter for the wrong-password modal title
+        // ("Wrong password (attempt N)"). Resets per activation so a
+        // later LUKS device starts at attempt 1 again.
+        let mut attempts: u32 = 0;
+        // Inner loop: run the activation, and on exit code 2 from a
+        // `luks-password` step surface the wrong-password modal so the
+        // operator can retry without restarting the boot. Every other
+        // exit code, plus a wrong-password modal that returns Reboot
+        // or Shell, leaves this loop via `return`.
+        let stdin_owned: Option<Zeroizing<Vec<u8>>> = loop {
+            // Per-iteration reborrow; without it the compiler keeps the
+            // mutable borrow live across loop turns and rejects iter #2.
+            let supplier_ref: Option<&mut dyn PasswordSupplier> = match password_supplier {
+                Some(ref mut s) => Some(&mut **s),
+                None => None,
+            };
+            // Briefly hand the reporter's console to the supplier so the
+            // passphrase modal renders through the same backend as the
+            // surrounding boot-status screen. The reporter borrow is
+            // paused for the duration of the prompt and resumed after.
+            let stdin_owned = collect_stdin(activation, &mut *reporter.console, supplier_ref)?;
+            let stdin_slice = stdin_owned.as_ref().map(|z| z.as_slice());
 
-        let outcome = run(&activation.binary, &activation.argv, stdin_slice)
-            .map_err(|source| wrap_runner_error(activation, source))?;
+            let outcome = run(&activation.binary, &activation.argv, stdin_slice)
+                .map_err(|source| wrap_runner_error(activation, source))?;
 
-        if outcome.exit_code != 0 {
+            if outcome.exit_code == 0 {
+                break stdin_owned;
+            }
+
+            // Wrong-password fast path: cryptsetup signals "no key
+            // available" via exit code 2. Show the retry modal; any
+            // other non-zero exit code is fatal as before.
+            if activation.kind == ActivationKind::LuksPassword && outcome.exit_code == 2 {
+                attempts = attempts.saturating_add(1);
+                match handle_wrong_password(config, &mut *reporter.console, activation, attempts)?
+                {
+                    WrongPasswordHandled::TryAgain => continue,
+                    WrongPasswordHandled::Reboot => {
+                        return Err(NmblError::OperatorChoseReboot {
+                            context: format!(
+                                "activation {} ({})",
+                                kind_label(activation.kind),
+                                activation.description,
+                            ),
+                        });
+                    }
+                    WrongPasswordHandled::ShellExited => {
+                        return Err(NmblError::WrongPasswordShellExited {
+                            context: format!(
+                                "activation {} ({})",
+                                kind_label(activation.kind),
+                                activation.description,
+                            ),
+                        });
+                    }
+                }
+            }
+
             return Err(exit_code_error(activation, outcome));
-        }
+        };
 
         let device_count = activation.produces_devices.len();
         let wait_operation = format!("phase 3: {} waiting for", kind_label(activation.kind));
@@ -222,6 +264,108 @@ fn exit_code_error(a: &Activation, outcome: ProcessOutcome) -> NmblError {
             source: std::io::Error::other(ctx.clone()),
             context: ctx,
         }),
+    }
+}
+
+/// Resolved outcome of [`handle_wrong_password`]. Distinct from
+/// [`crate::ui::WrongPasswordOutcome`] (the modal-level reply) because
+/// the helper also resolves the Shell sub-modal and actually drives
+/// the in-process shell session before returning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrongPasswordHandled {
+    /// Re-prompt for the passphrase and re-run cryptsetup.
+    TryAgain,
+    /// Operator picked [Reboot] on the wrong-password modal (or in the
+    /// shell sub-modal indirectly via Back from a re-shown modal — but
+    /// today only the wrong-password modal yields this directly).
+    Reboot,
+    /// Operator opened a recovery shell (Normal or Pretty) and the
+    /// shell has now exited. Caller turns this into
+    /// [`NmblError::WrongPasswordShellExited`] so the standard
+    /// emergency menu can surface and offer [Retry boot from config].
+    ShellExited,
+}
+
+/// Render the wrong-password modal, dispatch on the operator's choice,
+/// and — for the Shell branch — run the shell sub-modal + the chosen
+/// in-process shell session. Returns when the operator's choice has
+/// been fully resolved (modal closed; shell, if any, has exited).
+///
+/// Shell sub-modal returning [`crate::ui::ShellKind::Back`] loops back
+/// to the wrong-password modal so the operator can change their mind
+/// without re-running cryptsetup.
+fn handle_wrong_password(
+    config: &Config,
+    console: &mut dyn Console,
+    _activation: &Activation,
+    attempt: u32,
+) -> Result<WrongPasswordHandled> {
+    use crate::ui::{ShellKind, WrongPasswordOutcome, show_shell_kind_picker, show_wrong_password_modal};
+
+    loop {
+        match show_wrong_password_modal(console, attempt)? {
+            WrongPasswordOutcome::TryAgain => return Ok(WrongPasswordHandled::TryAgain),
+            WrongPasswordOutcome::Reboot => return Ok(WrongPasswordHandled::Reboot),
+            WrongPasswordOutcome::Shell => match show_shell_kind_picker(console)? {
+                ShellKind::Normal => {
+                    // Console-picker + multiplexed busybox PTY.
+                    // Errors are surfaced via a modal-error so the
+                    // wrong-password flow doesn't crash the boot — we
+                    // still want the operator to be able to retry.
+                    if let Err(e) =
+                        crate::ui::console_picker::run_picker_session(console, config)
+                    {
+                        let chain = crate::error::format_chain(&e as &dyn std::error::Error);
+                        crate::nmbl_warn!(
+                            "wrong-password shell-picker session failed: {chain}"
+                        );
+                        let _ = crate::ui::show_modal_error(
+                            console,
+                            "Emergency shell failed",
+                            &chain,
+                            std::time::Duration::from_secs(10),
+                        );
+                    }
+                    return Ok(WrongPasswordHandled::ShellExited);
+                }
+                #[cfg(feature = "image-splash")]
+                ShellKind::Pretty => {
+                    if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(console, config) {
+                        let chain = crate::error::format_chain(&e as &dyn std::error::Error);
+                        crate::nmbl_warn!("wrong-password pretty-shell failed: {chain}");
+                        let _ = crate::ui::show_modal_error(
+                            console,
+                            "Pretty Shell failed to start",
+                            &chain,
+                            std::time::Duration::from_secs(10),
+                        );
+                    }
+                    return Ok(WrongPasswordHandled::ShellExited);
+                }
+                #[cfg(not(feature = "image-splash"))]
+                ShellKind::Pretty => {
+                    // No splash feature: fall through to Normal shell so
+                    // the operator isn't stranded with a button that
+                    // does nothing.
+                    if let Err(e) =
+                        crate::ui::console_picker::run_picker_session(console, config)
+                    {
+                        let chain = crate::error::format_chain(&e as &dyn std::error::Error);
+                        crate::nmbl_warn!(
+                            "wrong-password shell-picker session failed: {chain}"
+                        );
+                        let _ = crate::ui::show_modal_error(
+                            console,
+                            "Emergency shell failed",
+                            &chain,
+                            std::time::Duration::from_secs(10),
+                        );
+                    }
+                    return Ok(WrongPasswordHandled::ShellExited);
+                }
+                ShellKind::Back => continue,
+            },
+        }
     }
 }
 

@@ -330,6 +330,13 @@ fn suggested_action(err: &NmblError) -> String {
         NmblError::OperatorAborted { .. } => {
             "You aborted the wait. Pick a different option.".to_string()
         }
+        NmblError::OperatorChoseReboot { .. } => {
+            "You picked Reboot on the wrong-password modal.".to_string()
+        }
+        NmblError::WrongPasswordShellExited { context } => format!(
+            "You dropped to a shell after a wrong passphrase ({context}). \
+             Pick [Retry boot from config] to re-prompt for the passphrase."
+        ),
     }
 }
 

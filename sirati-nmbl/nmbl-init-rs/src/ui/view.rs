@@ -480,6 +480,89 @@ pub fn render_modal_confirm(frame: &mut Frame<'_>, data: &ModalConfirmScreenData
     render_footer(frame, footer, data.hint);
 }
 
+/// State needed to render a three-button modal (used by the
+/// wrong-password retry flow and its shell sub-modal). The driver loop
+/// in `crate::ui::mod::show_modal_choice3` paints all three button
+/// labels and inverts whichever index `selected` points at.
+pub struct ModalChoice3ScreenData<'a> {
+    /// Short title shown on the modal's title bar.
+    pub title: &'a str,
+    /// Pre-formatted body text; rendered with `Wrap { trim: false }`.
+    pub message: &'a str,
+    /// Three bracketed button labels, painted left-to-right.
+    pub labels: [&'a str; 3],
+    /// Index in `labels` (0..=2) of the currently highlighted button;
+    /// values out of range are clamped to 0 by the renderer.
+    pub selected: usize,
+    /// Footer hint, typically "Left/Right select  Enter confirm  Esc …".
+    pub hint: &'a str,
+}
+
+/// Render a centred three-button modal over the body area. Mirrors the
+/// layout of [`render_modal_confirm`]: bordered modal on a fresh
+/// `Clear`, wrapped message above a button bar, footer hint underneath.
+pub fn render_modal_choice3(frame: &mut Frame<'_>, data: &ModalChoice3ScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    // 64 cols matches `render_modal_confirm`; height bumped to 10 to
+    // leave room for the longer "Wrong password (attempt N)" body.
+    let h = body.height.saturating_div(2).max(10);
+    let modal = centered_rect(body, 64, h);
+    frame.render_widget(Clear, modal);
+
+    let block = Block::bordered().title(data.title.to_owned());
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    if inner.height == 0 {
+        render_footer(frame, footer, data.hint);
+        return;
+    }
+
+    let button_row_h: u16 = 1;
+    let msg_h = inner.height.saturating_sub(button_row_h);
+    let msg_rect = Rect::new(inner.x, inner.y, inner.width, msg_h);
+    let btn_rect = Rect::new(
+        inner.x,
+        inner.y.saturating_add(msg_h),
+        inner.width,
+        button_row_h,
+    );
+
+    let msg_para =
+        Paragraph::new(Text::from(data.message.to_owned())).wrap(Wrap { trim: false });
+    frame.render_widget(msg_para, msg_rect);
+
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
+    let unselected_style = Style::default();
+    let selected = data.selected.min(2);
+    let style_for = |i: usize| {
+        if i == selected {
+            selected_style
+        } else {
+            unselected_style
+        }
+    };
+    // labels has exactly three slots; `.get(i)` keeps the `indexing_slicing`
+    // lint happy without needing a per-call allow attribute.
+    let label = |i: usize| data.labels.get(i).copied().unwrap_or("");
+    let line = Line::from(vec![
+        Span::styled(format!("[{}]", label(0)), style_for(0)),
+        Span::raw("  "),
+        Span::styled(format!("[{}]", label(1)), style_for(1)),
+        Span::raw("  "),
+        Span::styled(format!("[{}]", label(2)), style_for(2)),
+    ]);
+    let buttons = Paragraph::new(line).alignment(Alignment::Center);
+    frame.render_widget(buttons, btn_rect);
+
+    render_footer(frame, footer, data.hint);
+}
+
 /// State needed to render a transient modal-error dialog (used by the
 /// pretty-shell path when openpty / fork / mount fails so the operator
 /// sees what happened instead of a stale "boot failed" panel underneath).
