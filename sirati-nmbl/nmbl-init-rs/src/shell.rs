@@ -403,6 +403,13 @@ fn suggested_action(err: &NmblError) -> String {
             "You dropped to a shell after a wrong passphrase ({context}). \
              Pick [Retry boot from config] to re-prompt for the passphrase."
         ),
+        NmblError::StateTooLarge { encoded_len, max } => format!(
+            "state.bin payload {encoded_len} bytes overflowed the {max} byte slot — installer bug."
+        ),
+        NmblError::StateRoundtripMismatch { path } => format!(
+            "state.bin at {} did not round-trip through encode/decode; refusing to overwrite.",
+            path.display()
+        ),
     }
 }
 
