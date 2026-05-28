@@ -49,6 +49,7 @@ pub mod reporter;
 #[cfg(feature = "network-rescue")]
 pub mod rescue;
 pub mod timeout;
+pub mod tty_enum;
 pub mod view;
 
 use std::io::{BufRead, Write};

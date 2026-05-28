@@ -114,20 +114,39 @@ pub fn drop_to_emergency(
                 return TerminalAction::Reboot;
             }
             EmergencyChoice::RawShell => {
-                if let Err(e) =
-                    crate::ui::console_picker::run_picker_session(&mut *console, config)
-                {
-                    let chain = format_chain(&e as &dyn std::error::Error);
-                    nmbl_warn!("emergency-shell picker session failed: {chain}");
-                    let _ = crate::ui::show_modal_error(
-                        &mut *console,
-                        "Emergency shell failed",
-                        &chain,
-                        std::time::Duration::from_secs(10),
-                    );
+                match crate::ui::console_picker::run_picker_session(&mut *console, config) {
+                    Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached {
+                        targets,
+                    }) => {
+                        // Fire-and-forget regime: tell the operator
+                        // their shell(s) have been started elsewhere
+                        // so they don't wonder why the menu re-appeared
+                        // unchanged. show_modal_error renders a
+                        // press-any-key modal; we reuse it because the
+                        // shape (single screen-size modal with body
+                        // text + dismiss hint) is exactly what we need.
+                        let body = format_detached_targets(&targets);
+                        let _ = crate::ui::show_modal_error(
+                            &mut *console,
+                            "Shell spawned",
+                            &body,
+                            std::time::Duration::from_secs(5),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let chain = format_chain(&e as &dyn std::error::Error);
+                        nmbl_warn!("emergency-shell picker session failed: {chain}");
+                        let _ = crate::ui::show_modal_error(
+                            &mut *console,
+                            "Emergency shell failed",
+                            &chain,
+                            std::time::Duration::from_secs(10),
+                        );
+                    }
                 }
-                // Picker session done (shell exited or cancelled);
-                // re-show the emergency menu.
+                // Picker session done (shell exited, detached, or
+                // cancelled); re-show the emergency menu.
                 continue;
             }
             #[cfg(feature = "image-splash")]
@@ -254,6 +273,19 @@ pub fn print_halt_banner(cause: &NmblError) {
         eprintln!("  {line}");
     }
     eprintln!("{separator}");
+}
+
+/// Render the "Shell spawned on …" body for the fire-and-forget
+/// success modal. Single target → `Shell spawned on /dev/X`; multiple
+/// → comma-separated. Keeps the message single-line so the modal stays
+/// readable on serial.
+fn format_detached_targets(targets: &[std::path::PathBuf]) -> String {
+    let joined = targets
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Shell spawned on {joined}")
 }
 
 /// Pick the modal title shown when an emergency action returns an
