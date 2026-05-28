@@ -426,20 +426,9 @@ in
             # bring-up falls back to "console unavailable". These
             # belong in `earlyKernelModules` so they load in phase 2a,
             # before `open_console` reaches for the DRM card.
-            #
-            # Keyboard driver chain: QEMU's q35 machine emulates a PS/2
-            # keyboard via i8042; without `i8042` + `atkbd` the kernel
-            # never registers an input device, the VT keyboard layer
-            # has nothing to demultiplex from, and every VNC keypress
-            # silently lands in the bit bucket. The `atkbd` chain
-            # surfaced this in the key-echo diagnostic harness: bytes
-            # never reached SplashInput::poll because the kernel
-            # never produced any.
             earlyKernelModules = [
               "virtio_pci"
               "virtio_gpu"
-              "i8042"
-              "atkbd"
             ];
             kernelModules = [ ];
             mountPrefix = "/mnt";
@@ -464,16 +453,12 @@ in
           ];
 
           # Minimal kernel-module set: just enough to bring up the
-          # framebuffer + DRI for the splash + the PS/2 keyboard
-          # chain so VNC keystrokes actually reach the splash input
-          # layer. virtio_blk is harmless filler (the VM has no
-          # -drive but matches other tests).
+          # framebuffer + DRI for the splash. virtio_blk is harmless
+          # filler (the VM has no -drive but matches other tests).
           boot.initrd.availableKernelModules = [
             "virtio_gpu"
             "virtio_pci"
             "virtio_blk"
-            "i8042"
-            "atkbd"
           ];
           boot.initrd.kernelModules = [ ];
 
