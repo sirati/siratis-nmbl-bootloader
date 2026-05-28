@@ -73,6 +73,13 @@ pub fn run_all_activations(
     }
 
     let loaded = loaded_modules()?;
+    // Gate the verifying spinner OUT entirely on serial: ratatui-style
+    // renders on a UART flood the line with cursor/colour escape
+    // sequences and risk starving cryptsetup's stdin reader. The serial
+    // UX matches every distro's: plaintext prompt, then silence until
+    // kexec or error. See `passphrase_prompt_on_console` for the
+    // matching gate on the *input* side.
+    let serial_console = config.general.serial_console;
 
     for activation in &config.activations {
         let _ = reporter.set_phase(format!(
@@ -111,7 +118,12 @@ pub fn run_all_activations(
             // pressing Enter and the unlock result. Other activation
             // kinds (LVM, mdraid, …) keep the simpler blocking `run`.
             let outcome = if activation.kind == ActivationKind::LuksPassword {
-                run_luks_with_spinner(activation, stdin_slice, &mut *reporter.console)?
+                run_luks_with_spinner(
+                    activation,
+                    stdin_slice,
+                    &mut *reporter.console,
+                    serial_console,
+                )?
             } else {
                 run(&activation.binary, &activation.argv, stdin_slice)
                     .map_err(|source| wrap_runner_error(activation, source))?
@@ -248,11 +260,32 @@ fn collect_stdin(
 /// overlaid. We do NOT share state with the supplier's App (which was
 /// consumed inside `collect_stdin`) — a fresh App is cheaper than
 /// threading a mutable reference through the supplier trait.
+///
+/// When `serial_console` is `true` the spinner is bypassed entirely:
+/// the verifying-state ratatui render would flood the UART with cursor
+/// and colour escape sequences (`[?25l`, `[H`, `[m`, …) at ~6.7 Hz and
+/// has been observed to starve cryptsetup's stdin reader so a forwarded
+/// passphrase never advances the unlock. On serial we just block on
+/// the child via [`run`] — the operator already saw the plaintext
+/// "Enter LUKS passphrase:" line and now sees silence until kexec or
+/// error, which matches every other Linux distro's serial LUKS UX.
 fn run_luks_with_spinner(
     activation: &Activation,
     stdin_slice: Option<&[u8]>,
     console: &mut dyn Console,
+    serial_console: bool,
 ) -> Result<ProcessOutcome> {
+    if serial_console {
+        // Serial gate: no ratatui frames, no per-tick render. The
+        // `console` handle is intentionally untouched — the serial
+        // backend has already printed the prompt via stdout in
+        // `serial_passphrase_prompt`, and the child inherits the same
+        // stdout for its own diagnostics.
+        let _ = console;
+        return run(&activation.binary, &activation.argv, stdin_slice)
+            .map_err(|source| wrap_runner_error(activation, source));
+    }
+
     let label = activation
         .prompt_label
         .as_deref()
@@ -555,6 +588,44 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
     /// supplier trait without bringing up a real backend.
     struct NoopConsole;
 
+    /// Counting [`Console`] that records how many times [`render`] was
+    /// invoked. Used to assert the serial-gate in
+    /// [`run_luks_with_spinner`] never paints a frame.
+    struct CountingConsole {
+        renders: u32,
+    }
+
+    impl Console for CountingConsole {
+        fn render(&mut self, _app: &crate::ui::app::App<'_>) -> Result<()> {
+            self.renders = self.renders.saturating_add(1);
+            Ok(())
+        }
+        fn poll_key(
+            &mut self,
+            _timeout: Duration,
+        ) -> Result<Option<crossterm::event::KeyEvent>> {
+            Ok(None)
+        }
+        fn size(&self) -> (u16, u16) {
+            (80, 24)
+        }
+        fn kind(&self) -> crate::ui::console::ConsoleKind {
+            crate::ui::console::ConsoleKind::Tty
+        }
+        fn draw_with(
+            &mut self,
+            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn suspend(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     impl Console for NoopConsole {
         fn render(&mut self, _app: &crate::ui::app::App<'_>) -> Result<()> {
             Ok(())
@@ -630,5 +701,77 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
         assert!(!is_activation_success(2));
         assert!(!is_activation_success(1));
         assert!(!is_activation_success(127));
+    }
+
+    /// Locate a binary on disk via `PATH`. Mirrors the `which` helper
+    /// in `sys::activation::tests` so these tests stay self-contained
+    /// without leaking PATH parsing into production code.
+    fn which(name: &str) -> Option<PathBuf> {
+        let path_env = std::env::var_os("PATH")?;
+        for dir in std::env::split_paths(&path_env) {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    fn make_activation(binary: PathBuf) -> Activation {
+        Activation {
+            kind: ActivationKind::LuksPassword,
+            required_modules: Vec::new(),
+            binary,
+            argv: Vec::new(),
+            produces_devices: Vec::new(),
+            description: "test luks-password".to_string(),
+            prompt_label: Some("Unlock root".to_string()),
+            pass_to_stage1: None,
+        }
+    }
+
+    #[test]
+    fn serial_console_skips_spinner_render() {
+        // serial_console = true must NOT enter the spinner-tick loop:
+        // no console.render call before, during, or after the child.
+        // The child still runs (here, `true`, exits 0), so the
+        // outcome matches a plain `run` invocation.
+        let Some(bin) = which("true") else {
+            eprintln!("skipping: `true` not found on PATH");
+            return;
+        };
+        let activation = make_activation(bin);
+        let mut console = CountingConsole { renders: 0 };
+        let outcome = run_luks_with_spinner(&activation, None, &mut console, true)
+            .expect("run with serial gate");
+        assert_eq!(outcome.exit_code, 0);
+        assert!(outcome.normal_exit);
+        assert_eq!(
+            console.renders, 0,
+            "serial gate must not invoke console.render at all",
+        );
+    }
+
+    #[test]
+    fn tty_console_paints_initial_verifying_frame() {
+        // serial_console = false: the existing behaviour is preserved.
+        // The function paints at least the pre-fork verifying frame
+        // and a post-child cleanup frame. We don't count exact ticks
+        // (the child exits faster than the 150 ms cadence on `true`)
+        // but we DO require at least one render, which proves the
+        // spinner branch is still wired up.
+        let Some(bin) = which("true") else {
+            eprintln!("skipping: `true` not found on PATH");
+            return;
+        };
+        let activation = make_activation(bin);
+        let mut console = CountingConsole { renders: 0 };
+        let outcome = run_luks_with_spinner(&activation, None, &mut console, false)
+            .expect("run without serial gate");
+        assert_eq!(outcome.exit_code, 0);
+        assert!(
+            console.renders >= 1,
+            "non-serial path must paint at least the initial verifying frame",
+        );
     }
 }
