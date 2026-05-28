@@ -58,13 +58,11 @@ pub enum Decision {
 pub enum EmergencyChoice {
     /// Reboot the machine via `reboot(RB_AUTOBOOT)`.
     Reboot,
-    /// Drop to the configured emergency shell.
-    Shell,
     /// Stay inside NMBL and host an emulated terminal inside the
-    /// existing ratatui chrome. Unlike [`EmergencyChoice::Shell`] this
-    /// does NOT `execve(2)` — NMBL keeps PID 1 and pumps bytes between
-    /// the operator's keystrokes and a forked shell on a PTY. When the
-    /// shell exits, control returns to the emergency screen.
+    /// existing ratatui chrome. Unlike [`EmergencyChoice::RawShell`]
+    /// this does NOT `execve(2)` — NMBL keeps PID 1 and pumps bytes
+    /// between the operator's keystrokes and a forked shell on a PTY.
+    /// When the shell exits, control returns to the emergency screen.
     ///
     /// Gated behind the `image-splash` feature because the terminal
     /// emulator reuses `alacritty_terminal` (already an optional dep
@@ -72,8 +70,17 @@ pub enum EmergencyChoice {
     /// way to render an ANSI grid and would either need a private
     /// terminal emulator (forbidden by the no-reimplement rule) or a
     /// degraded plain-text mode that defeats the purpose.
+    ///
+    /// Pretty Shell is the preferred default whenever the feature is
+    /// compiled in; it sits at the top of the shell options on the
+    /// emergency picker, with the raw busybox-on-tty fallback below it.
     #[cfg(feature = "image-splash")]
     PrettyShell,
+    /// Drop to the configured emergency shell on a raw tty via the
+    /// console picker + multiplexed busybox PTY relay. Kept available
+    /// even when `image-splash` is on so operators can fall back when
+    /// the terminal emulator misbehaves.
+    RawShell,
     /// Re-run the full normal boot path (phases 3, 3b, 4, 5) from the
     /// emergency screen. Use case: a transient activation failure
     /// (network mount times out, USB key not seated) that the operator
@@ -375,15 +382,30 @@ impl<'a> App<'a> {
                     false
                 }
             }
-            // Hotkeys: 'r' for reboot, 's' for shell. Operators in a
-            // boot-failure scenario tend to be muscle-memory typing one
-            // of those two letters.
+            // Hotkeys: 'r' for reboot, 'p' for Pretty Shell (when
+            // compiled in), 's' for the raw shell, 't' for reTry boot,
+            // 'v' for Verify kexec readiness. Operators in a boot-
+            // failure scenario tend to be muscle-memory typing one of
+            // these letters; we commit straight away on the first key.
             KeyCode::Char('r') => {
                 *chosen = Some(EmergencyChoice::Reboot);
                 true
             }
+            #[cfg(feature = "image-splash")]
+            KeyCode::Char('p') => {
+                *chosen = Some(EmergencyChoice::PrettyShell);
+                true
+            }
             KeyCode::Char('s') => {
-                *chosen = Some(EmergencyChoice::Shell);
+                *chosen = Some(EmergencyChoice::RawShell);
+                true
+            }
+            KeyCode::Char('t') => {
+                *chosen = Some(EmergencyChoice::RetryBoot);
+                true
+            }
+            KeyCode::Char('v') => {
+                *chosen = Some(EmergencyChoice::VerifyKexecReadiness);
                 true
             }
             KeyCode::Esc => {
@@ -906,8 +928,8 @@ mod tests {
                     choice: EmergencyChoice::Reboot,
                 },
                 EmergencyItem {
-                    label: "Shell",
-                    choice: EmergencyChoice::Shell,
+                    label: "Raw Shell",
+                    choice: EmergencyChoice::RawShell,
                 },
             ],
             selected: 0,
@@ -960,11 +982,11 @@ mod tests {
         assert!(app.on_key(press(KeyCode::Enter)));
         assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::Reboot));
 
-        // selected=1 -> Shell.
+        // selected=1 -> RawShell.
         let mut app = emergency_app();
         assert!(!app.on_key(press(KeyCode::Down)));
         assert!(app.on_key(press(KeyCode::Enter)));
-        assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::Shell));
+        assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::RawShell));
     }
 
     #[test]
@@ -989,7 +1011,29 @@ mod tests {
 
         let mut app = emergency_app();
         assert!(app.on_key(press(KeyCode::Char('s'))));
-        assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::Shell));
+        assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::RawShell));
+    }
+
+    #[cfg(feature = "image-splash")]
+    #[test]
+    fn emergency_hotkey_p_commits_pretty_shell() {
+        let mut app = emergency_app();
+        assert!(app.on_key(press(KeyCode::Char('p'))));
+        assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::PrettyShell));
+    }
+
+    #[test]
+    fn emergency_hotkeys_t_and_v_commit_retry_and_verify() {
+        let mut app = emergency_app();
+        assert!(app.on_key(press(KeyCode::Char('t'))));
+        assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::RetryBoot));
+
+        let mut app = emergency_app();
+        assert!(app.on_key(press(KeyCode::Char('v'))));
+        assert_eq!(
+            emergency_state(&app).1,
+            Some(EmergencyChoice::VerifyKexecReadiness)
+        );
     }
 
     #[test]
