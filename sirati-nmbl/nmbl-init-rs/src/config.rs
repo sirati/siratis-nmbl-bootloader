@@ -54,6 +54,14 @@ pub struct General {
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u32,
 
+    /// Per-device readiness budget (seconds) used while waiting for a
+    /// `fileSystems[].device` to appear during mount, and while waiting
+    /// for cryptsetup / LVM / mdraid activations to materialise their
+    /// produced block devices. Honoured by `devices::wait_for` at every
+    /// call site.
+    #[serde(default = "default_device_timeout_secs")]
+    pub device_timeout_secs: u64,
+
     #[serde(default = "default_panic_report_dir")]
     pub panic_report_dir: PathBuf,
 
@@ -66,6 +74,7 @@ impl Default for General {
         Self {
             verbosity: Verbosity::default(),
             timeout_secs: default_timeout_secs(),
+            device_timeout_secs: default_device_timeout_secs(),
             panic_report_dir: default_panic_report_dir(),
             serial_console: false,
         }
@@ -74,6 +83,10 @@ impl Default for General {
 
 fn default_timeout_secs() -> u32 {
     5
+}
+
+fn default_device_timeout_secs() -> u64 {
+    30
 }
 
 fn default_panic_report_dir() -> PathBuf {
@@ -627,6 +640,23 @@ mod tests {
         let c = config_with(vec![fs_entry("PARTUUID=abc-123", "/data")]);
         c.validate()
             .expect_err("PARTUUID= short form must be rejected");
+    }
+
+    #[test]
+    fn device_timeout_secs_defaults_to_thirty_when_absent() {
+        // External TOMLs predating the knob must keep parsing cleanly
+        // and observe the historic 30 s budget so the boot UX doesn't
+        // silently regress on upgrade.
+        let toml_text = "[general]\ntimeout_secs = 3\n";
+        let config: Config = toml::from_str(toml_text).expect("config must parse");
+        assert_eq!(config.general.device_timeout_secs, 30);
+    }
+
+    #[test]
+    fn device_timeout_secs_is_honoured_when_present() {
+        let toml_text = "[general]\ndevice_timeout_secs = 90\n";
+        let config: Config = toml::from_str(toml_text).expect("config must parse");
+        assert_eq!(config.general.device_timeout_secs, 90);
     }
 
     #[cfg(feature = "image-splash")]
