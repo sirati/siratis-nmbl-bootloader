@@ -37,12 +37,49 @@ pub struct Config {
     #[serde(default)]
     pub emergency_shell: EmergencyShellConfig,
 
+    /// Top-level `[stateful]` table that gates the rollback flow. Absent
+    /// in non-stateful builds and in stateful builds whose Nix config did
+    /// not enable `boot.nmbl.stateful.enable`. When `Some`, the boot-time
+    /// dispatcher reads `state.bin` and consults
+    /// [`crate::state::decide`].
+    #[cfg(feature = "stateful")]
+    #[serde(default)]
+    pub stateful: Option<StatefulConfig>,
+
     /// Populated by Phase 0.5 with the runtime mountpoint of the boot
     /// partition. `None` in legacy embedded-config mode. Never parsed
     /// from TOML — `#[serde(skip)]` keeps it out of the wire schema and
     /// makes [`Default for Config`] supply `None` automatically.
     #[serde(skip)]
     pub runtime_boot_mountpoint: Option<PathBuf>,
+
+    /// Populated by Phase 0.5 when the bootstrap TOML carries a
+    /// `[bootstrap.state]` section. Holds the RW twin mountpoint of the
+    /// boot filesystem so `select_and_act` can resolve `state.bin` and
+    /// the kexec teardown can detach the mount before handoff. `None`
+    /// when the operator has not opted into stateful storage.
+    #[cfg(feature = "stateful")]
+    #[serde(skip)]
+    pub runtime_state_mountpoint: Option<PathBuf>,
+}
+
+/// `[stateful]` section. Required fields have no Rust defaults — the
+/// Nix side enforces the operator-facing defaults so a typo'd TOML
+/// fails parsing instead of silently picking a value.
+#[cfg(feature = "stateful")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StatefulConfig {
+    /// Maximum number of consecutive failed boots before the rollback
+    /// loop gives up and surfaces a rescue condition.
+    pub max_recovery_attempts: u32,
+
+    /// systemd target whose `Reached` signal flips the
+    /// `last_boot_succeeded` flag. Not consumed by NMBL at boot time —
+    /// the systemd unit (Phase 5) runs `nmbl-init --boot-succeeded`
+    /// after this target is reached — but parsed and stored so future
+    /// boot-time consumers can read the same source of truth.
+    pub success_target: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -413,7 +450,11 @@ impl Config {
             splash: Splash::default(),
             rescue: RescueConfig::default(),
             emergency_shell: EmergencyShellConfig::default(),
+            #[cfg(feature = "stateful")]
+            stateful: None,
             runtime_boot_mountpoint: None,
+            #[cfg(feature = "stateful")]
+            runtime_state_mountpoint: None,
         }
     }
 }
@@ -1201,6 +1242,55 @@ mystery        = "boom"
         // must be rejected as an unknown field by `deny_unknown_fields`.
         let toml = r#"runtime_boot_mountpoint = "/mnt/boot""#;
         toml::from_str::<Config>(toml).expect_err("runtime_boot_mountpoint is runtime-only");
+    }
+
+    #[cfg(feature = "stateful")]
+    #[test]
+    fn stateful_section_absent_decodes_to_none() {
+        // Configs that predate the stateful knob must still parse and
+        // produce `stateful = None`; the rollback flow only engages when
+        // the operator opts in.
+        let toml = "[general]\ntimeout_secs = 3\n";
+        let cfg: Config = toml::from_str(toml).expect("config must parse");
+        assert!(cfg.stateful.is_none());
+    }
+
+    #[cfg(feature = "stateful")]
+    #[test]
+    fn stateful_section_present_parses_required_fields() {
+        let toml = r#"
+[stateful]
+max_recovery_attempts = 5
+success_target        = "multi-user.target"
+"#;
+        let cfg: Config = toml::from_str(toml).expect("[stateful] must parse");
+        let s = cfg.stateful.expect("stateful should be Some");
+        assert_eq!(s.max_recovery_attempts, 5);
+        assert_eq!(s.success_target, "multi-user.target");
+    }
+
+    #[cfg(feature = "stateful")]
+    #[test]
+    fn stateful_section_rejects_unknown_field() {
+        let toml = r#"
+[stateful]
+max_recovery_attempts = 5
+success_target        = "multi-user.target"
+mystery               = "boom"
+"#;
+        let err = toml::from_str::<Config>(toml)
+            .expect_err("unknown field in [stateful] must be rejected");
+        assert!(err.to_string().contains("mystery"), "{err}");
+    }
+
+    #[cfg(feature = "stateful")]
+    #[test]
+    fn stateful_section_requires_max_recovery_attempts() {
+        let toml = r#"
+[stateful]
+success_target = "multi-user.target"
+"#;
+        toml::from_str::<Config>(toml).expect_err("missing max_recovery_attempts must reject");
     }
 
     #[test]

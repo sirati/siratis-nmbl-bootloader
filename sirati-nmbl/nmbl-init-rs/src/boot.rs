@@ -217,6 +217,16 @@ pub fn kexec_into(
     // so reverse_mount_targets already covers it. detaching twice gets
     // EINVAL on the second call ("not a mount point").
     let mut already: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // Detach the stateful RW twin first when present — it sits "above"
+    // the operator's filesystems in mount order (mounted in phase 0.5
+    // after boot_fs but before phases 1+), so it must come off before
+    // anything else in the reverse-mount sweep below.
+    #[cfg(feature = "stateful")]
+    if let Some(state_mp) = config.runtime_state_mountpoint.as_deref()
+        && already.insert(state_mp.to_path_buf())
+    {
+        detach(state_mp);
+    }
     for target in reverse_mount_targets(config) {
         if already.insert(target.clone()) {
             detach(&target);
