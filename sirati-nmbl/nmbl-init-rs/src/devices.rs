@@ -187,7 +187,15 @@ pub fn mount_system_filesystems(
     // wait_for loop below — disko-style configs reference paths
     // under /dev/disk/by-*, and waiting for a symlink we'll never
     // create just burns the 30 s budget.
-    crate::sys::blkid::populate_disk_by_symlinks()?;
+    let btrfs_devs = crate::sys::blkid::populate_disk_by_symlinks()?;
+
+    // Issue BTRFS_IOC_SCAN_DEV on every btrfs member found by blkid so
+    // the kernel assembles multi-device btrfs filesystems (RAID0/RAID1)
+    // before mount(2) is called. Without this, mount fails with
+    // "devid N uuid ... is missing" when only the first member is known.
+    if !btrfs_devs.is_empty() {
+        crate::sys::btrfs::scan_devices(&btrfs_devs)?;
+    }
 
     for entry in &config.filesystems {
         let dev = Path::new(&entry.device);
