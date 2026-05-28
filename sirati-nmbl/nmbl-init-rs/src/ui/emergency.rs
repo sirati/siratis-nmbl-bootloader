@@ -75,31 +75,31 @@ fn build_message(err: &NmblError) -> String {
 /// default if the operator just presses Enter, and it's what the
 /// timeout rolls over to.
 ///
-/// `Pretty Shell` is inserted between `Shell` and the retry/verify
-/// items only when the `image-splash` Cargo feature is compiled in —
-/// it depends on the `alacritty_terminal` parser which is only an
-/// optional dep of that feature. The `Retry boot from config` and
-/// `Verify kexec readiness` actions are unconditional: they only need
-/// the existing phase 3/4/5 plumbing already in the binary.
+/// `Pretty Shell` is inserted between `Reboot` and `Raw Shell` only
+/// when the `image-splash` Cargo feature is compiled in — it depends
+/// on the `alacritty_terminal` parser which is only an optional dep of
+/// that feature. When the feature is on Pretty Shell is the preferred
+/// recovery shell; the raw busybox-on-tty path sits below it as a
+/// fallback. The `Retry boot from config` and `Verify kexec readiness`
+/// actions are unconditional: they only need the existing phase 3/4/5
+/// plumbing already in the binary.
 fn default_items() -> Vec<EmergencyItem> {
     // `mut` is conditionally used (the `insert` below is feature-gated);
     // suppress the unused_mut warning on no-feature builds without
     // duplicating the vec literal.
     #[cfg_attr(not(feature = "image-splash"), allow(unused_mut))]
-    let mut items = vec![
-        EmergencyItem {
-            label: "Reboot",
-            choice: EmergencyChoice::Reboot,
-        },
-        EmergencyItem {
-            label: "Shell",
-            choice: EmergencyChoice::Shell,
-        },
-    ];
+    let mut items = vec![EmergencyItem {
+        label: "Reboot",
+        choice: EmergencyChoice::Reboot,
+    }];
     #[cfg(feature = "image-splash")]
     items.push(EmergencyItem {
         label: "Pretty Shell",
         choice: EmergencyChoice::PrettyShell,
+    });
+    items.push(EmergencyItem {
+        label: "Raw Shell",
+        choice: EmergencyChoice::RawShell,
     });
     items.push(EmergencyItem {
         label: "Retry boot from config",
@@ -315,18 +315,20 @@ mod tests {
 
     #[test]
     fn drive_emergency_loop_returns_selected_on_enter() {
-        // Move down once, press Enter. Expected choice: Shell.
-        // The clock never advances, so the timeout never fires.
+        // Press the 's' hotkey to commit the Raw Shell entry. The
+        // hotkey path is feature-independent, so this test stays
+        // stable whether or not `image-splash` adds a Pretty Shell row
+        // between the Reboot and Raw Shell rows in default_items. The
+        // clock never advances, so the timeout never fires.
         let start = Instant::now();
         let frozen_now = move || start;
 
         let mut app = build_emergency_app("boot failed", &default_items());
-        let mut console =
-            TestConsole::new(vec![Some(press(KeyCode::Down)), Some(press(KeyCode::Enter))]);
+        let mut console = TestConsole::new(vec![Some(press(KeyCode::Char('s')))]);
 
         let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
             .expect("loop must not error on the happy path");
-        assert_eq!(outcome, EmergencyChoice::Shell);
+        assert_eq!(outcome, EmergencyChoice::RawShell);
     }
 
     #[test]
@@ -399,25 +401,38 @@ mod tests {
         // surprising behaviour. Pin the contract here.
         let items = default_items();
         assert_eq!(items[0].choice, EmergencyChoice::Reboot);
-        assert_eq!(items[1].choice, EmergencyChoice::Shell);
+        // With `image-splash` the Pretty Shell entry sits at index 1
+        // and the Raw Shell entry at index 2; without the feature the
+        // Raw Shell entry falls back to index 1.
+        #[cfg(feature = "image-splash")]
+        {
+            assert_eq!(items[1].choice, EmergencyChoice::PrettyShell);
+            assert_eq!(items[2].choice, EmergencyChoice::RawShell);
+        }
+        #[cfg(not(feature = "image-splash"))]
+        {
+            assert_eq!(items[1].choice, EmergencyChoice::RawShell);
+        }
     }
 
     #[test]
     fn default_items_includes_retry_and_verify_in_order() {
         // The dispatcher in `shell.rs` matches on these variants by
         // name; the order pinned here is what the operator actually
-        // sees on the picker. Reboot and Shell come first (muscle-
-        // memory), then PrettyShell (feature-gated), then RetryBoot,
-        // then VerifyKexecReadiness — most-destructive to least-
-        // destructive, so a stray Enter on the default doesn't kick
-        // off an in-process retry the operator didn't want.
+        // sees on the picker. Reboot comes first (muscle-memory + the
+        // 30s timeout default), then Pretty Shell (feature-gated, the
+        // preferred recovery shell when available), then Raw Shell,
+        // then RetryBoot, then VerifyKexecReadiness — most-destructive
+        // to least-destructive, so a stray Enter on the default
+        // doesn't kick off an in-process retry the operator didn't
+        // want.
         let items = default_items();
         let choices: Vec<EmergencyChoice> = items.iter().map(|it| it.choice).collect();
 
-        let mut expected: Vec<EmergencyChoice> =
-            vec![EmergencyChoice::Reboot, EmergencyChoice::Shell];
+        let mut expected: Vec<EmergencyChoice> = vec![EmergencyChoice::Reboot];
         #[cfg(feature = "image-splash")]
         expected.push(EmergencyChoice::PrettyShell);
+        expected.push(EmergencyChoice::RawShell);
         expected.push(EmergencyChoice::RetryBoot);
         expected.push(EmergencyChoice::VerifyKexecReadiness);
 
