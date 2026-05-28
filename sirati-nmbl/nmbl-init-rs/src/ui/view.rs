@@ -480,28 +480,28 @@ pub fn render_modal_confirm(frame: &mut Frame<'_>, data: &ModalConfirmScreenData
     render_footer(frame, footer, data.hint);
 }
 
-/// State needed to render a three-button modal (used by the
-/// wrong-password retry flow and its shell sub-modal). The driver loop
-/// in `crate::ui::mod::show_modal_choice3` paints all three button
-/// labels and inverts whichever index `selected` points at.
-pub struct ModalChoice3ScreenData<'a> {
+/// State needed to render an N-button modal (used by the
+/// wrong-password retry flow). The driver loop in
+/// `crate::ui::mod::show_wrong_password_modal` paints every button
+/// label in order and inverts whichever index `selected` points at.
+pub struct ModalButtonsScreenData<'a> {
     /// Short title shown on the modal's title bar.
     pub title: &'a str,
     /// Pre-formatted body text; rendered with `Wrap { trim: false }`.
     pub message: &'a str,
-    /// Three bracketed button labels, painted left-to-right.
-    pub labels: [&'a str; 3],
-    /// Index in `labels` (0..=2) of the currently highlighted button;
-    /// values out of range are clamped to 0 by the renderer.
+    /// Bracketed button labels, painted left-to-right.
+    pub labels: &'a [&'a str],
+    /// Index in `labels` of the currently highlighted button; values
+    /// out of range are clamped to the last legal index by the renderer.
     pub selected: usize,
     /// Footer hint, typically "Left/Right select  Enter confirm  Esc …".
     pub hint: &'a str,
 }
 
-/// Render a centred three-button modal over the body area. Mirrors the
+/// Render a centred N-button modal over the body area. Mirrors the
 /// layout of [`render_modal_confirm`]: bordered modal on a fresh
 /// `Clear`, wrapped message above a button bar, footer hint underneath.
-pub fn render_modal_choice3(frame: &mut Frame<'_>, data: &ModalChoice3ScreenData<'_>) {
+pub fn render_modal_buttons(frame: &mut Frame<'_>, data: &ModalButtonsScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
 
@@ -539,7 +539,8 @@ pub fn render_modal_choice3(frame: &mut Frame<'_>, data: &ModalChoice3ScreenData
         .bg(Color::Gray)
         .add_modifier(Modifier::BOLD);
     let unselected_style = Style::default();
-    let selected = data.selected.min(2);
+    let last_idx = data.labels.len().saturating_sub(1);
+    let selected = data.selected.min(last_idx);
     let style_for = |i: usize| {
         if i == selected {
             selected_style
@@ -547,17 +548,14 @@ pub fn render_modal_choice3(frame: &mut Frame<'_>, data: &ModalChoice3ScreenData
             unselected_style
         }
     };
-    // labels has exactly three slots; `.get(i)` keeps the `indexing_slicing`
-    // lint happy without needing a per-call allow attribute.
-    let label = |i: usize| data.labels.get(i).copied().unwrap_or("");
-    let line = Line::from(vec![
-        Span::styled(format!("[{}]", label(0)), style_for(0)),
-        Span::raw("  "),
-        Span::styled(format!("[{}]", label(1)), style_for(1)),
-        Span::raw("  "),
-        Span::styled(format!("[{}]", label(2)), style_for(2)),
-    ]);
-    let buttons = Paragraph::new(line).alignment(Alignment::Center);
+    let mut spans: Vec<Span<'_>> = Vec::with_capacity(data.labels.len().saturating_mul(2));
+    for (i, label) in data.labels.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(format!("[{label}]"), style_for(i)));
+    }
+    let buttons = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
     frame.render_widget(buttons, btn_rect);
 
     render_footer(frame, footer, data.hint);

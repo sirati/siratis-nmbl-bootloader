@@ -338,7 +338,7 @@ pub enum PickerSessionOutcome {
 ///
 /// The function NEVER produces a [`crate::terminal::TerminalAction`]:
 /// NMBL stays at PID 1 throughout. This is the deliberate departure
-/// from the legacy `EmergencyChoice::Shell` -> execve path.
+/// from the legacy `EmergencyChoice::RawShell` -> execve path.
 pub fn run_picker_session(
     console: &mut dyn Console,
     config: &Config,

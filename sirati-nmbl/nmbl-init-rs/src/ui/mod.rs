@@ -131,23 +131,15 @@ pub enum WrongPasswordOutcome {
     /// to [`crate::terminal::TerminalAction::Reboot`] without dropping
     /// to the emergency menu.
     Reboot,
-    /// Operator picked [Shell]; the caller opens the shell sub-modal
-    /// (Normal / Pretty) and runs the chosen session.
-    Shell,
-}
-
-/// Shell flavour picked from the wrong-password modal's sub-prompt.
-/// Mirrors the two interactive shell paths the emergency menu offers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShellKind {
-    /// Console-picker + multiplexed busybox PTY (always available).
-    Normal,
-    /// Alacritty-backed PTY terminal inside the splash TUI box
-    /// (only meaningful when `image-splash` is on; the caller is
-    /// expected to gate the variant at the call site).
-    Pretty,
-    /// Operator picked [Back]; return to the wrong-password modal.
-    Back,
+    /// Operator picked [Pretty Shell]; the caller runs the alacritty-
+    /// backed PTY session inside the splash TUI box. Only exposed on
+    /// the `image-splash` feature — the no-feature build hides the
+    /// button entirely so there is nothing to dispatch.
+    #[cfg(feature = "image-splash")]
+    PrettyShell,
+    /// Operator picked [Raw Shell]; the caller opens the console-
+    /// picker dialog and runs the multiplexed busybox PTY relay.
+    RawShell,
 }
 
 /// Show a centred yes/no confirmation modal with `title` + `message`
@@ -269,10 +261,11 @@ pub fn show_modal_error(
 }
 
 /// Show the wrong-password modal after a `luks-password` activation
-/// returns cryptsetup exit code 2 (no key available). Three buttons:
-/// `[Try again]` (default), `[Reboot]`, `[Shell]`. Esc maps to
-/// [`WrongPasswordOutcome::TryAgain`] so a stray Esc doesn't reboot
-/// the machine.
+/// returns cryptsetup exit code 2 (no key available). Four buttons when
+/// the `image-splash` feature is on (three otherwise): `[Try again]`
+/// (default), `[Reboot]`, `[Pretty Shell]` (feature-gated),
+/// `[Raw Shell]`. Esc maps to [`WrongPasswordOutcome::TryAgain`] so a
+/// stray Esc doesn't reboot the machine.
 ///
 /// `attempt` is 1-indexed; the title reads "Wrong password (attempt N)".
 ///
@@ -291,13 +284,22 @@ pub fn show_wrong_password_modal(
     let message =
         "cryptsetup rejected the passphrase. Try again, reboot, or open a recovery shell.";
     let hint = "Left/Right select  Enter confirm  Esc = Try again";
-    let labels: [&str; 3] = ["Try again", "Reboot", "Shell"];
+    // Button layout is feature-dependent: Pretty Shell only exists when
+    // the `image-splash` feature compiled the alacritty-backed PTY
+    // emulator into the binary. We materialise the label list once at
+    // entry so the render loop and the key handler share the same
+    // indexing.
+    #[cfg(feature = "image-splash")]
+    let labels: &[&str] = &["Try again", "Reboot", "Pretty Shell", "Raw Shell"];
+    #[cfg(not(feature = "image-splash"))]
+    let labels: &[&str] = &["Try again", "Reboot", "Raw Shell"];
+    let n = labels.len();
     let mut selected: usize = 0;
 
     let mut dirty = true;
     loop {
         if dirty {
-            let data = view::ModalChoice3ScreenData {
+            let data = view::ModalButtonsScreenData {
                 title: &title,
                 message,
                 labels,
@@ -305,7 +307,7 @@ pub fn show_wrong_password_modal(
                 hint,
             };
             if let Err(e) =
-                console.draw_with(&mut |frame| view::render_modal_choice3(frame, &data))
+                console.draw_with(&mut |frame| view::render_modal_buttons(frame, &data))
             {
                 eprintln!("[nmbl] {title}: {message}");
                 crate::nmbl_warn!("wrong-password modal render failed: {e}");
@@ -319,28 +321,30 @@ pub fn show_wrong_password_modal(
         };
         match key.code {
             KeyCode::Left | KeyCode::BackTab => {
-                selected = if selected == 0 { 2 } else { selected - 1 };
+                selected = if selected == 0 {
+                    n.saturating_sub(1)
+                } else {
+                    selected.saturating_sub(1)
+                };
                 dirty = true;
             }
             KeyCode::Right | KeyCode::Tab => {
-                selected = (selected + 1) % 3;
+                selected = selected.saturating_add(1) % n;
                 dirty = true;
             }
-            KeyCode::Enter => {
-                return Ok(match selected {
-                    1 => WrongPasswordOutcome::Reboot,
-                    2 => WrongPasswordOutcome::Shell,
-                    _ => WrongPasswordOutcome::TryAgain,
-                });
-            }
+            KeyCode::Enter => return Ok(decode_wrong_password_selection(selected)),
             KeyCode::Char('t') | KeyCode::Char('T') => {
                 return Ok(WrongPasswordOutcome::TryAgain);
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 return Ok(WrongPasswordOutcome::Reboot);
             }
+            #[cfg(feature = "image-splash")]
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                return Ok(WrongPasswordOutcome::PrettyShell);
+            }
             KeyCode::Char('s') | KeyCode::Char('S') => {
-                return Ok(WrongPasswordOutcome::Shell);
+                return Ok(WrongPasswordOutcome::RawShell);
             }
             KeyCode::Esc => return Ok(WrongPasswordOutcome::TryAgain),
             _ => {}
@@ -348,71 +352,26 @@ pub fn show_wrong_password_modal(
     }
 }
 
-/// Show the shell-kind sub-modal that appears when the operator picks
-/// `[Shell]` on the wrong-password modal. Three buttons:
-/// `[Normal shell]`, `[Pretty shell]`, `[Back]`. Esc returns
-/// [`ShellKind::Back`] so a stray Esc returns to the wrong-password
-/// modal rather than opening a shell.
-///
-/// On the `image-splash` feature the Pretty branch is fully functional;
-/// without the feature the caller is expected to handle
-/// `ShellKind::Pretty` by falling back to `ShellKind::Normal` (or by
-/// hiding the button — left to the caller, since the static three-
-/// button layout is shared with [`show_wrong_password_modal`]).
-pub fn show_shell_kind_picker(console: &mut dyn Console) -> Result<ShellKind> {
-    use crossterm::event::KeyCode;
-
-    let title = "Open emergency shell";
-    let message = "Normal shell drops to a busybox on the console picker; \
-                   Pretty shell runs the alacritty-backed terminal inside the splash UI.";
-    let hint = "Left/Right select  Enter confirm  Esc = Back";
-    let labels: [&str; 3] = ["Normal shell", "Pretty shell", "Back"];
-    let mut selected: usize = 0;
-
-    let mut dirty = true;
-    loop {
-        if dirty {
-            let data = view::ModalChoice3ScreenData {
-                title,
-                message,
-                labels,
-                selected,
-                hint,
-            };
-            if let Err(e) =
-                console.draw_with(&mut |frame| view::render_modal_choice3(frame, &data))
-            {
-                eprintln!("[nmbl] {title}: {message}");
-                crate::nmbl_warn!("shell-kind picker render failed: {e}");
-                return Ok(ShellKind::Back);
-            }
-            dirty = false;
+/// Map a wrong-password modal button index to its outcome. Index 0 is
+/// always Try again, index 1 is Reboot, then Pretty Shell (only when
+/// `image-splash` is on), then Raw Shell. Out-of-range indices fall
+/// back to TryAgain so a future button-layout drift can't crash boot.
+fn decode_wrong_password_selection(idx: usize) -> WrongPasswordOutcome {
+    #[cfg(feature = "image-splash")]
+    {
+        match idx {
+            1 => WrongPasswordOutcome::Reboot,
+            2 => WrongPasswordOutcome::PrettyShell,
+            3 => WrongPasswordOutcome::RawShell,
+            _ => WrongPasswordOutcome::TryAgain,
         }
-
-        let Some(key) = console.poll_key(POLL_SLICE)? else {
-            continue;
-        };
-        match key.code {
-            KeyCode::Left | KeyCode::BackTab => {
-                selected = if selected == 0 { 2 } else { selected - 1 };
-                dirty = true;
-            }
-            KeyCode::Right | KeyCode::Tab => {
-                selected = (selected + 1) % 3;
-                dirty = true;
-            }
-            KeyCode::Enter => {
-                return Ok(match selected {
-                    1 => ShellKind::Pretty,
-                    2 => ShellKind::Back,
-                    _ => ShellKind::Normal,
-                });
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') => return Ok(ShellKind::Normal),
-            KeyCode::Char('p') | KeyCode::Char('P') => return Ok(ShellKind::Pretty),
-            KeyCode::Char('b') | KeyCode::Char('B') => return Ok(ShellKind::Back),
-            KeyCode::Esc => return Ok(ShellKind::Back),
-            _ => {}
+    }
+    #[cfg(not(feature = "image-splash"))]
+    {
+        match idx {
+            1 => WrongPasswordOutcome::Reboot,
+            2 => WrongPasswordOutcome::RawShell,
+            _ => WrongPasswordOutcome::TryAgain,
         }
     }
 }
@@ -1217,32 +1176,72 @@ mod tests {
         assert_eq!(out, WrongPasswordOutcome::Reboot);
     }
 
+    #[cfg(feature = "image-splash")]
     #[test]
-    fn show_wrong_password_modal_two_rights_then_enter_opens_shell() {
-        // Right Right toggles to [Shell]; Enter commits.
+    fn show_wrong_password_modal_two_rights_then_enter_picks_pretty_shell() {
+        // With `image-splash` Pretty Shell sits at index 2. Right Right
+        // navigates there; Enter commits.
         let keys = vec![
             press(KeyCode::Right),
             press(KeyCode::Right),
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let out =
-            show_wrong_password_modal(&mut console, 2).expect("modal must succeed");
-        assert_eq!(out, WrongPasswordOutcome::Shell);
+        let out = show_wrong_password_modal(&mut console, 2).expect("modal must succeed");
+        assert_eq!(out, WrongPasswordOutcome::PrettyShell);
+    }
+
+    #[cfg(feature = "image-splash")]
+    #[test]
+    fn show_wrong_password_modal_three_rights_then_enter_picks_raw_shell() {
+        // With `image-splash` Raw Shell sits at index 3. Right Right Right
+        // navigates there; Enter commits.
+        let keys = vec![
+            press(KeyCode::Right),
+            press(KeyCode::Right),
+            press(KeyCode::Right),
+            press(KeyCode::Enter),
+        ];
+        let mut console = ScriptedConsole::new(keys);
+        let out = show_wrong_password_modal(&mut console, 2).expect("modal must succeed");
+        assert_eq!(out, WrongPasswordOutcome::RawShell);
+    }
+
+    #[cfg(not(feature = "image-splash"))]
+    #[test]
+    fn show_wrong_password_modal_two_rights_then_enter_picks_raw_shell_no_feature() {
+        // Without `image-splash` Raw Shell sits at index 2 (Pretty
+        // Shell row is hidden). Right Right + Enter commits Raw Shell.
+        let keys = vec![
+            press(KeyCode::Right),
+            press(KeyCode::Right),
+            press(KeyCode::Enter),
+        ];
+        let mut console = ScriptedConsole::new(keys);
+        let out = show_wrong_password_modal(&mut console, 2).expect("modal must succeed");
+        assert_eq!(out, WrongPasswordOutcome::RawShell);
     }
 
     #[test]
     fn show_wrong_password_modal_hotkeys_commit_directly() {
         // 't', 'r', 's' each commit regardless of highlighted button.
+        // 'p' is only wired when `image-splash` is compiled in.
         for (code, expected) in [
             (KeyCode::Char('t'), WrongPasswordOutcome::TryAgain),
             (KeyCode::Char('r'), WrongPasswordOutcome::Reboot),
-            (KeyCode::Char('s'), WrongPasswordOutcome::Shell),
+            (KeyCode::Char('s'), WrongPasswordOutcome::RawShell),
         ] {
             let mut console = ScriptedConsole::new(vec![press(code)]);
             let out = show_wrong_password_modal(&mut console, 1)
                 .expect("modal must succeed on hotkey");
             assert_eq!(out, expected, "hotkey {code:?} should yield {expected:?}");
+        }
+        #[cfg(feature = "image-splash")]
+        {
+            let mut console = ScriptedConsole::new(vec![press(KeyCode::Char('p'))]);
+            let out = show_wrong_password_modal(&mut console, 1)
+                .expect("modal must succeed on 'p' hotkey");
+            assert_eq!(out, WrongPasswordOutcome::PrettyShell);
         }
     }
 
@@ -1258,31 +1257,38 @@ mod tests {
     }
 
     #[test]
-    fn show_wrong_password_modal_left_wraps_from_try_again_to_shell() {
-        // Left arrow from index 0 wraps to index 2 (Shell). Enter commits.
+    fn show_wrong_password_modal_left_wraps_from_try_again_to_last_button() {
+        // Left arrow from index 0 wraps to the last button (Raw Shell
+        // in both feature configurations — it is the rightmost row).
         let keys = vec![press(KeyCode::Left), press(KeyCode::Enter)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_wrong_password_modal(&mut console, 1)
-            .expect("modal must succeed");
-        assert_eq!(out, WrongPasswordOutcome::Shell);
+        let out = show_wrong_password_modal(&mut console, 1).expect("modal must succeed");
+        assert_eq!(out, WrongPasswordOutcome::RawShell);
     }
 
     #[test]
     fn show_wrong_password_modal_renders_title_with_attempt_counter() {
         // End-to-end visual check: the title must include the literal
         // "attempt N" string so the operator sees the retry counter.
+        // Also pins that every button label paints — including the
+        // feature-gated Pretty Shell row when present.
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        let data = view::ModalChoice3ScreenData {
+        #[cfg(feature = "image-splash")]
+        let labels: &[&str] = &["Try again", "Reboot", "Pretty Shell", "Raw Shell"];
+        #[cfg(not(feature = "image-splash"))]
+        let labels: &[&str] = &["Try again", "Reboot", "Raw Shell"];
+
+        let data = view::ModalButtonsScreenData {
             title: "Wrong password (attempt 3)",
             message: "cryptsetup rejected the passphrase.",
-            labels: ["Try again", "Reboot", "Shell"],
+            labels,
             selected: 0,
             hint: "Left/Right select  Enter confirm  Esc = Try again",
         };
-        let mut term = Terminal::new(TestBackend::new(70, 16)).expect("test terminal");
-        term.draw(|f| view::render_modal_choice3(f, &data)).expect("draw");
+        let mut term = Terminal::new(TestBackend::new(80, 16)).expect("test terminal");
+        term.draw(|f| view::render_modal_buttons(f, &data)).expect("draw");
         let buf = term.backend().buffer();
         let dump: String = (0..buf.area.height)
             .map(|y| {
@@ -1298,61 +1304,11 @@ mod tests {
         );
         assert!(dump.contains("[Try again]"), "Try again button visible:\n{dump}");
         assert!(dump.contains("[Reboot]"), "Reboot button visible:\n{dump}");
-        assert!(dump.contains("[Shell]"), "Shell button visible:\n{dump}");
-    }
-
-    // --- show_shell_kind_picker --------------------------------------
-
-    #[test]
-    fn show_shell_kind_picker_default_enter_returns_normal() {
-        let keys = vec![press(KeyCode::Enter)];
-        let mut console = ScriptedConsole::new(keys);
-        let out = show_shell_kind_picker(&mut console).expect("modal must succeed");
-        assert_eq!(out, ShellKind::Normal);
-    }
-
-    #[test]
-    fn show_shell_kind_picker_right_enter_returns_pretty() {
-        let keys = vec![press(KeyCode::Right), press(KeyCode::Enter)];
-        let mut console = ScriptedConsole::new(keys);
-        let out = show_shell_kind_picker(&mut console).expect("modal must succeed");
-        assert_eq!(out, ShellKind::Pretty);
-    }
-
-    #[test]
-    fn show_shell_kind_picker_two_rights_enter_returns_back() {
-        let keys = vec![
-            press(KeyCode::Right),
-            press(KeyCode::Right),
-            press(KeyCode::Enter),
-        ];
-        let mut console = ScriptedConsole::new(keys);
-        let out = show_shell_kind_picker(&mut console).expect("modal must succeed");
-        assert_eq!(out, ShellKind::Back);
-    }
-
-    #[test]
-    fn show_shell_kind_picker_esc_returns_back() {
-        // Esc must map to Back so the operator goes back to the
-        // wrong-password modal, not into a Normal/Pretty shell they
-        // didn't ask for.
-        let keys = vec![press(KeyCode::Esc)];
-        let mut console = ScriptedConsole::new(keys);
-        let out = show_shell_kind_picker(&mut console).expect("modal must succeed on Esc");
-        assert_eq!(out, ShellKind::Back);
-    }
-
-    #[test]
-    fn show_shell_kind_picker_hotkeys_commit_directly() {
-        for (code, expected) in [
-            (KeyCode::Char('n'), ShellKind::Normal),
-            (KeyCode::Char('p'), ShellKind::Pretty),
-            (KeyCode::Char('b'), ShellKind::Back),
-        ] {
-            let mut console = ScriptedConsole::new(vec![press(code)]);
-            let out =
-                show_shell_kind_picker(&mut console).expect("hotkey must commit");
-            assert_eq!(out, expected, "hotkey {code:?} should yield {expected:?}");
-        }
+        assert!(dump.contains("[Raw Shell]"), "Raw Shell button visible:\n{dump}");
+        #[cfg(feature = "image-splash")]
+        assert!(
+            dump.contains("[Pretty Shell]"),
+            "Pretty Shell button visible:\n{dump}"
+        );
     }
 }
