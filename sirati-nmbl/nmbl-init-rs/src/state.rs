@@ -435,18 +435,19 @@ pub fn decide(
         // When `active_index` is already the oldest scanned generation,
         // the loop body never executes and we exhaust below.
         let last_attempt = state.last_attempted_generation.map(|v| v.get());
-        for idx in (active_index + 1)..generations.len() {
-            let n = generations[idx].number;
-            let in_known_good = state
-                .known_good_generations
-                .iter()
-                .any(|slot| slot.map(|v| v.get()) == Some(n));
-            let is_last_attempt = last_attempt == Some(n);
-            if !in_known_good && !is_last_attempt {
-                picked = Some(idx);
-                break;
-            }
-        }
+        picked = generations
+            .iter()
+            .enumerate()
+            .skip(active_index + 1)
+            .find_map(|(idx, g)| {
+                let n = g.number;
+                let in_known_good = state
+                    .known_good_generations
+                    .iter()
+                    .any(|slot| slot.map(|v| v.get()) == Some(n));
+                let is_last_attempt = last_attempt == Some(n);
+                (!in_known_good && !is_last_attempt).then_some(idx)
+            });
     }
 
     match picked {
