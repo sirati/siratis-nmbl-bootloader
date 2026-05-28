@@ -583,7 +583,8 @@ fn fire_and_forget_spawn(config: &Config, targets: &[PathBuf]) -> Result<()> {
 }
 
 /// Drive the render-poll-react loop until the picker commits an
-/// outcome.
+/// outcome. Uses `poll_event` so a host-reported terminal resize
+/// triggers an immediate redraw at the new grid.
 fn drive_picker_loop(state: &mut PickerState, console: &mut dyn Console) -> Result<()> {
     let mut dirty = true;
     loop {
@@ -591,12 +592,18 @@ fn drive_picker_loop(state: &mut PickerState, console: &mut dyn Console) -> Resu
             render_picker(console, state)?;
             dirty = false;
         }
-        if let Some(key) = console.poll_key(POLL_SLICE)? {
-            let exited = state.on_key(key);
-            dirty = true;
-            if exited {
-                return Ok(());
+        match console.poll_event(POLL_SLICE)? {
+            Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
+                dirty = true;
             }
+            Some(crate::ui::console::ConsoleEvent::Key(key)) => {
+                let exited = state.on_key(key);
+                dirty = true;
+                if exited {
+                    return Ok(());
+                }
+            }
+            None => {}
         }
     }
 }
