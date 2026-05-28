@@ -48,7 +48,9 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use rustix::termios::Termios;
 
 use crate::error::{NmblError, Result};
+use crate::log;
 use crate::nmbl_warn;
+use crate::sys::printk::PrintkQuiet;
 use crate::sys::tty::{enter_raw, open_console as open_console_fd, restore_termios, save_termios};
 use crate::ui::POLL_SLICE;
 use crate::ui::app::App;
@@ -83,6 +85,11 @@ pub struct TtyConsole {
     /// (e.g. the fd is a serial line and `KDGETMODE` returned ENOTTY),
     /// so [`Drop`] must leave it alone.
     previous_kd_mode: Option<libc::c_long>,
+    /// Serial-console mitigation for the "kernel printk echoes through
+    /// /dev/console while the TUI is also painting through it" smear
+    /// (see [`crate::sys::printk`]). `None` after `suspend()` or on
+    /// non-serial consoles where `KD_GRAPHICS` already handles it.
+    printk_quiet: Option<PrintkQuiet>,
     /// Ratatui terminal over the crossterm backend wrapping stdout.
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
@@ -103,10 +110,25 @@ impl TtyConsole {
         let backend = CrosstermBackend::new(std::io::stdout());
         let terminal = Terminal::new(backend).map_err(tui_err)?;
 
+        // Silence kernel-printk to console while we own the screen.
+        // KD_GRAPHICS already handles this on a framebuffer VT; on a
+        // serial console it returns ENOTTY (see `enter_kd_graphics`) so
+        // PrintkQuiet is the only mitigation for the smear that would
+        // otherwise duplicate every `[nmbl] phase N` line with a
+        // `[ N.xxx] [nmbl] phase N` kernel echo on the UART.
+        let printk_quiet = Some(PrintkQuiet::engage());
+
+        // Tell the `nmbl_*!` macros to stop writing to stderr. The
+        // BootReporter renders log lines through the TUI from the
+        // in-memory ring, so userspace duplicates would only smear the
+        // ratatui repaint. Cleared again on suspend / Drop.
+        log::set_tui_active();
+
         Ok(TtyConsole {
             fd,
             saved_termios: Some(saved),
             previous_kd_mode,
+            printk_quiet,
             terminal,
         })
     }
@@ -167,7 +189,14 @@ impl Console for TtyConsole {
     ///
     /// [`resume`]: TtyConsole::resume
     fn suspend(&mut self) -> Result<()> {
-        // KD_TEXT first so the kernel framebuffer reclaim happens
+        // Restore printk loglevel and re-enable the eprintln side of
+        // `nmbl_*!` first so any warnings emitted by the rest of the
+        // restore sequence go to the relay's pre-shell screen.
+        if let Some(mut q) = self.printk_quiet.take() {
+            q.restore();
+        }
+        log::clear_tui_active();
+        // KD_TEXT next so the kernel framebuffer reclaim happens
         // before the shell starts writing to the same fd; if termios
         // restoration fails the operator still ends up on a sane VT.
         if let Some(previous) = self.previous_kd_mode.take() {
@@ -205,6 +234,11 @@ impl Console for TtyConsole {
         // ENOTTY itself).
         self.previous_kd_mode = enter_kd_graphics(self.fd.as_fd());
 
+        // Re-engage the printk-quiet guard so the post-shell screen
+        // doesn't get kernel printk smear, and re-arm the macro gate.
+        self.printk_quiet = Some(PrintkQuiet::engage());
+        log::set_tui_active();
+
         // Force a full repaint on the next render: any kernel printk
         // or shell output that landed on the framebuffer while we
         // were suspended would otherwise bleed under the TUI.
@@ -215,6 +249,15 @@ impl Console for TtyConsole {
 
 impl Drop for TtyConsole {
     fn drop(&mut self) {
+        // Re-raise the printk loglevel and re-enable the eprintln side
+        // of `nmbl_*!` before any final warning so the post-NMBL kernel
+        // (kexec) or post-execve shell sees a normal console policy.
+        // PrintkQuiet's own Drop covers the case where the explicit
+        // `restore()` is skipped on the panic-unwind path.
+        if let Some(mut q) = self.printk_quiet.take() {
+            q.restore();
+        }
+        log::clear_tui_active();
         // Restore VT text mode first so the kernel can resume printk to
         // the framebuffer if the operator ends up in a recovery shell.
         // Best-effort: a failure here just means the VT stays in

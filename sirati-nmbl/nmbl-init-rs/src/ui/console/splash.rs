@@ -18,6 +18,7 @@ use crossterm::event::KeyEvent;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
+use crate::log;
 use crate::nmbl_warn;
 use crate::splash::drm::{SplashDrm, open_card_with_fallback};
 use crate::splash::glyph_cache::{self, GlyphCache};
@@ -97,6 +98,14 @@ impl SplashConsole {
         // 4. Open /dev/tty1 for raw-mode keyboard input.
         let input = SplashInput::open(Path::new(INPUT_TTY_PATH))?;
 
+        // The splash bring-up sequence already calls KDSETMODE(KD_GRAPHICS)
+        // on /dev/tty1, which suppresses kernel printk to that VT. We
+        // still flip the macro gate so `nmbl_*!` stops writing to
+        // stderr (which would race the ratatui repaint on the splash
+        // framebuffer and also leak to any serial line registered as a
+        // secondary console).
+        log::set_tui_active();
+
         Ok(Some(SplashConsole {
             drm,
             bg_scaled,
@@ -163,6 +172,10 @@ impl Console for SplashConsole {
     /// and re-renders the splash composite without re-running the
     /// font load / cover-scale pipeline.
     fn suspend(&mut self) -> Result<()> {
+        // Re-enable eprintln in the `nmbl_*!` macros so any warning
+        // emitted by the rest of the suspend / relay path reaches the
+        // operator's pre-shell screen. Re-armed on `resume`.
+        log::clear_tui_active();
         // DRM master FIRST: doing it before termios restore minimises
         // the window where the kernel could paint printk while
         // userspace still has raw-mode termios.
@@ -182,6 +195,19 @@ impl Console for SplashConsole {
             nmbl_warn!("SplashConsole::resume: input resume failed: {e}");
         }
         self.drm.acquire_master();
+        // Re-arm the macro gate so the post-shell render path doesn't
+        // leak eprintln smear over the splash framebuffer.
+        log::set_tui_active();
         Ok(())
+    }
+}
+
+impl Drop for SplashConsole {
+    fn drop(&mut self) {
+        // Final handover (kexec / emergency execve): re-enable
+        // eprintln in `nmbl_*!`. The splash backend's other Drop
+        // chains (SplashDrm, SplashInput) handle KD mode and termios
+        // restoration on their own.
+        log::clear_tui_active();
     }
 }

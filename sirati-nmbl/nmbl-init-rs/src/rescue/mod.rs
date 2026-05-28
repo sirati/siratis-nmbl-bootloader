@@ -124,32 +124,16 @@ fn dispatch_external(
     #[cfg(feature = "network-rescue")]
     {
         if config.rescue.network {
-            // Serial-console operators get the line-mode fallback; the
-            // ratatui screens assume a real terminal where escape
-            // sequences and key codes round-trip cleanly.
-            //
-            // NOTE: on the TUI path the boot console stays alive for
-            // the entire UI flow (it IS the UI's render target). It
-            // is dropped via scope exit before we return the
-            // TerminalAction; the dispatcher then performs the
-            // execve. Pre-execve VT restoration on the network path
-            // is now automatic from the type-driven flow.
-            let net_result = if config.general.serial_console {
-                // Console is unused on the serial-line UI; let it
-                // drop on the closing brace of this arm via scope
-                // exit so the backend's Drop fires before the
-                // dispatcher.
-                let _ = console;
-                let mut ui = net::ConsoleRescueUi;
-                net::try_network_rescue(config, &mut ui, &disk_err.to_string())
-            } else {
-                // Bind `console` into the else arm so it drops on the
-                // closing brace below — after the rescue UI finishes,
-                // before we evaluate the halt-with-banner branch.
-                let mut console = console;
-                let mut ui = crate::ui::rescue::make_rescue_ui(&mut *console);
-                net::try_network_rescue(config, &mut ui, &disk_err.to_string())
-            };
+            // Bind `console` into this arm so it drops on the closing
+            // brace below — after the rescue UI finishes, before we
+            // evaluate the halt-with-banner branch. The same ratatui
+            // screens drive the rescue flow on every console kind:
+            // serial UARTs receive the same vt100/xterm output as the
+            // framebuffer console, and terminal emulators (tmux,
+            // xterm, picocom) render it identically.
+            let mut console = console;
+            let mut ui = crate::ui::rescue::make_rescue_ui(&mut *console);
+            let net_result = net::try_network_rescue(config, &mut ui, &disk_err.to_string());
             let net_err = match net_result {
                 Ok(action) => return Ok(action),
                 Err(e) => e,
