@@ -49,7 +49,7 @@ use rustix::termios::Termios;
 
 use crate::error::{NmblError, Result};
 use crate::nmbl_warn;
-use crate::sys::tty::{enter_raw, open_console as open_console_fd, restore_termios};
+use crate::sys::tty::{enter_raw, open_console as open_console_fd, restore_termios, save_termios};
 use crate::ui::POLL_SLICE;
 use crate::ui::app::App;
 use crate::ui::console::{Console, ConsoleKind};
@@ -151,6 +151,65 @@ impl Console for TtyConsole {
             .draw(|f| body(f))
             .map(|_| ())
             .map_err(tui_err)
+    }
+
+    /// Restore the tty so the kernel VT and any foreign userspace
+    /// writer can paint without our raw-mode termios fighting them.
+    /// Releases:
+    /// - VT graphics mode (back to KD_TEXT) so the kernel resumes
+    ///   printk to the framebuffer behind a VT.
+    /// - Raw-mode termios (back to the snapshot we captured at open).
+    ///
+    /// The owned `fd` and `terminal` stay alive so [`resume`] can
+    /// re-apply the same flags without re-opening anything. Repeated
+    /// calls are tolerated: each `suspend` is paired with the next
+    /// `resume`.
+    ///
+    /// [`resume`]: TtyConsole::resume
+    fn suspend(&mut self) -> Result<()> {
+        // KD_TEXT first so the kernel framebuffer reclaim happens
+        // before the shell starts writing to the same fd; if termios
+        // restoration fails the operator still ends up on a sane VT.
+        if let Some(previous) = self.previous_kd_mode.take() {
+            restore_kd_mode(self.fd.as_fd(), previous);
+        }
+        if let Some(saved) = self.saved_termios.take()
+            && let Err(e) = restore_termios(self.fd.as_fd(), &saved)
+        {
+            // Suspend MUST stay non-fatal: the caller will continue
+            // into the relay loop anyway. Operator can `stty sane`.
+            nmbl_warn!(
+                "TtyConsole::suspend: failed to restore termios on fd {}: {e}",
+                self.fd.as_raw_fd()
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-acquire the tty for raw-mode TUI rendering. Re-snapshots the
+    /// current termios (the shell that just ran almost certainly
+    /// poked at it), re-enters raw mode, re-enters KD_GRAPHICS if the
+    /// underlying device is a VT, and clears the ratatui terminal so
+    /// the next render produces a full frame.
+    fn resume(&mut self) -> Result<()> {
+        // Capture whatever state the foreign writer (shell) left the
+        // termios in. We use this snapshot for the next `suspend`'s
+        // restore so a chain of suspend/resume rounds doesn't lose
+        // the shell's tweaks (e.g. `stty rows`).
+        let saved = save_termios(self.fd.as_fd())?;
+        // enter_raw also returns the original; we already captured it.
+        let _ = enter_raw(self.fd.as_fd())?;
+        self.saved_termios = Some(saved);
+
+        // Re-enter KD_GRAPHICS (no-op on serial; the helper handles
+        // ENOTTY itself).
+        self.previous_kd_mode = enter_kd_graphics(self.fd.as_fd());
+
+        // Force a full repaint on the next render: any kernel printk
+        // or shell output that landed on the framebuffer while we
+        // were suspended would otherwise bleed under the TUI.
+        self.terminal.clear().map_err(tui_err)?;
+        Ok(())
     }
 }
 

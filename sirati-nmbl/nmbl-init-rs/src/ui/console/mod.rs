@@ -63,6 +63,25 @@ pub trait Console {
     /// The same backend (splash or tty) is reused — no new terminal
     /// is constructed.
     fn draw_with(&mut self, body: &mut dyn FnMut(&mut Frame<'_>)) -> Result<()>;
+
+    /// Release the display so the kernel (or another userspace owner)
+    /// can paint to it without contention. Used by the
+    /// [`crate::ui::console_picker`] shell-relay path: when the
+    /// operator opts to multiplex the emergency shell onto the same
+    /// console the TUI is drawing to, we hand the display back to the
+    /// kernel VT / printk so the shell's output is visible.
+    ///
+    /// The backend keeps its fds open. A matching [`Console::resume`]
+    /// call must follow once the foreign user is done. Backends that
+    /// don't own a display (e.g. [`NoopConsole`]) implement this as a
+    /// no-op.
+    fn suspend(&mut self) -> Result<()>;
+
+    /// Inverse of [`Console::suspend`]: re-acquire the display and
+    /// repaint. After `resume` the next [`Console::render`] /
+    /// [`Console::draw_with`] call must produce a visible frame, even
+    /// if nothing about the underlying [`App`] state changed.
+    fn resume(&mut self) -> Result<()>;
 }
 
 pub mod noop;

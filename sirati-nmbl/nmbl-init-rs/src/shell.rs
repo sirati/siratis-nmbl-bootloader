@@ -5,21 +5,32 @@
 //!
 //! 1. Runs the [`crate::ui::run_emergency_screen`] TUI over the splash
 //!    backend (or a tty/serial fallback) to ask the operator whether
-//!    they want to reboot, drop to the legacy shell, or open the
-//!    in-process Pretty Shell (feature `image-splash`).
+//!    they want to reboot, open an in-process shell on the operator's
+//!    chosen console(s), open the Pretty Shell (feature
+//!    `image-splash`), retry the normal boot flow, or verify kexec
+//!    readiness without re-running the activation phases.
 //! 2. On [`EmergencyChoice::Reboot`] returns
 //!    [`TerminalAction::Reboot`].
-//! 3. On [`EmergencyChoice::Shell`] hands off to
-//!    [`crate::rescue::dispatch`], which produces a
-//!    [`TerminalAction::Execve`] (or `HaltWithBanner` when no rescue
-//!    path is reachable). The dispatcher decides whether to execve
-//!    the embedded busybox, loop-mount the external rescue squashfs,
-//!    fetch one over HTTP, or halt — see `src/rescue/mod.rs`.
+//! 3. On [`EmergencyChoice::Shell`] opens the console picker dialog
+//!    ([`crate::ui::console_picker`]), forks ONE busybox onto a PTY,
+//!    and runs the multiplex relay loop in PID 1
+//!    ([`crate::ui::console_relay`]). When the shell exits — or the
+//!    operator cancels the picker — control returns to the emergency
+//!    menu. This branch never produces a `TerminalAction`; NMBL stays
+//!    at PID 1.
 //! 4. On [`EmergencyChoice::PrettyShell`] (feature `image-splash`)
 //!    runs the alacritty-backed pty terminal inside the TUI box.
 //!    When the operator exits that shell — or it fails to start — we
 //!    re-enter this picker so they can try another action. This
 //!    branch never produces a `TerminalAction`; control stays here.
+//! 5. On [`EmergencyChoice::RetryBoot`] re-runs phases 3, 3b, 4 and
+//!    surfaces the selector; on success returns the resulting
+//!    [`TerminalAction`], on failure shows a modal and re-shows the
+//!    menu.
+//! 6. On [`EmergencyChoice::VerifyKexecReadiness`] skips phases 3 and
+//!    3b (operator presumed to have mounted manually), scans
+//!    generations, confirms with a yes/no modal, and either returns a
+//!    [`TerminalAction`] or re-shows the menu.
 //!
 //! All terminal-action syscalls — `execve`, `reboot(RB_AUTOBOOT)`,
 //! `reboot(RB_HALT_SYSTEM)`, `reboot(RB_KEXEC)` — happen in one
@@ -28,35 +39,53 @@
 //! every [`crate::ui::console::Console`] backend's `Drop` impl has
 //! already run (KD_TEXT restored, termios reset, fds closed) and the
 //! shell that inherits PID 1 sees a clean VT.
+//!
+//! ## EmergencyChoice::Shell — in-process flow (not execve)
+//!
+//! The `[Shell]` entry on the emergency menu used to translate into a
+//! `TerminalAction::Execve` aimed at `config.paths.shell`. As of the
+//! console-picker work it is now an **in-process** flow:
+//!
+//! 1. Open the picker dialog ([`crate::ui::console_picker`]) on the
+//!    live console.
+//! 2. On commit, fork ONE busybox onto a PTY and run the multiplex
+//!    relay loop in PID 1 ([`crate::ui::console_relay`]).
+//! 3. When the shell exits, re-show the emergency menu (the same way
+//!    `Pretty Shell` already does).
+//!
+//! NMBL stays at PID 1 throughout; `TerminalAction::Execve` is no
+//! longer reachable via the `[Shell]` choice. The legacy rescue
+//! dispatch path (`rescue::dispatch`) still produces `Execve` /
+//! `switch_root`-style actions for the OTHER rescue modes (embedded
+//! / external squashfs), reached from inside the picker-spawned shell
+//! itself — but the menu choice now hands control to the picker,
+//! not to the dispatcher.
 
 use crate::config::Config;
 use crate::error::{NmblError, format_chain};
 use crate::nmbl_warn;
-use crate::rescue;
 use crate::terminal::{EmergencyBanner, TerminalAction};
 use crate::ui::console::{Console, open_console};
 use crate::ui::emergency_actions::{retry_boot, surface_action_failure, verify_kexec_readiness};
 use crate::ui::{EmergencyChoice, TuiPasswordSupplier, run_emergency_screen};
 
-/// Print the operator-facing emergency banner and hand off to the
-/// rescue dispatcher. Returns the [`TerminalAction`] the dispatcher
-/// in `main` will perform once the call stack has fully unwound.
+/// Print the operator-facing emergency banner and drive the
+/// re-entrant emergency picker. Returns the [`TerminalAction`] the
+/// dispatcher in `main` will perform once the call stack has fully
+/// unwound.
 ///
 /// `console` is the live boot console the orchestrator still holds.
-/// We render the emergency-screen TUI through it; on the [`Shell`]
-/// branch we hand it on to [`rescue::dispatch`] for any further UI
-/// (network-rescue screens). The box is dropped by normal scope exit
-/// before the `TerminalAction` is fired in `main`, which is what
-/// restores KD_TEXT and termios — without that ordering the
-/// freshly-execve'd shell would run invisibly under a frozen splash
-/// frame.
+/// We render the emergency-screen TUI through it; the in-process
+/// shell, pretty-shell, retry-boot, and verify-kexec-readiness
+/// branches all keep the same `console` borrowed across the loop, so
+/// there is no second `/dev/console` grab and no flicker between
+/// splash and tty backends.
 ///
-/// The picker is **re-entrant** to accommodate the Pretty Shell
-/// branch: when the in-process pty session exits (operator typed
-/// `exit`, child died) we loop back and re-show the picker rather
-/// than producing a `TerminalAction`. The legacy shell and reboot
-/// branches still diverge into `TerminalAction` values that `main`
-/// fires after the stack has unwound.
+/// The picker is **re-entrant**: the Shell, Pretty Shell, Retry boot,
+/// and Verify kexec readiness branches all return control to this
+/// loop when their sub-flow exits or fails. Only the Reboot branch —
+/// and the success arms of Retry/Verify — diverge into a
+/// [`TerminalAction`] that `main` fires after the stack has unwound.
 ///
 /// [`Shell`]: EmergencyChoice::Shell
 pub fn drop_to_emergency(
@@ -66,27 +95,41 @@ pub fn drop_to_emergency(
 ) -> TerminalAction {
     let mut console = console;
 
-    // Re-entrant picker. The Pretty Shell, Retry boot, and Verify
-    // kexec readiness branches all return control to this loop on
-    // exit (sub-shell ended, retry failed, operator picked Back).
-    // The Reboot and Shell branches diverge into a `TerminalAction`
-    // and break out via `return`.
+    // Re-entrant picker. The Shell, Pretty Shell, Retry boot, and
+    // Verify kexec readiness branches all return control to this loop
+    // on exit (sub-shell ended, retry failed, operator picked Back).
+    // The Reboot branch — and the success arms of Retry/Verify —
+    // diverge into a `TerminalAction` and break out via `return`.
     //
-    // Without `image-splash` there's no PrettyShell variant, but the
-    // Retry/Verify branches are still re-entrant so we keep the loop
-    // in both builds and silence the `never_loop` lint locally — the
-    // loop's exits are all `return`s from `handle_choice` or the
-    // success arms below.
-    #[allow(
-        clippy::never_loop,
-        reason = "Retry/Verify branches re-enter via `continue` even \
-                  on the no-feature build; the loop exits only via \
-                  `return` in the Reboot/Shell arms"
-    )]
+    // The Shell branch now runs the in-process picker + multiplexed
+    // PTY relay (`crate::ui::console_picker::run_picker_session`);
+    // it never produces a `TerminalAction::Execve`. NMBL stays at
+    // PID 1 across the shell session.
     loop {
         let choice = run_emergency_screen(&mut *console, &err);
 
         match choice {
+            EmergencyChoice::Reboot => {
+                eprintln!("[nmbl] operator (or timeout) chose reboot");
+                return TerminalAction::Reboot;
+            }
+            EmergencyChoice::Shell => {
+                if let Err(e) =
+                    crate::ui::console_picker::run_picker_session(&mut *console, config)
+                {
+                    let chain = format_chain(&e as &dyn std::error::Error);
+                    nmbl_warn!("emergency-shell picker session failed: {chain}");
+                    let _ = crate::ui::show_modal_error(
+                        &mut *console,
+                        "Emergency shell failed",
+                        &chain,
+                        std::time::Duration::from_secs(10),
+                    );
+                }
+                // Picker session done (shell exited or cancelled);
+                // re-show the emergency menu.
+                continue;
+            }
             #[cfg(feature = "image-splash")]
             EmergencyChoice::PrettyShell => {
                 if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(&mut *console, config) {
@@ -133,9 +176,6 @@ pub fn drop_to_emergency(
                     }
                 }
             }
-            EmergencyChoice::Reboot | EmergencyChoice::Shell => {
-                return handle_choice(choice, console, config, err);
-            }
         }
     }
 }
@@ -158,74 +198,6 @@ pub fn open_console_and_drop_to_emergency(config: &Config, err: NmblError) -> Te
             );
             eprintln!("[nmbl] operator (or timeout) chose reboot");
             TerminalAction::Reboot
-        }
-    }
-}
-
-/// Act on the operator's emergency-screen choice. `console` is the
-/// live boot console (owned) the caller routed down; on the shell
-/// branch it is threaded into `rescue::dispatch` so the
-/// network-rescue screens paint through the same backend (no second
-/// `/dev/console` grab, no flicker between splash and tty).
-///
-/// The [`EmergencyChoice::PrettyShell`], [`EmergencyChoice::RetryBoot`],
-/// and [`EmergencyChoice::VerifyKexecReadiness`] branches are
-/// intercepted by the outer loop in [`drop_to_emergency`] and never
-/// reach this dispatcher. If a future refactor causes them to reach
-/// here we fall through to the legacy shell exec as the safest
-/// default — the `panic!`/`unreachable!` lint bans prevent us from
-/// asserting on the dead branch directly.
-fn handle_choice(
-    choice: EmergencyChoice,
-    console: Box<dyn Console>,
-    config: &Config,
-    err: NmblError,
-) -> TerminalAction {
-    match choice {
-        EmergencyChoice::Reboot => {
-            // `console` is owned by this arm and drops on the closing
-            // brace via scope exit; the dispatcher in `main` performs
-            // `reboot(RB_AUTOBOOT)` only after this whole call has
-            // returned.
-            let _ = console;
-            eprintln!("[nmbl] operator (or timeout) chose reboot");
-            TerminalAction::Reboot
-        }
-        EmergencyChoice::Shell => exec_shell(console, config, err),
-        #[cfg(feature = "image-splash")]
-        EmergencyChoice::PrettyShell => exec_shell(console, config, err),
-        // The outer loop in `drop_to_emergency` handles these two; if
-        // a future caller invokes `handle_choice` with them directly,
-        // collapsing to `exec_shell` is the safest fallback (it gets
-        // the operator to a working prompt instead of looping in
-        // recovery state).
-        EmergencyChoice::RetryBoot | EmergencyChoice::VerifyKexecReadiness => {
-            exec_shell(console, config, err)
-        }
-    }
-}
-
-/// Execute the chosen-shell path: hand off to the rescue dispatcher
-/// and let it produce a [`TerminalAction`]. On dispatch failure we
-/// print one last diagnostic and collapse to a halt-with-banner.
-fn exec_shell(console: Box<dyn Console>, config: &Config, err: NmblError) -> TerminalAction {
-    // rescue::dispatch builds a TerminalAction the caller in `main`
-    // will fire after every stack-allocated resource is dropped. The
-    // box is moved into the dispatcher; either it drops the console
-    // inside its arms or returns it dropped through the network-UI
-    // helper. Any Err means no rescue strategy could complete — we
-    // log the failure chain and surface a halt-with-banner so the
-    // operator sees a structured diagnostic.
-    match rescue::dispatch(config, console, err) {
-        Ok(action) => action,
-        Err(dispatch_err) => {
-            eprintln!(
-                "[nmbl] EMERGENCY RESCUE DISPATCH FAILED: {}",
-                format_chain(&dispatch_err as &dyn std::error::Error)
-            );
-            TerminalAction::HaltWithBanner {
-                cause: dispatch_err,
-            }
         }
     }
 }
@@ -402,6 +374,12 @@ mod tests {
         fn draw_with(&mut self, _body: &mut dyn FnMut(&mut Frame<'_>)) -> Result<()> {
             Ok(())
         }
+        fn suspend(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -409,37 +387,33 @@ mod tests {
     }
 
     #[test]
-    fn drop_to_emergency_returns_execve_on_shell_choice() {
-        // Down (selects Shell) + Enter. drop_to_emergency must hand
-        // off to rescue::dispatch which, with mode=Embedded
-        // (recovery-default), builds a TerminalAction::Execve aimed
-        // at config.paths.shell.
+    fn drop_to_emergency_shell_choice_cancels_picker_then_reboots() {
+        // The `[Shell]` choice now opens the in-process picker dialog
+        // (in-process flow, NOT TerminalAction::Execve). The script
+        // navigates Down to Shell + Enter, then Esc to cancel the
+        // picker, then 'r' on the re-displayed emergency menu to
+        // commit a reboot. Verifying the produced TerminalAction is
+        // Reboot — not Execve — pins the architectural change.
         let mut config = Config::recovery_default();
         config.rescue.mode = RescueMode::Embedded;
-        // Pin the shell path to a known value so we can assert the
-        // execve target without depending on the recovery-default
-        // string.
         config.paths.shell = PathBuf::from("/bin/test-emergency-shell");
 
         let console: Box<dyn Console> = Box::new(ScriptedConsole::new(vec![
+            // Emergency menu: Down (Shell) + Enter → enter picker.
             Some(press(KeyCode::Down)),
             Some(press(KeyCode::Enter)),
+            // Picker dialog: Esc to cancel back to the emergency menu.
+            Some(press(KeyCode::Esc)),
+            // Emergency menu (second iteration): 'r' commits Reboot.
+            Some(press(KeyCode::Char('r'))),
         ]));
 
         let action = drop_to_emergency(console, &config, io_err("synthetic boot failure"));
-
-        match action {
-            TerminalAction::Execve { path, banner, .. } => {
-                let path_bytes = path.as_bytes();
-                assert_eq!(
-                    path_bytes, b"/bin/test-emergency-shell",
-                    "execve target must match the configured shell"
-                );
-                let banner = banner.expect("emergency execve must carry a banner");
-                assert_eq!(banner.shell_path, PathBuf::from("/bin/test-emergency-shell"));
-            }
-            other => panic!("expected Execve, got {other:?}"),
-        }
+        assert!(
+            matches!(action, TerminalAction::Reboot),
+            "Shell choice must NOT produce a TerminalAction::Execve any more; \
+             got {action:?}"
+        );
     }
 
     #[test]

@@ -67,7 +67,7 @@ zeroize = { version = "1", features = ["derive"] }
 # rustix is already pulled in transitively via crossterm; promote it to an
 # explicit dependency so its safe wrappers for open(2) / termios are visible
 # at the manifest level.
-rustix = { version = "0.38", default-features = false, features = ["fs", "termios", "std"] }
+rustix = { version = "0.38", default-features = false, features = ["fs", "termios", "std", "event"] }
 # Pure-Rust decompression for kernel modules. NixOS kernels are built
 # without CONFIG_MODULE_DECOMPRESS, so userspace must decompress
 # .ko.{xz,zst,gz} before calling init_module(2). C-FFI crates (xz2,

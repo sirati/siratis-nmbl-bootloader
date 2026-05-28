@@ -347,6 +347,12 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
         ) -> Result<()> {
             Ok(())
         }
+        fn suspend(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
