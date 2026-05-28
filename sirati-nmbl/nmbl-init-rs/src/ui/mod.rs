@@ -832,6 +832,13 @@ pub(crate) fn passphrase_prompt_on_console(
             }
             if exited {
                 // Enter was pressed — extract the buffer and return.
+                // Silently ignore Enter while the buffer is empty so an
+                // accidental keystroke doesn't submit "" to cryptsetup.
+                if let Screen::Passphrase { ref buffer, .. } = app.screen
+                    && buffer.is_empty()
+                {
+                    continue;
+                }
                 if let Screen::Passphrase { buffer, .. } = app.screen {
                     return Ok(buffer);
                 }
@@ -991,6 +998,23 @@ mod tests {
             Some("Unlock root"),
             "render path must observe the supplied prompt label"
         );
+    }
+
+    #[test]
+    fn passphrase_prompt_ignores_enter_on_empty_buffer() {
+        // Enter on an empty buffer must be silently ignored (matches
+        // login-screen convention; an empty string would surface as a
+        // cryptsetup IO error otherwise). Once a char arrives, Enter
+        // submits as usual.
+        let keys = vec![
+            press(KeyCode::Enter),
+            press(KeyCode::Char('p')),
+            press(KeyCode::Enter),
+        ];
+        let mut console = ScriptedConsole::new(keys);
+        let secret = passphrase_prompt_on_console(&mut console, "Unlock")
+            .expect("Enter after a char submits the buffer");
+        assert_eq!(&**secret, "p");
     }
 
     #[test]

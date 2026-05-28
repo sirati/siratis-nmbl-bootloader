@@ -706,7 +706,21 @@ pub fn render_passphrase(frame: &mut Frame<'_>, data: &PassphraseScreenData<'_>)
         .block(Block::bordered().title("Passphrase"))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, modal);
-    render_footer(frame, footer, "Enter=submit  Esc=cancel");
+    // Empty buffer → "Enter=submit" hint is rendered DIM so the disabled
+    // state is visible; Enter is silently ignored in the read loop.
+    let submit_style = if data.buffer_len == 0 {
+        Style::default().add_modifier(Modifier::DIM)
+    } else {
+        Style::default()
+    };
+    let hint = Line::from(vec![
+        Span::styled("Enter=submit", submit_style),
+        Span::raw("  Esc=cancel"),
+    ]);
+    frame.render_widget(
+        Paragraph::new(hint).alignment(Alignment::Right),
+        footer,
+    );
 }
 
 #[cfg(test)]
@@ -844,6 +858,63 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("*****|"), "wrong mask count in:\n{text}");
         assert!(text.contains("Unlock /dev/sda2"));
+    }
+
+    /// Walk the rendered buffer and return the cell style under the first
+    /// occurrence of `needle`'s leading char on the line that contains it.
+    fn style_under_first_match(term: &Terminal<TestBackend>, needle: &str) -> Style {
+        let buf = term.backend().buffer();
+        let head = needle.chars().next().expect("non-empty needle");
+        let head_str = head.to_string();
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_owned()))
+                .collect();
+            if let Some(byte_idx) = row.find(needle) {
+                // Byte index in a single-byte ASCII needle equals column.
+                let col_chars = row
+                    .get(..byte_idx)
+                    .map_or(0, |prefix| prefix.chars().count());
+                // Locate cell at (col_chars, y) and assert its symbol matches.
+                let cell = buf
+                    .cell((col_chars as u16, y))
+                    .expect("cell in rendered area");
+                assert_eq!(cell.symbol(), head_str);
+                return cell.style();
+            }
+        }
+        panic!("needle {needle:?} not found in rendered buffer");
+    }
+
+    #[test]
+    fn test_render_passphrase_submit_hint_dim_when_buffer_empty() {
+        // Empty buffer → "Enter=submit" rendered DIM so the disabled
+        // state is visible to the operator. Non-empty buffer → default.
+        let empty = PassphraseScreenData {
+            prompt_label: "Unlock root",
+            buffer_len: 0,
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_passphrase(f, &empty)).expect("draw");
+        let style_empty = style_under_first_match(&term, "Enter=submit");
+        assert!(
+            style_empty.add_modifier.contains(Modifier::DIM),
+            "Enter=submit must be DIM when buffer is empty; got {style_empty:?}",
+        );
+
+        let filled = PassphraseScreenData {
+            prompt_label: "Unlock root",
+            buffer_len: 3,
+        };
+        let mut term2 = new_term(80, 24);
+        term2
+            .draw(|f| render_passphrase(f, &filled))
+            .expect("draw");
+        let style_filled = style_under_first_match(&term2, "Enter=submit");
+        assert!(
+            !style_filled.add_modifier.contains(Modifier::DIM),
+            "Enter=submit must NOT be DIM with non-empty buffer; got {style_filled:?}",
+        );
     }
 
     #[test]
