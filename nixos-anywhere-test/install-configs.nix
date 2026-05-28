@@ -477,6 +477,62 @@ in
     ];
   };
 
+  # Serial-TTY LUKS demo: same disko layout as splash-luks-vnc-demo but
+  # without the splash, with /dev/console routed to ttyS0 so the LUKS
+  # passphrase prompt comes up on the serial console. Used for end-to-end
+  # LUKS unlock verification driven entirely through the serial socket.
+  splash-luks-serial-demo = mkInstall {
+    hostName = "splash-luks-serial-demo";
+    diskoModule = ./disko-luks-password.nix;
+    extraInitrdKernelModules = [
+      "dm_mod"
+      "dm-crypt"
+      "aesni_intel"
+    ];
+    # Linux 6.6 trips a crypto-API init bug in dm-crypt; use latest.
+    nmblKernelPackage = pkgs.linuxPackages_latest.kernel;
+    bootstrapper = {
+      partition_table = "gpt";
+      bootMode = "uefi";
+      loader = "grub";
+      loader_extra_args = {
+        timeout = 0;
+      };
+    };
+    extraModules = [
+      (
+        { lib, ... }:
+        {
+          # Splash explicitly OFF; we want /dev/console = ttyS0 so the
+          # LUKS prompt comes up on the serial line.
+          boot.nmbl.splash.enable = false;
+          boot.nmbl.serialConsole = lib.mkForce "ttyS0,115200";
+          boot.nmbl.timeoutSeconds = lib.mkForce 600;
+          # No `console=tty1` — last console= wins for /dev/console, so we
+          # keep ttyS0 last to ensure stdin/stdout map to serial.
+          boot.nmbl.kernelParams = lib.mkForce [
+            "earlyprintk=serial,ttyS0,115200"
+            "console=ttyS0,115200"
+          ];
+          boot.kernelParams = lib.mkForce [
+            "earlyprintk=serial,ttyS0,115200"
+            "console=ttyS0,115200"
+            "loglevel=7"
+          ];
+          # LUKS unlock executed by NMBL stage-0 before mounting /.
+          boot.nmbl.activation.luks = [
+            {
+              name = "cryptroot";
+              device = "/dev/vda3";
+              unlock = "password";
+              promptLabel = "Enter LUKS passphrase for cryptroot";
+            }
+          ];
+        }
+      )
+    ];
+  };
+
   # Splash + LUKS demo: same disko layout as the LUKS test (vda3 wrapped
   # in a luks container unlocked with passphrase "test"), but with the
   # splash enabled so the LUKS prompt renders through the graphical UI
