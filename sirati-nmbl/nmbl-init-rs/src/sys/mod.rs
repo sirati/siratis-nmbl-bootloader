@@ -1,5 +1,6 @@
 pub mod activation;
 pub mod blkid;
+pub mod btrfs;
 pub mod cpio;
 pub mod kexec;
 pub mod loopdev;
