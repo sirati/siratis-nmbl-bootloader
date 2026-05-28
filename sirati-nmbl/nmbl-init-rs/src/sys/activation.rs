@@ -21,10 +21,22 @@ use std::ffi::{CString, NulError};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 
-use nix::sys::wait::{WaitStatus, waitpid};
+use std::thread::sleep;
+use std::time::Duration;
+
+use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, close, dup2, execve, fork, pipe, read, write};
 
 use crate::error::{NmblError, Result};
+
+/// Poll cadence for the tick-aware wait helper.
+///
+/// 150 ms is brisk enough that the operator sees the spinner move
+/// while a passphrase is being verified (cryptsetup --key-file=- runs
+/// in well under a second on modern hardware, but Argon2id key
+/// derivation can take ~1-3 s on a Raspberry Pi class CPU), and slow
+/// enough that the WNOHANG polling overhead stays negligible.
+const TICK_INTERVAL: Duration = Duration::from_millis(150);
 
 /// How a child process terminated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +71,28 @@ const EXEC_FAILED_EXIT_CODE: i32 = 127;
 /// whether that's fatal: `cryptsetup` returning 2 (wrong passphrase)
 /// is operationally different from the binary failing to start.
 pub fn run(binary: &Path, argv: &[String], stdin_data: Option<&[u8]>) -> Result<ProcessOutcome> {
+    run_with_tick(binary, argv, stdin_data, None::<&mut dyn FnMut()>)
+}
+
+/// Tick-aware variant of [`run`]: while waiting for the child to exit,
+/// invoke `tick` every ~150 ms. The caller uses the callback to advance
+/// a UI spinner so a slow activation (e.g. Argon2id LUKS unlock on a
+/// low-power CPU) doesn't look like the boot hung.
+///
+/// Semantics otherwise match [`run`]: stdin is piped, stdout/stderr are
+/// inherited, the [`ProcessOutcome`] reports the child's exit code, and
+/// a non-zero exit is **not** an `Err`.
+///
+/// `tick` is called from the parent process after the fork; on the
+/// child side nothing is changed — see the SAFETY comment in [`run`]
+/// for the post-fork constraints. Pass `None` to get the blocking
+/// behaviour of [`run`].
+pub fn run_with_tick<F: FnMut() + ?Sized>(
+    binary: &Path,
+    argv: &[String],
+    stdin_data: Option<&[u8]>,
+    tick: Option<&mut F>,
+) -> Result<ProcessOutcome> {
     // All CString construction and Vec allocation MUST happen here,
     // in the parent, before fork(2). After the fork, the child is
     // restricted to async-signal-safe operations until execve(2)
@@ -183,7 +217,7 @@ pub fn run(binary: &Path, argv: &[String], stdin_data: Option<&[u8]>) -> Result<
                 drop(write_end);
             }
 
-            wait_for_child(child, binary)
+            wait_for_child(child, binary, tick)
         }
     }
 }
@@ -276,7 +310,7 @@ pub fn run_capture(binary: &Path, argv: &[String]) -> Result<(ProcessOutcome, Ve
             let captured = read_all(&read_end, binary)?;
             drop(read_end);
 
-            let outcome = wait_for_child(child, binary)?;
+            let outcome = wait_for_child(child, binary, None::<&mut dyn FnMut()>)?;
             Ok((outcome, captured))
         }
     }
@@ -359,9 +393,27 @@ fn write_all(fd: &OwnedFd, mut buf: &[u8], binary: &Path) -> Result<()> {
 
 /// Wait for `child` to terminate and translate the resulting
 /// `WaitStatus` into a `ProcessOutcome`. EINTR is retried.
-fn wait_for_child(child: Pid, binary: &Path) -> Result<ProcessOutcome> {
+///
+/// When `tick` is `Some`, this loop polls with `WNOHANG` and calls
+/// `tick` every [`TICK_INTERVAL`] so the caller can advance a UI
+/// spinner. When `tick` is `None`, the loop reverts to a blocking
+/// `waitpid(None)` — identical behaviour to the original
+/// non-tick-aware function.
+fn wait_for_child<F: FnMut() + ?Sized>(
+    child: Pid,
+    binary: &Path,
+    mut tick: Option<&mut F>,
+) -> Result<ProcessOutcome> {
     loop {
-        match waitpid(child, None) {
+        // Choose blocking vs. WNOHANG based on whether a tick callback
+        // was supplied. The blocking branch matches the historical
+        // behaviour to keep callers without UI plumbing cheap.
+        let status = if tick.is_some() {
+            waitpid(child, Some(WaitPidFlag::WNOHANG))
+        } else {
+            waitpid(child, None)
+        };
+        match status {
             Ok(WaitStatus::Exited(_, code)) => {
                 return Ok(ProcessOutcome {
                     exit_code: code,
@@ -378,11 +430,20 @@ fn wait_for_child(child: Pid, binary: &Path) -> Result<ProcessOutcome> {
                     normal_exit: false,
                 });
             }
+            // `StillAlive` is the WNOHANG "child not yet exited"
+            // signal — invoke the spinner tick and sleep one slice
+            // before polling again.
+            Ok(WaitStatus::StillAlive) => {
+                if let Some(t) = tick.as_mut() {
+                    (*t)();
+                }
+                sleep(TICK_INTERVAL);
+                continue;
+            }
             // Stopped/Continued/Ptrace* are not possible without
-            // WUNTRACED / WCONTINUED / ptrace — but waitpid with
-            // `None` flags returns only Exited/Signaled in practice.
-            // We loop on the unexpected variants rather than panic.
-            Ok(WaitStatus::StillAlive) => continue,
+            // WUNTRACED / WCONTINUED / ptrace — but waitpid returns
+            // only Exited/Signaled/StillAlive in practice. We loop on
+            // the unexpected variants rather than panic.
             Ok(_) => continue,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => {

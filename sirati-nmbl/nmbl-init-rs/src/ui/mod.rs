@@ -580,10 +580,14 @@ pub(crate) fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_
         Screen::Passphrase {
             prompt_label,
             buffer,
+            verifying,
+            spinner_frame,
         } => {
             let data = PassphraseScreenData {
                 prompt_label,
                 buffer_len: buffer.len(),
+                verifying: *verifying,
+                spinner_frame: *spinner_frame,
             };
             render_passphrase(frame, &data);
         }
@@ -813,6 +817,8 @@ pub(crate) fn passphrase_prompt_on_console(
     app.screen = Screen::Passphrase {
         prompt_label: label.to_string(),
         buffer: Zeroizing::new(String::new()),
+        verifying: false,
+        spinner_frame: 0,
     };
 
     let mut dirty = true;
@@ -932,6 +938,7 @@ mod tests {
             if let Screen::Passphrase {
                 buffer,
                 prompt_label,
+                ..
             } = &app.screen
             {
                 self.last_buffer_len = buffer.len();
@@ -1028,6 +1035,8 @@ mod tests {
         let data = PassphraseScreenData {
             prompt_label: "Unlock root",
             buffer_len: 4,
+            verifying: false,
+            spinner_frame: 0,
         };
         let mut term = Terminal::new(TestBackend::new(60, 14)).expect("test terminal");
         term.draw(|f| render_passphrase(f, &data)).expect("draw");
