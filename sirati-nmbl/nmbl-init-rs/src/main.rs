@@ -657,12 +657,27 @@ fn run_inner(
             let _ = console;
             Ok(action)
         }
+        // Wrong-password modal Reboot path: the operator already picked
+        // [Reboot]; routing through the emergency menu would just ask
+        // them again. Short-circuit straight to the dispatcher's reboot
+        // syscall, dropping `console` along the way so its Drop restores
+        // the VT before reboot(2) fires.
+        Err(NmblError::OperatorChoseReboot { .. }) => {
+            let _ = console;
+            Ok(TerminalAction::Reboot)
+        }
         Err(err) => {
             // Hand the live boot console down to the emergency screen
             // so the operator keeps the same backend (splash or tty)
             // they saw during phase progress — no DRM/tty re-grab, no
             // flicker. drop_to_emergency itself drops the console
             // before returning, by way of normal scope exit.
+            //
+            // `NmblError::WrongPasswordShellExited` deliberately falls
+            // through this arm so the standard emergency menu surfaces
+            // — its [Retry boot from config] re-runs phase 3 and re-
+            // prompts for the passphrase, which is exactly what the
+            // operator wants after a shell detour.
             Ok(drop_to_emergency(console, &config, err))
         }
     }
