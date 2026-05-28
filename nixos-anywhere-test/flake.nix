@@ -748,6 +748,12 @@
           firmware = "uefi";
           displayMode = "vnc-demo";
         };
+        install-test-splash-luks-serial-demo = mkOrchestrator {
+          configName = "splash-luks-serial-demo";
+          port = "22098";
+          firmware = "uefi";
+          displayMode = "headless";
+        };
         install-test-gpt-bios-btrfs-raid1 = mkOrchestrator {
           configName = "install-gpt-bios-btrfs-raid1";
           port = "22021";
