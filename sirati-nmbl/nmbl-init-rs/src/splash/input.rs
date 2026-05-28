@@ -86,6 +86,36 @@ impl SplashInput {
         })
     }
 
+    /// Release the raw-mode termios so a foreign writer (the
+    /// multiplexed emergency shell on `/dev/tty1`) can drive the same
+    /// fd without our raw-mode flags eating its bytes. Pairs with
+    /// [`resume`].
+    ///
+    /// The fd stays open: we only restore the saved termios snapshot.
+    /// If the snapshot was already taken (a previous `suspend` without
+    /// a matching `resume`) the call is a no-op.
+    ///
+    /// [`resume`]: SplashInput::resume
+    pub fn suspend(&mut self) -> Result<()> {
+        if let Some(saved) = self.saved_termios.take() {
+            restore_termios(self.fd.as_fd(), &saved)?;
+        }
+        Ok(())
+    }
+
+    /// Re-enter raw mode after [`suspend`]. Captures the current
+    /// termios snapshot (the shell may have left them changed) so the
+    /// next `suspend` restores back to a coherent state.
+    pub fn resume(&mut self) -> Result<()> {
+        if self.saved_termios.is_some() {
+            // Already raw; nothing to do.
+            return Ok(());
+        }
+        let saved = enter_raw(self.fd.as_fd())?;
+        self.saved_termios = Some(saved);
+        Ok(())
+    }
+
     /// Poll for and parse a single key event. Returns `Ok(None)` if no
     /// input arrived within `timeout`.
     ///

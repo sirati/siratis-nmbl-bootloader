@@ -12,7 +12,7 @@
 //! via direct termios syscalls through `rustix`/`nix`.
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rustix::fs::{Mode, OFlags};
 use rustix::termios::{OptionalActions, Termios, tcgetattr, tcsetattr};
@@ -103,6 +103,58 @@ impl Drop for RawModeGuard<'_> {
     }
 }
 
+/// Read `/sys/class/tty/console/active` and return the kernel-elected
+/// primary interactive console as an absolute `/dev/<name>` path.
+///
+/// The sysfs file lists every active console driver, space-separated,
+/// in registration order. The *last* `console=` argument on the kernel
+/// cmdline becomes the primary interactive console (the one
+/// `register_console` calls `CON_CONSDEV` on); that entry appears
+/// **first** in the file's contents. We therefore return the first
+/// word, mapped to `/dev/<word>` (e.g. `tty0` → `/dev/tty0`,
+/// `ttyS0` → `/dev/ttyS0`).
+///
+/// Pure I/O: the function does not open the resulting device, so a
+/// caller can decide whether opening is appropriate (the picker dialog
+/// uses the path purely as a label and a target identity, not a fd).
+///
+/// `path` is parameterised so unit tests can point the helper at a
+/// fixture in a temp directory; production callers should use
+/// [`read_active_console`].
+pub fn read_active_console_from(path: &Path) -> Result<PathBuf> {
+    let text = std::fs::read_to_string(path).map_err(|source| NmblError::Io {
+        source,
+        context: format!("reading active console listing {}", path.display()),
+    })?;
+    parse_active_console(&text).ok_or_else(|| NmblError::Tui {
+        source: std::io::Error::other(format!(
+            "{} contains no console names",
+            path.display()
+        )),
+    })
+}
+
+/// Production wrapper around [`read_active_console_from`] pinned to
+/// the canonical sysfs path.
+pub fn read_active_console() -> Result<PathBuf> {
+    read_active_console_from(Path::new("/sys/class/tty/console/active"))
+}
+
+/// Parse one `/sys/class/tty/console/active` payload into the primary
+/// console's `/dev/<name>` path. Pure function — no I/O — so it can
+/// be unit-tested off-target.
+///
+/// The first whitespace-delimited token wins; the rest are the
+/// secondary outputs the kernel mirrors prints to. Whitespace-only or
+/// empty input returns `None`.
+fn parse_active_console(text: &str) -> Option<PathBuf> {
+    let first = text.split_whitespace().next()?;
+    if first.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from("/dev").join(first))
+}
+
 /// Wrap a `rustix::io::Errno` into our `NmblError::Tui` variant.
 /// `Errno` implements `From<Errno> for io::Error`, so the translation
 /// is lossless.
@@ -113,6 +165,11 @@ fn io_tui(e: rustix::io::Errno) -> NmblError {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests assert on contract failures"
+)]
 mod tests {
     use super::*;
     use std::fs::OpenOptions;
@@ -132,5 +189,62 @@ mod tests {
 
         let res = enter_raw(&file);
         assert!(res.is_err(), "expected ENOTTY on /dev/null, got Ok");
+    }
+
+    /// `parse_active_console` must take the FIRST whitespace-delimited
+    /// token (the kernel-elected primary interactive console) and
+    /// prepend `/dev/`. Both space- and tab-separated payloads occur
+    /// in the wild depending on kernel version.
+    #[test]
+    fn parse_active_console_picks_first_word() {
+        assert_eq!(
+            parse_active_console("ttyS0\n"),
+            Some(PathBuf::from("/dev/ttyS0"))
+        );
+        assert_eq!(
+            parse_active_console("tty0 ttyS0\n"),
+            Some(PathBuf::from("/dev/tty0"))
+        );
+        // Tabs and trailing newlines must both be tolerated.
+        assert_eq!(
+            parse_active_console("ttyS0\tttyAMA0\n"),
+            Some(PathBuf::from("/dev/ttyS0"))
+        );
+    }
+
+    #[test]
+    fn parse_active_console_empty_input_is_none() {
+        // The kernel never produces an empty file in practice, but
+        // gracefully handling the edge case keeps the picker dialog's
+        // fallback ("no active console detected") reachable.
+        assert!(parse_active_console("").is_none());
+        assert!(parse_active_console("   \n").is_none());
+    }
+
+    #[test]
+    fn read_active_console_from_temp_file_round_trips() {
+        // Production callers can't be tested without root, but the
+        // path-based variant lets us pin the I/O wrapper against a
+        // tempfile fixture so the parser is exercised end-to-end.
+        let dir = match tempfile::tempdir() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let path = dir.path().join("active");
+        if std::fs::write(&path, "ttyS0 tty0\n").is_err() {
+            return;
+        }
+        let resolved = read_active_console_from(&path).expect("fixture must read");
+        assert_eq!(resolved, PathBuf::from("/dev/ttyS0"));
+    }
+
+    #[test]
+    fn read_active_console_from_missing_file_is_io_error() {
+        let path = PathBuf::from("/tmp/this/does/not/exist/nmbl-active-console-test");
+        let err = read_active_console_from(&path).expect_err("missing file must error");
+        match err {
+            NmblError::Io { .. } => {}
+            other => panic!("expected NmblError::Io, got {other:?}"),
+        }
     }
 }
