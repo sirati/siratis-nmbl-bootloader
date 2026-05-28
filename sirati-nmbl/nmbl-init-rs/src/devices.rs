@@ -15,7 +15,7 @@ use nix::errno::Errno;
 use crate::config::{Config, FilesystemEntry};
 use crate::error::{NmblError, Result};
 use crate::nmbl_info;
-use crate::ui::{BootReporter, ProgressSink};
+use crate::ui::{BootReporter, ProgressSink, TickOutcome};
 
 /// Default per-device readiness deadline used by
 /// [`mount_system_filesystems`]. Held here (not in `Config`) until the
@@ -65,13 +65,21 @@ pub fn wait_for(
             });
         }
 
+        // The sink's `tick` itself blocks ~POLL_INTERVAL on `poll_key`,
+        // so when one is wired we let it provide the inter-poll cadence
+        // (and an Esc-abort hook). Without a sink (headless / tests)
+        // we still need the sleep so the loop doesn't busy-spin.
         if let Some(sink) = progress.as_deref_mut() {
             let elapsed = start.elapsed();
             let phase = format_wait_phase(operation, &device.display(), elapsed, timeout);
-            sink.tick(&phase);
+            if let TickOutcome::Aborted = sink.tick(&phase) {
+                return Err(NmblError::OperatorAborted {
+                    context: format!("waiting for {}", device.display()),
+                });
+            }
+        } else {
+            std::thread::sleep(POLL_INTERVAL);
         }
-
-        std::thread::sleep(POLL_INTERVAL);
     }
 }
 
@@ -288,9 +296,42 @@ mod tests {
     }
 
     impl ProgressSink for CountingSink {
-        fn tick(&mut self, phase: &str) {
+        fn tick(&mut self, phase: &str) -> TickOutcome {
             self.ticks = self.ticks.saturating_add(1);
             self.last_phase = Some(phase.to_string());
+            // Production `BootReporter::tick` blocks up to ~100 ms on
+            // `poll_key`, which gives the wait loop its natural
+            // cadence. A bare counting sink would busy-spin and
+            // generate millions of ticks per second, so simulate the
+            // same cadence here. Tests asserting on tick counts can
+            // then trust wallclock math.
+            std::thread::sleep(POLL_INTERVAL);
+            TickOutcome::Continue
+        }
+    }
+
+    /// ProgressSink that aborts on the Nth tick. Used to drive
+    /// `wait_for` into the OperatorAborted path without standing up a
+    /// full TUI console.
+    struct AbortingSink {
+        ticks: u32,
+        abort_at: u32,
+    }
+
+    impl AbortingSink {
+        fn at(abort_at: u32) -> Self {
+            Self { ticks: 0, abort_at }
+        }
+    }
+
+    impl ProgressSink for AbortingSink {
+        fn tick(&mut self, _phase: &str) -> TickOutcome {
+            self.ticks = self.ticks.saturating_add(1);
+            if self.ticks >= self.abort_at {
+                TickOutcome::Aborted
+            } else {
+                TickOutcome::Continue
+            }
         }
     }
 
@@ -348,6 +389,40 @@ mod tests {
             sink.ticks <= 15,
             "expected at most 15 ticks during a 500 ms wait (defensive upper bound), got {}",
             sink.ticks
+        );
+    }
+
+    #[test]
+    fn wait_for_returns_operator_aborted_when_sink_aborts() {
+        // First tick fires Aborted; wait_for must surface that as
+        // NmblError::OperatorAborted carrying the device-context string
+        // so the emergency menu can show "waiting for <device>".
+        let missing = Path::new("/nonexistent/nmbl-devices-abort-test");
+        let mut sink = AbortingSink::at(1);
+        let err = wait_for(
+            missing,
+            Duration::from_secs(30),
+            "phase 3b: waiting for",
+            Some(&mut sink),
+        )
+        .expect_err("aborting sink must abort the wait");
+
+        match err {
+            NmblError::OperatorAborted { context } => {
+                assert!(
+                    context.contains("nmbl-devices-abort-test"),
+                    "context must name the device being waited on: {context:?}"
+                );
+                assert!(
+                    context.starts_with("waiting for"),
+                    "context must lead with the action verb: {context:?}"
+                );
+            }
+            other => panic!("expected OperatorAborted, got {other:?}"),
+        }
+        assert_eq!(
+            sink.ticks, 1,
+            "wait_for must surface the abort after exactly one tick"
         );
     }
 

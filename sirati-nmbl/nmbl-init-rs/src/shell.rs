@@ -153,7 +153,11 @@ pub fn drop_to_emergency(
                             "emergency retry-boot failed: {}",
                             format_chain(&e as &dyn std::error::Error)
                         );
-                        surface_action_failure(&mut *console, "Retry boot failed", &e);
+                        surface_action_failure(
+                            &mut *console,
+                            abort_aware_title(&e, "Retry boot failed"),
+                            &e,
+                        );
                         continue;
                     }
                 }
@@ -169,7 +173,7 @@ pub fn drop_to_emergency(
                         );
                         surface_action_failure(
                             &mut *console,
-                            "Kexec readiness check failed",
+                            abort_aware_title(&e, "Kexec readiness check failed"),
                             &e,
                         );
                         continue;
@@ -252,6 +256,22 @@ pub fn print_halt_banner(cause: &NmblError) {
     eprintln!("{separator}");
 }
 
+/// Pick the modal title shown when an emergency action returns an
+/// error. The operator-abort path uses a distinct "Aborted by operator"
+/// banner so the modal reads naturally ("you pressed Esc") instead of
+/// the generic action-failed banner that would otherwise apply.
+///
+/// `OperatorAborted` can surface from any emergency action that
+/// internally calls `wait_for` (Retry boot, Kexec readiness check on a
+/// future code path) — funneling the rename here means the call sites
+/// don't have to duplicate the `matches!` check.
+fn abort_aware_title(err: &NmblError, default: &'static str) -> &'static str {
+    match err {
+        NmblError::OperatorAborted { .. } => "Aborted by operator",
+        _ => default,
+    }
+}
+
 /// One-line operator hint per error variant. Exhaustive `match` so
 /// adding a new variant to [`NmblError`] becomes a compile error here
 /// rather than a silently missing diagnostic at boot.
@@ -307,6 +327,9 @@ fn suggested_action(err: &NmblError) -> String {
             report_path.display()
         ),
         NmblError::Shell { .. } => "Failed to exec the emergency shell itself. Reboot.".to_string(),
+        NmblError::OperatorAborted { .. } => {
+            "You aborted the wait. Pick a different option.".to_string()
+        }
     }
 }
 
@@ -480,6 +503,22 @@ mod tests {
         };
         let s = suggested_action(&e);
         assert!(s.contains("/run/nmbl-panic-1.txt"), "{s}");
+    }
+
+    #[test]
+    fn suggested_action_for_operator_aborted_hints_pick_other_option() {
+        let e = NmblError::OperatorAborted {
+            context: "waiting for /dev/sda1".to_string(),
+        };
+        let s = suggested_action(&e);
+        assert!(
+            s.contains("aborted"),
+            "operator hint should mention the abort: {s}"
+        );
+        assert!(
+            s.contains("Pick a different option") || s.contains("different option"),
+            "operator hint should suggest picking another action: {s}"
+        );
     }
 
     #[test]
