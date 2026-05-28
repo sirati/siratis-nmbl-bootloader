@@ -29,10 +29,13 @@ let
       verbosity = cfg.verbosity;
       timeout_secs = cfg.timeoutSecs;
       panic_report_dir = toString cfg.panicReportDir;
-      # cfg.serialConsole is the legacy nullable string ("ttyS0,115200" or
-      # null); the Rust struct wants a plain bool. Coerce here so users
-      # keep configuring a single option.
-      serial_console = cfg.serialConsole != null;
+      # cfg.serialConsole drives kernel cmdline tagging at the Nix
+      # layer (see ../nixos-modules/* for the `console=` plumbing);
+      # the Rust TUI now renders identically on serial and
+      # framebuffer consoles, so the runtime no longer needs a
+      # boolean toggle. We omit the (formerly required) field
+      # entirely — `General::_serial_console_compat` accepts it as a
+      # no-op if a legacy TOML still sets it.
     };
 
     kernel_modules = {

@@ -1,17 +1,13 @@
-//! UI orchestrator. The frame loop and serial-console fallback live
-//! here; pure render functions live in [`view`], the state machine in
-//! [`app`], and the backend abstraction (splash framebuffer vs raw-mode
-//! tty) in [`console`]. Every interactive screen — selector, cmdline
-//! editor, passphrase modal, emergency picker — renders through the
-//! same `&mut dyn Console`; only the serial-mode fallback drops to
-//! direct stdin/stdout.
-//!
-//! ## Serial-console fallback
-//!
-//! When `config.general.serial_console` is true we skip the Console
-//! TUI and run a line-oriented prompt against stdin/stdout. Many
-//! serial environments mangle escape sequences; line mode is reliable
-//! and the operator can still drop to the shell or pick a generation.
+//! UI orchestrator. The frame loop lives here; pure render functions
+//! live in [`view`], the state machine in [`app`], and the backend
+//! abstraction (splash framebuffer vs raw-mode tty) in [`console`].
+//! Every interactive screen — selector, cmdline editor, passphrase
+//! modal, emergency picker — renders through the same `&mut dyn Console`,
+//! regardless of whether the underlying device is a framebuffer VT, a
+//! `/dev/tty1` keyboard line, or a serial UART. Ratatui's crossterm
+//! backend emits vt100/xterm escape sequences which every modern
+//! serial terminal emulator (xterm, tmux, picocom, screen, minicom)
+//! understands, so there is no longer a line-mode fallback path.
 //!
 //! ## Activation passphrase wiring
 //!
@@ -31,10 +27,6 @@
 //! Esc on the modal returns a [`NmblError::Tui`] which
 //! `run_all_activations` wraps as [`NmblError::Activation`] and the
 //! top-level driver routes to the emergency shell.
-//!
-//! Serial mode (`config.general.serial_console = true`) skips the
-//! Console plumbing and runs a line-mode `getpass`-style prompt on
-//! stdin/stdout, mirroring the rest of the serial code path.
 
 pub mod app;
 pub mod console;
@@ -53,7 +45,6 @@ pub mod timeout;
 pub mod tty_enum;
 pub mod view;
 
-use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -688,18 +679,14 @@ fn decode_wrong_password_selection(idx: usize) -> WrongPasswordOutcome {
 /// The console is brought up once by the orchestrator (main.rs) at the
 /// start of phase 1 and held through every phase; this function reuses
 /// it instead of opening a parallel splash bring-up, so the same DRM
-/// card / raw-mode tty serves the whole boot.
-///
-/// Falls back to a line-oriented serial prompt when the config opts
-/// in via `general.serial_console`.
+/// card / raw-mode tty serves the whole boot. Serial UARTs go through
+/// the same path — the TUI's crossterm backend emits portable
+/// vt100/xterm escapes that every modern serial terminal renders.
 pub fn run_selector(
     config: &Config,
     generations: &[Generation],
     console: &mut dyn Console,
 ) -> Result<Decision> {
-    if config.general.serial_console {
-        return select_generation_serial(config, generations);
-    }
     run_selector_on_console(config, generations, console)
 }
 
@@ -1018,173 +1005,33 @@ fn list_data<'a>(app: &'a App<'a>) -> ListScreenData<'a> {
     }
 }
 
-/// Line-oriented fallback for serial consoles. The protocol is
-/// intentionally trivial — operators on broken serial lines can drive
-/// it by hand. Commands:
-///   - empty line or "boot"          → boot default (index 0)
-///   - integer N (1-based)           → boot the Nth generation
-///   - "edit N" or "edit"            → boot Nth with edited cmdline
-///   - "shell" or "s"                → drop to emergency shell
-///   - "reboot" or "q"               → reboot
-fn select_generation_serial(_config: &Config, generations: &[Generation]) -> Result<Decision> {
-    let stdout = std::io::stdout();
-    let stdin = std::io::stdin();
-
-    {
-        let mut out = stdout.lock();
-        writeln!(out, "[nmbl] Serial console selector").map_err(tui_err)?;
-        for (i, g) in generations.iter().enumerate() {
-            let label = if g.label.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", g.label)
-            };
-            writeln!(out, "  {}) #{}{}", i.saturating_add(1), g.number, label).map_err(tui_err)?;
-        }
-        writeln!(
-            out,
-            "Enter number to boot, 'edit N' to edit cmdline, 'shell', or 'reboot':"
-        )
-        .map_err(tui_err)?;
-        out.flush().map_err(tui_err)?;
-    }
-
-    let mut line = String::new();
-    stdin.lock().read_line(&mut line).map_err(tui_err)?;
-    let trimmed = line.trim();
-    let last_idx = generations.len().saturating_sub(1);
-
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("boot") {
-        return Ok(Decision::Boot {
-            generation_index: 0,
-            cmdline_override: None,
-        });
-    }
-    if trimmed.eq_ignore_ascii_case("shell") || trimmed == "s" {
-        return Ok(Decision::Shell);
-    }
-    if trimmed.eq_ignore_ascii_case("reboot") || trimmed == "q" {
-        return Ok(Decision::Reboot);
-    }
-    if let Some(rest) = trimmed.strip_prefix("edit") {
-        let idx = parse_serial_index(rest.trim(), last_idx)?;
-        let original = generations
-            .get(idx)
-            .map(|g| g.kernel_params.join(" "))
-            .unwrap_or_default();
-        let edited = prompt_serial_line(&format!("cmdline [{original}]: "))?;
-        let override_str = if edited.trim().is_empty() {
-            original
-        } else {
-            edited
-        };
-        return Ok(Decision::Boot {
-            generation_index: idx,
-            cmdline_override: Some(override_str),
-        });
-    }
-    let idx = parse_serial_index(trimmed, last_idx)?;
-    Ok(Decision::Boot {
-        generation_index: idx,
-        cmdline_override: None,
-    })
-}
-
-/// Parse a 1-based generation number from a serial response and clamp
-/// it into the legal range. Empty input is treated as "first entry".
-fn parse_serial_index(input: &str, last_idx: usize) -> Result<usize> {
-    if input.is_empty() {
-        return Ok(0);
-    }
-    let n: usize = input.parse().map_err(|_| NmblError::Tui {
-        source: std::io::Error::other(format!("serial input {input:?} is not a number")),
-    })?;
-    let zero_based = n.saturating_sub(1);
-    Ok(zero_based.min(last_idx))
-}
-
-/// Prompt for and read a single trimmed line of serial input.
-fn prompt_serial_line(prompt: &str) -> Result<String> {
-    let stdout = std::io::stdout();
-    {
-        let mut out = stdout.lock();
-        write!(out, "{prompt}").map_err(tui_err)?;
-        out.flush().map_err(tui_err)?;
-    }
-    let mut buf = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut buf)
-        .map_err(tui_err)?;
-    // Strip exactly one trailing newline; don't trim user-meaningful
-    // spaces from inside the cmdline.
-    if buf.ends_with('\n') {
-        buf.pop();
-        if buf.ends_with('\r') {
-            buf.pop();
-        }
-    }
-    Ok(buf)
-}
-
 /// PasswordSupplier impl that pops a passphrase modal on the live
-/// boot console (splash framebuffer or raw-mode tty), or — when
-/// serial — does a line-mode `getpass`-style read on stdin/stdout.
+/// boot console (splash framebuffer or raw-mode tty — including a
+/// serial UART, which is just another tty character device).
 ///
 /// Does NOT open its own console. The orchestrator (main.rs) brings
 /// up exactly one `Console` for the whole boot and passes it through
 /// the activation runner; the supplier reuses that handle so the
 /// passphrase modal renders on the same backend as the surrounding
 /// boot-status screen.
-pub struct TuiPasswordSupplier {
-    pub config_serial: bool,
-}
+#[derive(Default)]
+pub struct TuiPasswordSupplier;
 
 impl TuiPasswordSupplier {
-    pub fn new(config: &Config) -> Self {
-        Self {
-            config_serial: config.general.serial_console,
-        }
+    #[must_use]
+    pub fn new(_config: &Config) -> Self {
+        // `_config` is accepted for forward-compatibility with
+        // future per-config passphrase policy (retry counts, masking
+        // toggles, …). Today the supplier is uniform — the same
+        // ratatui modal everywhere.
+        Self
     }
 }
 
 impl PasswordSupplier for TuiPasswordSupplier {
     fn prompt(&mut self, console: &mut dyn Console, label: &str) -> Result<Zeroizing<String>> {
-        if self.config_serial {
-            // Serial mode has no Console TUI plumbing; the rest of the
-            // serial code path uses stdin/stdout directly and so does
-            // the passphrase prompt. The supplied `console` handle is
-            // intentionally unused on this branch.
-            let _ = console;
-            return serial_passphrase_prompt(label);
-        }
         passphrase_prompt_on_console(console, label)
     }
-}
-
-/// Best-effort serial passphrase prompt. We can't reliably disable
-/// echo on every serial line discipline; we print the masking-disabled
-/// notice so the operator knows.
-fn serial_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
-    let stdout = std::io::stdout();
-    {
-        let mut out = stdout.lock();
-        writeln!(out, "[nmbl] {label}").map_err(tui_err)?;
-        write!(out, "Enter passphrase (input may be visible): ").map_err(tui_err)?;
-        out.flush().map_err(tui_err)?;
-    }
-    let mut buf = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut buf)
-        .map_err(tui_err)?;
-    if buf.ends_with('\n') {
-        buf.pop();
-        if buf.ends_with('\r') {
-            buf.pop();
-        }
-    }
-    Ok(Zeroizing::new(buf))
 }
 
 /// Drive the [`Screen::Passphrase`] modal on the supplied [`Console`]
@@ -1245,6 +1092,7 @@ pub(crate) fn passphrase_prompt_on_console(
     }
 }
 
+#[cfg(feature = "image-splash")]
 fn tui_err(source: std::io::Error) -> NmblError {
     NmblError::Tui { source }
 }
@@ -1258,37 +1106,6 @@ fn tui_err(source: std::io::Error) -> NmblError {
 )]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_serial_index_clamps_and_rejects_garbage() {
-        assert_eq!(parse_serial_index("", 4).expect("empty -> 0"), 0);
-        assert_eq!(parse_serial_index("1", 4).expect("1-based -> 0"), 0);
-        assert_eq!(parse_serial_index("3", 4).expect("3 -> 2"), 2);
-        // Clamps to last_idx.
-        assert_eq!(parse_serial_index("99", 4).expect("clamp"), 4);
-        assert!(parse_serial_index("not-a-number", 4).is_err());
-    }
-
-    #[test]
-    fn tui_password_supplier_carries_serial_flag() {
-        let sup = TuiPasswordSupplier {
-            config_serial: true,
-        };
-        assert!(sup.config_serial);
-    }
-
-    #[test]
-    fn tui_password_supplier_reads_serial_from_config() {
-        // serial_console = true → supplier picks the line-mode path.
-        let cfg: Config = toml::from_str("[general]\nserial_console = true\n").expect("parse cfg");
-        let sup = TuiPasswordSupplier::new(&cfg);
-        assert!(sup.config_serial);
-
-        // default config (no serial) leaves the raw-mode TUI path active.
-        let cfg_default: Config = toml::from_str("").expect("empty cfg parses");
-        let sup_default = TuiPasswordSupplier::new(&cfg_default);
-        assert!(!sup_default.config_serial);
-    }
 
     #[test]
     fn tui_password_supplier_satisfies_password_supplier_trait() {
