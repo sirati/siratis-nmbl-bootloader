@@ -5,6 +5,8 @@ pub mod devices;
 pub mod error;
 pub mod generations;
 pub mod log;
+#[cfg(feature = "mocking")]
+pub mod mocking;
 pub mod modules;
 pub mod mount;
 #[cfg(feature = "network-rescue")]

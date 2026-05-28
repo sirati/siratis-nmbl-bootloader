@@ -246,6 +246,13 @@ pub struct App<'a> {
     /// present so the timer doesn't restart. Once elapsed, the next
     /// visit to the emergency screen reboots immediately.
     pub error_countdown_deadline: Option<Instant>,
+    /// Scroll viewport offset for the modal text region. Only
+    /// meaningful when the modal layout returns `scrollable = true`
+    /// (stage H4 in `modal_layout`). Cleared by every modal-open and
+    /// modal-close path so a re-entry never inherits the previous
+    /// modal's scroll position. Ctrl+Shift+Up/Down advance by 1;
+    /// Ctrl+Shift+PageUp/PageDown advance by visible_lines - 1.
+    pub modal_scroll_offset: u16,
 }
 
 /// Number of frames in the boot-status spinner cycle.
@@ -275,6 +282,7 @@ impl<'a> App<'a> {
             decision: None,
             modal: None,
             error_countdown_deadline: None,
+            modal_scroll_offset: 0,
         }
     }
 
@@ -299,6 +307,7 @@ impl<'a> App<'a> {
             decision: None,
             modal: None,
             error_countdown_deadline: None,
+            modal_scroll_offset: 0,
         }
     }
 
@@ -319,7 +328,29 @@ impl<'a> App<'a> {
             decision: None,
             modal: None,
             error_countdown_deadline: None,
+            modal_scroll_offset: 0,
         }
+    }
+
+    /// Scroll the modal text viewport up by `n` rows (towards the top
+    /// of the buffer). Saturates at 0.
+    pub fn modal_scroll_up(&mut self, n: u16) {
+        self.modal_scroll_offset = self.modal_scroll_offset.saturating_sub(n);
+    }
+
+    /// Scroll the modal text viewport down by `n` rows, clamped at
+    /// `total - visible`. Saturates so the last visible row never
+    /// scrolls past the buffer's last row.
+    pub fn modal_scroll_down(&mut self, n: u16, total: u16, visible: u16) {
+        let max_off = total.saturating_sub(visible);
+        let new_off = self.modal_scroll_offset.saturating_add(n);
+        self.modal_scroll_offset = new_off.min(max_off);
+    }
+
+    /// Reset the modal scroll offset to 0. Called every modal open/close
+    /// path so a re-entry never inherits the previous modal's offset.
+    pub fn modal_scroll_reset(&mut self) {
+        self.modal_scroll_offset = 0;
     }
 
     /// Latch the auto-reboot deadline for the error (emergency) screen.
@@ -1440,6 +1471,48 @@ mod tests {
         let gens: Vec<Generation> = vec![];
         let app = App::new(&gens);
         assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn modal_scroll_offset_defaults_to_zero_on_construction() {
+        let gens: Vec<Generation> = vec![];
+        let app = App::new(&gens);
+        assert_eq!(app.modal_scroll_offset, 0);
+    }
+
+    #[test]
+    fn modal_scroll_down_clamps_at_total_minus_visible() {
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        // 10 total rows, viewport of 4 → max offset is 6.
+        app.modal_scroll_down(1, 10, 4);
+        assert_eq!(app.modal_scroll_offset, 1);
+        app.modal_scroll_down(10, 10, 4);
+        assert_eq!(app.modal_scroll_offset, 6, "clamped at total - visible");
+        // Down past max stays at max.
+        app.modal_scroll_down(99, 10, 4);
+        assert_eq!(app.modal_scroll_offset, 6);
+    }
+
+    #[test]
+    fn modal_scroll_up_saturates_at_zero() {
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        app.modal_scroll_offset = 3;
+        app.modal_scroll_up(2);
+        assert_eq!(app.modal_scroll_offset, 1);
+        // Past zero stays at zero.
+        app.modal_scroll_up(99);
+        assert_eq!(app.modal_scroll_offset, 0);
+    }
+
+    #[test]
+    fn modal_scroll_reset_clears_offset() {
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        app.modal_scroll_offset = 5;
+        app.modal_scroll_reset();
+        assert_eq!(app.modal_scroll_offset, 0);
     }
 
     #[test]
