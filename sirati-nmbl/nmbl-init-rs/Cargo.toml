@@ -86,6 +86,14 @@ ratatui = { version = "0.30", default-features = false, features = ["termwiz", "
 # `enable_raw_mode`).
 crossterm = "0.28"
 termwiz = { version = "0.23", default-features = false }
+# Direct dep so we can parse a bundled compiled terminfo entry via
+# `terminfo::Database::from_buffer`. The initramfs ships no terminfo
+# database, so without this termwiz has no `cup` (CursorAddress)
+# capability and its renderer falls back to a CSI cursor-address path
+# that transposes row/col — corrupting every incremental repaint. This
+# is the same `terminfo` crate termwiz already depends on (re-exported
+# only on Windows), pinned to the version in the lockfile.
+terminfo = { version = "0.9", default-features = false }
 zeroize = { version = "1", features = ["derive"] }
 # rustix is already pulled in transitively via crossterm; promote it to an
 # explicit dependency so its safe wrappers for open(2) / termios are visible
