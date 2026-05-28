@@ -31,6 +31,13 @@ pub struct EditScreenData<'a> {
 pub struct PassphraseScreenData<'a> {
     pub prompt_label: &'a str,
     pub buffer_len: usize,
+    /// `true` while the activation runner is verifying the passphrase
+    /// (cryptsetup running). The renderer overlays a spinner so the
+    /// operator sees the boot is alive rather than hung.
+    pub verifying: bool,
+    /// Spinner phase; indexes [`SPINNER_GLYPHS`] modulo [`SPINNER_FRAMES`].
+    /// Only meaningful when `verifying = true`; ignored otherwise.
+    pub spinner_frame: u8,
 }
 
 /// State needed to render the emergency-on-boot-failure screen.
@@ -679,23 +686,52 @@ pub fn render_pty_shell(frame: &mut Frame<'_>, data: &PtyShellScreenData<'_>) {
 }
 
 /// Render the passphrase modal over the body area.
+///
+/// When `data.verifying` is `true` the modal grows by one row and the
+/// extra row carries an ASCII spinner glyph plus a "verifying..." label,
+/// so the operator sees the boot is alive while cryptsetup runs. We
+/// pick the glyph from [`SPINNER_GLYPHS`] (same `|/-\\` rotor as the
+/// boot-status spinner) for backend parity — splash glyph cache lacks
+/// Unicode braille and would render blanks.
 pub fn render_passphrase(frame: &mut Frame<'_>, data: &PassphraseScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
-    let modal = centered_rect(body, 60, 7);
+    // Modal is one row taller in verifying mode so the spinner row
+    // doesn't displace the dotted input line.
+    let modal_height: u16 = if data.verifying { 8 } else { 7 };
+    let modal = centered_rect(body, 60, modal_height);
     frame.render_widget(Clear, modal);
     // Cap mask so a huge typo doesn't overflow the box.
     let dots: String = "*".repeat(data.buffer_len.min(40));
-    let lines: Vec<Line<'_>> = vec![
+    let mut lines: Vec<Line<'_>> = vec![
         Line::raw(data.prompt_label.to_owned()),
         Line::raw(String::new()),
         Line::from(vec![Span::raw(dots), Span::raw("|")]),
     ];
+    let footer_hint: &str = if data.verifying {
+        // Reuse the boot-status spinner glyphs (see crate::ui::app::
+        // SPINNER_GLYPHS) so both screens animate identically.
+        let glyph_idx = (data.spinner_frame % SPINNER_FRAMES) as usize;
+        let glyph = SPINNER_GLYPHS.get(glyph_idx).copied().unwrap_or('|');
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{glyph} "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "verifying passphrase...",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+        "verifying...  please wait"
+    } else {
+        "Enter=submit  Esc=cancel"
+    };
     let para = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title("Passphrase"))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, modal);
-    render_footer(frame, footer, "Enter=submit  Esc=cancel");
+    render_footer(frame, footer, footer_hint);
 }
 
 #[cfg(test)]
@@ -827,12 +863,75 @@ mod tests {
         let data = PassphraseScreenData {
             prompt_label: "Unlock /dev/sda2",
             buffer_len: 5,
+            verifying: false,
+            spinner_frame: 0,
         };
         let mut term = new_term(80, 24);
         term.draw(|f| render_passphrase(f, &data)).expect("draw");
         let text = buffer_text(&term);
         assert!(text.contains("*****|"), "wrong mask count in:\n{text}");
         assert!(text.contains("Unlock /dev/sda2"));
+        assert!(
+            !text.contains("verifying"),
+            "non-verifying render must not show the spinner label"
+        );
+        assert!(
+            text.contains("Enter=submit"),
+            "default footer hint must appear: {text}"
+        );
+    }
+
+    #[test]
+    fn test_render_passphrase_verifying_shows_spinner_and_label() {
+        // When verifying=true the modal must paint a spinner glyph and
+        // the "verifying passphrase..." label so the operator doesn't
+        // think the UI hung while cryptsetup runs.
+        for frame_idx in 0..SPINNER_FRAMES {
+            let data = PassphraseScreenData {
+                prompt_label: "Unlock /dev/sda2",
+                buffer_len: 8,
+                verifying: true,
+                spinner_frame: frame_idx,
+            };
+            let mut term = new_term(80, 24);
+            term.draw(|f| render_passphrase(f, &data)).expect("draw");
+            let text = buffer_text(&term);
+            // The dotted input row is still present.
+            assert!(text.contains("********|"), "input row missing: {text}");
+            // The verifying overlay row.
+            assert!(
+                text.contains("verifying passphrase"),
+                "missing verifying label at frame {frame_idx}:\n{text}"
+            );
+            // The expected spinner glyph for this frame.
+            let expected = SPINNER_GLYPHS[frame_idx as usize];
+            assert!(
+                text.contains(expected),
+                "expected spinner glyph '{expected}' at frame {frame_idx}:\n{text}"
+            );
+            // Footer hint switches.
+            assert!(
+                text.contains("verifying..."),
+                "verifying footer hint missing at frame {frame_idx}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_passphrase_verifying_out_of_range_frame_does_not_panic() {
+        // Defence-in-depth: a caller that didn't wrap modulo
+        // SPINNER_FRAMES must not crash the renderer. We pin that the
+        // out-of-range frame falls back to a sensible default glyph.
+        let data = PassphraseScreenData {
+            prompt_label: "Unlock",
+            buffer_len: 2,
+            verifying: true,
+            spinner_frame: 99,
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_passphrase(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(text.contains("verifying passphrase"));
     }
 
     #[test]
