@@ -4,7 +4,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use serde::Deserialize;
 
@@ -45,6 +45,43 @@ pub fn init(v: Verbosity) {
 
 pub fn current() -> Verbosity {
     Verbosity::from_u8(CURRENT.load(Ordering::SeqCst))
+}
+
+/// Set when an interactive console (splash framebuffer or raw-mode tty)
+/// owns the screen. While true, the `nmbl_*!` macros suppress their
+/// stderr branch — the TUI already surfaces phase/log output through its
+/// own render loop, and writing through stderr races the ratatui
+/// re-paint and produces visible smear (especially on serial, where
+/// stderr→/dev/console and the kernel's printk echo to the same UART
+/// produce duplicated lines like "phase 3" appearing back-to-back with a
+/// `[ 1.234] phase 3` printk variant).
+///
+/// `/dev/kmsg` writes are still performed so the kernel ring buffer (and
+/// any console the operator picked up via `console=` cmdline) keeps a
+/// timestamped record — only the userspace stderr duplicate is silenced.
+/// On `suspend` / handover to kexec/execve the flag is cleared so the
+/// post-handover path sees normal eprintln output again.
+static TUI_OWNED_CONSOLE: AtomicBool = AtomicBool::new(false);
+
+/// Mark the console as TUI-owned: the `nmbl_*!` macros stop writing to
+/// stderr until [`clear_tui_active`] runs. Idempotent; cheap; safe to
+/// call from any code path that brings up a [`crate::ui::console::Console`].
+pub fn set_tui_active() {
+    TUI_OWNED_CONSOLE.store(true, Ordering::SeqCst);
+}
+
+/// Inverse of [`set_tui_active`]. Called when the TUI hands the screen
+/// back to the kernel/foreign userspace (suspend, kexec handoff,
+/// emergency-shell relay, drop on scope exit).
+pub fn clear_tui_active() {
+    TUI_OWNED_CONSOLE.store(false, Ordering::SeqCst);
+}
+
+/// Internal helper for the `nmbl_*!` macros so the macro body stays
+/// short and the gating logic has a single home.
+#[doc(hidden)]
+pub fn tui_active() -> bool {
+    TUI_OWNED_CONSOLE.load(Ordering::SeqCst)
 }
 
 /// `/dev/kmsg` accepts writes from userspace and routes the resulting
@@ -264,7 +301,9 @@ fn write_truncated(path: &Path, header: Option<&str>, body: &[u8]) -> std::io::R
 macro_rules! nmbl_warn {
     ($($arg:tt)*) => {{
         let __line = format!("{}", format_args!($($arg)*));
-        eprintln!("[nmbl] {}", __line);
+        if !$crate::log::tui_active() {
+            eprintln!("[nmbl] {}", __line);
+        }
         $crate::log::emit_kmsg(&__line);
     }};
 }
@@ -275,7 +314,9 @@ macro_rules! nmbl_info {
         match $crate::log::current() {
             $crate::log::Verbosity::Info | $crate::log::Verbosity::Verbose => {
                 let __line = format!("{}", format_args!($($arg)*));
-                eprintln!("[nmbl] {}", __line);
+                if !$crate::log::tui_active() {
+                    eprintln!("[nmbl] {}", __line);
+                }
                 $crate::log::emit_kmsg(&__line);
             }
             $crate::log::Verbosity::Quiet => {}
@@ -288,7 +329,9 @@ macro_rules! nmbl_verbose {
     ($($arg:tt)*) => {{
         if $crate::log::current() == $crate::log::Verbosity::Verbose {
             let __line = format!("{}", format_args!($($arg)*));
-            eprintln!("[nmbl] {}", __line);
+            if !$crate::log::tui_active() {
+                eprintln!("[nmbl] {}", __line);
+            }
             $crate::log::emit_kmsg(&__line);
         }
     }};

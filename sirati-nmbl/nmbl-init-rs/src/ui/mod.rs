@@ -1,17 +1,13 @@
-//! UI orchestrator. The frame loop and serial-console fallback live
-//! here; pure render functions live in [`view`], the state machine in
-//! [`app`], and the backend abstraction (splash framebuffer vs raw-mode
-//! tty) in [`console`]. Every interactive screen — selector, cmdline
-//! editor, passphrase modal, emergency picker — renders through the
-//! same `&mut dyn Console`; only the serial-mode fallback drops to
-//! direct stdin/stdout.
-//!
-//! ## Serial-console fallback
-//!
-//! When `config.general.serial_console` is true we skip the Console
-//! TUI and run a line-oriented prompt against stdin/stdout. Many
-//! serial environments mangle escape sequences; line mode is reliable
-//! and the operator can still drop to the shell or pick a generation.
+//! UI orchestrator. The frame loop lives here; pure render functions
+//! live in [`view`], the state machine in [`app`], and the backend
+//! abstraction (splash framebuffer vs raw-mode tty) in [`console`].
+//! Every interactive screen — selector, cmdline editor, passphrase
+//! modal, emergency picker — renders through the same `&mut dyn Console`,
+//! regardless of whether the underlying device is a framebuffer VT, a
+//! `/dev/tty1` keyboard line, or a serial UART. Ratatui's crossterm
+//! backend emits vt100/xterm escape sequences which every modern
+//! serial terminal emulator (xterm, tmux, picocom, screen, minicom)
+//! understands, so there is no longer a line-mode fallback path.
 //!
 //! ## Activation passphrase wiring
 //!
@@ -31,10 +27,6 @@
 //! Esc on the modal returns a [`NmblError::Tui`] which
 //! `run_all_activations` wraps as [`NmblError::Activation`] and the
 //! top-level driver routes to the emergency shell.
-//!
-//! Serial mode (`config.general.serial_console = true`) skips the
-//! Console plumbing and runs a line-mode `getpass`-style prompt on
-//! stdin/stdout, mirroring the rest of the serial code path.
 
 pub mod app;
 pub mod console;
@@ -43,6 +35,7 @@ pub mod console_relay;
 pub mod emergency;
 pub mod emergency_actions;
 pub mod key_echo;
+pub mod modal_layout;
 #[cfg(feature = "image-splash")]
 pub mod pretty_shell;
 pub mod reporter;
@@ -52,7 +45,6 @@ pub mod timeout;
 pub mod tty_enum;
 pub mod view;
 
-use std::io::{BufRead, Write};
 use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
@@ -144,6 +136,93 @@ pub enum WrongPasswordOutcome {
     RawShell,
 }
 
+/// Inspect a [`KeyEvent`] for the modal-scroll bindings
+/// (Ctrl+Shift+Up/Down/PgUp/PgDn). Returns `Some(new_offset)` when the
+/// key matched and was consumed, `None` when the key should fall
+/// through to the caller's regular key dispatch.
+///
+/// `console.size()` is sampled here so the helper can compute the
+/// visible-line count from the same layout the renderer uses. Empty
+/// or pathologically small consoles fall back to a 1-line viewport so
+/// the offset still advances by one per keypress.
+fn handle_modal_scroll_key(
+    key: crossterm::event::KeyEvent,
+    message: &str,
+    has_buttons: bool,
+    btn_count: u16,
+    console: &mut dyn Console,
+    scroll_offset: u16,
+) -> Option<u16> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    if !(ctrl && shift) {
+        return None;
+    }
+    // Re-derive the current layout from the console's reported size.
+    // Mirrors `view::split_chrome`: 3-row header + body + 1-row footer.
+    let (cols, rows) = console.size();
+    let body_h = rows.saturating_sub(4);
+    let body = ratatui::layout::Rect::new(0, 3, cols, body_h);
+    let layout = modal_layout::compute_modal_layout(message, has_buttons, btn_count, body);
+    if !layout.scrollable {
+        // Even when not scrollable we still consume the key combo so
+        // a stray Ctrl+Shift+arrow doesn't leak through to whatever
+        // dispatch would have run otherwise. Returning the unchanged
+        // offset keeps the renderer's clamping clean.
+        match key.code {
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                return Some(scroll_offset);
+            }
+            _ => return None,
+        }
+    }
+    let visible = layout.inner_text_rect.height.max(1);
+    let total = u16::try_from(layout.wrapped_lines.len()).unwrap_or(u16::MAX);
+    let max_off = total.saturating_sub(visible);
+    let page = visible.saturating_sub(1).max(1);
+    let new_off = match key.code {
+        KeyCode::Up => scroll_offset.saturating_sub(1),
+        KeyCode::Down => scroll_offset.saturating_add(1).min(max_off),
+        KeyCode::PageUp => scroll_offset.saturating_sub(page),
+        KeyCode::PageDown => scroll_offset.saturating_add(page).min(max_off),
+        KeyCode::Home => 0,
+        KeyCode::End => max_off,
+        _ => return None,
+    };
+    Some(new_off)
+}
+
+/// Outcome of polling a long-running render loop's input slice. Wraps
+/// the trichotomy "key arrived / host terminal reported a new size /
+/// nothing this tick" into a single value the caller pattern-matches on
+/// so every modal loop redraws on resize without duplicating the
+/// `match` boilerplate.
+enum ModalPollOutcome {
+    /// A key event the caller should dispatch.
+    Key(crossterm::event::KeyEvent),
+    /// Host terminal reported a new grid. Caller should set its
+    /// `dirty` flag so the next iteration repaints against the new
+    /// layout.
+    Resized,
+    /// No event this slice. Caller may continue ticking countdowns
+    /// or re-poll.
+    Idle,
+}
+
+/// Poll once via [`Console::poll_event`] and classify the outcome for a
+/// modal render loop. Shared by every long-running interactive modal
+/// (passphrase, generations picker, rescue menu, console picker,
+/// confirm / error / buttons) so they all react to host-reported
+/// resize events uniformly.
+fn modal_poll(console: &mut dyn Console, timeout: Duration) -> Result<ModalPollOutcome> {
+    match console.poll_event(timeout)? {
+        Some(crate::ui::console::ConsoleEvent::Key(k)) => Ok(ModalPollOutcome::Key(k)),
+        Some(crate::ui::console::ConsoleEvent::Resize { .. }) => Ok(ModalPollOutcome::Resized),
+        None => Ok(ModalPollOutcome::Idle),
+    }
+}
+
 /// Show a centred yes/no confirmation modal with `title` + `message`
 /// on the supplied console and block until the operator commits.
 ///
@@ -177,6 +256,7 @@ pub fn show_modal_confirm(
 
     let hint = "Left/Right select  Enter confirm  Esc cancel";
     let mut yes_selected = yes_default;
+    let mut scroll_offset: u16 = 0;
 
     let mut dirty = true;
     loop {
@@ -188,6 +268,7 @@ pub fn show_modal_confirm(
                 no_label,
                 yes_selected,
                 hint,
+                scroll_offset,
             };
             if let Err(e) = console.draw_with(&mut |frame| view::render_modal_confirm(frame, &data))
             {
@@ -198,9 +279,19 @@ pub fn show_modal_confirm(
             dirty = false;
         }
 
-        let Some(key) = console.poll_key(POLL_SLICE)? else {
-            continue;
+        let key = match modal_poll(console, POLL_SLICE)? {
+            ModalPollOutcome::Key(k) => k,
+            ModalPollOutcome::Resized => {
+                dirty = true;
+                continue;
+            }
+            ModalPollOutcome::Idle => continue,
         };
+        if let Some(new_off) = handle_modal_scroll_key(key, message, true, 2, console, scroll_offset) {
+            scroll_offset = new_off;
+            dirty = true;
+            continue;
+        }
         match key.code {
             KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
                 yes_selected = !yes_selected;
@@ -238,6 +329,7 @@ pub fn show_modal_confirm_over(
     use crossterm::event::KeyCode;
 
     let hint = "Left/Right select  Enter confirm  Esc cancel";
+    app.modal_scroll_reset();
     let outcome = (|| -> Result<ConfirmOutcome> {
         app.modal = Some(ModalKind::Confirm {
             title: title.to_owned(),
@@ -259,9 +351,34 @@ pub fn show_modal_confirm_over(
                 dirty = false;
             }
 
-            let Some(key) = console.poll_key(POLL_SLICE)? else {
-                continue;
+            let key = match modal_poll(console, POLL_SLICE)? {
+                ModalPollOutcome::Key(k) => k,
+                ModalPollOutcome::Resized => {
+                    dirty = true;
+                    continue;
+                }
+                ModalPollOutcome::Idle => continue,
             };
+            // Pull the modal's message out for the scroll helper. We
+            // need an immutable read here BEFORE the mutable borrow on
+            // app.modal for `yes_selected` below; otherwise borrowck
+            // rejects the second access.
+            let modal_message = match &app.modal {
+                Some(ModalKind::Confirm { message, .. }) => message.clone(),
+                _ => return Ok(ConfirmOutcome::No),
+            };
+            if let Some(new_off) = handle_modal_scroll_key(
+                key,
+                &modal_message,
+                true,
+                2,
+                console,
+                app.modal_scroll_offset,
+            ) {
+                app.modal_scroll_offset = new_off;
+                dirty = true;
+                continue;
+            }
             let Some(ModalKind::Confirm { yes_selected, .. }) = &mut app.modal else {
                 return Ok(ConfirmOutcome::No);
             };
@@ -285,6 +402,7 @@ pub fn show_modal_confirm_over(
         }
     })();
     app.modal = None;
+    app.modal_scroll_reset();
     outcome
 }
 
@@ -304,23 +422,25 @@ pub fn show_modal_error(
     timeout: Duration,
 ) -> Result<()> {
     let hint = "press any key to continue";
-    let data = view::ModalErrorScreenData {
-        title,
-        message,
-        hint,
-    };
-    // Render once. If the backend itself is broken we still want the
-    // operator to see the failure — print to stderr as a fallback so
-    // the modal isn't the only chance.
-    if let Err(e) = console.draw_with(&mut |frame| view::render_modal_error(frame, &data)) {
-        eprintln!("[nmbl] {title}: {message}");
-        // Surfaced as a warning so the boot transcript shows we tried.
-        crate::nmbl_warn!("modal-error render failed: {e}");
-        return Ok(());
-    }
-
+    let mut scroll_offset: u16 = 0;
+    let mut dirty = true;
     let deadline = Instant::now().checked_add(timeout);
     loop {
+        if dirty {
+            let data = view::ModalErrorScreenData {
+                title,
+                message,
+                hint,
+                scroll_offset,
+            };
+            if let Err(e) = console.draw_with(&mut |frame| view::render_modal_error(frame, &data))
+            {
+                eprintln!("[nmbl] {title}: {message}");
+                crate::nmbl_warn!("modal-error render failed: {e}");
+                return Ok(());
+            }
+            dirty = false;
+        }
         let slice = match deadline {
             Some(d) => match d.checked_duration_since(Instant::now()) {
                 Some(remaining) => remaining.min(POLL_SLICE),
@@ -328,10 +448,22 @@ pub fn show_modal_error(
             },
             None => POLL_SLICE,
         };
-        match console.poll_key(slice)? {
-            Some(_) => return Ok(()),
-            None => continue,
+        let key = match modal_poll(console, slice)? {
+            ModalPollOutcome::Key(k) => k,
+            ModalPollOutcome::Resized => {
+                dirty = true;
+                continue;
+            }
+            ModalPollOutcome::Idle => continue,
+        };
+        // Scroll keys advance the viewport instead of dismissing; any
+        // other key dismisses the modal.
+        if let Some(new_off) = handle_modal_scroll_key(key, message, false, 0, console, scroll_offset) {
+            scroll_offset = new_off;
+            dirty = true;
+            continue;
         }
+        return Ok(());
     }
 }
 
@@ -346,20 +478,23 @@ pub fn show_modal_error_over(
     timeout: Duration,
 ) -> Result<()> {
     let hint = "press any key to continue";
+    app.modal_scroll_reset();
     app.modal = Some(ModalKind::Error {
         title: title.to_owned(),
         message: message.to_owned(),
         hint: hint.to_owned(),
     });
-    if let Err(e) = console.render(app) {
-        eprintln!("[nmbl] {title}: {message}");
-        crate::nmbl_warn!("modal-error render failed: {e}");
-        app.modal = None;
-        return Ok(());
-    }
-
     let deadline = Instant::now().checked_add(timeout);
+    let mut dirty = true;
     let res = loop {
+        if dirty {
+            if let Err(e) = console.render(app) {
+                eprintln!("[nmbl] {title}: {message}");
+                crate::nmbl_warn!("modal-error render failed: {e}");
+                break Ok(());
+            }
+            dirty = false;
+        }
         let slice = match deadline {
             Some(d) => match d.checked_duration_since(Instant::now()) {
                 Some(remaining) => remaining.min(POLL_SLICE),
@@ -367,12 +502,25 @@ pub fn show_modal_error_over(
             },
             None => POLL_SLICE,
         };
-        match console.poll_key(slice)? {
-            Some(_) => break Ok(()),
-            None => continue,
+        let key = match modal_poll(console, slice)? {
+            ModalPollOutcome::Key(k) => k,
+            ModalPollOutcome::Resized => {
+                dirty = true;
+                continue;
+            }
+            ModalPollOutcome::Idle => continue,
+        };
+        if let Some(new_off) =
+            handle_modal_scroll_key(key, message, false, 0, console, app.modal_scroll_offset)
+        {
+            app.modal_scroll_offset = new_off;
+            dirty = true;
+            continue;
         }
+        break Ok(());
     };
     app.modal = None;
+    app.modal_scroll_reset();
     res
 }
 
@@ -411,6 +559,7 @@ pub fn show_wrong_password_modal(
     let labels: &[&str] = &["Try again", "Reboot", "Raw Shell"];
     let n = labels.len();
     let mut selected: usize = 0;
+    let mut scroll_offset: u16 = 0;
 
     let mut dirty = true;
     loop {
@@ -421,6 +570,7 @@ pub fn show_wrong_password_modal(
                 labels,
                 selected,
                 hint,
+                scroll_offset,
             };
             if let Err(e) =
                 console.draw_with(&mut |frame| view::render_modal_buttons(frame, &data))
@@ -432,9 +582,22 @@ pub fn show_wrong_password_modal(
             dirty = false;
         }
 
-        let Some(key) = console.poll_key(POLL_SLICE)? else {
-            continue;
+        let key = match modal_poll(console, POLL_SLICE)? {
+            ModalPollOutcome::Key(k) => k,
+            ModalPollOutcome::Resized => {
+                dirty = true;
+                continue;
+            }
+            ModalPollOutcome::Idle => continue,
         };
+        let btn_count = u16::try_from(n).unwrap_or(u16::MAX);
+        if let Some(new_off) =
+            handle_modal_scroll_key(key, message, true, btn_count, console, scroll_offset)
+        {
+            scroll_offset = new_off;
+            dirty = true;
+            continue;
+        }
         match key.code {
             KeyCode::Left | KeyCode::BackTab => {
                 selected = if selected == 0 {
@@ -463,6 +626,84 @@ pub fn show_wrong_password_modal(
                 return Ok(WrongPasswordOutcome::RawShell);
             }
             KeyCode::Esc => return Ok(WrongPasswordOutcome::TryAgain),
+            _ => {}
+        }
+    }
+}
+
+/// Show a generic N-button modal and return the committed button
+/// index. Used by callers that don't fit the wrong-password layout
+/// (the only specialised driver today) but want the same look-and-feel:
+/// bordered modal, wrapped message, right-aligned button row.
+///
+/// Esc returns the LAST button index (caller convention: rightmost is
+/// "Cancel" / "Back"). Empty `labels` returns 0 immediately so the
+/// caller's caller never indexes off the end.
+pub fn show_modal_buttons(
+    console: &mut dyn Console,
+    title: &str,
+    message: &str,
+    labels: &[&str],
+    hint: &str,
+) -> Result<usize> {
+    use crossterm::event::KeyCode;
+    let n = labels.len();
+    if n == 0 {
+        return Ok(0);
+    }
+    let mut selected: usize = 0;
+    let mut scroll_offset: u16 = 0;
+    let mut dirty = true;
+    loop {
+        if dirty {
+            let data = view::ModalButtonsScreenData {
+                title,
+                message,
+                labels,
+                selected,
+                hint,
+                scroll_offset,
+            };
+            if let Err(e) =
+                console.draw_with(&mut |frame| view::render_modal_buttons(frame, &data))
+            {
+                eprintln!("[nmbl] {title}: {message}");
+                crate::nmbl_warn!("modal-buttons render failed: {e}");
+                return Ok(n.saturating_sub(1));
+            }
+            dirty = false;
+        }
+        let key = match modal_poll(console, POLL_SLICE)? {
+            ModalPollOutcome::Key(k) => k,
+            ModalPollOutcome::Resized => {
+                dirty = true;
+                continue;
+            }
+            ModalPollOutcome::Idle => continue,
+        };
+        let btn_count = u16::try_from(n).unwrap_or(u16::MAX);
+        if let Some(new_off) =
+            handle_modal_scroll_key(key, message, true, btn_count, console, scroll_offset)
+        {
+            scroll_offset = new_off;
+            dirty = true;
+            continue;
+        }
+        match key.code {
+            KeyCode::Left | KeyCode::BackTab => {
+                selected = if selected == 0 {
+                    n.saturating_sub(1)
+                } else {
+                    selected.saturating_sub(1)
+                };
+                dirty = true;
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                selected = selected.saturating_add(1) % n;
+                dirty = true;
+            }
+            KeyCode::Enter => return Ok(selected),
+            KeyCode::Esc => return Ok(n.saturating_sub(1)),
             _ => {}
         }
     }
@@ -498,10 +739,9 @@ fn decode_wrong_password_selection(idx: usize) -> WrongPasswordOutcome {
 /// The console is brought up once by the orchestrator (main.rs) at the
 /// start of phase 1 and held through every phase; this function reuses
 /// it instead of opening a parallel splash bring-up, so the same DRM
-/// card / raw-mode tty serves the whole boot.
-///
-/// Falls back to a line-oriented serial prompt when the config opts
-/// in via `general.serial_console`.
+/// card / raw-mode tty serves the whole boot. Serial UARTs go through
+/// the same path — the TUI's crossterm backend emits portable
+/// vt100/xterm escapes that every modern serial terminal renders.
 pub fn run_selector(
     config: &Config,
     generations: &[Generation],
@@ -512,10 +752,6 @@ pub fn run_selector(
     // timeout boots) the generation they rolled back to — not the
     // higher-numbered one they rolled away from.
     let default_index = active_generation_index(generations, &config.paths.nix_profiles_dir);
-
-    if config.general.serial_console {
-        return select_generation_serial(config, generations, default_index);
-    }
     run_selector_on_console(config, generations, console, default_index)
 }
 
@@ -548,18 +784,26 @@ fn run_selector_on_console(
 
     // 2. Event loop. Renders on dirty, polls in short slices so future
     //    callers that need to drive an animation can plug in without
-    //    rewriting the loop.
+    //    rewriting the loop. Driven via `poll_event` so a host-reported
+    //    `CSI 8;rows;cols t` resize redraws the picker against the new
+    //    grid instead of stranding the old layout.
     let mut dirty = true;
     loop {
         if dirty {
             console.render(&app)?;
             dirty = false;
         }
-        if let Some(key) = console.poll_key(POLL_SLICE)? {
-            if app.on_key(key) {
-                break;
+        match console.poll_event(POLL_SLICE)? {
+            Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
+                dirty = true;
             }
-            dirty = true;
+            Some(crate::ui::console::ConsoleEvent::Key(key)) => {
+                if app.on_key(key) {
+                    break;
+                }
+                dirty = true;
+            }
+            None => {}
         }
         if app.decision.is_some() {
             break;
@@ -695,11 +939,11 @@ pub(crate) fn render_splash_frame_with(
 pub(crate) fn render_current_screen(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
     render_screen_body(frame, app);
     if let Some(modal) = &app.modal {
-        render_modal_overlay(frame, modal);
+        render_modal_overlay(frame, modal, app.modal_scroll_offset);
     }
 }
 
-fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind) {
+fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind, scroll_offset: u16) {
     match modal {
         ModalKind::Confirm {
             title,
@@ -716,6 +960,7 @@ fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind) {
                 no_label,
                 yes_selected: *yes_selected,
                 hint,
+                scroll_offset,
             };
             view::render_modal_confirm(frame, &data);
         }
@@ -724,6 +969,7 @@ fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind) {
                 title,
                 message,
                 hint,
+                scroll_offset,
             };
             view::render_modal_error(frame, &data);
         }
@@ -743,6 +989,7 @@ fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind) {
                 labels: &label_refs,
                 selected: *selected,
                 hint,
+                scroll_offset,
             };
             view::render_modal_buttons(frame, &data);
         }
@@ -835,185 +1082,33 @@ fn list_data<'a>(app: &'a App<'a>) -> ListScreenData<'a> {
     }
 }
 
-/// Line-oriented fallback for serial consoles. The protocol is
-/// intentionally trivial — operators on broken serial lines can drive
-/// it by hand. Commands:
-///   - empty line or "boot"          → boot the active profile default
-///   - integer N (1-based)           → boot the Nth generation
-///   - "edit N" or "edit"            → boot Nth with edited cmdline
-///   - "shell" or "s"                → drop to emergency shell
-///   - "reboot" or "q"               → reboot
-fn select_generation_serial(
-    _config: &Config,
-    generations: &[Generation],
-    default_index: usize,
-) -> Result<Decision> {
-    let stdout = std::io::stdout();
-    let stdin = std::io::stdin();
-
-    {
-        let mut out = stdout.lock();
-        writeln!(out, "[nmbl] Serial console selector").map_err(tui_err)?;
-        for (i, g) in generations.iter().enumerate() {
-            let label = if g.label.is_empty() {
-                String::new()
-            } else {
-                format!(" {}", g.label)
-            };
-            let marker = if i == default_index { "*" } else { " " };
-            writeln!(
-                out,
-                " {marker}{}) #{}{}",
-                i.saturating_add(1),
-                g.number,
-                label
-            )
-            .map_err(tui_err)?;
-        }
-        writeln!(
-            out,
-            "Enter number to boot, 'edit N' to edit cmdline, 'shell', or 'reboot':"
-        )
-        .map_err(tui_err)?;
-        out.flush().map_err(tui_err)?;
-    }
-
-    let mut line = String::new();
-    stdin.lock().read_line(&mut line).map_err(tui_err)?;
-    let trimmed = line.trim();
-    let last_idx = generations.len().saturating_sub(1);
-
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("boot") {
-        return Ok(Decision::Boot {
-            generation_index: default_index.min(last_idx),
-            cmdline_override: None,
-        });
-    }
-    if trimmed.eq_ignore_ascii_case("shell") || trimmed == "s" {
-        return Ok(Decision::Shell);
-    }
-    if trimmed.eq_ignore_ascii_case("reboot") || trimmed == "q" {
-        return Ok(Decision::Reboot);
-    }
-    if let Some(rest) = trimmed.strip_prefix("edit") {
-        let idx = parse_serial_index(rest.trim(), last_idx)?;
-        let original = generations
-            .get(idx)
-            .map(|g| g.kernel_params.join(" "))
-            .unwrap_or_default();
-        let edited = prompt_serial_line(&format!("cmdline [{original}]: "))?;
-        let override_str = if edited.trim().is_empty() {
-            original
-        } else {
-            edited
-        };
-        return Ok(Decision::Boot {
-            generation_index: idx,
-            cmdline_override: Some(override_str),
-        });
-    }
-    let idx = parse_serial_index(trimmed, last_idx)?;
-    Ok(Decision::Boot {
-        generation_index: idx,
-        cmdline_override: None,
-    })
-}
-
-/// Parse a 1-based generation number from a serial response and clamp
-/// it into the legal range. Empty input is treated as "first entry".
-fn parse_serial_index(input: &str, last_idx: usize) -> Result<usize> {
-    if input.is_empty() {
-        return Ok(0);
-    }
-    let n: usize = input.parse().map_err(|_| NmblError::Tui {
-        source: std::io::Error::other(format!("serial input {input:?} is not a number")),
-    })?;
-    let zero_based = n.saturating_sub(1);
-    Ok(zero_based.min(last_idx))
-}
-
-/// Prompt for and read a single trimmed line of serial input.
-fn prompt_serial_line(prompt: &str) -> Result<String> {
-    let stdout = std::io::stdout();
-    {
-        let mut out = stdout.lock();
-        write!(out, "{prompt}").map_err(tui_err)?;
-        out.flush().map_err(tui_err)?;
-    }
-    let mut buf = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut buf)
-        .map_err(tui_err)?;
-    // Strip exactly one trailing newline; don't trim user-meaningful
-    // spaces from inside the cmdline.
-    if buf.ends_with('\n') {
-        buf.pop();
-        if buf.ends_with('\r') {
-            buf.pop();
-        }
-    }
-    Ok(buf)
-}
-
 /// PasswordSupplier impl that pops a passphrase modal on the live
-/// boot console (splash framebuffer or raw-mode tty), or — when
-/// serial — does a line-mode `getpass`-style read on stdin/stdout.
+/// boot console (splash framebuffer or raw-mode tty — including a
+/// serial UART, which is just another tty character device).
 ///
 /// Does NOT open its own console. The orchestrator (main.rs) brings
 /// up exactly one `Console` for the whole boot and passes it through
 /// the activation runner; the supplier reuses that handle so the
 /// passphrase modal renders on the same backend as the surrounding
 /// boot-status screen.
-pub struct TuiPasswordSupplier {
-    pub config_serial: bool,
-}
+#[derive(Default)]
+pub struct TuiPasswordSupplier;
 
 impl TuiPasswordSupplier {
-    pub fn new(config: &Config) -> Self {
-        Self {
-            config_serial: config.general.serial_console,
-        }
+    #[must_use]
+    pub fn new(_config: &Config) -> Self {
+        // `_config` is accepted for forward-compatibility with
+        // future per-config passphrase policy (retry counts, masking
+        // toggles, …). Today the supplier is uniform — the same
+        // ratatui modal everywhere.
+        Self
     }
 }
 
 impl PasswordSupplier for TuiPasswordSupplier {
     fn prompt(&mut self, console: &mut dyn Console, label: &str) -> Result<Zeroizing<String>> {
-        if self.config_serial {
-            // Serial mode has no Console TUI plumbing; the rest of the
-            // serial code path uses stdin/stdout directly and so does
-            // the passphrase prompt. The supplied `console` handle is
-            // intentionally unused on this branch.
-            let _ = console;
-            return serial_passphrase_prompt(label);
-        }
         passphrase_prompt_on_console(console, label)
     }
-}
-
-/// Best-effort serial passphrase prompt. We can't reliably disable
-/// echo on every serial line discipline; we print the masking-disabled
-/// notice so the operator knows.
-fn serial_passphrase_prompt(label: &str) -> Result<Zeroizing<String>> {
-    let stdout = std::io::stdout();
-    {
-        let mut out = stdout.lock();
-        writeln!(out, "[nmbl] {label}").map_err(tui_err)?;
-        write!(out, "Enter passphrase (input may be visible): ").map_err(tui_err)?;
-        out.flush().map_err(tui_err)?;
-    }
-    let mut buf = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut buf)
-        .map_err(tui_err)?;
-    if buf.ends_with('\n') {
-        buf.pop();
-        if buf.ends_with('\r') {
-            buf.pop();
-        }
-    }
-    Ok(Zeroizing::new(buf))
 }
 
 /// Drive the [`Screen::Passphrase`] modal on the supplied [`Console`]
@@ -1045,35 +1140,46 @@ pub(crate) fn passphrase_prompt_on_console(
             dirty = false;
         }
 
-        if let Some(key) = console.poll_key(POLL_SLICE)? {
-            let exited = app.on_key(key);
-            // Esc on the passphrase screen sets a Shell decision.
-            if matches!(app.decision, Some(Decision::Shell)) {
-                return Err(NmblError::Tui {
-                    source: std::io::Error::other("operator cancelled passphrase entry"),
-                });
+        // Drive `poll_event` so host-reported `CSI 8;rows;cols t`
+        // resizes redraw the modal at the new dimensions instead of
+        // smearing the old layout until the next keypress.
+        match console.poll_event(POLL_SLICE)? {
+            Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
+                dirty = true;
             }
-            if exited {
-                // Enter was pressed — extract the buffer and return.
-                // Silently ignore Enter while the buffer is empty so an
-                // accidental keystroke doesn't submit "" to cryptsetup.
-                if let Screen::Passphrase { ref buffer, .. } = app.screen
-                    && buffer.is_empty()
-                {
-                    continue;
+            Some(crate::ui::console::ConsoleEvent::Key(key)) => {
+                let exited = app.on_key(key);
+                // Esc on the passphrase screen sets a Shell decision.
+                if matches!(app.decision, Some(Decision::Shell)) {
+                    return Err(NmblError::Tui {
+                        source: std::io::Error::other("operator cancelled passphrase entry"),
+                    });
                 }
-                if let Screen::Passphrase { buffer, .. } = app.screen {
-                    return Ok(buffer);
+                if exited {
+                    // Enter was pressed — extract the buffer and return.
+                    // Silently ignore Enter while the buffer is empty so
+                    // an accidental keystroke doesn't submit "" to
+                    // cryptsetup.
+                    if let Screen::Passphrase { ref buffer, .. } = app.screen
+                        && buffer.is_empty()
+                    {
+                        continue;
+                    }
+                    if let Screen::Passphrase { buffer, .. } = app.screen {
+                        return Ok(buffer);
+                    }
+                    return Err(NmblError::Tui {
+                        source: std::io::Error::other("passphrase screen exited without a buffer"),
+                    });
                 }
-                return Err(NmblError::Tui {
-                    source: std::io::Error::other("passphrase screen exited without a buffer"),
-                });
+                dirty = true;
             }
-            dirty = true;
+            None => {}
         }
     }
 }
 
+#[cfg(feature = "image-splash")]
 fn tui_err(source: std::io::Error) -> NmblError {
     NmblError::Tui { source }
 }
@@ -1089,37 +1195,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_serial_index_clamps_and_rejects_garbage() {
-        assert_eq!(parse_serial_index("", 4).expect("empty -> 0"), 0);
-        assert_eq!(parse_serial_index("1", 4).expect("1-based -> 0"), 0);
-        assert_eq!(parse_serial_index("3", 4).expect("3 -> 2"), 2);
-        // Clamps to last_idx.
-        assert_eq!(parse_serial_index("99", 4).expect("clamp"), 4);
-        assert!(parse_serial_index("not-a-number", 4).is_err());
-    }
-
-    #[test]
-    fn tui_password_supplier_carries_serial_flag() {
-        let sup = TuiPasswordSupplier {
-            config_serial: true,
-        };
-        assert!(sup.config_serial);
-    }
-
-    #[test]
-    fn tui_password_supplier_reads_serial_from_config() {
-        // serial_console = true → supplier picks the line-mode path.
-        let cfg: Config = toml::from_str("[general]\nserial_console = true\n").expect("parse cfg");
-        let sup = TuiPasswordSupplier::new(&cfg);
-        assert!(sup.config_serial);
-
-        // default config (no serial) leaves the raw-mode TUI path active.
-        let cfg_default: Config = toml::from_str("").expect("empty cfg parses");
-        let sup_default = TuiPasswordSupplier::new(&cfg_default);
-        assert!(!sup_default.config_serial);
-    }
-
-    #[test]
     fn tui_password_supplier_satisfies_password_supplier_trait() {
         // The integration contract: activation::run_all_activations
         // accepts `Option<&mut dyn PasswordSupplier>`. This test pins
@@ -1132,7 +1207,7 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use crate::ui::console::ConsoleKind;
+    use crate::ui::console::{ConsoleEvent, ConsoleKind};
 
     /// Console test double that returns canned key events and records
     /// every render call. `poll_key` first drains the queue (returning
@@ -1170,8 +1245,8 @@ mod tests {
             }
             Ok(())
         }
-        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
-            Ok(self.keys.pop_front())
+        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+            Ok(self.keys.pop_front().map(ConsoleEvent::Key))
         }
         fn size(&self) -> (u16, u16) {
             (80, 24)
@@ -1536,6 +1611,7 @@ mod tests {
             labels,
             selected: 0,
             hint: "Left/Right select  Enter confirm  Esc = Try again",
+            scroll_offset: 0,
         };
         let mut term = Terminal::new(TestBackend::new(80, 16)).expect("test terminal");
         term.draw(|f| view::render_modal_buttons(f, &data)).expect("draw");

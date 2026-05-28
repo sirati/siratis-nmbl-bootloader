@@ -47,7 +47,7 @@ pub struct ModuleEntry {
 /// an underscore), and `modules.dep` preserves the file-system spelling
 /// verbatim. Folding both the parsed entry names and the lookup queries
 /// through this function lets either form resolve consistently.
-fn canonical_module_name(raw: &str) -> String {
+pub(crate) fn canonical_module_name(raw: &str) -> String {
     raw.replace('-', "_")
 }
 
@@ -512,6 +512,37 @@ c.ko:
         let order = resolve_load_order("a", &idx).expect("resolve failed");
         let names: Vec<&str> = order.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn canonical_lookup_matches_hyphen_and_underscore() {
+        // Regression: operators write `dm-crypt` in
+        // `boot.initrd.kernelModules`, but the modules tree files the
+        // .ko under the canonical underscore name `dm_crypt`. The
+        // by-name index must be reachable through either spelling so
+        // the explicit-load loop doesn't silently mark the module as
+        // built-in and skip it — letting the kernel hit a downstream
+        // "unknown target type" failure when activation runs.
+        let text = "kernel/dm_crypt.ko.xz:\n";
+        let root = PathBuf::from("/m");
+        let entries = parse_modules_dep_text(text, &root);
+        let idx = index_by_name(&entries);
+        // The on-disk filename is `dm_crypt.ko.xz`; the canonical name
+        // collapses hyphens to underscores so the index key is
+        // `dm_crypt`.
+        let dm_crypt = canonical_module_name("dm-crypt");
+        assert!(
+            idx.contains_key(dm_crypt.as_str()),
+            "canonicalized lookup must hit the by-name index"
+        );
+        let order = resolve_load_order("dm-crypt", &idx).expect("resolve failed");
+        let names: Vec<&str> = order.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["dm_crypt"],
+            "resolve_load_order must accept the hyphen spelling and produce \
+             the canonical entry"
+        );
     }
 
     #[test]

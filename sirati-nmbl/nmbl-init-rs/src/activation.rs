@@ -115,7 +115,13 @@ pub fn run_all_activations(
                     .map_err(|source| wrap_runner_error(activation, source))?
             };
 
-            if outcome.exit_code == 0 {
+            // Exit code 0 is the obvious success; exit code 5 also
+            // means success for cryptsetup luksOpen — the device-mapper
+            // mapping already exists (already-open volume from a prior
+            // attempt this session), so cryptsetup refuses to re-open
+            // rather than failing. The LUKS volume is accessible either
+            // way, so treat both as a clean break.
+            if is_activation_success(outcome.exit_code) {
                 break stdin_owned;
             }
 
@@ -330,6 +336,16 @@ fn wrap_runner_error(a: &Activation, source: NmblError) -> NmblError {
     }
 }
 
+/// Exit codes that mean the activation step is satisfied. `0` is the
+/// obvious success; `5` from cryptsetup luksOpen means "device already
+/// active" — the device-mapper mapping survived from a prior attempt
+/// this session, so the LUKS volume is already open and accessible
+/// rather than re-opened. Treating it as fatal would block kexec for
+/// no reason.
+fn is_activation_success(exit_code: i32) -> bool {
+    exit_code == 0 || exit_code == 5
+}
+
 /// Inner `Io` carries the exit code + signalled-vs-normal flag in one line.
 fn exit_code_error(a: &Activation, outcome: ProcessOutcome) -> NmblError {
     let how = if outcome.normal_exit {
@@ -542,10 +558,10 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
         fn render(&mut self, _app: &crate::ui::app::App<'_>) -> Result<()> {
             Ok(())
         }
-        fn poll_key(
+        fn poll_event(
             &mut self,
             _timeout: Duration,
-        ) -> Result<Option<crossterm::event::KeyEvent>> {
+        ) -> Result<Option<crate::ui::console::ConsoleEvent>> {
             Ok(None)
         }
         fn size(&self) -> (u16, u16) {
@@ -588,5 +604,30 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
         assert_eq!(kind_label(ActivationKind::LuksKeyfile), "luks-keyfile");
         assert_eq!(kind_label(ActivationKind::LuksPassword), "luks-password");
         assert_eq!(kind_label(ActivationKind::Zfs), "zfs");
+    }
+
+    #[test]
+    fn cryptsetup_exit_code_5_is_success() {
+        // "Device already active" — cryptsetup luksOpen sees an
+        // existing device-mapper mapping (e.g. left over from an
+        // earlier unlock attempt this same boot) and refuses to
+        // re-open. The volume is open and accessible, so NMBL must
+        // treat this as a clean success rather than blocking kexec.
+        let outcome = ProcessOutcome {
+            exit_code: 5,
+            normal_exit: true,
+        };
+        assert!(
+            is_activation_success(outcome.exit_code),
+            "exit code 5 must classify as success so the activation loop breaks",
+        );
+
+        // Exit code 0 stays a success; the wrong-password code 2 and
+        // an arbitrary fatal code must remain non-success so the
+        // wrong-password modal / fatal error paths still fire.
+        assert!(is_activation_success(0));
+        assert!(!is_activation_success(2));
+        assert!(!is_activation_success(1));
+        assert!(!is_activation_success(127));
     }
 }

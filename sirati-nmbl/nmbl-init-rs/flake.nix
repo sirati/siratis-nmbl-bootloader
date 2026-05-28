@@ -50,7 +50,18 @@
         # Compiler/linker flags shared between buildDepsOnly and buildPackage.
         # -Oz, fat LTO, single codegen unit, strip — all for minimum image size.
         commonArgs = {
-          src = craneLib.cleanCargoSource ./.;
+          # `cleanCargoSource` keeps only Rust/Cargo files, which drops the
+          # compiled terminfo entry bundled via `include_bytes!`
+          # (`src/ui/console/data/xterm-256color`). Union it back in so the
+          # crate compiles; without `cup` from this entry termwiz transposes
+          # row/col on every incremental serial repaint.
+          src = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              (craneLib.fileset.commonCargoSources ./.)
+              ./src/ui/console/data/xterm-256color
+            ];
+          };
           strictDeps = true;
 
           CARGO_BUILD_TARGET = rustTarget;

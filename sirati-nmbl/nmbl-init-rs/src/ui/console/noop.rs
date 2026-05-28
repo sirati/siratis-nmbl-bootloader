@@ -25,11 +25,9 @@
 
 use std::time::Duration;
 
-use crossterm::event::KeyEvent;
-
 use crate::error::Result;
 use crate::ui::app::App;
-use crate::ui::console::{Console, ConsoleKind};
+use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
 
 /// Drop-in [`Console`] that discards everything. See the module docs
 /// for the precise role.
@@ -69,7 +67,7 @@ impl Console for NoopConsole {
     /// No input source is wired up before the real console comes up.
     /// Any caller that tries to poll us gets an immediate `None` so
     /// blocking flows do not deadlock against the sentinel.
-    fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+    fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
         Ok(None)
     }
 

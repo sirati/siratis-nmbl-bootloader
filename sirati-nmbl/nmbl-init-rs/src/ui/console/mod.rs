@@ -27,6 +27,21 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::ui::app::App;
 
+/// A single input event from a console backend.
+///
+/// Today only key and resize events are produced; the enum is open-coded
+/// so future additions (mouse, paste) can land additively without
+/// breaking the `poll_event` signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleEvent {
+    /// A key press / repeat / release synthesised by the backend.
+    Key(KeyEvent),
+    /// The host terminal reported a new grid size via CSI 8; rows; cols t.
+    /// Backends with a fixed grid (the DRM splash framebuffer) never
+    /// emit this variant.
+    Resize { rows: u16, cols: u16 },
+}
+
 /// Which backend a [`Console`] is. Surfaced via [`Console::kind`] so
 /// callers that need to behave differently (e.g. tests, or activation
 /// paths that want to know whether DRM is still owned) can branch.
@@ -44,14 +59,38 @@ pub enum ConsoleKind {
 pub trait Console {
     /// Render one frame from the current [`App`] state.
     fn render(&mut self, app: &App<'_>) -> Result<()>;
-    /// Poll for one key event. Returns `Ok(None)` at or before `timeout`.
+    /// Poll for one input event. Returns `Ok(None)` at or before `timeout`.
     ///
     /// Backends may return early — in particular, both current backends
     /// cap the effective wait at [`crate::ui::POLL_SLICE`] (~100ms) so
     /// callers can drive ticking countdowns and spinner animations with
     /// consistent cadence regardless of backend. Callers that want a
     /// longer effective block must loop.
-    fn poll_key(&mut self, timeout: Duration) -> Result<Option<KeyEvent>>;
+    ///
+    /// Long-running render loops that need to redraw on host-terminal
+    /// resize (passphrase modal, generations picker, rescue menu,
+    /// console picker) should call `poll_event` directly so they can
+    /// react to [`ConsoleEvent::Resize`]. Everything else can keep using
+    /// the [`Console::poll_key`] default below, which silently drains
+    /// resize events and applies them to the backend.
+    fn poll_event(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>>;
+
+    /// Convenience wrapper around [`Console::poll_event`] that drops
+    /// resize events on the floor and only surfaces keys to the caller.
+    ///
+    /// Backends override `poll_event`; this default takes care of the
+    /// common "I only care about keypresses" path while still letting
+    /// the backend update its own grid state internally as resize
+    /// events go by.
+    fn poll_key(&mut self, timeout: Duration) -> Result<Option<KeyEvent>> {
+        match self.poll_event(timeout)? {
+            Some(ConsoleEvent::Key(k)) => Ok(Some(k)),
+            // Resize events were consumed by `poll_event` (which is
+            // responsible for re-sizing the backend's render target);
+            // the caller asked for a key, so report no key this slice.
+            Some(ConsoleEvent::Resize { .. }) | None => Ok(None),
+        }
+    }
     /// Backend grid size in (cols, rows). Useful for centring modals
     /// without a redundant `Terminal::size()` round-trip.
     fn size(&self) -> (u16, u16);
@@ -89,6 +128,8 @@ pub use self::noop::NoopConsole;
 
 pub mod tty;
 pub use self::tty::TtyConsole;
+
+pub(crate) mod parser;
 
 #[cfg(feature = "image-splash")]
 pub mod splash;

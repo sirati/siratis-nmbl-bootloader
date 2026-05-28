@@ -42,7 +42,6 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::nmbl_warn;
 use crate::sys::pty::{PtyChild, spawn_shell};
-use crate::sys::tty::read_active_console;
 use crate::ui::POLL_SLICE;
 use crate::ui::console::Console;
 use crate::ui::console_picker::display_overlaps_targets;
@@ -104,14 +103,23 @@ fn open_target_nonblocking(path: &Path) -> Option<OwnedFd> {
 /// Spawn the shell + open every selected target, then drive the
 /// multiplex loop until the shell exits.
 ///
-/// `targets` MUST be non-empty (the picker enforces this). The first
-/// target's display-overlap status decides whether we suspend the
-/// live [`Console`] for the duration of the shell, or keep the TUI
-/// up with a modal banner.
+/// `targets` MUST be non-empty (the picker enforces this).
+///
+/// `display_target` is the precomputed device path the live
+/// [`Console`] is currently rendering to, supplied by the picker via
+/// [`crate::ui::console_picker::display_target_for`]. It is the
+/// authoritative source of truth for the overlap decision — the relay
+/// MUST NOT re-derive it from `/sys/class/tty/console/active`, because
+/// sysfs lists kernel-cmdline consoles in declaration order and the
+/// picker's splash backend always renders to `/dev/tty1` regardless of
+/// the cmdline ordering. Re-reading sysfs here used to flip the overlap
+/// verdict and leave the operator staring at a frozen "Shell running"
+/// modal with the shell painting invisibly behind it.
 pub fn run_relay(
     console: &mut dyn Console,
     config: &Config,
     targets: &[PathBuf],
+    display_target: &Path,
 ) -> Result<()> {
     if targets.is_empty() {
         // Defence in depth: picker guarantees non-empty, but explicit
@@ -119,18 +127,7 @@ pub fn run_relay(
         return Ok(());
     }
 
-    // Resolve the display target ONCE so the overlap decision is stable
-    // for the lifetime of this call. The resolver may fail on a broken
-    // initramfs; in that case fall back to /dev/console — the picker
-    // makes the same fallback so we agree on the overlap predicate.
-    let display_target = read_active_console().unwrap_or_else(|e| {
-        nmbl_warn!(
-            "console_relay: active-console resolver failed: {e}; \
-             assuming /dev/console for the display-overlap decision"
-        );
-        PathBuf::from("/dev/console")
-    });
-    let overlap = display_overlaps_targets(&display_target, targets);
+    let overlap = display_overlaps_targets(display_target, targets);
 
     // Open every target. Bad targets are skipped (open_target_nonblocking
     // returns None + logs); the surviving set drives the relay.
