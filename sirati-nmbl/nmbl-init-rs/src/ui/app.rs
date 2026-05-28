@@ -23,6 +23,7 @@
 //! modal sets a [`Decision::Shell`] exit.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use zeroize::Zeroizing;
@@ -182,6 +183,51 @@ pub enum Screen<'a> {
     },
 }
 
+/// One overlay drawn on top of [`App::screen`].
+///
+/// The underlying screen keeps rendering behind the modal so the
+/// operator can see "where they were" — closing the modal returns to
+/// exactly the same screen state (same selection, same scroll). Owned
+/// `String` fields keep the App `'static`-friendly so a future caller
+/// doesn't have to thread a borrow through the modal lifetime.
+#[derive(Debug, Clone)]
+pub enum ModalKind {
+    /// Two-button yes/no confirmation overlay. Driven by
+    /// [`crate::ui::show_modal_confirm`].
+    Confirm {
+        title: String,
+        message: String,
+        yes_label: String,
+        no_label: String,
+        yes_selected: bool,
+        hint: String,
+    },
+    /// Read-only error overlay. Driven by
+    /// [`crate::ui::show_modal_error`].
+    Error {
+        title: String,
+        message: String,
+        hint: String,
+    },
+    /// N-button overlay. Driven by
+    /// [`crate::ui::show_wrong_password_modal`].
+    Buttons {
+        title: String,
+        message: String,
+        labels: Vec<String>,
+        selected: usize,
+        hint: String,
+    },
+    /// Animated progress overlay shown by [`crate::ui::BootReporter`]
+    /// when an emergency-action wants the menu visible behind. The
+    /// terminal-boot path stays on [`Screen::BootStatus`].
+    Status {
+        phase: String,
+        log_lines: Vec<String>,
+        spinner_frame: u8,
+    },
+}
+
 /// Top-level TUI app state.
 pub struct App<'a> {
     pub generations: &'a [Generation],
@@ -190,6 +236,16 @@ pub struct App<'a> {
     pub show_kernel_params: bool,
     pub countdown_remaining_secs: Option<u64>,
     pub decision: Option<Decision>,
+    /// When `Some`, painted on top of `screen` by the renderer. The
+    /// underlying screen keeps rendering behind so closing the modal
+    /// returns to the same selection / scroll state.
+    pub modal: Option<ModalKind>,
+    /// Latch for the emergency-screen auto-reboot countdown. Set on
+    /// the FIRST entry to the emergency (error) screen and never reset
+    /// — re-entries after dismissing a modal find the deadline already
+    /// present so the timer doesn't restart. Once elapsed, the next
+    /// visit to the emergency screen reboots immediately.
+    pub error_countdown_deadline: Option<Instant>,
 }
 
 /// Number of frames in the boot-status spinner cycle.
@@ -217,6 +273,8 @@ impl<'a> App<'a> {
             show_kernel_params: false,
             countdown_remaining_secs: None,
             decision: None,
+            modal: None,
+            error_countdown_deadline: None,
         }
     }
 
@@ -239,6 +297,8 @@ impl<'a> App<'a> {
             show_kernel_params: false,
             countdown_remaining_secs: None,
             decision: None,
+            modal: None,
+            error_countdown_deadline: None,
         }
     }
 
@@ -257,6 +317,23 @@ impl<'a> App<'a> {
             show_kernel_params: false,
             countdown_remaining_secs: None,
             decision: None,
+            modal: None,
+            error_countdown_deadline: None,
+        }
+    }
+
+    /// Latch the auto-reboot deadline for the error (emergency) screen.
+    ///
+    /// Sets `error_countdown_deadline` only when it is currently
+    /// `None` — re-entries (after dismissing a modal and returning to
+    /// the error screen) find the deadline already present so the
+    /// timer never restarts. If the deadline already elapsed during
+    /// time spent on another screen, the next visit will observe
+    /// `now >= deadline` and the loop driver reboots immediately.
+    pub fn latch_error_countdown(&mut self, auto_reboot_in: std::time::Duration) {
+        if self.error_countdown_deadline.is_none() {
+            let now = Instant::now();
+            self.error_countdown_deadline = Some(now.checked_add(auto_reboot_in).unwrap_or(now));
         }
     }
 
@@ -1302,6 +1379,93 @@ mod tests {
         app.set_boot_log_lines(vec!["ignored".into()]);
         app.tick_boot_spinner();
         assert!(matches!(app.screen, Screen::List));
+    }
+
+    // ---- Error-screen countdown latch -----------------------------
+
+    #[test]
+    fn latch_error_countdown_sets_deadline_on_first_call() {
+        // First invocation must transition deadline from None → Some.
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        assert!(app.error_countdown_deadline.is_none());
+        app.latch_error_countdown(std::time::Duration::from_secs(30));
+        assert!(app.error_countdown_deadline.is_some());
+    }
+
+    #[test]
+    fn latch_error_countdown_is_idempotent_across_reentries() {
+        // Re-entry to the error screen (operator dismissed a modal,
+        // navigated back) MUST NOT restart the timer. The deadline
+        // captured on the first call must survive every subsequent
+        // call regardless of duration.
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        app.latch_error_countdown(std::time::Duration::from_secs(30));
+        let deadline_a = app.error_countdown_deadline;
+        // Re-enter twice with different (smaller / larger) durations.
+        app.latch_error_countdown(std::time::Duration::from_secs(5));
+        let deadline_b = app.error_countdown_deadline;
+        app.latch_error_countdown(std::time::Duration::from_secs(99));
+        let deadline_c = app.error_countdown_deadline;
+        assert_eq!(deadline_a, deadline_b);
+        assert_eq!(deadline_a, deadline_c);
+    }
+
+    #[test]
+    fn latch_error_countdown_preserves_elapsed_deadline() {
+        // If the deadline already elapsed during time spent on
+        // another screen, the latch must keep the elapsed deadline
+        // — the loop driver observes `now >= deadline` and reboots
+        // immediately. We test this by pre-setting a deadline in
+        // the past and confirming the latch leaves it alone.
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        let past = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        app.error_countdown_deadline = Some(past);
+        app.latch_error_countdown(std::time::Duration::from_secs(30));
+        assert_eq!(
+            app.error_countdown_deadline,
+            Some(past),
+            "latch must not refresh an already-elapsed deadline"
+        );
+    }
+
+    // ---- Modal overlay state --------------------------------------
+
+    #[test]
+    fn modal_field_defaults_to_none_on_construction() {
+        // App::new() must start with no modal so a fresh boot doesn't
+        // accidentally render a stale overlay.
+        let gens: Vec<Generation> = vec![];
+        let app = App::new(&gens);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn modal_field_carries_status_overlay_payload() {
+        // ModalKind::Status round-trips its payload exactly. The
+        // BootReporter writes into this variant when an emergency
+        // action wants the menu visible behind a progress dialog.
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        app.modal = Some(ModalKind::Status {
+            phase: "phase X".into(),
+            log_lines: vec!["one".into()],
+            spinner_frame: 2,
+        });
+        match &app.modal {
+            Some(ModalKind::Status {
+                phase,
+                log_lines,
+                spinner_frame,
+            }) => {
+                assert_eq!(phase, "phase X");
+                assert_eq!(log_lines, &vec!["one".to_string()]);
+                assert_eq!(*spinner_frame, 2);
+            }
+            other => panic!("expected ModalKind::Status, got {other:?}"),
+        }
     }
 
     #[test]
