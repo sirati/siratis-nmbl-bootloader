@@ -314,12 +314,157 @@ pub fn mark_boot_succeeded(dir: &Path) -> Result<(), NmblError> {
     write_padded(&path, &state)
 }
 
+/// Outcome of the boot-time rollback decision.
+///
+/// Returned by [`decide`] and consumed by the caller (see Phase 4.2's
+/// `select_and_act`) which performs the on-disk write-back and `kexec_into`
+/// dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatefulDecision {
+    /// Healthy boot — honour whatever generation the operator (TUI /
+    /// timeout default) picked. The caller still records the choice in
+    /// `last_attempted_generation` before kexec.
+    HonourTui,
+    /// In-progress recovery — boot the generation at this index in the
+    /// scanned `generations` slice. The caller MUST persist `state`
+    /// (which `decide` has already mutated) before invoking kexec.
+    ForcePick(usize),
+    /// Recovery budget exhausted; the caller must surface this as a
+    /// rescue condition. `decide` deliberately leaves `state` untouched
+    /// in this branch.
+    Exhausted,
+}
+
+/// Run the rollback decision for the current boot.
+///
+/// `decide` is called ONCE per boot, BEFORE the kexec dispatch, with:
+/// - `state`: the on-disk `state.bin` decoded into memory. Mutated in
+///   place per the rules below; the caller writes it back to disk on
+///   the non-Exhausted branches.
+/// - `generations`: the result of `scan_generations`, sorted newest-first.
+/// - `active_index`: the index inside `generations` of the currently
+///   active Nix system profile, as returned by `active_generation_index`.
+/// - `max_recovery_attempts`: operator-configured rollback budget.
+///
+/// `decide` does NOT touch `last_attempted_generation` or
+/// `last_boot_succeeded` — that bookkeeping belongs to the caller, which
+/// records the chosen generation and clears the success flag immediately
+/// before kexec. Keeping those writes outside `decide` makes the
+/// rotation/reset semantics independent of where the resulting boot ends
+/// up going.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "ring slots are statically indexed within their fixed-size array; \
+              the fallback `generations[idx]` is bounded by the `0..len()` range"
+)]
+pub fn decide(
+    state: &mut State,
+    generations: &[crate::generations::Generation],
+    active_index: usize,
+    max_recovery_attempts: u32,
+) -> StatefulDecision {
+    if state.last_boot_succeeded {
+        // Rotation: bring the just-succeeded generation to the front of
+        // known_good, then reset the rollback counter.
+        if let Some(last) = state.last_attempted_generation {
+            let n = last.get();
+            // Only rotate if the gen is still on disk — a GC'd target
+            // is treated as if we never attempted it. The array stays
+            // a snapshot of generations actually available right now.
+            if generations.iter().any(|g| g.number == n) {
+                let existing = state
+                    .known_good_generations
+                    .iter()
+                    .position(|slot| slot.map(|v| v.get()) == Some(n));
+                match existing {
+                    None => {
+                        // Shift right by one, drop the tail, insert at [0].
+                        let len = state.known_good_generations.len();
+                        for i in (1..len).rev() {
+                            state.known_good_generations[i] = state.known_good_generations[i - 1];
+                        }
+                        state.known_good_generations[0] = Some(last);
+                    }
+                    Some(pos) => {
+                        // Only re-promote to the front when the
+                        // succeeded gen is the one Nix considers active
+                        // — otherwise the operator just rolled forward
+                        // past a known-good and the ring already
+                        // captured that boot at the right place.
+                        let active_n = generations.get(active_index).map(|g| g.number);
+                        if Some(n) == active_n && pos > 0 {
+                            let slot = state.known_good_generations[pos];
+                            for i in (1..=pos).rev() {
+                                state.known_good_generations[i] =
+                                    state.known_good_generations[i - 1];
+                            }
+                            state.known_good_generations[0] = slot;
+                        }
+                    }
+                }
+            }
+        }
+        state.recovery_attempt = 0;
+        return StatefulDecision::HonourTui;
+    }
+
+    // Failure path. Budget check first — never mutate state if we're
+    // already over budget, the caller may decide to skip the write.
+    if state.recovery_attempt >= max_recovery_attempts {
+        return StatefulDecision::Exhausted;
+    }
+
+    // First pick: try `known_good_generations[recovery_attempt]` if it
+    // points at a generation that's still on disk.
+    let r = state.recovery_attempt as usize;
+    let mut picked: Option<usize> = None;
+    if r < state.known_good_generations.len()
+        && let Some(slot) = state.known_good_generations[r]
+    {
+        let n = slot.get();
+        picked = generations.iter().position(|g| g.number == n);
+    }
+
+    if picked.is_none() {
+        // Fallback walk: strictly OLDER than the active Nix profile.
+        // `scan_generations` sorts newest-first (descending number), so
+        // OLDER entries sit at HIGHER indices than `active_index`. Skip
+        // anything already in known_good or the gen we tried most
+        // recently (last_attempted_generation tracks the previous boot's
+        // pick — preventing an immediate retry of the just-failed gen).
+        // When `active_index` is already the oldest scanned generation,
+        // the loop body never executes and we exhaust below.
+        let last_attempt = state.last_attempted_generation.map(|v| v.get());
+        for idx in (active_index + 1)..generations.len() {
+            let n = generations[idx].number;
+            let in_known_good = state
+                .known_good_generations
+                .iter()
+                .any(|slot| slot.map(|v| v.get()) == Some(n));
+            let is_last_attempt = last_attempt == Some(n);
+            if !in_known_good && !is_last_attempt {
+                picked = Some(idx);
+                break;
+            }
+        }
+    }
+
+    match picked {
+        Some(idx) => {
+            state.recovery_attempt = state.recovery_attempt.saturating_add(1);
+            StatefulDecision::ForcePick(idx)
+        }
+        None => StatefulDecision::Exhausted,
+    }
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
     clippy::indexing_slicing,
+    clippy::field_reassign_with_default,
     reason = "tests assert on contract failures"
 )]
 mod tests {
@@ -526,5 +671,311 @@ mod tests {
 
         let after = std::fs::read(&path).expect("read after");
         assert_eq!(after, before);
+    }
+
+    // -- decide() unit tests ------------------------------------------------
+
+    use crate::generations::Generation;
+    use std::path::PathBuf;
+
+    /// Build a synthetic [`Generation`] with just the `number` field
+    /// meaningful — `decide` only looks at `.number`, the rest is filler
+    /// the test never inspects.
+    fn fake_gen(n: u32) -> Generation {
+        Generation {
+            number: n,
+            profile_link: PathBuf::from(format!("/profile-{n}")),
+            kernel: PathBuf::from("/kernel"),
+            initrd: PathBuf::from("/initrd"),
+            init_path: PathBuf::from("/init"),
+            kernel_params: Vec::new(),
+            label: String::new(),
+        }
+    }
+
+    /// Convenience: build generations newest-first matching the order
+    /// `scan_generations` produces. Pass numbers in any order; this
+    /// re-sorts descending so callers can write `[10, 7, 3]` literally.
+    fn gens(numbers: &[u32]) -> Vec<Generation> {
+        let mut v: Vec<Generation> = numbers.iter().map(|n| fake_gen(*n)).collect();
+        v.sort_by_key(|g| std::cmp::Reverse(g.number));
+        v
+    }
+
+    fn nm(n: u32) -> Option<NonMaxU32> {
+        NonMaxU32::new(n)
+    }
+
+    #[test]
+    fn decide_success_inserts_new_into_known_good_front() {
+        let mut state = State::default();
+        state.last_boot_succeeded = true;
+        state.last_attempted_generation = nm(42);
+        state.known_good_generations[0] = nm(7);
+        state.known_good_generations[1] = nm(5);
+        state.recovery_attempt = 3;
+        let gs = gens(&[42, 7, 5]);
+
+        let d = decide(&mut state, &gs, 0, 3);
+        assert_eq!(d, StatefulDecision::HonourTui);
+        assert_eq!(state.known_good_generations[0], nm(42));
+        assert_eq!(state.known_good_generations[1], nm(7));
+        assert_eq!(state.known_good_generations[2], nm(5));
+        // Tail drop: the previously-last slot is gone (was None anyway).
+        assert_eq!(state.known_good_generations[19], None);
+        assert_eq!(state.recovery_attempt, 0);
+    }
+
+    #[test]
+    fn decide_success_inserts_drops_tail_when_full() {
+        let mut state = State::default();
+        state.last_boot_succeeded = true;
+        state.last_attempted_generation = nm(100);
+        for (i, slot) in state.known_good_generations.iter_mut().enumerate() {
+            *slot = nm((i as u32) + 1);
+        }
+        // Active is gen 100 — present in generations; not in known_good.
+        let mut numbers: Vec<u32> = (1..=20).collect();
+        numbers.push(100);
+        let gs = gens(&numbers);
+        let active_index = gs.iter().position(|g| g.number == 100).expect("active");
+
+        let _ = decide(&mut state, &gs, active_index, 3);
+        assert_eq!(state.known_good_generations[0], nm(100));
+        assert_eq!(state.known_good_generations[1], nm(1));
+        // The original tail (slot 19 == 20) was dropped to make room.
+        assert_eq!(state.known_good_generations[19], nm(19));
+    }
+
+    #[test]
+    fn decide_success_promotes_when_in_known_good_and_active() {
+        let mut state = State::default();
+        state.last_boot_succeeded = true;
+        // The succeeded gen is the active one AND already in known_good
+        // at index 2 — promote it to the front, shifting [0] and [1]
+        // down by one.
+        state.last_attempted_generation = nm(50);
+        state.known_good_generations[0] = nm(99);
+        state.known_good_generations[1] = nm(80);
+        state.known_good_generations[2] = nm(50);
+        state.recovery_attempt = 2;
+        let gs = gens(&[99, 80, 50, 10]);
+        let active_index = gs.iter().position(|g| g.number == 50).expect("active");
+
+        let d = decide(&mut state, &gs, active_index, 3);
+        assert_eq!(d, StatefulDecision::HonourTui);
+        assert_eq!(state.known_good_generations[0], nm(50));
+        assert_eq!(state.known_good_generations[1], nm(99));
+        assert_eq!(state.known_good_generations[2], nm(80));
+        assert_eq!(state.recovery_attempt, 0);
+    }
+
+    #[test]
+    fn decide_success_in_known_good_but_not_active_is_noop_on_array() {
+        let mut state = State::default();
+        state.last_boot_succeeded = true;
+        state.last_attempted_generation = nm(50);
+        state.known_good_generations[0] = nm(99);
+        state.known_good_generations[2] = nm(50);
+        state.recovery_attempt = 1;
+        // Active is 99, not 50 — leave the array untouched.
+        let gs = gens(&[99, 80, 50, 10]);
+        let active_index = gs.iter().position(|g| g.number == 99).expect("active");
+        let snapshot = state.known_good_generations;
+
+        let d = decide(&mut state, &gs, active_index, 3);
+        assert_eq!(d, StatefulDecision::HonourTui);
+        assert_eq!(state.known_good_generations, snapshot);
+        assert_eq!(state.recovery_attempt, 0);
+    }
+
+    #[test]
+    fn decide_success_last_attempt_gc_is_noop_on_array() {
+        let mut state = State::default();
+        state.last_boot_succeeded = true;
+        // 999 was attempted but is no longer on disk — array stays.
+        state.last_attempted_generation = nm(999);
+        state.known_good_generations[0] = nm(42);
+        state.recovery_attempt = 1;
+        let gs = gens(&[42, 7]);
+        let snapshot = state.known_good_generations;
+
+        let d = decide(&mut state, &gs, 0, 3);
+        assert_eq!(d, StatefulDecision::HonourTui);
+        assert_eq!(state.known_good_generations, snapshot);
+        assert_eq!(state.recovery_attempt, 0);
+    }
+
+    #[test]
+    fn decide_success_last_attempt_none_is_noop_on_array() {
+        let mut state = State::default();
+        state.last_boot_succeeded = true;
+        state.last_attempted_generation = None;
+        state.known_good_generations[0] = nm(42);
+        state.recovery_attempt = 5;
+        let gs = gens(&[42, 7]);
+        let snapshot = state.known_good_generations;
+
+        let d = decide(&mut state, &gs, 0, 3);
+        assert_eq!(d, StatefulDecision::HonourTui);
+        assert_eq!(state.known_good_generations, snapshot);
+        assert_eq!(state.recovery_attempt, 0);
+    }
+
+    #[test]
+    fn decide_failure_first_pick_from_known_good_slot_zero() {
+        let mut state = State::default();
+        state.last_boot_succeeded = false;
+        state.recovery_attempt = 0;
+        state.known_good_generations[0] = nm(50);
+        let gs = gens(&[100, 50, 10]);
+        let target = gs.iter().position(|g| g.number == 50).expect("target");
+
+        let d = decide(&mut state, &gs, 0, 3);
+        assert_eq!(d, StatefulDecision::ForcePick(target));
+        assert_eq!(state.recovery_attempt, 1);
+    }
+
+    #[test]
+    fn decide_failure_first_pick_missing_falls_back_to_older() {
+        let mut state = State::default();
+        state.last_boot_succeeded = false;
+        state.recovery_attempt = 0;
+        // Slot 0 is empty — must walk strictly OLDER gens. Active is
+        // the newest (idx 0); fallback picks the next-older (idx 1).
+        state.known_good_generations[0] = None;
+        let gs = gens(&[100, 50, 10]);
+        let d = decide(&mut state, &gs, 0, 3);
+        assert_eq!(d, StatefulDecision::ForcePick(1));
+        assert_eq!(state.recovery_attempt, 1);
+    }
+
+    #[test]
+    fn decide_failure_known_good_gc_falls_back_to_older() {
+        let mut state = State::default();
+        state.last_boot_succeeded = false;
+        state.recovery_attempt = 0;
+        // Points at gen 999 which is no longer on disk — first pick
+        // misses, fallback walks older gens past `active_index`.
+        state.known_good_generations[0] = nm(999);
+        let gs = gens(&[100, 50, 10]);
+        // Active = 100 (idx 0); fallback picks the next-older (idx 1 = 50).
+        let d = decide(&mut state, &gs, 0, 3);
+        assert_eq!(d, StatefulDecision::ForcePick(1));
+        assert_eq!(state.recovery_attempt, 1);
+    }
+
+    #[test]
+    fn decide_failure_fallback_skips_known_good_entries() {
+        let mut state = State::default();
+        state.last_boot_succeeded = false;
+        state.recovery_attempt = 0;
+        // First pick miss — slot 0 absent.
+        state.known_good_generations[0] = None;
+        // But 50 IS marked known-good elsewhere in the ring — the
+        // fallback walk must skip it and prefer 10 (the next older
+        // entry strictly past active).
+        state.known_good_generations[5] = nm(50);
+        let gs = gens(&[100, 50, 10]);
+        let active_index = gs.iter().position(|g| g.number == 100).expect("active");
+
+        let d = decide(&mut state, &gs, active_index, 3);
+        let target = gs.iter().position(|g| g.number == 10).expect("target");
+        assert_eq!(d, StatefulDecision::ForcePick(target));
+        assert_eq!(state.recovery_attempt, 1);
+    }
+
+    #[test]
+    fn decide_failure_fallback_skips_last_attempted_generation() {
+        let mut state = State::default();
+        state.last_boot_succeeded = false;
+        state.recovery_attempt = 0;
+        state.known_good_generations[0] = None;
+        // We just tried 50 last boot — fallback must skip it and pick
+        // 10 (the next strictly-older candidate).
+        state.last_attempted_generation = nm(50);
+        let gs = gens(&[100, 50, 10]);
+        let active_index = gs.iter().position(|g| g.number == 100).expect("active");
+
+        let d = decide(&mut state, &gs, active_index, 3);
+        let target = gs.iter().position(|g| g.number == 10).expect("target");
+        assert_eq!(d, StatefulDecision::ForcePick(target));
+        assert_eq!(state.recovery_attempt, 1);
+    }
+
+    #[test]
+    fn decide_failure_exhausted_does_not_mutate_state() {
+        let mut state = State::default();
+        state.last_boot_succeeded = false;
+        state.recovery_attempt = 3;
+        state.last_attempted_generation = nm(42);
+        state.known_good_generations[0] = nm(50);
+        let gs = gens(&[100, 50, 10]);
+        let snapshot = state.clone();
+
+        let d = decide(&mut state, &gs, 0, 3);
+        assert_eq!(d, StatefulDecision::Exhausted);
+        assert_eq!(state, snapshot);
+    }
+
+    #[test]
+    fn decide_failure_no_candidate_returns_exhausted() {
+        let mut state = State::default();
+        state.last_boot_succeeded = false;
+        state.recovery_attempt = 0;
+        state.known_good_generations[0] = None;
+        // active_index = 0 means no strictly older candidate; first
+        // pick also misses — exhausted.
+        let gs = gens(&[100]);
+        let d = decide(&mut state, &gs, 0, 3);
+        assert_eq!(d, StatefulDecision::Exhausted);
+        // No mutation on the exhausted branch.
+        assert_eq!(state.recovery_attempt, 0);
+    }
+
+    #[test]
+    fn decide_failure_empty_generations_returns_exhausted() {
+        let mut state = State::default();
+        state.last_boot_succeeded = false;
+        state.recovery_attempt = 0;
+        state.known_good_generations[0] = nm(50);
+        let gs: Vec<Generation> = Vec::new();
+        let d = decide(&mut state, &gs, 0, 3);
+        assert_eq!(d, StatefulDecision::Exhausted);
+        assert_eq!(state.recovery_attempt, 0);
+    }
+
+    #[test]
+    fn decide_failure_active_index_zero_does_not_pick_active() {
+        // `generations` is sorted newest-first by `scan_generations`.
+        // Active at index 0 (the newest) must still leave room for the
+        // fallback to pick an older entry — and it must NOT return
+        // index 0 itself. This pins the "older = higher index"
+        // convention against accidental sign flips in the walk.
+        let mut state = State::default();
+        state.last_boot_succeeded = false;
+        state.recovery_attempt = 0;
+        state.known_good_generations[0] = None;
+        let gs = gens(&[100, 50]);
+        let d = decide(&mut state, &gs, 0, 3);
+        assert_eq!(d, StatefulDecision::ForcePick(1));
+        assert_ne!(d, StatefulDecision::ForcePick(0));
+    }
+
+    #[test]
+    fn decide_failure_active_is_oldest_returns_exhausted() {
+        // Active sits at the OLDEST slot (last index). No
+        // strictly-older candidate exists, first pick missed, so the
+        // result is Exhausted with no mutation.
+        let mut state = State::default();
+        state.last_boot_succeeded = false;
+        state.recovery_attempt = 0;
+        state.known_good_generations[0] = None;
+        let gs = gens(&[100, 50, 10]);
+        let active_index = gs.iter().position(|g| g.number == 10).expect("active");
+
+        let d = decide(&mut state, &gs, active_index, 3);
+        assert_eq!(d, StatefulDecision::Exhausted);
+        assert_eq!(state.recovery_attempt, 0);
     }
 }
