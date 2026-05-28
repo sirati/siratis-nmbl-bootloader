@@ -185,6 +185,21 @@ let
   # if B.2's option tree hasn't been merged yet.
   configLocation = cfg.configLocation or "embedded";
 
+  # Operator input device baseline. NMBL replaces systemd-stage-1, so
+  # NixOS's automatic input-driver inclusion does not apply. Any
+  # interactive screen (LUKS passphrase, emergency menu, wrong-password
+  # modal, console picker) is unusable without these — applied to both
+  # earlyKernelModules (so they are live before the first prompt) and
+  # availableKernelModules (so they ship in the initramfs).
+  defaultKeyboardDrivers = [
+    "i8042"
+    "atkbd"
+    "usbhid"
+    "hid_generic"
+    "xhci_pci"
+    "ehci_pci"
+  ];
+
   # Determine legacy boot mode string for compatibility
   legacyBootMode =
     if bootstrapper.partition_table == "gpt" && bootstrapper.bootMode == "bios" then
@@ -420,6 +435,9 @@ in
 
     # NMBL supports initrd secrets since it has an initramfs
     boot.loader.supportsInitrdSecrets = true;
+
+    boot.nmbl.earlyKernelModules = defaultKeyboardDrivers;
+    boot.nmbl.availableKernelModules = defaultKeyboardDrivers;
 
     # Populate boot.initrd.supportedFilesystems using the same logic as stage-1.nix
     # This triggers filesystem-specific modules (vfat.nix, ext.nix, etc.) to add their
