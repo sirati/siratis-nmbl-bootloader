@@ -39,6 +39,20 @@
       # Import test runners
       testRunners = import ./testing/test-runners.nix { inherit nixpkgs system; };
 
+      # Common test-artefact value type plus helpers that convert NMBL
+      # VM configs into the uniform artefact shape every renderer
+      # (screen-based vm-serial-man, tmux-serial, future SDL/VNC, …)
+      # consumes. Keeps the "what to test" and "how to display it"
+      # axes orthogonal so each one can evolve without N×M duplication.
+      testArtefact = import ./testing/test-artefact.nix { inherit nixpkgs system; };
+
+      # tmux-serial renderer. Reads a testArtefact, returns a
+      # writeShellApplication that hosts QEMU directly in a named tmux
+      # pane (no socat / pty broker — QEMU's `-serial mon:stdio` IS the
+      # pane's pty). Used to verify the unified ratatui TUI renders
+      # the LUKS passphrase modal cleanly over serial.
+      tmuxSerial = import ./testing/serial-tmux-harness.nix { inherit nixpkgs system; };
+
       # Import vm-serial-man package directly
       vmSerialManFlake = import ../vm-serial-man-rs/flake.nix;
       vmSerialMan =
@@ -104,7 +118,15 @@
         install-test-gpt-uefi-systemd-btrfs-raid1 = nixosAnywhereTest.apps.${system}.install-test-gpt-uefi-systemd-btrfs-raid1;
       };
 
-      # Build test runner apps for each configuration
+      # Build test runner apps for each configuration. Each entry
+      # gets two apps:
+      #   - `<name>`               → vm-serial-man + GNU screen (legacy)
+      #   - `tmux-serial-<name>`   → tmux pane hosting QEMU directly,
+      #                              ratatui TUI renders over the
+      #                              pane's pty.
+      # The tmux-serial variant exists because the ratatui passphrase
+      # modal renders 1:1 over a serial UART, so a vt100-aware tmux
+      # pane is now a first-class display for any NMBL boot test.
       testApps = builtins.listToAttrs (
         builtins.concatLists (
           builtins.attrValues (
@@ -112,8 +134,10 @@
               name: cfg:
               let
                 config = testing.mkTestConfigurations.${name};
-                # Only create the main app - bootMode is derived from config.bootstrapper
-                app = {
+                artefact = testArtefact.artefactFromVmConfig {
+                  inherit name config;
+                };
+                legacyApp = {
                   name = "${name}";
                   value = {
                     type = "app";
@@ -123,8 +147,16 @@
                     }}";
                   };
                 };
+                tmuxApp = {
+                  name = "tmux-serial-${name}";
+                  value = {
+                    type = "app";
+                    program =
+                      "${tmuxSerial.mkTmuxSerialRunner { inherit artefact; }}/bin/tmux-serial-${name}";
+                  };
+                };
               in
-              [ app ]
+              [ legacyApp tmuxApp ]
             ) testing.configs
           )
         )
@@ -177,8 +209,32 @@
       # Run with: nix run .#test-gpt-qemu-kernel-invoke
       # Run with: nix run .#test-gpt-qemu-kernel-invoke -- --debug-shell  (drops to emergency shell)
       # Run with: nix run .#test-rescue-ssh -- [--pubkey-file PATH] [--port N]
+      # Run with: nix run .#tmux-serial-test-gpt-uefi-grub-luks-password
       apps.${system} = testApps // {
         test-rescue-ssh = rescueVmTestApp;
       } // nixosAnywhereTestApps;
+
+      # Reusable library: external flakes (the LUKS install orchestrator,
+      # rescue-vm-test, future variants) consume `testArtefact` to
+      # describe their VM-under-test and `tmuxSerial.mkTmuxSerialRunner`
+      # to render it into a tmux session. Exposed as legacyPackages so
+      # callers can `nmbl.legacyPackages.${system}.testArtefact.mkArtefact ...`
+      # without re-importing the testing/ files by relative path.
+      #
+      # `tmuxSerialRunners` is a precomputed attrset of every per-config
+      # runner derivation, keyed by the same name as `apps.<...>`. Useful
+      # when an external flake wants to `nix build` a runner directly
+      # (e.g. as a release artefact) rather than `nix run` it.
+      legacyPackages.${system} = {
+        inherit testArtefact tmuxSerial;
+        tmuxSerialRunners = builtins.mapAttrs (
+          name: _cfg:
+          let
+            config = testing.mkTestConfigurations.${name};
+            artefact = testArtefact.artefactFromVmConfig { inherit name config; };
+          in
+          tmuxSerial.mkTmuxSerialRunner { inherit artefact; }
+        ) testing.configs;
+      };
     };
 }
