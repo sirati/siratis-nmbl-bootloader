@@ -26,11 +26,33 @@
 //! handles for both backends.
 
 use std::borrow::Cow;
+use std::time::Duration;
+
+use crossterm::event::KeyCode;
 
 use crate::error::Result;
 use crate::log;
 use crate::ui::app::App;
 use crate::ui::console::Console;
+
+/// Slice we wait on input per tick. Matches the 100 ms poll cadence of
+/// the device-wait loop so the tick stays cheap and the operator's
+/// Esc keypress aborts within one iteration.
+const TICK_POLL_SLICE: Duration = Duration::from_millis(100);
+
+/// Outcome of a single [`ProgressSink::tick`] call.
+///
+/// `Aborted` lets a blocking wait loop bail out cleanly when the
+/// operator presses Esc on the boot-status screen; the caller is
+/// expected to surface this as [`crate::error::NmblError::OperatorAborted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TickOutcome {
+    /// No operator input demanded an abort; keep polling.
+    Continue,
+    /// Operator pressed Esc; the wait loop should stop and propagate
+    /// an [`crate::error::NmblError::OperatorAborted`] up to its caller.
+    Aborted,
+}
 
 /// Animated progress sink for blocking wait loops.
 ///
@@ -45,12 +67,15 @@ use crate::ui::console::Console;
 /// the phase string is unchanged is allowed but not required.
 pub trait ProgressSink {
     /// Update the visible phase label, advance the spinner one frame,
-    /// refresh the log snapshot, and push a frame to the backend.
+    /// refresh the log snapshot, push a frame to the backend, and poll
+    /// the backend for an abort key (Esc).
     ///
     /// The implementation is expected to swallow non-fatal render errors
     /// (e.g. transient DRM hiccups) rather than abort the wait — the
-    /// boot must not fail because the spinner couldn't repaint.
-    fn tick(&mut self, phase: &str);
+    /// boot must not fail because the spinner couldn't repaint. The
+    /// only way `tick` should return [`TickOutcome::Aborted`] is when
+    /// the operator pressed Esc on the boot-status screen.
+    fn tick(&mut self, phase: &str) -> TickOutcome;
 }
 
 /// Number of log lines pulled from the ring on every refresh.
@@ -116,11 +141,20 @@ impl<'c> BootReporter<'c> {
 
 impl ProgressSink for BootReporter<'_> {
     /// Update the phase label, refresh the log snapshot, advance the
-    /// spinner, and render. Errors from the backend are deliberately
-    /// dropped: a flaky DRM ioctl shouldn't abort a 30 s device wait —
-    /// the next iteration will retry. Phase code still sees a
-    /// fatal error if the underlying wait itself fails.
-    fn tick(&mut self, phase: &str) {
+    /// spinner, render, and poll the backend for an abort key.
+    ///
+    /// Errors from the backend are deliberately dropped: a flaky DRM
+    /// ioctl shouldn't abort a 30 s device wait — the next iteration
+    /// will retry. Phase code still sees a fatal error if the
+    /// underlying wait itself fails.
+    ///
+    /// Returns [`TickOutcome::Aborted`] when the operator presses Esc
+    /// on the boot-status screen — the caller (`devices::wait_for`,
+    /// `activation` waits, …) surfaces this as
+    /// [`crate::error::NmblError::OperatorAborted`] so the emergency
+    /// menu can re-appear with the operator's explicit "abort"
+    /// context.
+    fn tick(&mut self, phase: &str) -> TickOutcome {
         // Promote to an owned Cow so the borrow on `phase` doesn't
         // escape this call (BootStatusData::phase is `Cow<'static, str>`).
         self.app
@@ -128,6 +162,16 @@ impl ProgressSink for BootReporter<'_> {
         self.app.set_boot_log_lines(log::snapshot(LOG_SNAPSHOT_LINES));
         self.app.tick_boot_spinner();
         let _ = self.console.render(&self.app);
+
+        // Poll for a single key with a short timeout so the wait stays
+        // responsive without adding latency beyond the existing 100 ms
+        // POLL_INTERVAL in `devices::wait_for`. A failed poll (transient
+        // DRM / tty error) is treated as "no key" — same swallowing
+        // policy as the render above.
+        match self.console.poll_key(TICK_POLL_SLICE) {
+            Ok(Some(key)) if key.code == KeyCode::Esc => TickOutcome::Aborted,
+            _ => TickOutcome::Continue,
+        }
     }
 }
 
@@ -140,7 +184,7 @@ impl ProgressSink for BootReporter<'_> {
 mod tests {
     use std::time::Duration;
 
-    use crossterm::event::KeyEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
     use crate::ui::app::Screen;
@@ -148,11 +192,17 @@ mod tests {
 
     /// Test double for [`Console`]. Records every render call so we can
     /// assert the reporter actually drives the backend on each API call.
+    ///
+    /// `scripted_keys` lets a test feed a sequence of optional
+    /// `KeyEvent`s in to `poll_key` so [`ProgressSink::tick`]'s abort
+    /// poll can be exercised without a live tty.
     struct MockConsole {
         renders: u32,
         last_phase: Option<String>,
         last_log_len: usize,
         last_spinner: u8,
+        scripted_keys: Vec<Option<KeyEvent>>,
+        key_cursor: usize,
     }
 
     impl MockConsole {
@@ -162,7 +212,15 @@ mod tests {
                 last_phase: None,
                 last_log_len: 0,
                 last_spinner: 0,
+                scripted_keys: Vec::new(),
+                key_cursor: 0,
             }
+        }
+
+        fn with_keys(keys: Vec<Option<KeyEvent>>) -> Self {
+            let mut c = Self::new();
+            c.scripted_keys = keys;
+            c
         }
     }
 
@@ -177,7 +235,9 @@ mod tests {
             Ok(())
         }
         fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
-            Ok(None)
+            let v = self.scripted_keys.get(self.key_cursor).copied().flatten();
+            self.key_cursor = self.key_cursor.saturating_add(1);
+            Ok(v)
         }
         fn size(&self) -> (u16, u16) {
             (80, 24)
@@ -250,12 +310,15 @@ mod tests {
     #[test]
     fn progress_sink_tick_updates_phase_advances_spinner_and_renders() {
         // ProgressSink::tick is the one-call helper device-wait loops use:
-        // it must set the phase string, advance the spinner, and push a
-        // frame to the backend — all in a single call.
+        // it must set the phase string, advance the spinner, push a
+        // frame to the backend, and report TickOutcome::Continue when
+        // no operator key arrived — all in a single call.
         let mut console = MockConsole::new();
         let mut reporter = BootReporter::new(&mut console, "starting");
-        ProgressSink::tick(&mut reporter, "phase 3b: waiting for /dev/sda1 (5s / 30s)");
-        ProgressSink::tick(&mut reporter, "phase 3b: waiting for /dev/sda1 (6s / 30s)");
+        let o1 = ProgressSink::tick(&mut reporter, "phase 3b: waiting for /dev/sda1 (5s / 30s)");
+        let o2 = ProgressSink::tick(&mut reporter, "phase 3b: waiting for /dev/sda1 (6s / 30s)");
+        assert_eq!(o1, TickOutcome::Continue, "no key → Continue");
+        assert_eq!(o2, TickOutcome::Continue, "no key → Continue");
         assert_eq!(
             console.renders, 2,
             "each ProgressSink::tick must call render once"
@@ -266,6 +329,39 @@ mod tests {
             "render must observe the most recent phase string"
         );
         assert_eq!(console.last_spinner, 2, "two ticks land on frame 2");
+    }
+
+    #[test]
+    fn progress_sink_tick_returns_aborted_on_esc_key() {
+        // Operator presses Esc on the boot-status screen while a wait
+        // is in flight: tick must surface TickOutcome::Aborted so the
+        // caller can convert it into an `OperatorAborted` error.
+        let mut console = MockConsole::with_keys(vec![Some(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ))]);
+        let mut reporter = BootReporter::new(&mut console, "phase 3b: waiting");
+        let outcome = ProgressSink::tick(&mut reporter, "phase 3b: waiting for /dev/sda1");
+        assert_eq!(
+            outcome,
+            TickOutcome::Aborted,
+            "Esc on boot-status must produce TickOutcome::Aborted"
+        );
+    }
+
+    #[test]
+    fn progress_sink_tick_ignores_non_esc_keys() {
+        // Stray keypresses (Enter, letters, …) should not abort the
+        // wait — only Esc carries the operator-abort semantics.
+        let mut console = MockConsole::with_keys(vec![
+            Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+        ]);
+        let mut reporter = BootReporter::new(&mut console, "phase 3b: waiting");
+        let o1 = ProgressSink::tick(&mut reporter, "p");
+        let o2 = ProgressSink::tick(&mut reporter, "p");
+        assert_eq!(o1, TickOutcome::Continue, "Enter must not abort");
+        assert_eq!(o2, TickOutcome::Continue, "'q' must not abort");
     }
 
     #[test]

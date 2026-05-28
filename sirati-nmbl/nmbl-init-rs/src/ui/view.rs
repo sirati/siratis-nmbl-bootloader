@@ -303,6 +303,22 @@ pub fn render_boot_status(frame: &mut Frame<'_>, data: &BootStatusData<'_>) {
         .wrap(Wrap { trim: false });
     frame.render_widget(log_para, body);
 
+    // Bottom-of-box hint. Paint a dim "Esc to abort" indicator on the
+    // last inner row of the log panel — same placement pattern as
+    // pretty_shell's "Ctrl+Shift+Up/Dn scroll" hint. The hint is
+    // unconditional so the operator always knows the escape route is
+    // available; render only when the box has at least one inner row.
+    if inner.height > 0 {
+        let hint_row = inner.y.saturating_add(inner.height.saturating_sub(1));
+        let hint_rect = Rect::new(inner.x, hint_row, inner.width, 1);
+        let hint = Paragraph::new(Span::styled(
+            "Esc to abort",
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+        .alignment(Alignment::Right);
+        frame.render_widget(hint, hint_rect);
+    }
+
     // Status line. SPINNER_FRAMES is non-zero (it's a const = 4), but
     // we still defend against a degenerate config: an empty glyph
     // array would underflow the modulo. `get` returns `None` for the
@@ -875,6 +891,57 @@ mod tests {
         assert!(txt0.contains('|'), "frame0 must contain |");
         assert!(txt1.contains('/'), "frame1 must contain /");
         assert_ne!(txt0, txt1, "spinner advance must change buffer");
+    }
+
+    #[test]
+    fn test_render_boot_status_shows_esc_to_abort_hint() {
+        // The "Esc to abort" hint must always be present on the
+        // BootStatus screen so the operator knows the wait is
+        // interruptible without having to read the docs.
+        let data = boot_status_data("phase 3b: waiting", &["mount /proc"], 0);
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_boot_status(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Esc to abort"),
+            "missing 'Esc to abort' hint in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_render_boot_status_esc_hint_is_bottom_right_of_log_panel() {
+        // Stronger assertion: the hint must sit on the bottom-right of
+        // the log box, mirroring pretty-shell's scroll-hint placement.
+        // We pin the row (last interior row of the log panel) and the
+        // alignment (right edge) so a future refactor can't silently
+        // move the hint to a place the operator won't notice.
+        let data = boot_status_data("p", &["line"], 0);
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_boot_status(f, &data)).expect("draw");
+        let lines = buffer_lines(&term);
+
+        // Layout: 3-row header, body fills the middle, 1-row status.
+        // The log box borders the body, so its bottom border row is at
+        // `header_h + body_h - 1 = 3 + 20 - 1 = 22`. The hint paints on
+        // the LAST INNER row, which is one above the bottom border:
+        // row 21.
+        let hint_row_idx = 21;
+        let hint_row = lines
+            .get(hint_row_idx)
+            .expect("hint row must exist in 24-row term");
+        assert!(
+            hint_row.contains("Esc to abort"),
+            "hint missing on expected row {hint_row_idx}: {hint_row:?}"
+        );
+        // Right alignment: the hint should sit near the right border,
+        // not the left. Specifically, the column where "Esc to abort"
+        // starts should be well past column 40 (mid-width on an 80-col
+        // terminal).
+        let hint_col = hint_row.find("Esc to abort").expect("hint substring");
+        assert!(
+            hint_col > 40,
+            "hint must be right-aligned (col {hint_col} should exceed 40): {hint_row:?}"
+        );
     }
 
     #[test]
