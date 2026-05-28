@@ -202,9 +202,61 @@ pub fn scan_generations(config: &Config) -> Result<Vec<Generation>> {
         return Err(NmblError::NoGenerations { searched: dir });
     }
 
-    // Newest first — the TUI selects index 0 as the default boot entry.
+    // Newest first; the active-profile lookup below maps the operator's
+    // currently-selected generation onto the correct slot in this Vec.
     generations.sort_by_key(|g| std::cmp::Reverse(g.number));
     Ok(generations)
+}
+
+/// Resolve the index of the generation that `<profiles_dir>/system`
+/// currently points at, or `0` (highest-numbered, the historical
+/// default) when that pointer cannot be honoured.
+///
+/// The `system` symlink is what `nixos-rebuild --rollback` flips: the
+/// `system-N-link` entries on disk are append-only history, but the
+/// `system` pointer marks which of them is active. Selecting purely
+/// by max generation number would silently boot the entry the operator
+/// just rolled away from.
+pub(crate) fn active_generation_index(generations: &[Generation], profiles_dir: &Path) -> usize {
+    let link = profiles_dir.join("system");
+    let target = match std::fs::read_link(&link) {
+        Ok(t) => t,
+        Err(err) => {
+            nmbl_warn!(
+                "active generation symlink {} unreadable, falling back to newest: {err}",
+                link.display()
+            );
+            return 0;
+        }
+    };
+    let name = match target.file_name().and_then(|s| s.to_str()) {
+        Some(n) => n,
+        None => {
+            nmbl_warn!(
+                "active generation symlink {} target {:?} has no usable filename, falling back to newest",
+                link.display(),
+                target,
+            );
+            return 0;
+        }
+    };
+    let Some(number) = parse_generation_number(name) else {
+        nmbl_warn!(
+            "active generation symlink {} target {:?} does not match system-N-link, falling back to newest",
+            link.display(),
+            target,
+        );
+        return 0;
+    };
+    match generations.iter().position(|g| g.number == number) {
+        Some(idx) => idx,
+        None => {
+            nmbl_warn!(
+                "active generation {number} not present in scan (likely filtered for missing init), falling back to newest"
+            );
+            0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -354,6 +406,87 @@ mod tests {
         );
         assert_eq!(gens[0].init_path, profiles_dir.join("system-3-link/init"));
         assert_eq!(gens[0].kernel_params, vec!["quiet".to_string()]);
+    }
+
+    /// Helper for the active-generation-index tests: builds a profiles
+    /// dir with the requested generation numbers (each backed by a
+    /// usable profile) and returns the resulting (profiles_dir,
+    /// scanned generations) pair.
+    fn profiles_with_gens(tmp: &Path, numbers: &[u32]) -> (PathBuf, Vec<Generation>) {
+        let profiles = tmp.join("profiles");
+        let backing = tmp.join("backing");
+        std::fs::create_dir_all(&profiles).expect("profiles");
+        std::fs::create_dir_all(&backing).expect("backing");
+        for n in numbers {
+            make_profile(&backing, *n, "quiet");
+            link_profile_relative(&profiles, *n, &format!("../backing/profile-{n}"));
+        }
+        let gens = scan_generations(&config_for(&profiles, tmp)).expect("scan ok");
+        (profiles, gens)
+    }
+
+    #[test]
+    fn active_generation_index_matches_system_symlink_target() {
+        let tmp = TempDir::new().expect("temp dir");
+        let (profiles, gens) = profiles_with_gens(tmp.path(), &[1, 10, 42]);
+        // Pin the active generation to 10, which is NOT the newest.
+        symlink("system-10-link", profiles.join("system")).expect("system symlink");
+        let idx = active_generation_index(&gens, &profiles);
+        assert_eq!(gens[idx].number, 10);
+        // Regression guard: this must not be the default (highest-number) slot.
+        assert_ne!(idx, 0);
+    }
+
+    #[test]
+    fn active_generation_index_missing_symlink_returns_zero() {
+        let tmp = TempDir::new().expect("temp dir");
+        let (profiles, gens) = profiles_with_gens(tmp.path(), &[1, 7]);
+        // No `system` symlink at all.
+        assert_eq!(active_generation_index(&gens, &profiles), 0);
+    }
+
+    #[test]
+    fn active_generation_index_bogus_target_returns_zero() {
+        let tmp = TempDir::new().expect("temp dir");
+        let (profiles, gens) = profiles_with_gens(tmp.path(), &[3]);
+        symlink("not-a-system-link", profiles.join("system")).expect("bogus symlink");
+        assert_eq!(active_generation_index(&gens, &profiles), 0);
+    }
+
+    #[test]
+    fn active_generation_index_unscanned_generation_returns_zero() {
+        // `system` points at generation 9, but generation 9 was filtered
+        // from the scan (no `init`), so we can't honour the pointer and
+        // must fall back to the highest-numbered scanned entry.
+        let tmp = TempDir::new().expect("temp dir");
+        let profiles = tmp.path().join("profiles");
+        let backing = tmp.path().join("backing");
+        std::fs::create_dir_all(&profiles).expect("profiles");
+        std::fs::create_dir_all(&backing).expect("backing");
+        make_profile(&backing, 7, "quiet");
+        link_profile_relative(&profiles, 7, "../backing/profile-7");
+        let bad = backing.join("profile-9");
+        std::fs::create_dir_all(&bad).expect("bad dir");
+        std::fs::write(bad.join("kernel"), b"k").expect("kernel");
+        std::fs::write(bad.join("initrd"), b"i").expect("initrd");
+        std::fs::write(bad.join("kernel-params"), "x").expect("params");
+        link_profile_relative(&profiles, 9, "../backing/profile-9");
+        symlink("system-9-link", profiles.join("system")).expect("system symlink");
+
+        let gens = scan_generations(&config_for(&profiles, tmp.path())).expect("scan ok");
+        // Gen 9 was filtered (missing init); only gen 7 remains.
+        assert_eq!(gens.len(), 1);
+        assert_eq!(active_generation_index(&gens, &profiles), 0);
+    }
+
+    #[test]
+    fn active_generation_index_regular_file_returns_zero() {
+        let tmp = TempDir::new().expect("temp dir");
+        let (profiles, gens) = profiles_with_gens(tmp.path(), &[5]);
+        // A regular file where the `system` symlink should be — readlink
+        // will refuse it. We must not panic and must fall back to 0.
+        std::fs::write(profiles.join("system"), b"not a symlink").expect("regular file");
+        assert_eq!(active_generation_index(&gens, &profiles), 0);
     }
 
     #[test]
