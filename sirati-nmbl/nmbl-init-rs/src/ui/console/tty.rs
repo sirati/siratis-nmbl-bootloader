@@ -391,26 +391,71 @@ impl Drop for TtyConsole {
     }
 }
 
-/// Build a termwiz `Capabilities` set, falling back to a hard-coded
-/// `xterm-256color` if `$TERM` is unset (which it is in PID-1 boot).
-/// `Capabilities::new_from_env` returns an error in that case; we
-/// translate it into the explicit minimum-viable capability set so
-/// the TUI still renders. On the (extremely unlikely) double failure
-/// we surface a `Tui` error to the caller instead of panicking.
+/// A compiled `xterm-256color` terminfo entry, bundled into the binary.
+///
+/// The initramfs ships no terminfo database. Without one, termwiz's
+/// `Capabilities` carry no `cup` (`CursorAddress`) capability, and its
+/// terminfo renderer falls back to a hand-rolled CSI cursor-address path
+/// (`render/terminfo.rs::move_cursor_absolute`) that emits
+/// `CSI {x+1};{y+1} H` — transposing row and column. ratatui's
+/// `TermwizBackend` positions every changed cell with an absolute
+/// `CursorPosition`, so on every incremental repaint that transposition
+/// turns a horizontal run of cells into a vertical-down stair-step (a
+/// full repaint after a resize is immune because `repaint_all` moves
+/// between lines with `\r\n`, not absolute addressing).
+///
+/// Bundling a terminfo entry that defines `cup` makes termwiz take the
+/// correct `CursorAddress` path, which fixes the corruption. This is the
+/// same byte-for-byte entry termwiz ships for its own Windows
+/// `apply_builtin_terminfo` path.
+const BUNDLED_TERMINFO: &[u8] = include_bytes!("data/xterm-256color");
+
+/// Build a termwiz `Capabilities` set for the NMBL serial/VT console.
+///
+/// We deliberately do **not** trust the runtime environment: PID-1 boots
+/// with no `$TERM` and no terminfo database on disk. Instead we feed
+/// termwiz an explicit [`ProbeHints`] carrying:
+///
+/// - the bundled `xterm-256color` terminfo (for a correct `cup` —
+///   see [`BUNDLED_TERMINFO`]),
+/// - [`ColorLevel::TrueColor`] so 24-bit RGB is emitted directly as
+///   `CSI 38;2;r;g;b m` rather than being quantised to a palette index,
+/// - every optional capability enabled (hyperlinks, sixel, iTerm2 image
+///   protocol, bracketed paste, mouse reporting) so the full terminal
+///   feature set is available to any modern emulator on the other end of
+///   the serial line,
+/// - `force_terminfo_render_to_use_ansi_sgr` so SGR attributes are
+///   emitted as standard ECMA-48 sequences, which render correctly even
+///   through pagers and minimal emulators.
+///
+/// On the (extremely unlikely) failure to even parse the bundled
+/// terminfo we fall back to the same hints without a database; the
+/// truecolor/feature overrides still apply, only `cup` is missing.
 fn caps_from_env_with_fallback() -> Result<Capabilities> {
-    if let Ok(caps) = Capabilities::new_from_env() {
-        return Ok(caps);
-    }
-    // Force a known-good terminfo entry. `new_with_hints` accepts a
-    // ProbeHints with `term` set; using that bypasses the env lookup.
-    let hints = termwiz::caps::ProbeHints::new_from_env().term(Some("xterm-256color".to_owned()));
-    if let Ok(c) = Capabilities::new_with_hints(hints) {
-        return Ok(c);
-    }
-    // Absolute last resort: build with no hints. Returns an error
-    // only if no terminfo is compiled in, in which case the TUI is
-    // already doomed — surface that error to the caller.
-    Capabilities::new_with_hints(termwiz::caps::ProbeHints::new_from_env()).map_err(tw_err)
+    use termwiz::caps::{ColorLevel, ProbeHints};
+
+    let hints = ProbeHints::default()
+        .term(Some("xterm-256color".to_owned()))
+        .color_level(Some(ColorLevel::TrueColor))
+        .hyperlinks(Some(true))
+        .sixel(Some(true))
+        .iterm2_image(Some(true))
+        .bracketed_paste(Some(true))
+        .mouse_reporting(Some(true))
+        .force_terminfo_render_to_use_ansi_sgr(Some(true));
+
+    let hints = match terminfo::Database::from_buffer(BUNDLED_TERMINFO) {
+        Ok(db) => hints.terminfo_db(Some(db)),
+        Err(e) => {
+            nmbl_warn!(
+                "TtyConsole: bundled terminfo failed to parse ({e}); \
+                 cursor addressing may be wrong on incremental repaints"
+            );
+            hints
+        }
+    };
+
+    Capabilities::new_with_hints(hints).map_err(tw_err)
 }
 
 /// Try to switch `fd`'s VT into `KD_GRAPHICS`.
@@ -568,5 +613,76 @@ mod tests {
             Err(_) => return,
         };
         restore_kd_mode(file.as_fd(), KD_TEXT);
+    }
+
+    /// The bundled terminfo must parse and define `cup`
+    /// (`CursorAddress`). This is the single fact that keeps termwiz off
+    /// its row/col-transposing CSI fallback in `move_cursor_absolute`.
+    #[test]
+    fn bundled_terminfo_defines_cursor_address() {
+        use terminfo::capability::CursorAddress;
+        let db = terminfo::Database::from_buffer(BUNDLED_TERMINFO)
+            .expect("bundled xterm-256color terminfo must parse");
+        assert!(
+            db.get::<CursorAddress>().is_some(),
+            "bundled terminfo must define cup (CursorAddress); without it \
+             termwiz transposes row/col on every incremental repaint"
+        );
+    }
+
+    /// Regression pin for the horizontal→vertical-down flip. Render an
+    /// absolute cursor move `(x=col, y=row)` through the *actual*
+    /// capabilities NMBL builds and assert termwiz emits
+    /// `CSI {row+1};{col+1} H` — row first, then column. The pre-fix
+    /// no-terminfo fallback emitted `CSI {col+1};{row+1} H` (transposed),
+    /// which is exactly the corruption the operator reported.
+    #[test]
+    fn absolute_cursor_move_is_row_then_col() {
+        use std::io::Write;
+        use termwiz::render::RenderTty;
+        use termwiz::render::terminfo::TerminfoRenderer;
+        use termwiz::surface::{Change, Position};
+
+        struct CaptureTty {
+            buf: Vec<u8>,
+        }
+        impl Write for CaptureTty {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.buf.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RenderTty for CaptureTty {
+            fn get_size_in_cells(&mut self) -> termwiz::Result<(usize, usize)> {
+                Ok((200, 60))
+            }
+        }
+
+        let caps = caps_from_env_with_fallback().expect("caps must build");
+        let mut renderer = TerminfoRenderer::new(caps);
+        let mut tty = CaptureTty { buf: Vec::new() };
+
+        // x = column 7, y = row 3. A correct backend emits a move to
+        // row 3, column 7.
+        let change = Change::CursorPosition {
+            x: Position::Absolute(7),
+            y: Position::Absolute(3),
+        };
+        renderer
+            .render_to(&[change], &mut tty)
+            .expect("render must succeed");
+
+        let out = String::from_utf8_lossy(&tty.buf);
+        assert!(
+            out.contains("\x1b[4;8H"),
+            "expected row-first CSI cursor address \\x1b[4;8H (row 3+1, col 7+1), got {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[8;4H"),
+            "transposed (col-first) cursor address \\x1b[8;4H must NOT appear: {out:?}"
+        );
     }
 }

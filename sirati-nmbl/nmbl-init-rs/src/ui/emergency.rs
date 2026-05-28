@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 use crate::error::{NmblError, Result, format_chain};
 use crate::ui::POLL_SLICE;
 use crate::ui::app::{App, EmergencyChoice, EmergencyItem, Screen};
-use crate::ui::console::Console;
+use crate::ui::console::{Console, ConsoleEvent};
 
 /// Default countdown to auto-reboot when the operator is not present.
 const EMERGENCY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -235,19 +235,32 @@ where
             None => POLL_SLICE,
         };
 
-        if let Some(key) = console.poll_key(slice)? {
-            // Any keypress cancels the auto-reboot countdown for the
-            // remainder of this session: clear both the display field
-            // and the latched deadline so re-entries don't re-arm it
-            // and so the loop body above falls through to "no
-            // deadline" handling.
-            app.countdown_remaining_secs = None;
-            app.error_countdown_deadline = None;
-            if app.on_key(key) {
-                break;
+        // Use `poll_event` (not `poll_key`) so a host-reported terminal
+        // resize repaints immediately, matching the passphrase modal and
+        // the tty picker. `poll_key` silently drops `Resize`, which left
+        // this dialog stale until the next keystroke.
+        match console.poll_event(slice)? {
+            Some(ConsoleEvent::Resize { .. }) => {
+                // Geometry changed; the next iteration must repaint the
+                // whole frame against the new size.
+                dirty = true;
+                continue;
             }
-            dirty = true;
-            continue;
+            Some(ConsoleEvent::Key(key)) => {
+                // Any keypress cancels the auto-reboot countdown for the
+                // remainder of this session: clear both the display field
+                // and the latched deadline so re-entries don't re-arm it
+                // and so the loop body above falls through to "no
+                // deadline" handling.
+                app.countdown_remaining_secs = None;
+                app.error_countdown_deadline = None;
+                if app.on_key(key) {
+                    break;
+                }
+                dirty = true;
+                continue;
+            }
+            None => {}
         }
 
         // No input this slice. Tick the displayed countdown if the
@@ -287,7 +300,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::cell::Cell;
 
-    use crate::ui::console::{ConsoleEvent, ConsoleKind};
+    use crate::ui::console::ConsoleKind;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
