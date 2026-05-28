@@ -190,6 +190,42 @@ let
         })
       ];
     };
+    # Stateful boot-tracking variant: same UEFI+GRUB chain as
+    # test-external-config, but with stateful boot tracking enabled.
+    # NMBL records boot attempts to /boot/nmbl/state.bin and recovers to
+    # a known-good generation after consecutive failures.
+    test-stateful = {
+      name = "test-stateful";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "uefi";
+        loader = "grub";
+        loader_extra_args = {
+          timeout = 0;
+          extraConfig = ''
+            serial --unit=0 --speed=115200
+            terminal_input serial
+            terminal_output serial
+          '';
+        };
+      };
+      extraModules = [
+        ({ ... }: {
+          boot.nmbl.configLocation = "external";
+          boot.nmbl.stateful.enable = true;
+          # Default maxRecoveryAttempts = 5, successTarget = "multi-user.target"
+          boot.nmbl.bootstrap.bootFs.device = "/dev/vda1";
+          boot.nmbl.bootstrap.kernelModules.explicit = [
+            "virtio_pci"
+            "virtio_blk"
+            "vfat"
+            "nls_cp437"
+            "nls_iso8859_1"
+          ];
+        })
+      ];
+    };
+
   } // nixpkgs.lib.optionalAttrs (disko != null) {
     # LUKS-password variant: same UEFI+GRUB chain as test-gpt-uefi-grub,
     # but vda3 is a LUKS container that NMBL unlocks via the TUI passphrase
