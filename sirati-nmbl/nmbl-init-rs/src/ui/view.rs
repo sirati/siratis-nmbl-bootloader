@@ -690,7 +690,7 @@ pub fn render_modal_error(frame: &mut Frame<'_>, data: &ModalErrorScreenData<'_>
 /// Owned by the [`crate::ui::pretty_shell::PtyShellState`] driver; the
 /// renderer is a pure consumer of the snapshot. The grid is supplied
 /// pre-flattened as `rows_text` so this file can stay independent of
-/// `alacritty_terminal` (which is only compiled in when `image-splash`
+/// `alacritty_terminal` (which is only compiled in when `pretty-shell`
 /// is on, but this struct is unconditionally visible here so the
 /// `view` module's tests don't fragment over feature flags).
 pub struct PtyShellScreenData<'a> {

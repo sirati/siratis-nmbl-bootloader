@@ -101,23 +101,25 @@ pub(crate) fn build_message(err: &NmblError) -> String {
 /// timeout rolls over to.
 ///
 /// `Pretty Shell` is inserted between `Reboot` and `Raw Shell` only
-/// when the `image-splash` Cargo feature is compiled in — it depends
+/// when the `pretty-shell` Cargo feature is compiled in — it depends
 /// on the `alacritty_terminal` parser which is only an optional dep of
-/// that feature. When the feature is on Pretty Shell is the preferred
-/// recovery shell; the raw busybox-on-tty path sits below it as a
-/// fallback. The `Retry boot from config` and `Verify kexec readiness`
-/// actions are unconditional: they only need the existing phase 3/4/5
-/// plumbing already in the binary.
+/// that feature. `pretty-shell` is default-on (and also pulled in by
+/// `image-splash`), so the normal build shows it; a
+/// `--no-default-features` build hides it. When the feature is on
+/// Pretty Shell is the preferred recovery shell; the raw busybox-on-tty
+/// path sits below it as a fallback. The `Retry boot from config` and
+/// `Verify kexec readiness` actions are unconditional: they only need
+/// the existing phase 3/4/5 plumbing already in the binary.
 pub(crate) fn default_items() -> Vec<EmergencyItem> {
     // `mut` is conditionally used (the `insert` below is feature-gated);
     // suppress the unused_mut warning on no-feature builds without
     // duplicating the vec literal.
-    #[cfg_attr(not(feature = "image-splash"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "pretty-shell"), allow(unused_mut))]
     let mut items = vec![EmergencyItem {
         label: "Reboot",
         choice: EmergencyChoice::Reboot,
     }];
-    #[cfg(feature = "image-splash")]
+    #[cfg(feature = "pretty-shell")]
     items.push(EmergencyItem {
         label: "Pretty Shell",
         choice: EmergencyChoice::PrettyShell,
@@ -397,7 +399,7 @@ mod tests {
     fn drive_emergency_loop_returns_selected_on_enter() {
         // Press the 's' hotkey to commit the Raw Shell entry. The
         // hotkey path is feature-independent, so this test stays
-        // stable whether or not `image-splash` adds a Pretty Shell row
+        // stable whether or not `pretty-shell` adds a Pretty Shell row
         // between the Reboot and Raw Shell rows in default_items. The
         // clock never advances, so the timeout never fires.
         let start = Instant::now();
@@ -686,15 +688,15 @@ mod tests {
         // surprising behaviour. Pin the contract here.
         let items = default_items();
         assert_eq!(items[0].choice, EmergencyChoice::Reboot);
-        // With `image-splash` the Pretty Shell entry sits at index 1
+        // With `pretty-shell` the Pretty Shell entry sits at index 1
         // and the Raw Shell entry at index 2; without the feature the
         // Raw Shell entry falls back to index 1.
-        #[cfg(feature = "image-splash")]
+        #[cfg(feature = "pretty-shell")]
         {
             assert_eq!(items[1].choice, EmergencyChoice::PrettyShell);
             assert_eq!(items[2].choice, EmergencyChoice::RawShell);
         }
-        #[cfg(not(feature = "image-splash"))]
+        #[cfg(not(feature = "pretty-shell"))]
         {
             assert_eq!(items[1].choice, EmergencyChoice::RawShell);
         }
@@ -715,7 +717,7 @@ mod tests {
         let choices: Vec<EmergencyChoice> = items.iter().map(|it| it.choice).collect();
 
         let mut expected: Vec<EmergencyChoice> = vec![EmergencyChoice::Reboot];
-        #[cfg(feature = "image-splash")]
+        #[cfg(feature = "pretty-shell")]
         expected.push(EmergencyChoice::PrettyShell);
         expected.push(EmergencyChoice::RawShell);
         expected.push(EmergencyChoice::RetryBoot);

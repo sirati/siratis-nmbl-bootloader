@@ -36,7 +36,7 @@ pub mod emergency;
 pub mod emergency_actions;
 pub mod key_echo;
 pub mod modal_layout;
-#[cfg(feature = "image-splash")]
+#[cfg(feature = "pretty-shell")]
 pub mod pretty_shell;
 pub mod reporter;
 #[cfg(feature = "network-rescue")]
@@ -126,10 +126,11 @@ pub enum WrongPasswordOutcome {
     /// to the emergency menu.
     Reboot,
     /// Operator picked [Pretty Shell]; the caller runs the alacritty-
-    /// backed PTY session inside the splash TUI box. Only exposed on
-    /// the `image-splash` feature — the no-feature build hides the
+    /// backed PTY session inside the TUI box. Exposed on the
+    /// `pretty-shell` feature (default-on; also pulled in by
+    /// `image-splash`) — a `--no-default-features` build hides the
     /// button entirely so there is nothing to dispatch.
-    #[cfg(feature = "image-splash")]
+    #[cfg(feature = "pretty-shell")]
     PrettyShell,
     /// Operator picked [Raw Shell]; the caller opens the console-
     /// picker dialog and runs the multiplexed busybox PTY relay.
@@ -549,13 +550,13 @@ pub fn show_wrong_password_modal(
         "cryptsetup rejected the passphrase. Try again, reboot, or open a recovery shell.";
     let hint = "Left/Right select  Enter confirm  Esc = Try again";
     // Button layout is feature-dependent: Pretty Shell only exists when
-    // the `image-splash` feature compiled the alacritty-backed PTY
+    // the `pretty-shell` feature compiled the alacritty-backed PTY
     // emulator into the binary. We materialise the label list once at
     // entry so the render loop and the key handler share the same
     // indexing.
-    #[cfg(feature = "image-splash")]
+    #[cfg(feature = "pretty-shell")]
     let labels: &[&str] = &["Try again", "Reboot", "Pretty Shell", "Raw Shell"];
-    #[cfg(not(feature = "image-splash"))]
+    #[cfg(not(feature = "pretty-shell"))]
     let labels: &[&str] = &["Try again", "Reboot", "Raw Shell"];
     let n = labels.len();
     let mut selected: usize = 0;
@@ -618,7 +619,7 @@ pub fn show_wrong_password_modal(
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 return Ok(WrongPasswordOutcome::Reboot);
             }
-            #[cfg(feature = "image-splash")]
+            #[cfg(feature = "pretty-shell")]
             KeyCode::Char('p') | KeyCode::Char('P') => {
                 return Ok(WrongPasswordOutcome::PrettyShell);
             }
@@ -711,10 +712,10 @@ pub fn show_modal_buttons(
 
 /// Map a wrong-password modal button index to its outcome. Index 0 is
 /// always Try again, index 1 is Reboot, then Pretty Shell (only when
-/// `image-splash` is on), then Raw Shell. Out-of-range indices fall
+/// `pretty-shell` is on), then Raw Shell. Out-of-range indices fall
 /// back to TryAgain so a future button-layout drift can't crash boot.
 fn decode_wrong_password_selection(idx: usize) -> WrongPasswordOutcome {
-    #[cfg(feature = "image-splash")]
+    #[cfg(feature = "pretty-shell")]
     {
         match idx {
             1 => WrongPasswordOutcome::Reboot,
@@ -723,7 +724,7 @@ fn decode_wrong_password_selection(idx: usize) -> WrongPasswordOutcome {
             _ => WrongPasswordOutcome::TryAgain,
         }
     }
-    #[cfg(not(feature = "image-splash"))]
+    #[cfg(not(feature = "pretty-shell"))]
     {
         match idx {
             1 => WrongPasswordOutcome::Reboot,
@@ -1492,10 +1493,10 @@ mod tests {
         assert_eq!(out, WrongPasswordOutcome::Reboot);
     }
 
-    #[cfg(feature = "image-splash")]
+    #[cfg(feature = "pretty-shell")]
     #[test]
     fn show_wrong_password_modal_two_rights_then_enter_picks_pretty_shell() {
-        // With `image-splash` Pretty Shell sits at index 2. Right Right
+        // With `pretty-shell` Pretty Shell sits at index 2. Right Right
         // navigates there; Enter commits.
         let keys = vec![
             press(KeyCode::Right),
@@ -1507,10 +1508,10 @@ mod tests {
         assert_eq!(out, WrongPasswordOutcome::PrettyShell);
     }
 
-    #[cfg(feature = "image-splash")]
+    #[cfg(feature = "pretty-shell")]
     #[test]
     fn show_wrong_password_modal_three_rights_then_enter_picks_raw_shell() {
-        // With `image-splash` Raw Shell sits at index 3. Right Right Right
+        // With `pretty-shell` Raw Shell sits at index 3. Right Right Right
         // navigates there; Enter commits.
         let keys = vec![
             press(KeyCode::Right),
@@ -1523,10 +1524,10 @@ mod tests {
         assert_eq!(out, WrongPasswordOutcome::RawShell);
     }
 
-    #[cfg(not(feature = "image-splash"))]
+    #[cfg(not(feature = "pretty-shell"))]
     #[test]
     fn show_wrong_password_modal_two_rights_then_enter_picks_raw_shell_no_feature() {
-        // Without `image-splash` Raw Shell sits at index 2 (Pretty
+        // Without `pretty-shell` Raw Shell sits at index 2 (Pretty
         // Shell row is hidden). Right Right + Enter commits Raw Shell.
         let keys = vec![
             press(KeyCode::Right),
@@ -1541,7 +1542,7 @@ mod tests {
     #[test]
     fn show_wrong_password_modal_hotkeys_commit_directly() {
         // 't', 'r', 's' each commit regardless of highlighted button.
-        // 'p' is only wired when `image-splash` is compiled in.
+        // 'p' is only wired when `pretty-shell` is compiled in.
         for (code, expected) in [
             (KeyCode::Char('t'), WrongPasswordOutcome::TryAgain),
             (KeyCode::Char('r'), WrongPasswordOutcome::Reboot),
@@ -1552,7 +1553,7 @@ mod tests {
                 .expect("modal must succeed on hotkey");
             assert_eq!(out, expected, "hotkey {code:?} should yield {expected:?}");
         }
-        #[cfg(feature = "image-splash")]
+        #[cfg(feature = "pretty-shell")]
         {
             let mut console = ScriptedConsole::new(vec![press(KeyCode::Char('p'))]);
             let out = show_wrong_password_modal(&mut console, 1)
@@ -1591,9 +1592,9 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        #[cfg(feature = "image-splash")]
+        #[cfg(feature = "pretty-shell")]
         let labels: &[&str] = &["Try again", "Reboot", "Pretty Shell", "Raw Shell"];
-        #[cfg(not(feature = "image-splash"))]
+        #[cfg(not(feature = "pretty-shell"))]
         let labels: &[&str] = &["Try again", "Reboot", "Raw Shell"];
 
         let data = view::ModalButtonsScreenData {
@@ -1622,7 +1623,7 @@ mod tests {
         assert!(dump.contains("[Try again]"), "Try again button visible:\n{dump}");
         assert!(dump.contains("[Reboot]"), "Reboot button visible:\n{dump}");
         assert!(dump.contains("[Raw Shell]"), "Raw Shell button visible:\n{dump}");
-        #[cfg(feature = "image-splash")]
+        #[cfg(feature = "pretty-shell")]
         assert!(
             dump.contains("[Pretty Shell]"),
             "Pretty Shell button visible:\n{dump}"
