@@ -92,6 +92,13 @@ let
   rescueDiskModules =
     if cfg.rescue.mode == "external" then [ "loop" "squashfs" ] else [ ];
 
+  # af_packet is required by the DHCP client (socket(AF_PACKET, SOCK_DGRAM,
+  # ETH_P_IP)). Without this module the raw-socket DHCP exchange fails with
+  # EAFNOSUPPORT even though the NIC driver is loaded. Include it whenever
+  # the network-rescue path is compiled in.
+  rescuePacketModule =
+    if cfg.rescue.network && cfg.rescue.mode == "external" then [ "af_packet" ] else [ ];
+
   # Import kernel modules management module
   kernelModulesManager = import ./modules/kernel-modules.nix {
     inherit
@@ -100,7 +107,7 @@ let
       config
       cfg
       ;
-    extraExplicitModules = lib.unique (rescueNicModules ++ rescueDiskModules);
+    extraExplicitModules = lib.unique (rescueNicModules ++ rescueDiskModules ++ rescuePacketModule);
   };
 
   # Import assertions module
