@@ -15,6 +15,19 @@ let
     inherit lib config;
   };
 
+  # The cosmic-greeter repo stores assets via Git LFS, so the
+  # raw.githubusercontent.com URL returns a pointer file. The
+  # media.githubusercontent.com prefix transparently smudges LFS
+  # content and gives us the actual JPEG.
+  cosmicGreeterBackgroundPng = pkgs.runCommand "cosmic-greeter-background.png"
+    { nativeBuildInputs = [ pkgs.imagemagick ]; }
+    ''
+      magick ${pkgs.fetchurl {
+        url = "https://media.githubusercontent.com/media/pop-os/cosmic-greeter/master/res/background.jpg";
+        sha256 = "sha256-dQD3AvBIjUqN8sWr63ypEHp8p5mOBEFyfLr3lGWwI4g=";
+      }} -strip -define png:color-type=6 "$out"
+    '';
+
   # Auto-detected NIC driver modules from hardware-configuration.nix.
   # Pure function over `lib` + `config`; consumed only when
   # `boot.nmbl.rescue.network = true`.
@@ -226,6 +239,36 @@ in
         Include modules needed for:
         - Your filesystem (ext4, btrfs, xfs, etc.)
         - Your storage controller (ahci, nvme, virtio_blk, etc.)
+
+        Loaded in phase 2b, after the boot console is up so the operator
+        sees per-module progress. For graphics drivers that must be in
+        place BEFORE the splash console attaches (e.g. on
+        `bootMode = "qemu_kernel_invoke"` where there is no kmod
+        auto-load), use `boot.nmbl.earlyKernelModules` instead.
+      '';
+    };
+
+    earlyKernelModules = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [
+        "virtio_pci"
+        "virtio_gpu"
+        "simpledrm"
+      ];
+      description = lib.mdDoc ''
+        Kernel modules loaded BEFORE the NMBL boot console is brought up.
+
+        Reserved for graphics drivers that must populate
+        `/dev/dri/card*` so the splash backend can attach. NMBL ships
+        without udev / kmod auto-load — anything the splash needs to
+        find at `open_console` time has to be listed here, otherwise
+        the splash falls back to the tty console.
+
+        Loaded in phase 2a, immediately after pseudo-filesystem mount
+        and before the boot console open. Storage / filesystem drivers
+        belong in `boot.nmbl.kernelModules` (phase 2b) so the operator
+        sees their progress on the live console.
       '';
     };
 
@@ -405,6 +448,29 @@ in
       '';
     };
 
+    earlyExplicitKernelModules = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = lib.unique (
+        lib.filter (m: !(lib.elem m cfg.blacklistedKernelModules))
+          cfg.earlyKernelModules
+      );
+      defaultText = lib.literalMD ''
+        `boot.nmbl.earlyKernelModules` with
+        `boot.nmbl.blacklistedKernelModules` removed.
+      '';
+      description = lib.mdDoc ''
+        Kernel modules the NMBL /init will load BEFORE bringing up the
+        boot console. Computed by default from
+        `boot.nmbl.earlyKernelModules` with the blacklist applied; set
+        directly to override.
+
+        Surfaced to the runtime TOML config as
+        `kernel_modules.early`; the Rust side calls
+        `modules::load_modules(_, ModuleSet::Early)` in phase 2a,
+        immediately before `open_console`.
+      '';
+    };
+
     fileSystems = lib.mkOption {
       type = lib.types.attrsOf lib.types.attrs;
       internal = true;
@@ -440,6 +506,43 @@ in
         description = lib.mdDoc ''
           Whether the TUI displays the resolved kernel command line for
           the highlighted generation.
+        '';
+      };
+    };
+
+    splash = {
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = lib.mdDoc ''
+          Render the boot menu as a PNG-backed graphical splash via
+          simpledrm. Falls back to the tty UI on any failure. Selecting
+          this also switches `system.build.nmblInit` to the
+          `nmbl-init-splash` package built with the `image-splash`
+          cargo feature.
+        '';
+      };
+
+      backgroundImage = lib.mkOption {
+        type = lib.types.path;
+        default = cosmicGreeterBackgroundPng;
+        defaultText = lib.literalExpression "cosmic-greeter background.jpg converted to PNG";
+        description = lib.mdDoc ''
+          PNG to use as the splash background. Must be a real PNG, RGBA8.
+          Embedded into the initramfs at `/etc/splash/image.png`. The
+          default is the cosmic-greeter project's background.jpg, fetched
+          at Nix build time and converted to PNG via imagemagick.
+        '';
+      };
+
+      fontPath = lib.mkOption {
+        type = lib.types.path;
+        default = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf";
+        defaultText = lib.literalExpression
+          ''"''${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf"'';
+        description = lib.mdDoc ''
+          TrueType font (monospaced) used to rasterize the splash menu.
+          Embedded into the initramfs at `/etc/splash/font.ttf`.
         '';
       };
     };
@@ -655,6 +758,27 @@ in
         description = lib.mdDoc ''
           Pre-fills the SHA-256 field in the hash-confirm prompt. Only
           emitted into the runtime TOML when `rescue.network = true`.
+        '';
+      };
+    };
+
+    emergencyShell = {
+      extraConsoles = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [ "/dev/ttyS0" "/dev/tty1" ];
+        description = lib.mdDoc ''
+          Additional `/dev/<tty>` devices the operator may multiplex
+          the emergency shell onto via the in-TUI picker dialog.
+
+          Each entry MUST be a /dev path the operator considers
+          acceptable to expose a root shell on. Untrusted serial
+          access (IPMI SOL, server-room serial concentrators) becomes
+          a privilege exposure when added here.
+
+          Default: empty — only `/dev/console` (kernel-elected primary
+          interactive console) gets the shell. The picker still lets
+          the operator narrow the selection at runtime.
         '';
       };
     };

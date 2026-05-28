@@ -22,18 +22,18 @@ pub mod disk;
 #[cfg(feature = "network-rescue")]
 pub mod net;
 
-use std::convert::Infallible;
 use std::ffi::CString;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use nix::mount::MsFlags;
-use nix::sys::reboot::{RebootMode, reboot};
-use nix::unistd::{chdir, chroot, execve};
+use nix::unistd::{chdir, chroot};
 use serde::Deserialize;
 
 use crate::config::Config;
-use crate::error::{NmblError, Result, format_chain};
+use crate::error::{NmblError, Result};
+use crate::terminal::TerminalAction;
+use crate::ui::console::Console;
 
 /// Shell binary expected inside the rescue squashfs. The squashfs ships
 /// busybox under `/bin/sh`, so this path is the post-switch-root one.
@@ -65,28 +65,59 @@ pub enum RescueMode {
 
 /// Decide whether to drop into the embedded shell, mount the external
 /// squashfs, or halt. `cause` is the error that triggered the rescue
-/// (surfaced in the banner). On success this function does not return —
-/// it execs the rescue shell or halts the system.
+/// (surfaced in the banner). Returns a [`TerminalAction`] the
+/// dispatcher in `main` performs after every stack-allocated
+/// resource has been dropped via normal unwinding.
 ///
 /// The `External` arm tries the disk-rescue path first; on failure it
 /// falls through to the network-rescue path when the `network-rescue`
 /// Cargo feature is compiled in AND `config.rescue.network` is true.
 /// Anything else collapses to [`halt_with_banner`] so the operator
 /// sees a structured diagnostic instead of a silent reboot loop.
-pub fn dispatch(config: &Config, cause: &NmblError) -> Result<Infallible> {
+///
+/// `console` is the live boot console the orchestrator holds, passed
+/// BY OWNERSHIP so the External arm can keep it alive for the
+/// network-rescue UI. Embedded / halt arms drop it on entry — they
+/// never interact with the operator further. Either way, the
+/// returned `TerminalAction` carries no console reference: the box
+/// is dropped before the function returns, which is the whole point
+/// of routing every syscall through `main`.
+pub fn dispatch(
+    config: &Config,
+    console: Box<dyn Console>,
+    cause: NmblError,
+) -> Result<TerminalAction> {
+    // `console` is owned by this function and drops by normal scope
+    // exit before the dispatcher in `main` fires any syscall. The
+    // External arm threads it down into `dispatch_external` for the
+    // network-rescue UI; Embedded and None drop it at their match
+    // arm's closing brace.
     match config.rescue.mode {
-        RescueMode::Embedded => exec_embedded(config),
-        RescueMode::External => dispatch_external(config, cause),
-        RescueMode::None => halt_with_banner(cause),
+        RescueMode::Embedded => exec_embedded(config, cause),
+        RescueMode::External => dispatch_external(config, console, cause),
+        RescueMode::None => Ok(halt_with_banner(cause)),
     }
 }
 
 /// Internal helper: try disk-rescue, then network-rescue (when
 /// compiled in + enabled), then halt-with-banner. Split out so the
 /// `dispatch` match stays a single line per arm.
-fn dispatch_external(config: &Config, cause: &NmblError) -> Result<Infallible> {
-    let disk_err = match disk::try_disk_rescue(config, cause) {
-        Ok(infallible) => match infallible {},
+fn dispatch_external(
+    config: &Config,
+    console: Box<dyn Console>,
+    cause: NmblError,
+) -> Result<TerminalAction> {
+    // Phase 1: mount the rescue squashfs. We hold onto the console
+    // across this call so a mount failure can fall through to the
+    // network-rescue UI without re-opening /dev/console.
+    let disk_err = match disk::prepare_disk_rescue(config, &cause) {
+        Ok(rescue_dir) => {
+            // Mount succeeded. `console` falls out of scope when this
+            // arm returns, so the backend's Drop runs (KD_TEXT
+            // restore, termios reset) before the dispatcher in
+            // `main` fires the execve.
+            return switch_root_and_exec(rescue_dir);
+        }
         Err(e) => e,
     };
 
@@ -96,50 +127,71 @@ fn dispatch_external(config: &Config, cause: &NmblError) -> Result<Infallible> {
             // Serial-console operators get the line-mode fallback; the
             // ratatui screens assume a real terminal where escape
             // sequences and key codes round-trip cleanly.
-            let net_err = if config.general.serial_console {
+            //
+            // NOTE: on the TUI path the boot console stays alive for
+            // the entire UI flow (it IS the UI's render target). It
+            // is dropped via scope exit before we return the
+            // TerminalAction; the dispatcher then performs the
+            // execve. Pre-execve VT restoration on the network path
+            // is now automatic from the type-driven flow.
+            let net_result = if config.general.serial_console {
+                // Console is unused on the serial-line UI; let it
+                // drop on the closing brace of this arm via scope
+                // exit so the backend's Drop fires before the
+                // dispatcher.
+                let _ = console;
                 let mut ui = net::ConsoleRescueUi;
-                match net::try_network_rescue(config, &mut ui, &disk_err.to_string()) {
-                    Ok(infallible) => match infallible {},
-                    Err(e) => e,
-                }
+                net::try_network_rescue(config, &mut ui, &disk_err.to_string())
             } else {
-                let mut ui = crate::ui::rescue::make_rescue_ui();
-                match net::try_network_rescue(config, &mut ui, &disk_err.to_string()) {
-                    Ok(infallible) => match infallible {},
-                    Err(e) => e,
-                }
+                // Bind `console` into the else arm so it drops on the
+                // closing brace below — after the rescue UI finishes,
+                // before we evaluate the halt-with-banner branch.
+                let mut console = console;
+                let mut ui = crate::ui::rescue::make_rescue_ui(&mut *console);
+                net::try_network_rescue(config, &mut ui, &disk_err.to_string())
+            };
+            let net_err = match net_result {
+                Ok(action) => return Ok(action),
+                Err(e) => e,
             };
             // Both disk AND network paths failed. Surface the
             // network error (it's the more recent attempt) chained
             // under the original `cause` so the banner shows every
             // step.
-            return halt_with_banner(&NmblError::Rescue {
+            return Ok(halt_with_banner(NmblError::Rescue {
                 stage: "network-rescue-failed",
                 source: Box::new(net_err),
-            });
+            }));
         }
     }
 
     // Either the feature was off or the operator disabled network
     // rescue — fall back to the structured halt with the disk-rescue
-    // error surfaced.
+    // error surfaced. `console` falls out of scope on the function
+    // return so VT/termios are restored before the dispatcher fires
+    // the halt syscall.
+    let _ = console;
     let _ = &disk_err; // silence unused warning when feature is off
-    halt_with_banner(&NmblError::Rescue {
+    Ok(halt_with_banner(NmblError::Rescue {
         stage: "disk-rescue-failed",
         source: Box::new(disk_err),
-    })
+    }))
 }
 
-/// `execve(2)` the operator-configured shell (`cfg.paths.shell`) with
-/// an empty environment. Mirrors the existing
-/// [`crate::shell::drop_to_emergency`] body byte-for-byte so the
-/// embedded rescue path retains its long-tested behaviour while
-/// [`dispatch`] becomes the single decision point.
+/// Build a [`TerminalAction::Execve`] for the operator-configured
+/// shell (`cfg.paths.shell`) with an empty environment. Mirrors the
+/// pre-refactor `exec_embedded` body byte-for-byte in terms of which
+/// argv/env it constructs — the only difference is that the syscall
+/// itself is deferred to the dispatcher in `main`.
 ///
-/// Returns `Result<Infallible>` so callers can chain — on success the
-/// function does not return, on failure the returned `Err` carries the
-/// underlying [`NmblError::Shell`] for the banner.
-pub fn exec_embedded(config: &Config) -> Result<Infallible> {
+/// The `cause` is moved into the [`crate::terminal::EmergencyBanner`]
+/// so the dispatcher can render the operator-facing banner
+/// immediately before the execve.
+///
+/// Returns `Err(NmblError::Rescue { stage, ... })` on the rare path
+/// where the configured shell path or argv contains an interior NUL
+/// — execve cannot proceed and the caller halts with a banner.
+pub fn exec_embedded(config: &Config, cause: NmblError) -> Result<TerminalAction> {
     let shell_path = config.paths.shell.as_path();
     let argv0_bytes: Vec<u8> = shell_path
         .file_name()
@@ -165,77 +217,39 @@ pub fn exec_embedded(config: &Config) -> Result<Infallible> {
         }),
     })?;
 
-    let argv: [&CString; 1] = [&argv0_c];
-    let env: [&CString; 0] = [];
-
-    // execve only returns on error.
-    let exec_err = execve(&path_c, &argv, &env).err();
-    if let Some(source) = exec_err {
-        return Err(NmblError::Rescue {
-            stage: "exec-shell",
-            source: Box::new(NmblError::Shell { source }),
-        });
-    }
-    // execve returned Ok somehow — the kernel docs say this cannot
-    // happen, but the type system forces us to produce something.
-    // Treat it as an exec failure.
-    Err(NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "execve returned Ok without replacing the process image".to_string(),
-            context: format!("execve {}", shell_path.display()),
-        }),
+    Ok(TerminalAction::Execve {
+        path: path_c,
+        argv: vec![argv0_c],
+        env: Vec::new(),
+        banner: Some(crate::terminal::EmergencyBanner::new(config, cause)),
     })
 }
 
-/// Print a one-screen banner naming the failure cause, then halt the
-/// system via `reboot(RB_HALT_SYSTEM)`. Used for [`RescueMode::None`]
-/// installs where no toolkit ships and the kindest UX is to stop —
-/// rather than leave the operator at an inert PID 1.
+/// Build a [`TerminalAction::HaltWithBanner`] for the no-rescue path.
+/// Used for [`RescueMode::None`] installs where no toolkit ships and
+/// the kindest UX is to stop — rather than leave the operator at an
+/// inert PID 1.
 ///
-/// Returns `Result<Infallible>` for signature symmetry with the other
-/// dispatch arms; in practice the function diverges (either the kernel
-/// halts or `libc::_exit` terminates).
-pub fn halt_with_banner(cause: &NmblError) -> Result<Infallible> {
-    let separator = "=".repeat(72);
-    eprintln!("{separator}");
-    eprintln!("NMBL: no rescue toolkit available — halting");
-    eprintln!("{separator}");
-    eprintln!();
-    eprintln!("Configured rescue mode is `none`. The initramfs ships no");
-    eprintln!("interactive shell, and the operator did not enable the");
-    eprintln!("external squashfs rescue. The system will halt.");
-    eprintln!();
-    eprintln!("Error chain:");
-    let chain = format_chain(cause as &dyn std::error::Error);
-    for line in chain.lines() {
-        eprintln!("  {line}");
-    }
-    eprintln!("{separator}");
-
-    // reboot() does not return on success. If the kernel refuses
-    // (CAP_SYS_BOOT missing in a test sandbox, not PID 1, …) fall
-    // through to libc::_exit, which is itself `!`.
-    let _ = reboot(RebootMode::RB_HALT_SYSTEM);
-    // SAFETY: libc::_exit is async-signal-safe and unconditionally
-    // terminates the process; no crate wraps it (rustix issue #844).
-    // Matches the divergent halt path in `src/shell.rs`.
-    unsafe { libc::_exit(1) };
+/// The banner text is rendered by the dispatcher; this constructor
+/// only packages the cause so every halt-with-banner producer goes
+/// through the same code path.
+pub fn halt_with_banner(cause: NmblError) -> TerminalAction {
+    TerminalAction::HaltWithBanner { cause }
 }
 
-/// Switch from the initramfs root into `new_root` and `execve` the
-/// rescue shell (`/bin/sh`).
+/// Switch from the initramfs root into `new_root` and produce a
+/// [`TerminalAction::Execve`] for `/bin/sh`.
 ///
 /// Mirrors the busybox `switch_root(8)` dance: `chdir(new_root)` →
-/// `mount --move . /` (MS_MOVE) → `chroot(.)` → `chdir(/)` →
-/// `execve("/bin/sh", ...)` with a minimal `TERM`/`PATH` env.
+/// `mount --move . /` (MS_MOVE) → `chroot(.)` → `chdir(/)`. The
+/// actual `execve` is deferred to the dispatcher in `main` so any
+/// console handles still on the stack have been dropped first.
 ///
 /// Replaces `pivot_root(2)`, which always returns `EINVAL` when the
 /// outgoing root is the initramfs rootfs pseudo-filesystem. After
 /// MS_MOVE the initramfs is detached and no longer reachable via any
-/// path. On success this never returns — the process image is replaced
-/// by the rescue shell.
-pub(crate) fn switch_root_and_exec(new_root: &Path) -> Result<Infallible> {
+/// path.
+pub(crate) fn switch_root_and_exec(new_root: &Path) -> Result<TerminalAction> {
     // Step 1: cd into the new root (the mounted squashfs).
     chdir(new_root).map_err(|source| NmblError::Rescue {
         stage: "switch-root",
@@ -280,13 +294,15 @@ pub(crate) fn switch_root_and_exec(new_root: &Path) -> Result<Infallible> {
         }),
     })?;
 
-    exec_rescue_shell()
+    build_rescue_shell_action()
 }
 
-/// `execve("/bin/sh", ...)` inside the freshly switched-root rescue
-/// root with a minimal `TERM=linux` + `PATH` environment. Shared by
-/// the disk and network rescue paths.
-fn exec_rescue_shell() -> Result<Infallible> {
+/// Construct the [`TerminalAction::Execve`] for `/bin/sh` inside the
+/// freshly switched-root rescue root with a minimal `TERM=linux` +
+/// `PATH` environment. Shared by the disk and network rescue paths.
+/// No banner: the rescue UI has already taken the operator through
+/// its own screens, so a second emergency banner would be redundant.
+fn build_rescue_shell_action() -> Result<TerminalAction> {
     let path_c = CString::new(RESCUE_SHELL).map_err(|_| NmblError::Rescue {
         stage: "exec-shell",
         source: Box::new(NmblError::ConfigInvalid {
@@ -316,26 +332,12 @@ fn exec_rescue_shell() -> Result<Infallible> {
                 context: format!("preparing execve of {RESCUE_SHELL}"),
             }),
         })?;
-    let argv: [&CString; 1] = [&argv0_c];
-    let env: [&CString; 2] = [&term_c, &path_env_c];
 
-    // execve only returns on error.
-    let exec_err = execve(&path_c, &argv, &env).err();
-    if let Some(source) = exec_err {
-        return Err(NmblError::Rescue {
-            stage: "exec-shell",
-            source: Box::new(NmblError::Shell { source }),
-        });
-    }
-    // execve returned Ok without replacing the process image. The
-    // kernel docs say this cannot happen; the type system demands a
-    // value, so surface it as an exec failure.
-    Err(NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "execve returned Ok without replacing the process image".to_string(),
-            context: format!("execve {RESCUE_SHELL}"),
-        }),
+    Ok(TerminalAction::Execve {
+        path: path_c,
+        argv: vec![argv0_c],
+        env: vec![term_c, path_env_c],
+        banner: None,
     })
 }
 
@@ -489,6 +491,58 @@ mod tests {
             locate_sfs(&c).expect("nested override resolves"),
             Path::new("/mnt/boot/custom/r.sfs"),
         );
+    }
+
+    #[test]
+    fn dispatch_embedded_returns_execve_action() {
+        // mode=Embedded must yield TerminalAction::Execve pointed at
+        // config.paths.shell. No syscall fires — this is the whole
+        // point of the type-driven flow.
+        let mut cfg = Config::recovery_default();
+        cfg.rescue.mode = RescueMode::Embedded;
+        cfg.paths.shell = PathBuf::from("/bin/test-embedded-shell");
+        let console: Box<dyn Console> = Box::new(crate::ui::console::NoopConsole::new());
+        let cause = NmblError::Io {
+            source: std::io::Error::other("synthetic"),
+            context: "rescue test".to_string(),
+        };
+
+        let action = dispatch(&cfg, console, cause).expect("embedded dispatch must succeed");
+        match action {
+            TerminalAction::Execve { path, banner, .. } => {
+                assert_eq!(path.as_bytes(), b"/bin/test-embedded-shell");
+                let banner = banner.expect("embedded execve must carry a banner");
+                assert_eq!(
+                    banner.shell_path,
+                    PathBuf::from("/bin/test-embedded-shell"),
+                );
+            }
+            other => panic!("expected Execve from Embedded mode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_none_returns_halt_with_banner() {
+        // mode=None must yield TerminalAction::HaltWithBanner; the
+        // dispatcher in main is responsible for printing + halting.
+        let mut cfg = Config::recovery_default();
+        cfg.rescue.mode = RescueMode::None;
+        let console: Box<dyn Console> = Box::new(crate::ui::console::NoopConsole::new());
+        let cause = NmblError::ConfigInvalid {
+            reason: "synthetic".to_string(),
+            context: "rescue test".to_string(),
+        };
+
+        let action = dispatch(&cfg, console, cause).expect("none dispatch must succeed");
+        match action {
+            TerminalAction::HaltWithBanner { cause } => match cause {
+                NmblError::ConfigInvalid { reason, .. } => {
+                    assert_eq!(reason, "synthetic");
+                }
+                other => panic!("HaltWithBanner cause should round-trip, got {other:?}"),
+            },
+            other => panic!("expected HaltWithBanner from None mode, got {other:?}"),
+        }
     }
 
     #[test]

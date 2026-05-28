@@ -7,10 +7,13 @@
   pkgs,
   utils,
   nmblInit,
-  # Builder form supplied by flake.nix. When the network-rescue path is
-  # enabled we re-build the binary with `--features=network-rescue` so
-  # `src/net/` is compiled in. Defaults to ignoring features and
-  # returning the prebuilt `nmblInit` if the host flake is older.
+  nmblInitSplash,
+  # Builder form supplied by flake.nix. When extra Cargo features are
+  # requested (e.g. `network-rescue` when `boot.nmbl.rescue.network`
+  # is enabled, combined with `image-splash` when both are on) we
+  # re-build the binary with those features. Defaults to ignoring
+  # features and returning the prebuilt `nmblInit` if the host flake
+  # is older.
   mkNmblInit ? (_: nmblInit),
   ...
 }:
@@ -19,16 +22,26 @@ let
   cfg = config.boot.nmbl;
   bootstrapper = cfg.bootstrapper;
 
-  # Cargo features to enable in the /init binary. Gated on rescue
-  # options so feature-free builds (default) stay byte-identical to
-  # today's binary.
-  nmblFeatures = lib.optional cfg.rescue.network "network-rescue";
+  # Cargo features to enable in the /init binary. Gated on splash and
+  # rescue options so feature-free builds (default) stay byte-identical
+  # to today's binary. When only `image-splash` is requested we prefer
+  # the prebuilt `nmblInitSplash` to keep the existing CI cache hot;
+  # when only `network-rescue` is requested we use `mkNmblInit`. When
+  # both are requested we build a combined binary via `mkNmblInit`.
+  nmblFeatures =
+    lib.optional cfg.splash.enable "image-splash"
+    ++ lib.optional cfg.rescue.network "network-rescue";
 
   # Resolved /init binary used by the initramfs builder. Identity-equal
-  # to the prebuilt `nmblInit` when no features are requested so Nix's
-  # store-path dedup keeps the existing CI cache hot.
-  resolvedNmblInit =
-    if nmblFeatures == [ ] then nmblInit else mkNmblInit { features = nmblFeatures; };
+  # to the prebuilt `nmblInit` / `nmblInitSplash` in the single-feature
+  # cases so Nix's store-path dedup keeps the existing CI cache hot.
+  selectedNmblInit =
+    if nmblFeatures == [ ] then
+      nmblInit
+    else if nmblFeatures == [ "image-splash" ] then
+      nmblInitSplash
+    else
+      mkNmblInit { features = nmblFeatures; };
 
   # Activation options are contributed by ./modules/activation.nix. Read
   # defensively so this file still evaluates if that module hasn't been
@@ -140,8 +153,12 @@ let
   # Render the runtime configuration that the Rust /init reads at startup.
   # All previously string-interpolated state (filesystems, modules, timeouts,
   # serial console, verbosity, activation blocks) lives in this TOML file.
+  # The Rust binary used for `--validate-config` must match the one shipped
+  # in the initramfs, otherwise we could validate against a different schema
+  # than what actually runs at boot.
   nmblConfigToml = import ./config-toml.nix {
-    inherit pkgs lib config nmblInit;
+    inherit pkgs lib config;
+    nmblInit = selectedNmblInit;
   };
 
   # Render the embedded bootstrap TOML used in external-config mode.
@@ -167,6 +184,21 @@ let
   # bootstrap default (`/nmbl/config.toml`) so the field is defensible
   # if B.2's option tree hasn't been merged yet.
   configLocation = cfg.configLocation or "embedded";
+
+  # Operator input device baseline. NMBL replaces systemd-stage-1, so
+  # NixOS's automatic input-driver inclusion does not apply. Any
+  # interactive screen (LUKS passphrase, emergency menu, wrong-password
+  # modal, console picker) is unusable without these — applied to both
+  # earlyKernelModules (so they are live before the first prompt) and
+  # availableKernelModules (so they ship in the initramfs).
+  defaultKeyboardDrivers = [
+    "i8042"
+    "atkbd"
+    "usbhid"
+    "hid_generic"
+    "xhci_pci"
+    "ehci_pci"
+  ];
 
   # Determine legacy boot mode string for compatibility
   legacyBootMode =
@@ -273,7 +305,7 @@ in
 
         baseContents = [
           {
-            object = "${resolvedNmblInit}/bin/nmbl-init";
+            object = "${selectedNmblInit}/bin/nmbl-init";
             symlink = "/init";
           }
         ] ++ configContents ++ shellContents ++ [
@@ -298,8 +330,22 @@ in
           }
         ];
 
+        # When the splash UI is enabled, ship the background image and
+        # the menu font at the fixed paths the Rust /init expects (see
+        # lib/config-toml.nix `splash.background_image`/`splash.font_path`).
+        splashContents = lib.optionals cfg.splash.enable [
+          {
+            object = cfg.splash.backgroundImage;
+            symlink = "/etc/splash/image.png";
+          }
+          {
+            object = cfg.splash.fontPath;
+            symlink = "/etc/splash/font.ttf";
+          }
+        ];
+
         initramfs = pkgs.makeInitrd {
-          contents = baseContents ++ activationExtraContents;
+          contents = baseContents ++ splashContents ++ activationExtraContents;
           compressor = "gzip -9";
         };
       in
@@ -309,6 +355,10 @@ in
 
     # Build the bootloader kernel
     system.build.nmblKernel = cfg.kernelPackage;
+
+    # Expose the actually-selected /init binary for downstream tooling
+    # (debug scripts, manual nix builds). Mirrors nmblKernel/nmblInitramfs.
+    system.build.nmblInit = selectedNmblInit;
 
     # Expose the rendered runtime config TOML so it can be inspected
     # (and validated) independently of the initramfs build. Used by
@@ -385,6 +435,9 @@ in
 
     # NMBL supports initrd secrets since it has an initramfs
     boot.loader.supportsInitrdSecrets = true;
+
+    boot.nmbl.earlyKernelModules = defaultKeyboardDrivers;
+    boot.nmbl.availableKernelModules = defaultKeyboardDrivers;
 
     # Populate boot.initrd.supportedFilesystems using the same logic as stage-1.nix
     # This triggers filesystem-specific modules (vfat.nix, ext.nix, etc.) to add their

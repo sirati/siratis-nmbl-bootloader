@@ -36,6 +36,10 @@ let
     };
 
     kernel_modules = {
+      # Pre-console graphics drivers (phase 2a). Loaded before
+      # `open_console` so the splash backend has a DRM card to attach
+      # to in `qemu_kernel_invoke` mode (no kmod auto-load).
+      early = cfg.earlyExplicitKernelModules;
       # Activation modules load FIRST: LUKS needs AES + cipher modes
       # registered with the kernel crypto API before encrypted_keys can
       # init successfully (it calls alloc_cipher("ecb(aes)") at module-
@@ -108,6 +112,28 @@ let
         default_url = cfg.rescue.defaultUrl;
         default_sha256 = cfg.rescue.defaultSha256;
       };
+
+    # Operator-curated list of extra `/dev/<tty>` paths the picker
+    # dialog offers as multiplex targets for the emergency shell.
+    # Empty by default — only `/dev/console` (the kernel-elected
+    # primary interactive console) is offered. The Rust serde struct
+    # is `EmergencyShellConfig`.
+    emergency_shell = {
+      extra_consoles = cfg.emergencyShell.extraConsoles;
+    };
+  }
+  # Splash rendering. Emitted only when the graphical splash is enabled
+  # so the validator (`deny_unknown_fields`) accepts the TOML on builds
+  # that don't pull in the Rust-side `splash` config struct. Runtime
+  # paths are fixed because the initramfs landing locations (see
+  # lib/config.nix `splashContents`) are fixed.
+  // lib.optionalAttrs cfg.splash.enable {
+    splash = {
+      enable           = true;
+      background_image = "/etc/splash/image.png";
+      font_path        = "/etc/splash/font.ttf";
+      dri_path         = "/dev/dri/card0";
+    };
   };
 
   rawToml = tomlFormat.generate "nmbl-config.toml" tomlValue;

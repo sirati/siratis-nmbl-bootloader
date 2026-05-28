@@ -111,6 +111,32 @@ pub enum NmblError {
         #[source]
         source: nix::Error,
     },
+
+    /// The operator pressed Esc on the boot-status screen while a
+    /// blocking wait (device readiness, activation poll, …) was in
+    /// flight. Surfaced by [`crate::ui::ProgressSink::tick`] returning
+    /// [`crate::ui::TickOutcome::Aborted`]; the caller of the wait
+    /// helper wraps the abort with a short `context` string ("waiting
+    /// for /dev/sda1", "activation foo", …) so the emergency menu can
+    /// tell the operator exactly which step they cut short.
+    #[error("operator aborted: {context}")]
+    OperatorAborted { context: String },
+
+    /// The operator picked [Reboot] on the wrong-password modal during
+    /// a `luks-password` activation. Plumbed up so `main::run_inner`
+    /// can short-circuit to [`crate::terminal::TerminalAction::Reboot`]
+    /// without dropping into the emergency menu first — the operator
+    /// already made the call.
+    #[error("operator chose reboot at wrong-password modal ({context})")]
+    OperatorChoseReboot { context: String },
+
+    /// The operator picked [Shell] on the wrong-password modal, the
+    /// shell was opened, and the shell has now exited. The activation
+    /// layer surfaces this so `main` routes through the standard
+    /// emergency menu (where [Retry boot from config] re-runs phase 3
+    /// and re-prompts for the passphrase).
+    #[error("operator dropped to shell from wrong-password modal ({context})")]
+    WrongPasswordShellExited { context: String },
 }
 
 pub type Result<T> = std::result::Result<T, NmblError>;
@@ -194,6 +220,89 @@ mod tests {
         };
         let src = Error::source(&e).expect("Rescue should expose a source");
         assert_eq!(src.to_string(), inner_msg);
+    }
+
+    #[test]
+    fn operator_chose_reboot_display_mentions_context() {
+        // The dispatcher short-circuits on this variant, but the
+        // operator-facing log line ("operator chose reboot at
+        // wrong-password modal (<ctx>)") is still surfaced through
+        // every transcript and grep — pin the exact shape.
+        let e = NmblError::OperatorChoseReboot {
+            context: "activation luks-password (root)".to_string(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("operator chose reboot"), "{s}");
+        assert!(s.contains("wrong-password modal"), "{s}");
+        assert!(s.contains("activation luks-password (root)"), "{s}");
+    }
+
+    #[test]
+    fn wrong_password_shell_exited_display_mentions_context() {
+        let e = NmblError::WrongPasswordShellExited {
+            context: "activation luks-password (root)".to_string(),
+        };
+        let s = e.to_string();
+        assert!(s.contains("dropped to shell"), "{s}");
+        assert!(s.contains("activation luks-password (root)"), "{s}");
+    }
+
+    #[test]
+    fn format_chain_renders_wrong_password_variants_single_line() {
+        // Both variants are leaves (no inner source) — format_chain
+        // must emit just the head with no trailing "caused by:" line.
+        for variant in [
+            NmblError::OperatorChoseReboot {
+                context: "activation luks-password".to_string(),
+            },
+            NmblError::WrongPasswordShellExited {
+                context: "activation luks-password".to_string(),
+            },
+        ] {
+            let formatted = format_chain(&variant as &dyn Error);
+            assert!(
+                !formatted.contains("caused by"),
+                "leaf variant must not emit a caused-by line: {formatted}"
+            );
+            assert!(
+                formatted.contains("luks-password"),
+                "context must reach the operator: {formatted}"
+            );
+        }
+    }
+
+    #[test]
+    fn operator_aborted_display_mentions_context() {
+        // The user-facing emergency banner reads this string verbatim,
+        // so the exact "operator aborted: <context>" shape is a
+        // contract. Pin it.
+        let e = NmblError::OperatorAborted {
+            context: "waiting for /dev/sda1".to_string(),
+        };
+        let s = e.to_string();
+        assert_eq!(s, "operator aborted: waiting for /dev/sda1");
+    }
+
+    #[test]
+    fn format_chain_renders_operator_aborted_single_line() {
+        // OperatorAborted has no inner source — format_chain must emit
+        // just the head error with no trailing "caused by:" line.
+        let e = NmblError::OperatorAborted {
+            context: "phase 3b: waiting for /dev/nvme0n1p2".to_string(),
+        };
+        let formatted = format_chain(&e as &dyn Error);
+        assert!(
+            formatted.contains("operator aborted"),
+            "format_chain must lead with the variant prefix: {formatted}"
+        );
+        assert!(
+            formatted.contains("/dev/nvme0n1p2"),
+            "format_chain must surface the abort context: {formatted}"
+        );
+        assert!(
+            !formatted.contains("caused by"),
+            "OperatorAborted has no source — no caused-by line expected: {formatted}"
+        );
     }
 
     #[test]

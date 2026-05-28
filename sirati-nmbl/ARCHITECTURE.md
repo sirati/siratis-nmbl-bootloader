@@ -517,6 +517,16 @@ crash hard, not loop.
     reason; the syscall is wrapped by no portable Rust crate.
   - `libc::_exit(1)` in `panic.rs` (halt fallback when re-exec fails)
     and `shell.rs` (halt after the emergency-shell exec failure).
+  - **`src/splash/` adds zero new NMBL-side `unsafe`.** The
+    `image-splash` Cargo feature pulls in `drm`, `png`, `fontdue`, and
+    `alacritty_terminal`; the latter contains three `unsafe` blocks we
+    execute (`TabStops::clear_all`, `grid::storage::swap`,
+    `Poller::register`), all optimization-justified and accepted as
+    vendored per `docs/splash-research.md`. Splash DRM bring-up uses a
+    closure-shaped `SplashDrm::render(|fb, dims| …)` rather than
+    storing the dumb-buffer mapping next to the card, so the
+    self-reference problem that would have required a lifetime
+    `transmute` doesn't arise.
 - **`std::process::Command::` and any `execve(` are forbidden outside
   three files: `src/shell.rs`, `src/panic.rs`, `src/sys/activation.rs`.**
   Enforced by the `nmbl-init-no-exec` flake check, which `grep`s the

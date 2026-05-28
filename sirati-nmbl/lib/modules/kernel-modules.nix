@@ -23,6 +23,16 @@ rec {
     )
   );
 
+  # Pre-console graphics drivers. Loaded by NMBL in phase 2a, before the
+  # splash backend attaches to /dev/dri/card*. Kept disjoint from
+  # `explicitKernelModules` so the operator's split between
+  # `boot.nmbl.earlyKernelModules` and `boot.nmbl.kernelModules` is
+  # preserved on the wire.
+  earlyKernelModules = lib.unique (
+    lib.filter (m: !(lib.elem m cfg.blacklistedKernelModules))
+      cfg.earlyKernelModules
+  );
+
   # Modules to include in the initrd (available but not necessarily loaded)
   # Include both explicit and available modules so they can be loaded on-demand if needed.
   # `activation.extraKernelModules` is contributed by ./activation.nix for storage
@@ -33,6 +43,7 @@ rec {
     lib.filter (m: !(lib.elem m cfg.blacklistedKernelModules)) (
       cfg.availableKernelModules
       ++ explicitKernelModules
+      ++ earlyKernelModules
       ++ config.boot.initrd.availableKernelModules
       ++ activationExtraKernelModules
     )

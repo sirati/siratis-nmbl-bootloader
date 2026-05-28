@@ -1,14 +1,47 @@
 # NMBL boot-splash add-on — feasibility & design
 
+> **Status (2026-05-27): implemented behind the `image-splash` Cargo
+> feature; see `sirati-nmbl/nmbl-init-rs/src/splash/`. This file
+> remains as the design archive.**
+>
+> **Deferred follow-ups** (knowingly left for a future pass; the
+> implementation works without them):
+> - **CI byte-identity guard.** The default-feature build is currently
+>   `ea0a9c9a32fada40d9fa888a19f78857eac5a9ce0b622a04af659cea655b8b6b`.
+>   A flake check that pins this hash (or, better, builds the binary
+>   with and without `image-splash` in the manifest and asserts the
+>   no-feature output is byte-identical) would catch silent drift.
+>   Today the invariant is enforced only by manual / audit checks.
+> - **Rescue-VM splash smoke test.** Booting a VM with
+>   `boot.nmbl.splash.enable = true` via `vm-serial-man --display
+>   vnc=:N`, sleeping 10 s, and `screendump`ing a non-black PPM is a
+>   one-shot regression net the project would benefit from. The VM
+>   harness (Phase 8 work) already exposes the primitives.
+> - **1920×1080 default background asset.** The shipped placeholder is
+>   an 8×8 RGBA PNG; the scaler upsizes it correctly because it's
+>   cover-style, but a full-resolution NMBL placeholder would look
+>   less amateurish.
+> - **`boot.nmbl.splash.driPath` NixOS option.** The Rust `Splash`
+>   struct has the field; the NixOS module hard-codes
+>   `/dev/dri/card0`. Operators with non-default DRI nodes can edit
+>   the rendered TOML, but a module-level handle would be more
+>   ergonomic.
+> - **Passphrase modal via splash.** Currently the passphrase prompt
+>   drops back to the tty UI even when the splash is active, because
+>   activation runs after the boot-selector hand-off and the DRM card
+>   may already be returned to the kernel console. A second
+>   `SplashDrm::open_card` round inside `tui_passphrase_prompt` would
+>   work but needs careful handoff sequencing.
+
 Consolidated findings from two rounds of research on adding an
 optional graphical boot splash (PNG background + rasterized text)
 to the NMBL Rust `/init`. The default tty-on-`/dev/console` UI is
 unaffected; the splash lives behind a Cargo feature gate.
 
-**Current verdict: GO**, given the constraints below. Not yet
-implemented — this file documents the design so we can pick it up
-when scheduled. Confidence: HIGH for the per-component viability,
-MEDIUM for the integration LOC estimate (no working prototype yet).
+**Current verdict: GO**, given the constraints below. Confidence:
+HIGH for the per-component viability, MEDIUM for the integration LOC
+estimate at the time of writing (the actual implementation came in
+under those estimates).
 
 ## Constraints that drive the design
 
