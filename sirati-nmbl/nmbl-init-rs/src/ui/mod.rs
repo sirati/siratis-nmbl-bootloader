@@ -57,7 +57,7 @@ use zeroize::Zeroizing;
 use crate::activation::PasswordSupplier;
 use crate::config::Config;
 use crate::error::{NmblError, Result};
-use crate::generations::Generation;
+use crate::generations::{Generation, active_generation_index};
 use crate::sys::tty::{RawModeGuard, open_console};
 use crate::ui::timeout::{TimeoutOutcome, run_countdown};
 use crate::ui::view::{
@@ -79,12 +79,19 @@ pub(crate) const POLL_SLICE: Duration = Duration::from_millis(100);
 /// Falls back to a line-oriented serial prompt when the config opts
 /// in via `general.serial_console`.
 pub fn run_selector(config: &Config, generations: &[Generation]) -> Result<Decision> {
+    // The pre-selected entry must match the active `system` profile so
+    // an operator who ran `nixos-rebuild --rollback` sees (and on
+    // timeout boots) the generation they rolled back to — not the
+    // higher-numbered one they rolled away from.
+    let default_index = active_generation_index(generations, &config.paths.nix_profiles_dir);
+
     if config.general.serial_console {
-        return select_generation_serial(config, generations);
+        return select_generation_serial(config, generations, default_index);
     }
 
     with_console_terminal(|terminal| {
         let mut app = App::new(generations);
+        app.selected_index = default_index;
         app.show_kernel_params = config.tui.show_kernel_params;
 
         let countdown = Duration::from_secs(u64::from(config.general.timeout_secs));
@@ -92,10 +99,10 @@ pub fn run_selector(config: &Config, generations: &[Generation]) -> Result<Decis
 
         match countdown_outcome {
             TimeoutOutcome::Expired if app.decision.is_none() => {
-                // Auto-boot the default (index 0). The countdown reached
-                // zero without input — this is the documented happy path.
+                // Countdown reached zero without input — boot the same
+                // entry the list was highlighting (the active profile).
                 Ok(Decision::Boot {
-                    generation_index: 0,
+                    generation_index: default_index,
                     cmdline_override: None,
                 })
             }
@@ -231,12 +238,16 @@ fn list_data<'a>(app: &'a App<'a>) -> ListScreenData<'a> {
 /// Line-oriented fallback for serial consoles. The protocol is
 /// intentionally trivial — operators on broken serial lines can drive
 /// it by hand. Commands:
-///   - empty line or "boot"          → boot default (index 0)
+///   - empty line or "boot"          → boot the active profile default
 ///   - integer N (1-based)           → boot the Nth generation
 ///   - "edit N" or "edit"            → boot Nth with edited cmdline
 ///   - "shell" or "s"                → drop to emergency shell
 ///   - "reboot" or "q"               → reboot
-fn select_generation_serial(_config: &Config, generations: &[Generation]) -> Result<Decision> {
+fn select_generation_serial(
+    _config: &Config,
+    generations: &[Generation],
+    default_index: usize,
+) -> Result<Decision> {
     let stdout = std::io::stdout();
     let stdin = std::io::stdin();
 
@@ -249,7 +260,15 @@ fn select_generation_serial(_config: &Config, generations: &[Generation]) -> Res
             } else {
                 format!(" {}", g.label)
             };
-            writeln!(out, "  {}) #{}{}", i.saturating_add(1), g.number, label).map_err(tui_err)?;
+            let marker = if i == default_index { "*" } else { " " };
+            writeln!(
+                out,
+                " {marker}{}) #{}{}",
+                i.saturating_add(1),
+                g.number,
+                label
+            )
+            .map_err(tui_err)?;
         }
         writeln!(
             out,
@@ -266,7 +285,7 @@ fn select_generation_serial(_config: &Config, generations: &[Generation]) -> Res
 
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("boot") {
         return Ok(Decision::Boot {
-            generation_index: 0,
+            generation_index: default_index.min(last_idx),
             cmdline_override: None,
         });
     }
