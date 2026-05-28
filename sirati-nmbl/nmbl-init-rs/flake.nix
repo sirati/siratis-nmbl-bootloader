@@ -111,6 +111,18 @@
             pname = "nmbl-init";
           }
         );
+
+        # Same crate built with the optional `image-splash` cargo feature
+        # (drm + png + fontdue + alacritty_terminal). Kept as a separate
+        # package so users who don't want the splash never pull those deps.
+        nmbl-init-splash = craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit cargoArtifacts;
+            pname = "nmbl-init-splash";
+            cargoExtraArgs = "--features image-splash";
+          }
+        );
       in
       {
         # Function form: callers wire Cargo features through this
@@ -121,6 +133,7 @@
         packages = {
           default = nmbl-init;
           nmbl-init = nmbl-init;
+          nmbl-init-splash = nmbl-init-splash;
         };
 
         # Useful for hand-testing: just runs the binary in your shell. It will
@@ -151,6 +164,14 @@
           env = {
             CARGO_BUILD_TARGET = rustTarget;
           };
+
+          # Font path for splash::glyph_cache tests. Resolved at compile
+          # time via `option_env!`; tests skip cleanly if the variable is
+          # unset (e.g. when building outside the dev shell), so we never
+          # need to vendor the font itself into the repo.
+          shellHook = ''
+            export NMBL_TEST_FONT="${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf"
+          '';
         };
 
         checks = {

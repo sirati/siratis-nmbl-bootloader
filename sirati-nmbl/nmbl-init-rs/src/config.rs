@@ -27,8 +27,15 @@ pub struct Config {
     #[serde(default)]
     pub paths: Paths,
 
+    #[cfg(feature = "image-splash")]
+    #[serde(default)]
+    pub splash: Splash,
+
     #[serde(default)]
     pub rescue: RescueConfig,
+
+    #[serde(default)]
+    pub emergency_shell: EmergencyShellConfig,
 
     /// Populated by Phase 0.5 with the runtime mountpoint of the boot
     /// partition. `None` in legacy embedded-config mode. Never parsed
@@ -76,6 +83,18 @@ fn default_panic_report_dir() -> PathBuf {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelModules {
+    /// Modules loaded BEFORE the boot console is brought up. Reserved
+    /// for graphics drivers (`virtio_gpu`, `simpledrm`, `i915`, …) so
+    /// `/dev/dri/card*` exists when `open_console` tries to attach the
+    /// splash backend. Loaded by `modules::load_modules(_,_,
+    /// ModuleSet::Early)` during phase 2a, immediately before
+    /// `open_console`.
+    #[serde(default)]
+    pub early: Vec<String>,
+
+    /// Storage / filesystem / activation modules loaded in phase 2b,
+    /// AFTER the boot console is up so the operator sees per-module
+    /// progress.
     #[serde(default)]
     pub explicit: Vec<String>,
 
@@ -170,6 +189,50 @@ fn default_true() -> bool {
     true
 }
 
+#[cfg(feature = "image-splash")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Splash {
+    #[serde(default)]
+    pub enable: bool,
+
+    #[serde(default = "default_splash_background")]
+    pub background_image: PathBuf,
+
+    #[serde(default = "default_splash_font")]
+    pub font_path: PathBuf,
+
+    #[serde(default = "default_dri_path")]
+    pub dri_path: PathBuf,
+}
+
+#[cfg(feature = "image-splash")]
+impl Default for Splash {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            background_image: default_splash_background(),
+            font_path: default_splash_font(),
+            dri_path: default_dri_path(),
+        }
+    }
+}
+
+#[cfg(feature = "image-splash")]
+fn default_splash_background() -> PathBuf {
+    PathBuf::from("/etc/splash/image.png")
+}
+
+#[cfg(feature = "image-splash")]
+fn default_splash_font() -> PathBuf {
+    PathBuf::from("/etc/splash/font.ttf")
+}
+
+#[cfg(feature = "image-splash")]
+fn default_dri_path() -> PathBuf {
+    PathBuf::from("/dev/dri/card0")
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Paths {
@@ -251,6 +314,28 @@ pub struct RescueConfig {
     pub default_sha256: String,
 }
 
+/// `[emergency_shell]` section of the runtime config. Controls which
+/// `/dev/<tty>` devices the operator may multiplex the emergency shell
+/// onto. The list is operator-curated because exposing a root shell on
+/// a serial console (IPMI SOL, server-room concentrator, etc.) is a
+/// privilege exposure — the default of `[]` keeps the shell pinned to
+/// `/dev/console` (the kernel-elected primary interactive console)
+/// unless the operator opts in.
+///
+/// At picker time the dialog joins `extra_consoles` with the resolved
+/// `/dev/console` target so the operator sees the full candidate list;
+/// nothing is auto-added behind their back.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmergencyShellConfig {
+    /// Additional `/dev/<tty>` paths offered as multiplex targets in
+    /// the picker dialog. Operator-owned: each entry MUST be a tty the
+    /// operator considers safe to expose a root shell on. Defaults to
+    /// empty so only `/dev/console` is offered out of the box.
+    #[serde(default)]
+    pub extra_consoles: Vec<String>,
+}
+
 impl Config {
     /// Reject device specifiers the mount layer cannot resolve.
     ///
@@ -311,7 +396,10 @@ impl Config {
             activations: Vec::new(),
             tui: Tui::default(),
             paths: Paths::default(),
+            #[cfg(feature = "image-splash")]
+            splash: Splash::default(),
             rescue: RescueConfig::default(),
+            emergency_shell: EmergencyShellConfig::default(),
             runtime_boot_mountpoint: None,
         }
     }
@@ -541,6 +629,53 @@ mod tests {
             .expect_err("PARTUUID= short form must be rejected");
     }
 
+    #[cfg(feature = "image-splash")]
+    #[test]
+    fn config_parses_without_splash_table() {
+        // A config that doesn't mention [splash] at all must still parse,
+        // because the feature defaults to off and existing on-disk configs
+        // predate the new table.
+        let toml_text = "[general]\ntimeout_secs = 3\n";
+        let config: Config = toml::from_str(toml_text).expect("config must parse");
+        assert!(!config.splash.enable, "splash must default to disabled");
+        assert_eq!(
+            config.splash.background_image,
+            PathBuf::from("/etc/splash/image.png"),
+        );
+        assert_eq!(
+            config.splash.font_path,
+            PathBuf::from("/etc/splash/font.ttf"),
+        );
+        assert_eq!(config.splash.dri_path, PathBuf::from("/dev/dri/card0"));
+    }
+
+    #[cfg(feature = "image-splash")]
+    #[test]
+    fn config_parses_with_splash_table() {
+        let toml_text = "[splash]\nenable = true\nbackground_image = \"/foo.png\"\n";
+        let config: Config = toml::from_str(toml_text).expect("config must parse");
+        assert!(config.splash.enable, "enable = true must round-trip");
+        assert_eq!(config.splash.background_image, PathBuf::from("/foo.png"));
+        // Unset fields still pick up their defaults.
+        assert_eq!(
+            config.splash.font_path,
+            PathBuf::from("/etc/splash/font.ttf"),
+        );
+        assert_eq!(config.splash.dri_path, PathBuf::from("/dev/dri/card0"));
+    }
+
+    #[cfg(feature = "image-splash")]
+    #[test]
+    fn config_rejects_unknown_splash_field() {
+        let toml_text = "[splash]\nfoo = 1\n";
+        let err =
+            toml::from_str::<Config>(toml_text).expect_err("unknown splash field must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("foo") || msg.contains("unknown"),
+            "rejection should mention the unknown field, got: {msg}",
+        );
+    }
     #[test]
     fn bootstrap_parses_full_schema() {
         let toml = r#"
@@ -892,6 +1027,39 @@ mode    = "external"
 mystery = "boom"
 "#;
         toml::from_str::<Config>(toml).expect_err("unknown field must reject");
+    }
+
+    #[test]
+    fn emergency_shell_defaults_to_empty_extra_consoles() {
+        // The default — no opt-in — must pin the picker to /dev/console
+        // only. Adding extra_consoles is an explicit operator action,
+        // not a side effect of upgrading the config schema.
+        let cfg: Config = toml::from_str("").expect("missing emergency_shell must default");
+        assert!(cfg.emergency_shell.extra_consoles.is_empty());
+    }
+
+    #[test]
+    fn emergency_shell_parses_extra_consoles_list() {
+        let toml = r#"
+[emergency_shell]
+extra_consoles = ["/dev/ttyS0", "/dev/tty1"]
+"#;
+        let cfg: Config = toml::from_str(toml).expect("extra_consoles list must parse");
+        assert_eq!(
+            cfg.emergency_shell.extra_consoles,
+            vec!["/dev/ttyS0".to_string(), "/dev/tty1".to_string()],
+        );
+    }
+
+    #[test]
+    fn emergency_shell_rejects_unknown_field() {
+        let toml = r#"
+[emergency_shell]
+extra_consoles = []
+mystery        = "boom"
+"#;
+        toml::from_str::<Config>(toml)
+            .expect_err("unknown emergency_shell field must be rejected");
     }
 
     #[test]

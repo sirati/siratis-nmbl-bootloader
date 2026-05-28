@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::generations::Generation;
+use crate::ui::app::{BootStatusData, EmergencyItem, SPINNER_FRAMES, SPINNER_GLYPHS};
 
 /// State needed to render the generation-picker screen.
 pub struct ListScreenData<'a> {
@@ -30,6 +31,24 @@ pub struct EditScreenData<'a> {
 pub struct PassphraseScreenData<'a> {
     pub prompt_label: &'a str,
     pub buffer_len: usize,
+    /// `true` while the activation runner is verifying the passphrase
+    /// (cryptsetup running). The renderer overlays a spinner so the
+    /// operator sees the boot is alive rather than hung.
+    pub verifying: bool,
+    /// Spinner phase; indexes [`SPINNER_GLYPHS`] modulo [`SPINNER_FRAMES`].
+    /// Only meaningful when `verifying = true`; ignored otherwise.
+    pub spinner_frame: u8,
+}
+
+/// State needed to render the emergency-on-boot-failure screen.
+pub struct EmergencyScreenData<'a> {
+    /// Pre-formatted error chain (line-wrapped by ratatui).
+    pub message: &'a str,
+    pub items: &'a [EmergencyItem],
+    /// Index into `items`; rendered clamped to `items.len() - 1`.
+    pub selected_index: usize,
+    /// `Some(n)` while the auto-reboot countdown is still running.
+    pub countdown_remaining_secs: Option<u64>,
 }
 
 /// Split frame into (header, body, footer). Small frames degrade gracefully.
@@ -52,8 +71,8 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, countdown: Option<u64>) {
     let mut spans = vec![
-        Span::styled("NMBL ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("— NixOS Minimal BootLoader"),
+        Span::styled("sirati's NMBL ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("— bootloader"),
     ];
     if let Some(secs) = countdown {
         spans.push(Span::raw("   "));
@@ -86,30 +105,52 @@ fn char_column_for_byte_cursor(s: &str, byte_idx: usize) -> usize {
     s.get(..safe).map_or(0, |prefix| prefix.chars().count())
 }
 
-fn generation_item<'a>(g: &'a Generation, show_kernel_params: bool) -> ListItem<'a> {
+fn generation_item<'a>(g: &'a Generation, show_kernel_params: bool, body_width: u16) -> ListItem<'a> {
     let head = if g.label.is_empty() {
         format!("#{}", g.number)
     } else {
         format!("#{}  {}", g.number, g.label)
     };
-    let mut lines: Vec<Line<'a>> = vec![Line::from(head)];
-    if show_kernel_params {
-        lines.push(Line::styled(
-            format!("    {}", g.kernel_params.join(" ")),
-            Style::default().add_modifier(Modifier::DIM),
-        ));
+    if !show_kernel_params || g.kernel_params.is_empty() {
+        return ListItem::new(Line::from(head));
     }
-    ListItem::new(Text::from(lines))
+    // Compose head + (right-aligned) kernel params on a single line.
+    // Reserved chrome per row: 1 col border, 2 cols highlight symbol,
+    // 1 col gutter, 1 col border = 5. The list widget already accounts
+    // for the borders, so we subtract only the highlight symbol gutter.
+    let avail = body_width.saturating_sub(2) as usize;
+    let head_cols = head.chars().count();
+    let kp = g.kernel_params.join(" ");
+    let max_kp = avail.saturating_sub(head_cols).saturating_sub(2);
+    if max_kp == 0 {
+        return ListItem::new(Line::from(head));
+    }
+    let kp_truncated: String = if kp.chars().count() > max_kp {
+        let take = max_kp.saturating_sub(1);
+        kp.chars().take(take).chain(std::iter::once('…')).collect()
+    } else {
+        kp
+    };
+    let kp_cols = kp_truncated.chars().count();
+    let pad = avail.saturating_sub(head_cols).saturating_sub(kp_cols);
+    let line = Line::from(vec![
+        Span::raw(head),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(kp_truncated, Style::default().add_modifier(Modifier::DIM)),
+    ]);
+    ListItem::new(line)
 }
 
 /// Render the generation-picker screen.
 pub fn render_list(frame: &mut Frame<'_>, data: &ListScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, data.countdown_remaining_secs);
+    // Bordered block + highlight symbol consume 1 + 1 + 2 = 4 cols.
+    let inner_width = body.width.saturating_sub(4);
     let items: Vec<ListItem<'_>> = data
         .generations
         .iter()
-        .map(|g| generation_item(g, data.show_kernel_params))
+        .map(|g| generation_item(g, data.show_kernel_params, inner_width))
         .collect();
     let highlight = Style::default()
         .fg(Color::Black)
@@ -151,24 +192,560 @@ pub fn render_edit(frame: &mut Frame<'_>, data: &EditScreenData<'_>) {
     render_footer(frame, footer, "Enter=apply  Esc=cancel");
 }
 
+/// Render the emergency screen: a red "boot failed" header, a wrapped
+/// error message, and a list of [Reboot]/[Shell] items with selection
+/// highlight.
+///
+/// All chrome and colour is ratatui — the splash backend is purely a
+/// render target. This keeps every UI decision (layout, wrap, colour,
+/// hotkey hint) in one place.
+pub fn render_emergency(frame: &mut Frame<'_>, data: &EmergencyScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+
+    // Header: red bold "boot failed". Plus optional countdown.
+    let mut header_spans = vec![Span::styled(
+        "boot failed",
+        Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(secs) = data.countdown_remaining_secs {
+        header_spans.push(Span::raw("   "));
+        header_spans.push(Span::styled(
+            format!("auto-reboot in {secs}s"),
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
+    let header_para = Paragraph::new(Line::from(header_spans)).alignment(Alignment::Left);
+    frame.render_widget(header_para, header);
+
+    // Split the body horizontally: top area for the wrapped error
+    // message, bottom area (sized to the item list) for the picker.
+    let item_rows = u16::try_from(data.items.len().saturating_add(2)).unwrap_or(u16::MAX);
+    let [msg_area, list_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(item_rows)]).areas::<2>(body);
+
+    let msg_para = Paragraph::new(Text::from(data.message.to_owned()))
+        .block(Block::bordered().title("error"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(msg_para, msg_area);
+
+    // Picker. Build ListItems with bracketed labels so the operator
+    // immediately sees "[Reboot]" / "[Shell]" — the brackets reinforce
+    // that this is a discrete choice, not a free-form prompt.
+    let items: Vec<ListItem<'_>> = data
+        .items
+        .iter()
+        .map(|item| ListItem::new(Line::from(format!("[{}]", item.label))))
+        .collect();
+    let highlight = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
+    let list = List::new(items)
+        .block(Block::bordered().title("action"))
+        .highlight_style(highlight)
+        .highlight_symbol("> ");
+
+    let mut state = ListState::default();
+    if !data.items.is_empty() {
+        let last_idx = data.items.len().saturating_sub(1);
+        state.select(Some(data.selected_index.min(last_idx)));
+    }
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    render_footer(
+        frame,
+        footer,
+        "up/down select  Enter confirm  r reboot  s shell",
+    );
+}
+
+/// Render the early-boot status screen: project header, scrolling log
+/// panel, and a single status line with an animated spinner glyph.
+///
+/// Layout (top to bottom):
+///   1. Project header line (same style as the selector header).
+///   2. Bordered "log" panel showing the most recent log lines (most
+///      recent at the bottom). Lines exceeding the panel are clipped.
+///   3. Status line: " {spinner} {phase}".
+///
+/// The spinner uses a 4-frame ASCII rotor (`|/-\`) rather than the
+/// 10-frame braille sequence systemd uses, because the splash glyph
+/// cache only pre-rasterises ASCII printable plus a small box-drawing
+/// subset (see `src/splash/glyph_cache.rs`). Braille (U+2800 block) is
+/// not cached and would render as blank cells on the framebuffer
+/// backend. ASCII works on both crossterm and splash, so we trade
+/// fidelity for portability.
+pub fn render_boot_status(frame: &mut Frame<'_>, data: &BootStatusData<'_>) {
+    // Reuse the chrome split so the project header style matches the
+    // selector exactly. The footer slot is repurposed for the status
+    // line — same height (1 row), same alignment surface.
+    let [header, body, status] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    // Log panel. The bordered block subtracts 2 rows of chrome
+    // (top + bottom border). We pre-clip the source line list to
+    // `inner_rows` to bound copy work; ratatui still does the final
+    // visible-row clipping when a long line wraps under
+    // `Wrap { trim: false }`. We intentionally don't pay for a
+    // unicode-width-aware wrap count here — operator log lines are
+    // typically one row each, and the paragraph widget handles the
+    // overflow case correctly.
+    let log_block = Block::bordered().title("log");
+    let inner = log_block.inner(body);
+    let inner_rows = inner.height as usize;
+
+    let start = data.log_lines.len().saturating_sub(inner_rows);
+    let visible_lines: Vec<Line<'_>> = data
+        .log_lines
+        .get(start..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| Line::raw(s.clone()))
+        .collect();
+
+    let log_para = Paragraph::new(Text::from(visible_lines))
+        .block(log_block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(log_para, body);
+
+    // Bottom-of-box hint. Paint a dim "Esc to abort" indicator on the
+    // last inner row of the log panel — same placement pattern as
+    // pretty_shell's "Ctrl+Shift+Up/Dn scroll" hint. The hint is
+    // unconditional so the operator always knows the escape route is
+    // available; render only when the box has at least one inner row.
+    if inner.height > 0 {
+        let hint_row = inner.y.saturating_add(inner.height.saturating_sub(1));
+        let hint_rect = Rect::new(inner.x, hint_row, inner.width, 1);
+        let hint = Paragraph::new(Span::styled(
+            "Esc to abort",
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+        .alignment(Alignment::Right);
+        frame.render_widget(hint, hint_rect);
+    }
+
+    // Status line. SPINNER_FRAMES is non-zero (it's a const = 4), but
+    // we still defend against a degenerate config: an empty glyph
+    // array would underflow the modulo. `get` returns `None` for the
+    // pathological case and we fall back to a space — never panic.
+    let idx = (data.spinner_frame % SPINNER_FRAMES) as usize;
+    let glyph = SPINNER_GLYPHS.get(idx).copied().unwrap_or(' ');
+    let status_line = format!(" {glyph} {phase}", phase = data.phase);
+    let status_para = Paragraph::new(status_line).alignment(Alignment::Left);
+    frame.render_widget(status_para, status);
+}
+
+/// State needed to render the [`Screen::KeyEcho`] diagnostic view.
+///
+/// Both ring buffers are caller-owned (`App` holds the
+/// [`std::collections::VecDeque`]s); we only borrow slices to avoid
+/// cloning every frame. Most recent entries are at the back of each
+/// slice and end up at the bottom of their panel after rendering.
+pub struct KeyEchoScreenData<'a> {
+    pub events: &'a [String],
+    pub byte_log: &'a [String],
+}
+
+/// Render the key-echo diagnostic screen: header, two side-by-side
+/// ring-buffer panels (parsed events on the left, raw bytes on the
+/// right), and a single status hint at the bottom.
+pub fn render_key_echo(frame: &mut Frame<'_>, data: &KeyEchoScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .areas::<2>(body);
+
+    let events_block = Block::bordered().title("KeyEvents");
+    let bytes_block = Block::bordered().title("Raw bytes");
+    let events_inner_rows = events_block.inner(left).height as usize;
+    let bytes_inner_rows = bytes_block.inner(right).height as usize;
+
+    let events_start = data.events.len().saturating_sub(events_inner_rows);
+    let events_visible: Vec<Line<'_>> = data
+        .events
+        .get(events_start..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| Line::raw(s.clone()))
+        .collect();
+    let events_para = Paragraph::new(Text::from(events_visible))
+        .block(events_block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(events_para, left);
+
+    let bytes_start = data.byte_log.len().saturating_sub(bytes_inner_rows);
+    let bytes_visible: Vec<Line<'_>> = data
+        .byte_log
+        .get(bytes_start..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| Line::raw(s.clone()))
+        .collect();
+    let bytes_para = Paragraph::new(Text::from(bytes_visible))
+        .block(bytes_block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(bytes_para, right);
+
+    render_footer(
+        frame,
+        footer,
+        "key-echo test - Ctrl+C to exit (would be quit if not test)",
+    );
+}
+
+/// State needed to render a yes/no confirmation modal (used by the
+/// `[Verify kexec readiness]` emergency action to confirm "found N
+/// generations, boot one?" before handing off to the selector).
+///
+/// Two-button modal: the highlighted button is whatever
+/// `yes_selected == true` implies. The renderer paints both buttons
+/// bracketed; the driver loop in `crate::ui::mod::show_modal_confirm`
+/// toggles `yes_selected` on left/right/tab and commits on Enter.
+pub struct ModalConfirmScreenData<'a> {
+    /// Short title shown on the modal's title bar.
+    pub title: &'a str,
+    /// Pre-formatted body text; rendered with `Wrap { trim: false }`.
+    pub message: &'a str,
+    /// Label for the affirmative button (typically "Yes" or "Boot").
+    pub yes_label: &'a str,
+    /// Label for the negative button (typically "No" or "Back").
+    pub no_label: &'a str,
+    /// `true` when the yes button is currently highlighted.
+    pub yes_selected: bool,
+    /// Footer hint, typically "←/→ select  Enter confirm  Esc cancel".
+    pub hint: &'a str,
+}
+
+/// Render a centred yes/no confirmation modal over the body area. The
+/// bordered modal carries the body in default colour on a fresh
+/// `Clear` so the underlying emergency picker doesn't bleed through;
+/// the two buttons are painted on the bottom row of the modal with
+/// the selected one inverted.
+pub fn render_modal_confirm(frame: &mut Frame<'_>, data: &ModalConfirmScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    // Centred modal: 64 cols, fills the body height minus a small
+    // top/bottom gutter so a long wrapped message has room without
+    // crowding the chrome (min 9 to keep body + button row + borders
+    // fitting on a degraded 80x24 console).
+    let h = body.height.saturating_sub(2).max(9);
+    let modal = centered_rect(body, 64, h);
+    frame.render_widget(Clear, modal);
+
+    // Reserve the last inner row for the button bar; the rest holds
+    // the wrapped message.
+    let block = Block::bordered().title(data.title.to_owned());
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    if inner.height == 0 {
+        // Pathological tiny terminal — the border consumed the whole
+        // modal. Nothing more to paint; the footer hint below still
+        // reaches the operator.
+        render_footer(frame, footer, data.hint);
+        return;
+    }
+
+    let button_row_h: u16 = 1;
+    let msg_h = inner.height.saturating_sub(button_row_h);
+    let msg_rect = Rect::new(inner.x, inner.y, inner.width, msg_h);
+    let btn_rect = Rect::new(
+        inner.x,
+        inner.y.saturating_add(msg_h),
+        inner.width,
+        button_row_h,
+    );
+
+    let msg_para = Paragraph::new(Text::from(data.message.to_owned()))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(msg_para, msg_rect);
+
+    // Button bar: "[Yes]  [Back]" with the highlighted one inverted.
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
+    let unselected_style = Style::default();
+    let (yes_style, no_style) = if data.yes_selected {
+        (selected_style, unselected_style)
+    } else {
+        (unselected_style, selected_style)
+    };
+    let yes_text = format!("[{}]", data.yes_label);
+    let no_text = format!("[{}]", data.no_label);
+    let line = Line::from(vec![
+        Span::styled(yes_text, yes_style),
+        Span::raw("  "),
+        Span::styled(no_text, no_style),
+    ]);
+    let buttons = Paragraph::new(line).alignment(Alignment::Center);
+    frame.render_widget(buttons, btn_rect);
+
+    render_footer(frame, footer, data.hint);
+}
+
+/// State needed to render an N-button modal (used by the
+/// wrong-password retry flow). The driver loop in
+/// `crate::ui::mod::show_wrong_password_modal` paints every button
+/// label in order and inverts whichever index `selected` points at.
+pub struct ModalButtonsScreenData<'a> {
+    /// Short title shown on the modal's title bar.
+    pub title: &'a str,
+    /// Pre-formatted body text; rendered with `Wrap { trim: false }`.
+    pub message: &'a str,
+    /// Bracketed button labels, painted left-to-right.
+    pub labels: &'a [&'a str],
+    /// Index in `labels` of the currently highlighted button; values
+    /// out of range are clamped to the last legal index by the renderer.
+    pub selected: usize,
+    /// Footer hint, typically "Left/Right select  Enter confirm  Esc …".
+    pub hint: &'a str,
+}
+
+/// Render a centred N-button modal over the body area. Mirrors the
+/// layout of [`render_modal_confirm`]: bordered modal on a fresh
+/// `Clear`, wrapped message above a button bar, footer hint underneath.
+pub fn render_modal_buttons(frame: &mut Frame<'_>, data: &ModalButtonsScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    // 64 cols matches `render_modal_confirm`; fills the body height
+    // minus a small top/bottom gutter (min 10 to leave room for the
+    // longer "Wrong password (attempt N)" body on a degraded 80x24).
+    let h = body.height.saturating_sub(2).max(10);
+    let modal = centered_rect(body, 64, h);
+    frame.render_widget(Clear, modal);
+
+    let block = Block::bordered().title(data.title.to_owned());
+    let inner = block.inner(modal);
+    frame.render_widget(block, modal);
+
+    if inner.height == 0 {
+        render_footer(frame, footer, data.hint);
+        return;
+    }
+
+    let button_row_h: u16 = 1;
+    let msg_h = inner.height.saturating_sub(button_row_h);
+    let msg_rect = Rect::new(inner.x, inner.y, inner.width, msg_h);
+    let btn_rect = Rect::new(
+        inner.x,
+        inner.y.saturating_add(msg_h),
+        inner.width,
+        button_row_h,
+    );
+
+    let msg_para =
+        Paragraph::new(Text::from(data.message.to_owned())).wrap(Wrap { trim: false });
+    frame.render_widget(msg_para, msg_rect);
+
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Gray)
+        .add_modifier(Modifier::BOLD);
+    let unselected_style = Style::default();
+    let last_idx = data.labels.len().saturating_sub(1);
+    let selected = data.selected.min(last_idx);
+    let style_for = |i: usize| {
+        if i == selected {
+            selected_style
+        } else {
+            unselected_style
+        }
+    };
+    let mut spans: Vec<Span<'_>> = Vec::with_capacity(data.labels.len().saturating_mul(2));
+    for (i, label) in data.labels.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(format!("[{label}]"), style_for(i)));
+    }
+    let buttons = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
+    frame.render_widget(buttons, btn_rect);
+
+    render_footer(frame, footer, data.hint);
+}
+
+/// State needed to render a transient modal-error dialog (used by the
+/// pretty-shell path when openpty / fork / mount fails so the operator
+/// sees what happened instead of a stale "boot failed" panel underneath).
+pub struct ModalErrorScreenData<'a> {
+    /// Short title shown on the modal's title bar.
+    pub title: &'a str,
+    /// Pre-formatted error chain. Rendered with `Wrap { trim: false }`.
+    pub message: &'a str,
+    /// Footer hint, typically "press any key to continue".
+    pub hint: &'a str,
+}
+
+/// Render a centred modal dialog over the body area. The bordered
+/// modal carries the error chain in red on a fresh `Clear` so the
+/// stale emergency-screen content does not bleed through.
+pub fn render_modal_error(frame: &mut Frame<'_>, data: &ModalErrorScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    // Centred modal: 70 cols wide, fills the body height minus a
+    // small top/bottom gutter so a multi-line error chain has room
+    // (min 8 to keep title + a few message lines + border fitting
+    // on a degraded 80x24 console).
+    let h = body.height.saturating_sub(2).max(8);
+    let modal = centered_rect(body, 70, h);
+    frame.render_widget(Clear, modal);
+
+    let block = Block::bordered().title(Span::styled(
+        data.title.to_owned(),
+        Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let para = Paragraph::new(Text::from(data.message.to_owned()))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, modal);
+
+    render_footer(frame, footer, data.hint);
+}
+
+/// State needed to render the pretty-shell screen.
+///
+/// Owned by the [`crate::ui::pretty_shell::PtyShellState`] driver; the
+/// renderer is a pure consumer of the snapshot. The grid is supplied
+/// pre-flattened as `rows_text` so this file can stay independent of
+/// `alacritty_terminal` (which is only compiled in when `image-splash`
+/// is on, but this struct is unconditionally visible here so the
+/// `view` module's tests don't fragment over feature flags).
+pub struct PtyShellScreenData<'a> {
+    /// Grid width in cells. Used to clamp / pad the rendered rows.
+    pub cols: u16,
+    /// Grid height in cells. Used for layout decisions only — the
+    /// actual rendered height comes from `rows_text.len()`.
+    pub rows: u16,
+    /// One pre-built `String` per grid row, in row-major order. The
+    /// renderer trusts the caller to have produced exactly `rows` of
+    /// `cols` chars each; degraded inputs (short rows, missing rows)
+    /// just render shorter lines without panicking.
+    pub rows_text: &'a [String],
+    /// `Grid::display_offset` — rows above the live tail currently
+    /// visible. Zero means the live grid is shown.
+    pub scroll_offset: usize,
+}
+
+/// Render the pretty-shell screen: header, bordered "Shell" box
+/// containing the alacritty grid snapshot, and a footer showing the
+/// combined exit + scroll hint.
+///
+/// The bordered block's inner area is given over entirely to the
+/// alacritty terminal — no overlay text — so the operator sees an
+/// unobstructed shell. All hints live in the outer footer row.
+/// ASCII glyphs only — the splash glyph cache rasterises ASCII
+/// printable plus a box-drawing subset (see
+/// `src/splash/glyph_cache.rs`), so Unicode arrows (U+2191 / U+2193)
+/// would render as blank cells on the framebuffer backend.
+pub fn render_pty_shell(frame: &mut Frame<'_>, data: &PtyShellScreenData<'_>) {
+    let [header, body, footer] = split_chrome(frame.area());
+    render_header(frame, header, None);
+
+    let block = Block::bordered().title("Pretty Shell");
+    let inner = block.inner(body);
+    frame.render_widget(block, body);
+
+    // Inner area drives the visible rows. We always paint from the
+    // first cell of each grid row at the inner top-left; rows that
+    // overflow the inner area are clipped by ratatui.
+    let row_count = (inner.height as usize).min(data.rows_text.len());
+    let col_count = inner.width as usize;
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(row_count);
+    for row in data.rows_text.iter().take(row_count) {
+        // Clamp to inner width so a stray wide row doesn't bleed into
+        // the right border. `chars().take(n)` is char-correct.
+        let truncated: String = row.chars().take(col_count).collect();
+        lines.push(Line::raw(truncated));
+    }
+    let para = Paragraph::new(Text::from(lines));
+    frame.render_widget(para, inner);
+
+    // Footer hint covers both the exit shortcut and the scrollback
+    // bindings; when the operator has scrolled back, prefix a "[scrolled
+    // N]" tag so the indicator the inner overlay used to carry still
+    // reaches them.
+    let mut hint = String::new();
+    if data.scroll_offset > 0 {
+        hint.push_str(&format!("[scrolled {} lines]  ", data.scroll_offset));
+    }
+    hint.push_str(
+        "exit shell or Ctrl+Shift+Q to return to emergency  \
+         Ctrl+Shift+Up/Dn scroll",
+    );
+    render_footer(frame, footer, &hint);
+}
+
 /// Render the passphrase modal over the body area.
+///
+/// When `data.verifying` is `true` the modal grows by one row and the
+/// extra row carries an ASCII spinner glyph plus a "verifying..." label,
+/// so the operator sees the boot is alive while cryptsetup runs. We
+/// pick the glyph from [`SPINNER_GLYPHS`] (same `|/-\\` rotor as the
+/// boot-status spinner) for backend parity — splash glyph cache lacks
+/// Unicode braille and would render blanks.
 pub fn render_passphrase(frame: &mut Frame<'_>, data: &PassphraseScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
-    let modal = centered_rect(body, 60, 7);
+    // Modal is one row taller in verifying mode so the spinner row
+    // doesn't displace the dotted input line.
+    let modal_height: u16 = if data.verifying { 8 } else { 7 };
+    let modal = centered_rect(body, 60, modal_height);
     frame.render_widget(Clear, modal);
     // Cap mask so a huge typo doesn't overflow the box.
     let dots: String = "*".repeat(data.buffer_len.min(40));
-    let lines: Vec<Line<'_>> = vec![
+    let mut lines: Vec<Line<'_>> = vec![
         Line::raw(data.prompt_label.to_owned()),
         Line::raw(String::new()),
         Line::from(vec![Span::raw(dots), Span::raw("|")]),
     ];
+    let hint_line: Line<'_> = if data.verifying {
+        // Reuse the boot-status spinner glyphs (see crate::ui::app::
+        // SPINNER_GLYPHS) so both screens animate identically.
+        let glyph_idx = (data.spinner_frame % SPINNER_FRAMES) as usize;
+        let glyph = SPINNER_GLYPHS.get(glyph_idx).copied().unwrap_or('|');
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{glyph} "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "verifying passphrase...",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+        Line::raw("verifying...  please wait")
+    } else {
+        // Empty buffer → "Enter=submit" hint is rendered DIM so the
+        // disabled state is visible; Enter is silently ignored in the
+        // read loop.
+        let submit_style = if data.buffer_len == 0 {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default()
+        };
+        Line::from(vec![
+            Span::styled("Enter=submit", submit_style),
+            Span::raw("  Esc=cancel"),
+        ])
+    };
     let para = Paragraph::new(Text::from(lines))
         .block(Block::bordered().title("Passphrase"))
         .wrap(Wrap { trim: false });
     frame.render_widget(para, modal);
-    render_footer(frame, footer, "Enter=submit  Esc=cancel");
+    frame.render_widget(
+        Paragraph::new(hint_line).alignment(Alignment::Right),
+        footer,
+    );
 }
 
 #[cfg(test)]
@@ -300,12 +877,352 @@ mod tests {
         let data = PassphraseScreenData {
             prompt_label: "Unlock /dev/sda2",
             buffer_len: 5,
+            verifying: false,
+            spinner_frame: 0,
         };
         let mut term = new_term(80, 24);
         term.draw(|f| render_passphrase(f, &data)).expect("draw");
         let text = buffer_text(&term);
         assert!(text.contains("*****|"), "wrong mask count in:\n{text}");
         assert!(text.contains("Unlock /dev/sda2"));
+        assert!(
+            !text.contains("verifying"),
+            "non-verifying render must not show the spinner label"
+        );
+        assert!(
+            text.contains("Enter=submit"),
+            "default footer hint must appear: {text}"
+        );
+    }
+
+    #[test]
+    fn test_render_passphrase_verifying_shows_spinner_and_label() {
+        // When verifying=true the modal must paint a spinner glyph and
+        // the "verifying passphrase..." label so the operator doesn't
+        // think the UI hung while cryptsetup runs.
+        for frame_idx in 0..SPINNER_FRAMES {
+            let data = PassphraseScreenData {
+                prompt_label: "Unlock /dev/sda2",
+                buffer_len: 8,
+                verifying: true,
+                spinner_frame: frame_idx,
+            };
+            let mut term = new_term(80, 24);
+            term.draw(|f| render_passphrase(f, &data)).expect("draw");
+            let text = buffer_text(&term);
+            // The dotted input row is still present.
+            assert!(text.contains("********|"), "input row missing: {text}");
+            // The verifying overlay row.
+            assert!(
+                text.contains("verifying passphrase"),
+                "missing verifying label at frame {frame_idx}:\n{text}"
+            );
+            // The expected spinner glyph for this frame.
+            let expected = SPINNER_GLYPHS[frame_idx as usize];
+            assert!(
+                text.contains(expected),
+                "expected spinner glyph '{expected}' at frame {frame_idx}:\n{text}"
+            );
+            // Footer hint switches.
+            assert!(
+                text.contains("verifying..."),
+                "verifying footer hint missing at frame {frame_idx}:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_passphrase_verifying_out_of_range_frame_does_not_panic() {
+        // Defence-in-depth: a caller that didn't wrap modulo
+        // SPINNER_FRAMES must not crash the renderer. We pin that the
+        // out-of-range frame falls back to a sensible default glyph.
+        let data = PassphraseScreenData {
+            prompt_label: "Unlock",
+            buffer_len: 2,
+            verifying: true,
+            spinner_frame: 99,
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_passphrase(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(text.contains("verifying passphrase"));
+    }
+
+    /// Walk the rendered buffer and return the cell style under the first
+    /// occurrence of `needle`'s leading char on the line that contains it.
+    fn style_under_first_match(term: &Terminal<TestBackend>, needle: &str) -> Style {
+        let buf = term.backend().buffer();
+        let head = needle.chars().next().expect("non-empty needle");
+        let head_str = head.to_string();
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_owned()))
+                .collect();
+            if let Some(byte_idx) = row.find(needle) {
+                // Byte index in a single-byte ASCII needle equals column.
+                let col_chars = row
+                    .get(..byte_idx)
+                    .map_or(0, |prefix| prefix.chars().count());
+                // Locate cell at (col_chars, y) and assert its symbol matches.
+                let cell = buf
+                    .cell((col_chars as u16, y))
+                    .expect("cell in rendered area");
+                assert_eq!(cell.symbol(), head_str);
+                return cell.style();
+            }
+        }
+        panic!("needle {needle:?} not found in rendered buffer");
+    }
+
+    #[test]
+    fn test_render_passphrase_submit_hint_dim_when_buffer_empty() {
+        // Empty buffer → "Enter=submit" rendered DIM so the disabled
+        // state is visible to the operator. Non-empty buffer → default.
+        let empty = PassphraseScreenData {
+            prompt_label: "Unlock root",
+            buffer_len: 0,
+            verifying: false,
+            spinner_frame: 0,
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_passphrase(f, &empty)).expect("draw");
+        let style_empty = style_under_first_match(&term, "Enter=submit");
+        assert!(
+            style_empty.add_modifier.contains(Modifier::DIM),
+            "Enter=submit must be DIM when buffer is empty; got {style_empty:?}",
+        );
+
+        let filled = PassphraseScreenData {
+            prompt_label: "Unlock root",
+            buffer_len: 3,
+            verifying: false,
+            spinner_frame: 0,
+        };
+        let mut term2 = new_term(80, 24);
+        term2
+            .draw(|f| render_passphrase(f, &filled))
+            .expect("draw");
+        let style_filled = style_under_first_match(&term2, "Enter=submit");
+        assert!(
+            !style_filled.add_modifier.contains(Modifier::DIM),
+            "Enter=submit must NOT be DIM with non-empty buffer; got {style_filled:?}",
+        );
+    }
+
+    #[test]
+    fn test_render_modal_confirm_shows_title_buttons_and_hint() {
+        let data = ModalConfirmScreenData {
+            title: "Boot one?",
+            message: "Found 3 generations.",
+            yes_label: "Yes",
+            no_label: "Back",
+            yes_selected: true,
+            hint: "Left/Right select  Enter confirm  Esc cancel",
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_modal_confirm(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(text.contains("Boot one?"), "title missing in:\n{text}");
+        assert!(
+            text.contains("Found 3 generations"),
+            "message missing in:\n{text}"
+        );
+        assert!(text.contains("[Yes]"), "yes button missing in:\n{text}");
+        assert!(text.contains("[Back]"), "no button missing in:\n{text}");
+        assert!(
+            text.contains("Enter confirm"),
+            "hint missing in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_render_modal_confirm_renders_with_no_selected() {
+        // Pin the other branch of yes_selected: when false, the "No"
+        // button gets the highlight. The plain-text scan can't see
+        // colour but it can confirm both labels paint.
+        let data = ModalConfirmScreenData {
+            title: "Confirm",
+            message: "Proceed?",
+            yes_label: "Boot",
+            no_label: "Back",
+            yes_selected: false,
+            hint: "h",
+        };
+        let mut term = new_term(60, 16);
+        term.draw(|f| render_modal_confirm(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(text.contains("[Boot]"), "yes label missing in:\n{text}");
+        assert!(text.contains("[Back]"), "no label missing in:\n{text}");
+    }
+
+    #[test]
+    fn test_render_modal_error_shows_title_message_and_hint() {
+        // Modal must surface the title, the error chain body, and the
+        // any-key hint in the footer. Cell-by-cell text scan is enough
+        // — the actual layout/colour is incidental detail tested in
+        // ratatui's own suite.
+        let data = ModalErrorScreenData {
+            title: "Pretty Shell failed to start",
+            message: "openpty failed: ENOENT: No such file or directory",
+            hint: "press any key to continue",
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_modal_error(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Pretty Shell failed to start"),
+            "title missing in:\n{text}"
+        );
+        assert!(text.contains("openpty failed"), "message missing in:\n{text}");
+        assert!(text.contains("press any key"), "hint missing in:\n{text}");
+    }
+
+    fn boot_status_data<'a>(
+        phase: &'a str,
+        lines: &[&str],
+        spinner_frame: u8,
+    ) -> BootStatusData<'a> {
+        BootStatusData {
+            phase: std::borrow::Cow::Borrowed(phase),
+            log_lines: lines.iter().map(|s| (*s).to_string()).collect(),
+            spinner_frame,
+        }
+    }
+
+    #[test]
+    fn test_render_boot_status_shows_header_lines_phase_and_spinner_frame0() {
+        // Layout assumes a 24-row terminal: 3-row header, body in the
+        // middle, 1-row status. Three log lines fit comfortably in the
+        // body so all three should be visible.
+        let data = boot_status_data(
+            "phase 1: udev coldplug",
+            &["mount /proc", "mount /sys", "starting udev"],
+            0,
+        );
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_boot_status(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+
+        assert!(text.contains("sirati's NMBL"), "missing header in:\n{text}");
+        assert!(
+            text.contains("phase 1: udev coldplug"),
+            "missing phase in:\n{text}"
+        );
+        for line in ["mount /proc", "mount /sys", "starting udev"] {
+            assert!(text.contains(line), "missing log line {line:?} in:\n{text}");
+        }
+        // Frame 0 -> '|'.
+        assert!(text.contains('|'), "missing spinner glyph '|' in:\n{text}");
+    }
+
+    #[test]
+    fn test_render_boot_status_spinner_advances_with_frame() {
+        // Render at frame 0 and frame 1 and assert the status row
+        // differs. Frame 1 must contain '/'; frame 0 must not (the
+        // header / log content is fixed in this fixture, so no other
+        // '/' appears in the buffer apart from the spinner cell).
+        let data0 = boot_status_data("waiting", &["a"], 0);
+        let data1 = boot_status_data("waiting", &["a"], 1);
+
+        let mut t0 = new_term(40, 10);
+        t0.draw(|f| render_boot_status(f, &data0)).expect("draw");
+        let mut t1 = new_term(40, 10);
+        t1.draw(|f| render_boot_status(f, &data1)).expect("draw");
+
+        let txt0 = buffer_text(&t0);
+        let txt1 = buffer_text(&t1);
+
+        assert!(txt0.contains('|'), "frame0 must contain |");
+        assert!(txt1.contains('/'), "frame1 must contain /");
+        assert_ne!(txt0, txt1, "spinner advance must change buffer");
+    }
+
+    #[test]
+    fn test_render_boot_status_shows_esc_to_abort_hint() {
+        // The "Esc to abort" hint must always be present on the
+        // BootStatus screen so the operator knows the wait is
+        // interruptible without having to read the docs.
+        let data = boot_status_data("phase 3b: waiting", &["mount /proc"], 0);
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_boot_status(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("Esc to abort"),
+            "missing 'Esc to abort' hint in:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_render_boot_status_esc_hint_is_bottom_right_of_log_panel() {
+        // Stronger assertion: the hint must sit on the bottom-right of
+        // the log box, mirroring pretty-shell's scroll-hint placement.
+        // We pin the row (last interior row of the log panel) and the
+        // alignment (right edge) so a future refactor can't silently
+        // move the hint to a place the operator won't notice.
+        let data = boot_status_data("p", &["line"], 0);
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_boot_status(f, &data)).expect("draw");
+        let lines = buffer_lines(&term);
+
+        // Layout: 3-row header, body fills the middle, 1-row status.
+        // The log box borders the body, so its bottom border row is at
+        // `header_h + body_h - 1 = 3 + 20 - 1 = 22`. The hint paints on
+        // the LAST INNER row, which is one above the bottom border:
+        // row 21.
+        let hint_row_idx = 21;
+        let hint_row = lines
+            .get(hint_row_idx)
+            .expect("hint row must exist in 24-row term");
+        assert!(
+            hint_row.contains("Esc to abort"),
+            "hint missing on expected row {hint_row_idx}: {hint_row:?}"
+        );
+        // Right alignment: the hint should sit near the right border,
+        // not the left. Specifically, the column where "Esc to abort"
+        // starts should be well past column 40 (mid-width on an 80-col
+        // terminal).
+        let hint_col = hint_row.find("Esc to abort").expect("hint substring");
+        assert!(
+            hint_col > 40,
+            "hint must be right-aligned (col {hint_col} should exceed 40): {hint_row:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_boot_status_clips_to_panel_height() {
+        // 50 lines into a 10-row terminal. The header eats 3 rows and
+        // the status line eats 1, leaving 6 rows for the bordered log
+        // panel; the panel borders eat 2 more, so only ~4 lines of
+        // content are visible. The exact panel height isn't load-
+        // bearing for this test — what matters is that *only* the
+        // most recent lines appear and *none* of the earliest ones
+        // do, regardless of clipping math.
+        //
+        // Zero-padded width-2 indices make each label uniquely
+        // identifiable as a substring (e.g. "log-00" is not a prefix
+        // of "log-49"), so `str::contains` is a safe substring check.
+        let lines: Vec<String> = (0..50).map(|i| format!("log-{i:02}")).collect();
+        let lines_refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let data = boot_status_data("phase X", &lines_refs, 0);
+
+        let mut term = new_term(40, 10);
+        term.draw(|f| render_boot_status(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+
+        // The last line must appear; the first and one mid-range
+        // sample must not.
+        assert!(
+            text.contains("log-49"),
+            "most-recent line missing in:\n{text}"
+        );
+        assert!(
+            !text.contains("log-00"),
+            "earliest line leaked through clipping in:\n{text}"
+        );
+        assert!(
+            !text.contains("log-10"),
+            "mid-range line leaked through clipping in:\n{text}"
+        );
     }
 
     #[test]

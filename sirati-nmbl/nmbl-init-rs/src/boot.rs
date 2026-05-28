@@ -4,7 +4,6 @@
 //! the still-mounted `/mnt/system`. Anything that fails after the image
 //! is loaded is logged + swallowed; we're about to replace this kernel.
 
-use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,6 +16,7 @@ use crate::error::Result;
 use crate::generations::Generation;
 use crate::sys;
 use crate::sys::cpio::{InjectionEntry, build_fragment};
+use crate::terminal::TerminalAction;
 use crate::{nmbl_info, nmbl_warn};
 
 /// Pseudo-filesystems from phase 1, mount order. Reversed for teardown.
@@ -96,8 +96,14 @@ fn detach(target: &Path) {
 
 /// Kexec into `generation` (PLAN.md §7 phase 6): load image, sync +
 /// settle, lazy-unmount config fs (reverse) + system_root + pseudo-fs
-/// (reverse), then `reboot(LINUX_REBOOT_CMD_KEXEC)`. `Infallible`
-/// encodes that success is the noreturn path.
+/// (reverse), then return [`TerminalAction::Kexec`] so the dispatcher
+/// in `main` fires `reboot(LINUX_REBOOT_CMD_KEXEC)` after every
+/// stack-allocated resource has been dropped via normal unwinding.
+///
+/// The image itself is loaded eagerly here — the kernel holds it in
+/// the kexec image slot — but the cutover syscall is deferred to the
+/// dispatcher so a stale console handle on the caller's stack cannot
+/// leak its `Drop` side effects past the reboot.
 ///
 /// When `key_injections` is non-empty, an in-memory cpio fragment
 /// containing those files is appended to the system initrd via
@@ -108,7 +114,7 @@ pub fn kexec_into(
     generation: &Generation,
     cmdline_override: Option<&str>,
     key_injections: &[KeyInjection],
-) -> Result<Infallible> {
+) -> Result<TerminalAction> {
     let cmdline = build_cmdline(generation, cmdline_override, &config.paths.system_root);
     nmbl_info!(
         "kexec: loading generation {} (kernel={}, initrd={})",
@@ -162,8 +168,8 @@ pub fn kexec_into(
         detach(Path::new(pseudo));
     }
 
-    nmbl_info!("kexec: handing off to new kernel");
-    sys::kexec::execute()
+    nmbl_info!("kexec: image staged; dispatcher will hand off to new kernel");
+    Ok(TerminalAction::Kexec)
 }
 
 #[cfg(test)]

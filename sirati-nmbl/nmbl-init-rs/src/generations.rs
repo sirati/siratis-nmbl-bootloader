@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
+use crate::ui::BootReporter;
 use crate::{nmbl_verbose, nmbl_warn};
 
 /// Single NixOS system generation discovered under
@@ -134,8 +135,16 @@ fn resolve_init_path(profile_link: &Path, toplevel: &Path) -> Result<PathBuf> {
 ///
 /// Returns [`NmblError::NoGenerations`] when the directory cannot be read or
 /// has no usable entries.
-pub fn scan_generations(config: &Config) -> Result<Vec<Generation>> {
+///
+/// `reporter` carries the live boot console; we surface the scan path
+/// as the boot-status phase label so the operator sees what's being
+/// inspected.
+pub fn scan_generations(
+    config: &Config,
+    reporter: &mut BootReporter<'_, '_>,
+) -> Result<Vec<Generation>> {
     let dir = config.paths.nix_profiles_dir.clone();
+    let _ = reporter.set_phase(format!("phase 4: scanning generations in {}", dir.display()));
     let mount_prefix = config.paths.system_root.as_path();
     let entries = match std::fs::read_dir(&dir) {
         Ok(it) => it,
@@ -267,15 +276,64 @@ pub(crate) fn active_generation_index(generations: &[Generation], profiles_dir: 
     reason = "tests are allowed to assert with panics"
 )]
 mod tests {
-    use super::*;
     use std::os::unix::fs::symlink;
+    use std::time::Duration;
+
+    use crossterm::event::KeyEvent;
     use tempfile::TempDir;
+
+    use super::*;
+    use crate::ui::app::App;
+    use crate::ui::console::{Console, ConsoleKind};
 
     fn config_for(profiles: &Path, system_root: &Path) -> Config {
         let text = format!(
             "[paths]\nnix_profiles_dir = {profiles:?}\nsystem_root = {system_root:?}\nshell = \"/bin/sh\"\n",
         );
         toml::from_str::<Config>(&text).expect("config parses")
+    }
+
+    /// No-op [`Console`] implementation for tests that only need a live
+    /// [`BootReporter`] to exercise `scan_generations`'s signature.
+    /// Tests never observe the boot-status screen here; they only care
+    /// that the scan returns the expected generations slice.
+    struct NoopConsole;
+
+    impl Console for NoopConsole {
+        fn render(&mut self, _app: &App<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+            Ok(None)
+        }
+        fn size(&self) -> (u16, u16) {
+            (80, 24)
+        }
+        fn kind(&self) -> ConsoleKind {
+            ConsoleKind::Tty
+        }
+        fn draw_with(
+            &mut self,
+            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn suspend(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run a closure with a fresh [`BootReporter`] backed by a no-op
+    /// console. The reporter is dropped before the closure returns, so
+    /// the closure can pass it as `&mut BootReporter<'_, '_>` without
+    /// fighting lifetimes against the surrounding test body.
+    fn with_reporter<R>(f: impl FnOnce(&mut BootReporter<'_, '_>) -> R) -> R {
+        let mut console = NoopConsole;
+        let mut reporter = BootReporter::new(&mut console, "test");
+        f(&mut reporter)
     }
 
     /// Build a fake profile dir; mount_aware_resolve on a regular file returns
@@ -302,7 +360,8 @@ mod tests {
     #[test]
     fn empty_dir_yields_no_generations() {
         let tmp = TempDir::new().expect("temp dir");
-        let err = scan_generations(&config_for(tmp.path(), tmp.path())).expect_err("must error");
+        let err = with_reporter(|r| scan_generations(&config_for(tmp.path(), tmp.path()), r))
+            .expect_err("must error");
         match err {
             NmblError::NoGenerations { searched } => assert_eq!(searched, tmp.path()),
             other => panic!("expected NoGenerations, got {other:?}"),
@@ -320,7 +379,8 @@ mod tests {
             make_profile(&backing, n, &format!("root=/dev/sda{n}"));
             link_profile_relative(&profiles, n, &format!("../backing/profile-{n}"));
         }
-        let gens = scan_generations(&config_for(&profiles, tmp.path())).expect("scan ok");
+        let gens = with_reporter(|r| scan_generations(&config_for(&profiles, tmp.path()), r))
+            .expect("scan ok");
         assert_eq!(
             gens.iter().map(|g| g.number).collect::<Vec<_>>(),
             [42, 10, 1]
@@ -351,7 +411,8 @@ mod tests {
         std::fs::write(bad.join("kernel-params"), "x").expect("params");
         link_profile_relative(&profiles, 9, "../backing/profile-9");
 
-        let gens = scan_generations(&config_for(&profiles, tmp.path())).expect("scan ok");
+        let gens = with_reporter(|r| scan_generations(&config_for(&profiles, tmp.path()), r))
+            .expect("scan ok");
         assert_eq!(gens.len(), 1);
         assert_eq!(gens[0].number, 7);
     }
@@ -394,7 +455,8 @@ mod tests {
         symlink(format!("/{store_rel}"), profiles_dir.join("system-3-link"))
             .expect("profile symlink");
 
-        let gens = scan_generations(&config_for(&profiles_dir, &mount_prefix)).expect("scan ok");
+        let gens = with_reporter(|r| scan_generations(&config_for(&profiles_dir, &mount_prefix), r))
+            .expect("scan ok");
         assert_eq!(gens.len(), 1);
         assert_eq!(
             gens[0].kernel,
@@ -500,7 +562,8 @@ mod tests {
         link_profile_relative(&profiles, 7, "../backing/profile-7");
         std::fs::write(profiles.join("system-bogus-link"), b"x").expect("bogus");
         std::fs::write(profiles.join("random_file"), b"x").expect("random");
-        let gens = scan_generations(&config_for(&profiles, tmp.path())).expect("scan ok");
+        let gens = with_reporter(|r| scan_generations(&config_for(&profiles, tmp.path()), r))
+            .expect("scan ok");
         assert_eq!(gens.len(), 1);
         assert_eq!(gens[0].number, 7);
         assert_eq!(gens[0].kernel_params, vec!["quiet".to_string()]);

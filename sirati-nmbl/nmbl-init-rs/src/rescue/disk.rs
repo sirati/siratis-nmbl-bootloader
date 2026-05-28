@@ -23,7 +23,6 @@
 //! Every failure point is wrapped in [`NmblError::Rescue`] with a
 //! `stage` string the emergency-shell banner surfaces verbatim.
 
-use std::convert::Infallible;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -40,14 +39,19 @@ use crate::sys::mount::mount_fs;
 /// with anything the initramfs created.
 const RESCUE_MOUNT: &str = "/rescue";
 
-/// Mount the rescue squashfs from the boot partition, switch root into
-/// it via the switch_root dance (MS_MOVE + chroot), and `execve` its
-/// `/bin/sh`. On success this never returns.
+/// Loop-mount the rescue squashfs at `/rescue`, returning the mount
+/// path. Caller is responsible for dropping the live boot console
+/// (so the backend's Drop impl restores VT text mode + termios) and
+/// then calling [`super::switch_root_and_exec`] with the returned
+/// path — splitting the steps this way keeps the no-return `execve`
+/// out of band from the (potentially-failing) mount work, so the
+/// dispatcher can fall through to network-rescue without losing the
+/// console.
 ///
 /// `cause` is the error that triggered the rescue. It is logged
 /// before the loop-mount dance so the operator can see what failed
 /// even if the squashfs mount itself misbehaves.
-pub fn try_disk_rescue(config: &Config, cause: &NmblError) -> Result<Infallible> {
+pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'static Path> {
     let sfs_path = super::locate_sfs(config)?;
     eprintln!(
         "[nmbl] external rescue: mounting {} (triggered by: {})",
@@ -111,10 +115,7 @@ pub fn try_disk_rescue(config: &Config, cause: &NmblError) -> Result<Infallible>
         }
     })?;
 
-    // Hand off to the shared `switch_root` dance: chdir + MS_MOVE +
-    // chroot + execve("/bin/sh"). Avoids `pivot_root(2)`'s EINVAL on
-    // the initramfs rootfs pseudo-filesystem.
-    super::switch_root_and_exec(rescue_dir)
+    Ok(rescue_dir)
 }
 
 /// Create `path` (and parents) on the rescue mountpoint side. Mirrors
@@ -162,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn try_disk_rescue_missing_sfs_is_locate_sfs_error() {
+    fn prepare_disk_rescue_missing_sfs_is_locate_sfs_error() {
         // Point at a path we know cannot exist so the locate-sfs guard
         // fires before we touch /dev/loop-control. This lets the test
         // assert error shape on every host, not just ones with a loop
@@ -190,7 +191,7 @@ mod tests {
             Some(PathBuf::from(&bogus_name)),
             Some(dir.path().to_path_buf()),
         );
-        let err = try_disk_rescue(&cfg, &cause).expect_err("missing sfs must error");
+        let err = prepare_disk_rescue(&cfg, &cause).expect_err("missing sfs must error");
         match err {
             NmblError::Rescue { stage, source } => {
                 assert_eq!(stage, "locate-sfs");
@@ -206,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn try_disk_rescue_without_mountpoint_is_locate_sfs_error() {
+    fn prepare_disk_rescue_without_mountpoint_is_locate_sfs_error() {
         // Legacy embedded-config mode: no runtime boot mountpoint is set,
         // so the locate-sfs guard must short-circuit before any disk I/O.
         let cause = NmblError::ConfigInvalid {
@@ -215,7 +216,7 @@ mod tests {
         };
         let cfg = cfg_with_sfs(None, None);
         let err =
-            try_disk_rescue(&cfg, &cause).expect_err("missing runtime boot mountpoint must error");
+            prepare_disk_rescue(&cfg, &cause).expect_err("missing runtime boot mountpoint must error");
         match err {
             NmblError::Rescue { stage, source } => {
                 assert_eq!(stage, "locate-sfs");
@@ -230,7 +231,7 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn try_disk_rescue_no_loop_control_is_loop_alloc_error() {
+    fn prepare_disk_rescue_no_loop_control_is_loop_alloc_error() {
         // Mirrors the skip pattern from sys::loopdev::tests: only
         // exercise the loop-alloc arm on hosts that lack
         // /dev/loop-control. Where the node exists the unprivileged
@@ -255,7 +256,7 @@ mod tests {
             reason: "synthetic".to_string(),
             context: "test".to_string(),
         };
-        let err = try_disk_rescue(&cfg, &cause).expect_err("no loop-control must error");
+        let err = prepare_disk_rescue(&cfg, &cause).expect_err("no loop-control must error");
         match err {
             NmblError::Rescue { stage, .. } => {
                 assert_eq!(stage, "loop-alloc");
