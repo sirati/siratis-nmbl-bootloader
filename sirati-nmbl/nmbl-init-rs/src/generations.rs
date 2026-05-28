@@ -226,7 +226,7 @@ pub fn scan_generations(
 /// `system` pointer marks which of them is active. Selecting purely
 /// by max generation number would silently boot the entry the operator
 /// just rolled away from.
-pub(crate) fn active_generation_index(generations: &[Generation], profiles_dir: &Path) -> usize {
+pub fn active_generation_index(generations: &[Generation], profiles_dir: &Path) -> usize {
     let link = profiles_dir.join("system");
     let target = match std::fs::read_link(&link) {
         Ok(t) => t,
