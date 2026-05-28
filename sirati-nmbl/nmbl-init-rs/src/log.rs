@@ -8,6 +8,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use serde::Deserialize;
 
+/// Tmpfs path the byte-ring is flushed to before every terminal action
+/// and before kexec. The same path is recreated in the next kernel's
+/// initramfs by the cpio fragment spliced into `kexec_file_load(2)`, so
+/// the booted system's `nmbl-log-import` stage-1 helper can drain it.
+/// Single source of truth for both the dispatcher (`main.rs`) and the
+/// kexec staging path (`boot.rs`).
+pub const NMBL_LOG_PATH: &str = "/nmbl-log/nmbl.log";
+
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Verbosity {

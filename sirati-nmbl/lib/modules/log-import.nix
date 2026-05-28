@@ -36,7 +36,7 @@ let
   '';
 in
 {
-  config = {
+  config = lib.mkIf config.boot.nmbl.enable {
     boot.initrd.systemd.services.nmbl-log-import = {
       description = "Import NMBL pre-kexec log into the booted journal";
       wantedBy = [ "initrd.target" ];

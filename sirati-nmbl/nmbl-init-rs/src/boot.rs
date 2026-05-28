@@ -23,13 +23,11 @@ use crate::{nmbl_info, nmbl_warn};
 /// Pseudo-filesystems from phase 1, mount order. Reversed for teardown.
 const PSEUDO_FS: &[&str] = &["/proc", "/sys", "/dev", "/run", "/tmp"];
 
-/// Tmpfs path the NMBL byte-ring is flushed to before kexec. The same
-/// path is recreated in the next kernel's initramfs by the cpio
-/// fragment we splice into `kexec_file_load(2)` below, so a stage-1
-/// helper (e.g. `nmbl-log-import`) can pick the transcript up. Must
-/// match the `NMBL_LOG_PATH` const in `main.rs`; the two sites are
-/// independent so the const is duplicated rather than re-exported.
-const NMBL_LOG_PATH: &str = "/nmbl-log/nmbl.log";
+// Tmpfs path the NMBL byte-ring is flushed to before kexec — recreated
+// in the next kernel's initramfs by the cpio fragment we splice into
+// `kexec_file_load(2)` below, so a stage-1 helper (e.g. `nmbl-log-import`)
+// can pick the transcript up. Single source of truth in `log`.
+use crate::log::NMBL_LOG_PATH;
 
 /// Post-`sync(2)` settle window. `sync` only schedules writeback; real
 /// hardware needs a beat to commit before we cut the mounts out.
