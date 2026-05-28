@@ -27,6 +27,14 @@
 //! snaps back to the live tail. Any keystroke that is not a scroll
 //! shortcut implicitly snaps the view to the bottom and is forwarded
 //! to the child via the master fd.
+//!
+//! ## Quitting
+//!
+//! `Ctrl+Shift+<letter>` is not encodable over a legacy serial/xterm
+//! line, so quit uses the OpenSSH-style escape instead: at the start of
+//! a line, type `~.` to return to the emergency menu. The `~` is only
+//! honoured immediately after a newline; a mid-line `~` is an ordinary
+//! character, and `~~` sends a literal tilde.
 
 use std::os::fd::AsFd;
 use std::time::Duration;
@@ -43,7 +51,7 @@ use crate::error::{NmblError, Result};
 use crate::nmbl_warn;
 use crate::sys::pty::{PtyChild, spawn_shell};
 use crate::ui::POLL_SLICE;
-use crate::ui::console::Console;
+use crate::ui::console::{Console, ConsoleEvent};
 use crate::ui::view::{PtyShellScreenData, render_pty_shell};
 
 /// Minimum grid dimensions used by the pretty-shell box. The runtime
@@ -104,6 +112,33 @@ pub struct PtyShellState {
     pub child_exited: bool,
     pub cols: u16,
     pub rows: u16,
+    /// SSH-style `<newline>~.` quit-escape recogniser. Tracks where in
+    /// the input stream we are so a bare `~` only triggers when typed at
+    /// the start of a line, exactly like OpenSSH's `~.` escape.
+    escape: EscapeState,
+}
+
+/// State of the SSH-style `~.` escape recogniser. The escape char is
+/// only honoured immediately after a line break (or at session start),
+/// mirroring OpenSSH client behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeState {
+    /// At the start of a line — a `~` here arms the escape.
+    LineStart,
+    /// Mid-line — `~` is an ordinary character.
+    MidLine,
+    /// A line-leading `~` was seen; the next byte selects the command
+    /// (`.` quits, anything else is passed through).
+    Armed,
+}
+
+/// What the escape recogniser decided for a chunk of outgoing bytes.
+enum EscapeOutcome {
+    /// Forward these bytes to the child (may differ from the input when
+    /// an escape was partially consumed), then continue.
+    Forward(Vec<u8>),
+    /// `~.` was completed — quit the pretty shell.
+    Quit,
 }
 
 impl PtyShellState {
@@ -120,7 +155,17 @@ impl PtyShellState {
             child_exited: false,
             cols,
             rows,
+            // The shell prompt starts a fresh line, so a `~` typed as
+            // the very first keystroke arms the escape.
+            escape: EscapeState::LineStart,
         }
+    }
+
+    /// Run a chunk of outgoing bytes (the encoding of one keystroke)
+    /// through the SSH-style escape recogniser, updating the line-start
+    /// tracking and detecting the `~.` quit sequence.
+    fn process_escape(&mut self, bytes: &[u8]) -> EscapeOutcome {
+        run_escape(&mut self.escape, bytes)
     }
 
     /// Current scrollback offset (rows above the live tail). Zero means
@@ -164,7 +209,7 @@ pub fn run_pretty_shell(console: &mut dyn Console, config: &Config) -> Result<()
 
 /// Main loop. Render-then-poll-then-pump. Exits when the child is
 /// reaped and the master fd has been drained, or when the operator
-/// types the abort shortcut (Ctrl+Shift+Q).
+/// types the SSH-style `<newline>~.` quit escape.
 fn drive(state: &mut PtyShellState, console: &mut dyn Console) -> Result<()> {
     let mut dirty = true;
     loop {
@@ -173,15 +218,25 @@ fn drive(state: &mut PtyShellState, console: &mut dyn Console) -> Result<()> {
             dirty = false;
         }
 
-        // 1. Poll the keyboard with a short timeout so we get back to
-        //    pumping the PTY promptly.
-        let key = console.poll_key(POLL_SLICE)?;
-        if let Some(k) = key {
-            match handle_key(state, k)? {
+        // 1. Poll for one input event with a short timeout so we get
+        //    back to pumping the PTY promptly. We use `poll_event` (not
+        //    `poll_key`) so host-terminal resizes reach us: the default
+        //    `poll_key` adapter silently drops `ConsoleEvent::Resize`,
+        //    which would leave the shell box stuck at its old geometry.
+        match console.poll_event(POLL_SLICE)? {
+            Some(ConsoleEvent::Key(k)) => match handle_key(state, k)? {
                 KeyOutcome::Quit => return Ok(()),
                 KeyOutcome::Redraw => dirty = true,
                 KeyOutcome::Noop => {}
+            },
+            Some(ConsoleEvent::Resize { .. }) => {
+                // The backend has already cached the new size; re-derive
+                // the grid geometry and push it to the emulator + child.
+                if apply_resize(state, console) {
+                    dirty = true;
+                }
             }
+            None => {}
         }
 
         // 2. Drain whatever the child has produced this slice. Multiple
@@ -247,12 +302,21 @@ fn collect_visible_rows(state: &PtyShellState) -> Vec<String> {
     let grid = state.term.grid();
     let cols = grid.columns();
     let rows = grid.screen_lines();
+    // `Grid`'s `Index<Point>` ignores the scrollback `display_offset`:
+    // `Line(0)` is always the top of the *live* viewport regardless of
+    // how far the operator has scrolled back. To render the DISPLAYED
+    // region we shift every line up by the offset, so `display_offset =
+    // N` shows the screenful that starts `N` rows above the live tail.
+    // The shifted lines stay within `[topmost_line, bottommost_line]`
+    // because `scroll_display` clamps the offset to the history size.
+    let offset = grid.display_offset() as i32;
     let mut out: Vec<String> = Vec::with_capacity(rows);
     for row in 0..rows {
+        let line_idx = row as i32 - offset;
         let mut line = String::with_capacity(cols);
         for col in 0..cols {
             let point = alacritty_terminal::index::Point::new(
-                alacritty_terminal::index::Line(row as i32),
+                alacritty_terminal::index::Line(line_idx),
                 alacritty_terminal::index::Column(col),
             );
             let cell = &grid[point];
@@ -263,6 +327,45 @@ fn collect_visible_rows(state: &PtyShellState) -> Vec<String> {
         out.push(line);
     }
     out
+}
+
+/// Derive the pretty-shell grid geometry from the current console
+/// frame size, the same way [`run_pretty_shell`] does at startup.
+fn grid_size_from_console(console: &dyn Console) -> (u16, u16) {
+    let (frame_cols, frame_rows) = console.size();
+    let cols = frame_cols
+        .saturating_sub(CHROME_COLS)
+        .max(PRETTY_SHELL_MIN_COLS);
+    let rows = frame_rows
+        .saturating_sub(CHROME_ROWS)
+        .max(PRETTY_SHELL_MIN_ROWS);
+    (cols, rows)
+}
+
+/// React to a host-terminal resize: re-derive the grid geometry from
+/// the (already-updated) console size, resize the alacritty emulator
+/// grid, update the cached `state.cols`/`state.rows`, and push the new
+/// winsize down to the PTY so the child shell and any full-screen
+/// program running on it get `SIGWINCH`. Returns `true` when the grid
+/// actually changed (so the caller should repaint).
+fn apply_resize(state: &mut PtyShellState, console: &dyn Console) -> bool {
+    let (cols, rows) = grid_size_from_console(console);
+    if cols == state.cols && rows == state.rows {
+        return false;
+    }
+    let size = GridSize {
+        columns: cols as usize,
+        screen_lines: rows as usize,
+    };
+    state.term.resize(size);
+    state.cols = cols;
+    state.rows = rows;
+    // Best-effort: the in-process grid has already reflowed; a failure
+    // here only means the child keeps stale `$LINES`/`$COLUMNS`.
+    if let Err(e) = state.child.resize(cols, rows) {
+        nmbl_warn!("pretty-shell PTY winsize update to {cols}x{rows} failed: {e}");
+    }
+    true
 }
 
 /// Internal pump-error type so the driver loop can distinguish "child
@@ -349,9 +452,6 @@ fn handle_key(state: &mut PtyShellState, key: KeyEvent) -> Result<KeyOutcome> {
                 state.term.grid_mut().scroll_display(Scroll::Top);
                 return Ok(KeyOutcome::Redraw);
             }
-            KeyCode::Char('q') | KeyCode::Char('Q') => {
-                return Ok(KeyOutcome::Quit);
-            }
             _ => {}
         }
     }
@@ -366,10 +466,71 @@ fn handle_key(state: &mut PtyShellState, key: KeyEvent) -> Result<KeyOutcome> {
     if bytes.is_empty() {
         return Ok(KeyOutcome::Noop);
     }
-    write_to_pty(state, &bytes)?;
+    // Run the keystroke's bytes through the SSH-style `<newline>~.`
+    // quit recogniser before forwarding. A line-leading `~` is held
+    // back until the next byte decides whether it begins the `~.` quit
+    // command or is just a literal tilde.
+    match state.process_escape(&bytes) {
+        EscapeOutcome::Quit => return Ok(KeyOutcome::Quit),
+        EscapeOutcome::Forward(forward) => {
+            if !forward.is_empty() {
+                write_to_pty(state, &forward)?;
+            }
+        }
+    }
     // The terminal grid won't change until the shell echoes the byte
     // back; let the read pump trigger the next repaint.
     Ok(KeyOutcome::Noop)
+}
+
+/// Compute the escape line-state implied by having just sent byte `b`:
+/// a carriage return or newline puts us at the start of a fresh line
+/// (where a `~` arms the escape); any other byte is mid-line.
+fn next_line_state(b: u8) -> EscapeState {
+    if b == b'\r' || b == b'\n' {
+        EscapeState::LineStart
+    } else {
+        EscapeState::MidLine
+    }
+}
+
+/// Pure SSH-style `<newline>~.` recogniser over a byte chunk. Mutates
+/// `escape` in place and returns the bytes to forward (or `Quit`). Split
+/// out as a free function so it can be unit-tested without a live PTY.
+fn run_escape(escape: &mut EscapeState, bytes: &[u8]) -> EscapeOutcome {
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len().saturating_add(1));
+    for &b in bytes {
+        match *escape {
+            EscapeState::Armed => {
+                if b == b'.' {
+                    return EscapeOutcome::Quit;
+                }
+                if b == b'~' {
+                    // `~~` is the escape for a single literal tilde
+                    // (OpenSSH convention): emit one `~` and stay
+                    // mid-line so a following `.` is not a quit.
+                    out.push(b'~');
+                    *escape = EscapeState::MidLine;
+                } else {
+                    // Not an escape command: emit the deferred `~` then
+                    // the current byte, recomputing line state.
+                    out.push(b'~');
+                    out.push(b);
+                    *escape = next_line_state(b);
+                }
+            }
+            EscapeState::LineStart if b == b'~' => {
+                // Defer the `~`: don't forward it yet — it may be the
+                // start of an escape.
+                *escape = EscapeState::Armed;
+            }
+            _ => {
+                out.push(b);
+                *escape = next_line_state(b);
+            }
+        }
+    }
+    EscapeOutcome::Forward(out)
 }
 
 /// Write `bytes` to the master fd, retrying on partial writes. EAGAIN
@@ -533,5 +694,140 @@ mod tests {
         // German u-umlaut: U+00FC, UTF-8 0xC3 0xBC.
         let out = key_to_bytes(press_with(KeyCode::Char('ü'), KeyModifiers::NONE));
         assert_eq!(out, vec![0xC3, 0xBC]);
+    }
+
+    // --- SSH-style `<newline>~.` quit escape ------------------------
+
+    /// Helper: feed a byte stream through the escape recogniser starting
+    /// at the start of a line, returning either the forwarded bytes or a
+    /// `None` sentinel meaning "quit fired".
+    fn feed(bytes: &[u8]) -> Option<Vec<u8>> {
+        let mut st = EscapeState::LineStart;
+        match run_escape(&mut st, bytes) {
+            EscapeOutcome::Quit => None,
+            EscapeOutcome::Forward(v) => Some(v),
+        }
+    }
+
+    #[test]
+    fn escape_tilde_dot_at_line_start_quits() {
+        // The canonical sequence: line-leading `~` then `.`.
+        assert_eq!(feed(b"~."), None, "~. at line start must quit");
+    }
+
+    #[test]
+    fn escape_tilde_dot_after_newline_quits() {
+        // Type `ls\r`, then `~.`: the `\r` returns us to line start so
+        // the `~` arms again.
+        assert_eq!(feed(b"ls\r~."), None);
+    }
+
+    #[test]
+    fn escape_midline_tilde_is_literal() {
+        // A `~` that is NOT at the start of a line is an ordinary char,
+        // so `a~.` forwards verbatim and never quits.
+        assert_eq!(feed(b"a~."), Some(b"a~.".to_vec()));
+    }
+
+    #[test]
+    fn escape_tilde_then_other_forwards_both() {
+        // `~` armed, then `x` (not `.`/`~`): the deferred `~` and the `x`
+        // are both forwarded.
+        assert_eq!(feed(b"~x"), Some(b"~x".to_vec()));
+    }
+
+    #[test]
+    fn escape_double_tilde_is_single_literal() {
+        // `~~` at line start collapses to one literal `~` (OpenSSH
+        // convention) and does not quit on a trailing `.`.
+        assert_eq!(feed(b"~~."), Some(b"~.".to_vec()));
+    }
+
+    #[test]
+    fn escape_lone_tilde_is_held_back() {
+        // A line-leading `~` with nothing after it yet is deferred (not
+        // forwarded) — exactly like SSH waiting for the escape command.
+        assert_eq!(feed(b"~"), Some(Vec::new()));
+    }
+
+    // --- scrollback rendering / resize ------------------------------
+
+    /// Build a bare [`Term`] (no PTY) so the grid-snapshot and resize
+    /// helpers can be exercised without forking a shell.
+    fn term_with_lines(cols: u16, rows: u16, lines: &[&str]) -> Term<VoidListener> {
+        let size = GridSize {
+            columns: cols as usize,
+            screen_lines: rows as usize,
+        };
+        let mut term = Term::new(TermConfig::default(), &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        for line in lines {
+            parser.advance(&mut term, line.as_bytes());
+            parser.advance(&mut term, b"\r\n");
+        }
+        term
+    }
+
+    /// Collect the displayed rows directly off a `Term`, mirroring the
+    /// production `collect_visible_rows` shift-by-`display_offset` logic.
+    fn visible(term: &Term<VoidListener>) -> Vec<String> {
+        let grid = term.grid();
+        let cols = grid.columns();
+        let rows = grid.screen_lines();
+        let offset = grid.display_offset() as i32;
+        (0..rows)
+            .map(|row| {
+                let line_idx = row as i32 - offset;
+                (0..cols)
+                    .map(|col| {
+                        let p = alacritty_terminal::index::Point::new(
+                            alacritty_terminal::index::Line(line_idx),
+                            alacritty_terminal::index::Column(col),
+                        );
+                        let c = grid[p].c;
+                        if c == '\0' { ' ' } else { c }
+                    })
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collect_visible_rows_reflects_display_offset() {
+        // Push more lines than fit so there is scrollback history.
+        let lines: Vec<String> = (0..30).map(|i| format!("line{i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let term = term_with_lines(20, 6, &refs);
+
+        // Live tail: the most recent lines are visible, "line0" is gone.
+        let tail = visible(&term).join("\n");
+        assert!(!tail.contains("line0"), "live tail should not show line0");
+
+        // Scroll up several rows; older content must come into view that
+        // was NOT visible at the live tail.
+        let mut term = term;
+        term.grid_mut()
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(10));
+        assert!(term.grid().display_offset() > 0, "offset must be non-zero");
+        let scrolled = visible(&term).join("\n");
+        assert_ne!(
+            scrolled, tail,
+            "scrolled view must differ from the live tail"
+        );
+    }
+
+    #[test]
+    fn resize_updates_grid_dimensions() {
+        let term = term_with_lines(80, 24, &["hello"]);
+        assert_eq!(term.grid().columns(), 80);
+        assert_eq!(term.grid().screen_lines(), 24);
+
+        let mut term = term;
+        term.resize(GridSize {
+            columns: 100,
+            screen_lines: 30,
+        });
+        assert_eq!(term.grid().columns(), 100, "cols must track resize");
+        assert_eq!(term.grid().screen_lines(), 30, "rows must track resize");
     }
 }

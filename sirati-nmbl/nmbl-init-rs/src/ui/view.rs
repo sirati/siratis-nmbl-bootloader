@@ -752,7 +752,7 @@ pub fn render_pty_shell(frame: &mut Frame<'_>, data: &PtyShellScreenData<'_>) {
         hint.push_str(&format!("[scrolled {} lines]  ", data.scroll_offset));
     }
     hint.push_str(
-        "exit shell or Ctrl+Shift+Q to return to emergency  \
+        "exit shell or press Enter then ~. to return to emergency  \
          Ctrl+Shift+Up/Dn scroll",
     );
     render_footer(frame, footer, &hint);
