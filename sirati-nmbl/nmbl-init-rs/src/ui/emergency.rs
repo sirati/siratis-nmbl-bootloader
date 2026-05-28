@@ -78,10 +78,10 @@ pub fn run_emergency_screen_with_app(
     console: &mut dyn Console,
     app: &mut App<'_>,
 ) -> EmergencyChoice {
-    // Latch on first entry — subsequent calls find Some(_) and keep
-    // the original deadline. Re-entry after an elapsed deadline trips
-    // the "remaining = None" branch below and returns Reboot at once.
-    app.latch_error_countdown(EMERGENCY_TIMEOUT);
+    // The loop itself latches on first entry — subsequent calls find
+    // Some(_) and keep the original deadline. Re-entry after an
+    // elapsed deadline trips the "remaining = None" branch inside the
+    // loop and returns Reboot at once.
     drive_emergency_loop(app, EMERGENCY_TIMEOUT, Instant::now, console)
         .unwrap_or(EmergencyChoice::Reboot)
 }
@@ -177,10 +177,41 @@ fn drive_emergency_loop<N>(
 where
     N: Fn() -> Instant,
 {
-    let start = now();
-    let deadline = start.checked_add(timeout).unwrap_or(start);
-    let initial_secs = timeout.as_secs();
-    app.countdown_remaining_secs = Some(initial_secs);
+    // Latch on first entry — `latch_error_countdown` is a no-op when
+    // the deadline is already `Some(_)`, so re-entries after a modal
+    // dismissal preserve the original wall-clock deadline. A session
+    // in which the operator has already pressed a key has its
+    // deadline cleared (see the keypress branch below); on the next
+    // loop tick we observe `error_countdown_deadline == None` and
+    // the latch fires again — that is correct on first entry but
+    // wrong inside a still-running loop. The latch therefore lives
+    // here at function entry only.
+    app.latch_error_countdown(timeout);
+
+    // Mirror the deadline into the App's display field. Only set the
+    // displayed remaining-seconds if the deadline is armed; a session
+    // that the operator already touched has `error_countdown_deadline
+    // == None` and shows no countdown.
+    let initial_secs = match app.error_countdown_deadline {
+        Some(d) => match d.checked_duration_since(now()) {
+            Some(r) => {
+                let s = r.as_secs();
+                app.countdown_remaining_secs = Some(s);
+                s
+            }
+            None => {
+                // Deadline already in the past on entry — reboot
+                // immediately. Matches the spec's "past_instant" case.
+                return Ok(EmergencyChoice::Reboot);
+            }
+        },
+        None => {
+            // No deadline armed — the countdown UI stays hidden and
+            // the loop only exits on keypress.
+            app.countdown_remaining_secs = None;
+            0
+        }
+    };
     let mut last_reported = initial_secs;
 
     let mut dirty = true;
@@ -190,20 +221,28 @@ where
             dirty = false;
         }
 
-        let current = now();
-        let remaining = match deadline.checked_duration_since(current) {
-            Some(r) => r,
-            None => {
-                // Timer expired. Default to Reboot (the first item).
-                return Ok(EmergencyChoice::Reboot);
-            }
+        // Resolve the poll slice against the (possibly disarmed)
+        // deadline. With no deadline we poll on the unconditional
+        // slice and never time out.
+        let slice = match app.error_countdown_deadline {
+            Some(d) => match d.checked_duration_since(now()) {
+                Some(r) => r.min(POLL_SLICE),
+                None => {
+                    // Timer expired. Default to Reboot.
+                    return Ok(EmergencyChoice::Reboot);
+                }
+            },
+            None => POLL_SLICE,
         };
-        let slice = remaining.min(POLL_SLICE);
 
         if let Some(key) = console.poll_key(slice)? {
-            // Any keypress cancels the auto-reboot countdown so the
-            // operator can take their time deciding once present.
+            // Any keypress cancels the auto-reboot countdown for the
+            // remainder of this session: clear both the display field
+            // and the latched deadline so re-entries don't re-arm it
+            // and so the loop body above falls through to "no
+            // deadline" handling.
             app.countdown_remaining_secs = None;
+            app.error_countdown_deadline = None;
             if app.on_key(key) {
                 break;
             }
@@ -211,12 +250,11 @@ where
             continue;
         }
 
-        // No input this slice. Tick the countdown if the displayed
-        // second has changed. We only show the countdown until the
-        // first keypress.
-        if app.countdown_remaining_secs.is_some() {
-            let current = now();
-            let Some(remaining) = deadline.checked_duration_since(current) else {
+        // No input this slice. Tick the displayed countdown if the
+        // visible second has changed. Skipped when the deadline is
+        // disarmed (operator already touched the menu).
+        if let Some(d) = app.error_countdown_deadline {
+            let Some(remaining) = d.checked_duration_since(now()) else {
                 return Ok(EmergencyChoice::Reboot);
             };
             let secs = remaining.as_secs();
@@ -235,6 +273,7 @@ where
         }),
     }
 }
+
 
 #[cfg(test)]
 #[allow(
@@ -362,7 +401,7 @@ mod tests {
     #[test]
     fn drive_emergency_loop_keypress_cancels_countdown() {
         // Press 'r' immediately, before the timer matters. Choice must
-        // be Reboot and the countdown must have been cleared.
+        // be Reboot and BOTH countdown fields must have been cleared.
         let start = Instant::now();
         let frozen_now = move || start;
 
@@ -372,6 +411,211 @@ mod tests {
         let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
             .expect("loop must succeed");
         assert_eq!(outcome, EmergencyChoice::Reboot);
+        assert!(app.countdown_remaining_secs.is_none());
+        assert!(
+            app.error_countdown_deadline.is_none(),
+            "keypress must disarm the deadline latch"
+        );
+    }
+
+    #[test]
+    fn drive_emergency_loop_fresh_entry_latches_deadline_and_sets_countdown() {
+        // Fresh App: no deadline armed. After one render the latch
+        // must have fired and the displayed countdown must be set.
+        // We capture `t_before` BEFORE calling the loop so the
+        // injected clock sits strictly earlier than the (real)
+        // `Instant::now()` used inside `latch_error_countdown`; that
+        // guarantees `remaining >= 30s` and `as_secs() == 30`.
+        let t_before = Instant::now();
+        let frozen_now = move || t_before;
+
+        let mut app = build_emergency_app("boot failed", &default_items());
+        assert!(app.error_countdown_deadline.is_none());
+        // One render then commit Reboot so the loop exits cleanly.
+        let mut console = TestConsole::new(vec![None, Some(press(KeyCode::Char('r')))]);
+
+        let _ = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
+            .expect("loop must succeed");
+
+        assert!(
+            app.error_countdown_deadline.is_none(),
+            "the trailing keypress must have cleared the deadline again"
+        );
+        // The crucial check is that the loop COULD set both fields
+        // when starting from None. Verify by running a non-committing
+        // sequence and inspecting the App after the first render but
+        // before any keypress: drive a fresh entry with no events,
+        // letting the timeout fire.
+        let mut app2 = build_emergency_app("boot failed", &default_items());
+        let t_before2 = Instant::now();
+        // First call returns t_before2 (deadline still future), second
+        // call jumps far past the deadline so the loop exits Reboot.
+        let calls = Cell::new(0u32);
+        let staggered_now = || {
+            let n = calls.get();
+            calls.set(n.saturating_add(1));
+            if n < 2 { t_before2 } else { t_before2 + Duration::from_secs(120) }
+        };
+        let mut console2 = TestConsole::new(vec![None]);
+        let outcome =
+            drive_emergency_loop(&mut app2, EMERGENCY_TIMEOUT, staggered_now, &mut console2)
+                .expect("loop must succeed");
+        assert_eq!(outcome, EmergencyChoice::Reboot);
+        // Deadline was latched before the loop body ticked. It stays
+        // Some(_) on the timeout path (no keypress cleared it).
+        assert!(
+            app2.error_countdown_deadline.is_some(),
+            "fresh entry must latch the deadline"
+        );
+        assert_eq!(
+            app2.countdown_remaining_secs,
+            Some(EMERGENCY_TIMEOUT.as_secs()),
+            "fresh entry must display the full timeout"
+        );
+    }
+
+    #[test]
+    fn drive_emergency_loop_preserves_existing_future_deadline() {
+        // Pre-arm a deadline 45s in the future. Latch must be a no-op
+        // and the original deadline must survive the loop. We commit
+        // Reboot via 'r' on the first event so the keypress branch
+        // clears the deadline — to test PRESERVATION we therefore
+        // sample the deadline before the keypress by running a
+        // non-committing tick first (None → tick → 'r').
+        let preset_now = Instant::now();
+        let preset_deadline = preset_now + Duration::from_secs(45);
+        let frozen_now = move || preset_now;
+
+        let mut app = build_emergency_app("boot failed", &default_items());
+        app.error_countdown_deadline = Some(preset_deadline);
+
+        // Capture state after the first non-committing tick using a
+        // probe console that reads the App between calls.
+        struct ProbeConsole {
+            renders: u32,
+            captured_deadline: Cell<Option<Instant>>,
+            captured_secs: Cell<Option<u64>>,
+        }
+        impl Console for ProbeConsole {
+            fn render(&mut self, app: &App<'_>) -> Result<()> {
+                if self.renders == 0 {
+                    self.captured_deadline.set(app.error_countdown_deadline);
+                    self.captured_secs.set(app.countdown_remaining_secs);
+                }
+                self.renders = self.renders.saturating_add(1);
+                Ok(())
+            }
+            fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+                // Capture happened during the single render before
+                // this first poll; commit Reboot now so the loop
+                // exits cleanly (with the frozen clock the countdown
+                // never ticks, so no second render would otherwise
+                // ever fire and the loop would spin forever).
+                Ok(Some(press(KeyCode::Char('r'))))
+            }
+            fn size(&self) -> (u16, u16) {
+                (80, 24)
+            }
+            fn kind(&self) -> ConsoleKind {
+                ConsoleKind::Tty
+            }
+            fn draw_with(
+                &mut self,
+                _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn suspend(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn resume(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let mut console = ProbeConsole {
+            renders: 0,
+            captured_deadline: Cell::new(None),
+            captured_secs: Cell::new(None),
+        };
+
+        let _ = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
+            .expect("loop must succeed");
+
+        assert_eq!(
+            console.captured_deadline.get(),
+            Some(preset_deadline),
+            "existing future deadline must be preserved verbatim"
+        );
+        assert_eq!(
+            console.captured_secs.get(),
+            Some(45),
+            "countdown display must reflect the preserved deadline"
+        );
+    }
+
+    #[test]
+    fn drive_emergency_loop_past_deadline_reboots_immediately() {
+        // Pre-arm a deadline in the past. The loop must return Reboot
+        // before consuming any input.
+        let preset_now = Instant::now();
+        let past = preset_now - Duration::from_secs(10);
+        let frozen_now = move || preset_now;
+
+        let mut app = build_emergency_app("boot failed", &default_items());
+        app.error_countdown_deadline = Some(past);
+
+        // No events scripted: if the loop tried to poll, it would
+        // get None forever and spin (the test would hang). We rely
+        // on the early-return guard.
+        let mut console = TestConsole::new(vec![]);
+
+        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
+            .expect("loop must succeed");
+        assert_eq!(outcome, EmergencyChoice::Reboot);
+        // Deadline preserved (the keypress branch never fired).
+        assert_eq!(app.error_countdown_deadline, Some(past));
+    }
+
+    #[test]
+    fn drive_emergency_loop_keypress_disarms_deadline_for_session() {
+        // Non-committing keypress (Down) followed by a timeout's
+        // worth of empty polls. Bug A regression: the original code
+        // hid the display but the local Instant deadline still
+        // fired. After the fix, ANY keypress disarms the deadline
+        // and subsequent empty polls must NOT reboot.
+        let start = Instant::now();
+        // The injected clock progresses way past the original 30s
+        // deadline after the first call. If the deadline were still
+        // armed, the second iteration would return Reboot. After
+        // the fix, the deadline is None and we keep looping.
+        let calls = Cell::new(0u32);
+        let staggered_now = || {
+            let n = calls.get();
+            calls.set(n.saturating_add(1));
+            if n < 2 { start } else { start + Duration::from_secs(120) }
+        };
+
+        let mut app = build_emergency_app("boot failed", &default_items());
+        // Sequence: Down (non-committing, disarms), then a few Nones
+        // (loop must NOT reboot), then 'r' to exit cleanly.
+        let mut console = TestConsole::new(vec![
+            Some(press(KeyCode::Down)),
+            None,
+            None,
+            None,
+            Some(press(KeyCode::Char('r'))),
+        ]);
+
+        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, staggered_now, &mut console)
+            .expect("loop must succeed");
+        // Outcome is Reboot only because we explicitly pressed 'r',
+        // NOT because the timer fired. The deadline was disarmed by
+        // the earlier Down keypress and never re-armed.
+        assert_eq!(outcome, EmergencyChoice::Reboot);
+        assert!(
+            app.error_countdown_deadline.is_none(),
+            "deadline must remain None after a non-committing keypress"
+        );
         assert!(app.countdown_remaining_secs.is_none());
     }
 
