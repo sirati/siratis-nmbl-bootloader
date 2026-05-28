@@ -559,10 +559,10 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
         fn render(&mut self, _app: &crate::ui::app::App<'_>) -> Result<()> {
             Ok(())
         }
-        fn poll_key(
+        fn poll_event(
             &mut self,
             _timeout: Duration,
-        ) -> Result<Option<crossterm::event::KeyEvent>> {
+        ) -> Result<Option<crate::ui::console::ConsoleEvent>> {
             Ok(None)
         }
         fn size(&self) -> (u16, u16) {

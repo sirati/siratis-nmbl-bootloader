@@ -287,14 +287,14 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::cell::Cell;
 
-    use crate::ui::console::ConsoleKind;
+    use crate::ui::console::{ConsoleEvent, ConsoleKind};
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     /// In-process [`Console`] for unit-testing the emergency loop.
-    /// Drives a scripted sequence of key events on `poll_key()` and
+    /// Drives a scripted sequence of key events on `poll_event()` and
     /// counts renders.
     struct TestConsole {
         events: Vec<Option<KeyEvent>>,
@@ -317,10 +317,10 @@ mod tests {
             self.renders = self.renders.saturating_add(1);
             Ok(())
         }
-        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
             let v = self.events.get(self.cursor).copied().flatten();
             self.cursor = self.cursor.saturating_add(1);
-            Ok(v)
+            Ok(v.map(ConsoleEvent::Key))
         }
         fn size(&self) -> (u16, u16) {
             (80, 24)
@@ -505,13 +505,13 @@ mod tests {
                 self.renders = self.renders.saturating_add(1);
                 Ok(())
             }
-            fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+            fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
                 // Capture happened during the single render before
                 // this first poll; commit Reboot now so the loop
                 // exits cleanly (with the frozen clock the countdown
                 // never ticks, so no second render would otherwise
                 // ever fire and the loop would spin forever).
-                Ok(Some(press(KeyCode::Char('r'))))
+                Ok(Some(ConsoleEvent::Key(press(KeyCode::Char('r')))))
             }
             fn size(&self) -> (u16, u16) {
                 (80, 24)
@@ -631,7 +631,7 @@ mod tests {
                     source: std::io::Error::other("backend dead"),
                 })
             }
-            fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
+            fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
                 Ok(None)
             }
             fn size(&self) -> (u16, u16) {

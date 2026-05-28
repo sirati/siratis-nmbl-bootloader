@@ -14,8 +14,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crossterm::event::KeyEvent;
-
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::log;
@@ -28,7 +26,7 @@ use crate::splash::scale;
 use crate::splash::types::CellDims;
 use crate::ui::POLL_SLICE;
 use crate::ui::app::App;
-use crate::ui::console::{Console, ConsoleKind};
+use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
 use crate::ui::{render_splash_frame, render_splash_frame_with};
 
 /// Tty node opened for raw-mode keyboard input alongside the DRM
@@ -134,14 +132,18 @@ impl Console for SplashConsole {
         )
     }
 
-    fn poll_key(&mut self, timeout: Duration) -> Result<Option<KeyEvent>> {
+    fn poll_event(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>> {
         // Cap the effective wait the same way [`TtyConsole`] does so
         // backends are uniformly responsive to ticking countdowns and
         // spinner animations. The caller-supplied timeout is honoured
         // but never longer than POLL_SLICE per call; the trait doc
         // pins this contract for both backends.
+        //
+        // The splash framebuffer has a fixed cell grid derived at
+        // bring-up from the DRM mode, so this backend never emits
+        // resize events — only keys.
         let slice = timeout.min(POLL_SLICE);
-        self.input.poll(slice)
+        Ok(self.input.poll(slice)?.map(ConsoleEvent::Key))
     }
 
     fn size(&self) -> (u16, u16) {
