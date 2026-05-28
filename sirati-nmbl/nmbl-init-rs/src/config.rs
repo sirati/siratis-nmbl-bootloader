@@ -102,8 +102,14 @@ pub struct General {
     #[serde(default = "default_panic_report_dir")]
     pub panic_report_dir: PathBuf,
 
-    #[serde(default)]
-    pub serial_console: bool,
+    /// Legacy toggle: kept as a no-op field so existing configs that
+    /// still set `serial_console = true/false` parse successfully under
+    /// `deny_unknown_fields`. The TUI now renders through ratatui's
+    /// crossterm backend on every console kind (framebuffer VT,
+    /// `/dev/tty1`, serial UART) — vt100/xterm escapes round-trip over
+    /// any modern serial terminal. No code path branches on this flag.
+    #[serde(default, rename = "serial_console")]
+    pub _serial_console_compat: bool,
 }
 
 impl Default for General {
@@ -113,7 +119,7 @@ impl Default for General {
             timeout_secs: default_timeout_secs(),
             device_timeout_secs: default_device_timeout_secs(),
             panic_report_dir: default_panic_report_dir(),
-            serial_console: false,
+            _serial_console_compat: false,
         }
     }
 }

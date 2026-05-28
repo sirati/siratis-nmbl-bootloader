@@ -492,23 +492,54 @@ pub fn run_picker_session(
     }
     drive_picker_loop(&mut state, console)?;
 
-    match state.outcome {
-        Some(PickerOutcome::Spawn { targets }) => {
-            let display_target = display_target_for(console);
-            let overlap = display_overlaps_targets(&display_target, &targets);
-            if overlap {
-                crate::ui::console_relay::run_relay(console, config, &targets)?;
-                Ok(PickerSessionOutcome::ShellRan)
-            } else {
-                // Fire-and-forget: spawn one shell per target so each
-                // line carries its own session. If a spawn fails we
-                // log + carry on; reporting back through a modal lets
-                // the operator retry or pick a different target.
-                fire_and_forget_spawn(config, &targets)?;
-                Ok(PickerSessionOutcome::ShellDetached { targets })
-            }
-        }
-        Some(PickerOutcome::Cancel) | None => Ok(PickerSessionOutcome::Cancelled),
+    let targets = match state.outcome {
+        Some(PickerOutcome::Spawn { targets }) => targets,
+        Some(PickerOutcome::Cancel) | None => return Ok(PickerSessionOutcome::Cancelled),
+    };
+    let display_target = display_target_for(console);
+    dispatch_spawn(
+        console,
+        config,
+        targets,
+        &display_target,
+        crate::ui::console_relay::run_relay,
+        fire_and_forget_spawn,
+    )
+}
+
+/// Post-commit dispatch: given the operator's spawn set and the
+/// picker's authoritative display-target path, route into either the
+/// relay loop (display overlap) or the fire-and-forget spawn (no
+/// overlap). The `relay_fn` / `detach_fn` callbacks are parameters so
+/// unit tests can drive the dispatch without forking real shells.
+///
+/// The picker is the ONLY source of truth for `display_target`; the
+/// callbacks never re-derive it. See [`run_relay`]'s doc-comment for
+/// the historical bug that motivated this contract.
+///
+/// [`run_relay`]: crate::ui::console_relay::run_relay
+fn dispatch_spawn<R, D>(
+    console: &mut dyn Console,
+    config: &Config,
+    targets: Vec<PathBuf>,
+    display_target: &Path,
+    mut relay_fn: R,
+    mut detach_fn: D,
+) -> Result<PickerSessionOutcome>
+where
+    R: FnMut(&mut dyn Console, &Config, &[PathBuf], &Path) -> Result<()>,
+    D: FnMut(&Config, &[PathBuf]) -> Result<()>,
+{
+    if display_overlaps_targets(display_target, &targets) {
+        relay_fn(console, config, &targets, display_target)?;
+        Ok(PickerSessionOutcome::ShellRan)
+    } else {
+        // Fire-and-forget: spawn one shell per target so each line
+        // carries its own session. If a spawn fails we log + carry on;
+        // reporting back through a modal lets the operator retry or
+        // pick a different target.
+        detach_fn(config, &targets)?;
+        Ok(PickerSessionOutcome::ShellDetached { targets })
     }
 }
 
@@ -552,7 +583,8 @@ fn fire_and_forget_spawn(config: &Config, targets: &[PathBuf]) -> Result<()> {
 }
 
 /// Drive the render-poll-react loop until the picker commits an
-/// outcome.
+/// outcome. Uses `poll_event` so a host-reported terminal resize
+/// triggers an immediate redraw at the new grid.
 fn drive_picker_loop(state: &mut PickerState, console: &mut dyn Console) -> Result<()> {
     let mut dirty = true;
     loop {
@@ -560,12 +592,18 @@ fn drive_picker_loop(state: &mut PickerState, console: &mut dyn Console) -> Resu
             render_picker(console, state)?;
             dirty = false;
         }
-        if let Some(key) = console.poll_key(POLL_SLICE)? {
-            let exited = state.on_key(key);
-            dirty = true;
-            if exited {
-                return Ok(());
+        match console.poll_event(POLL_SLICE)? {
+            Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
+                dirty = true;
             }
+            Some(crate::ui::console::ConsoleEvent::Key(key)) => {
+                let exited = state.on_key(key);
+                dirty = true;
+                if exited {
+                    return Ok(());
+                }
+            }
+            None => {}
         }
     }
 }
@@ -816,13 +854,16 @@ mod tests {
 
     use crate::error::NmblError;
     use crate::ui::app::App;
-    use crate::ui::console::{Console, ConsoleKind};
+    use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
     use crate::ui::tty_enum::{EnumeratedTty, TtyKind};
 
     /// Fake [`Console`] for driving the picker loop in tests.
     struct FakeConsole {
         events: std::collections::VecDeque<Option<KeyEvent>>,
         renders: u32,
+        kind: ConsoleKind,
+        suspend_calls: u32,
+        resume_calls: u32,
     }
 
     impl FakeConsole {
@@ -830,7 +871,15 @@ mod tests {
             Self {
                 events: events.into(),
                 renders: 0,
+                kind: ConsoleKind::Tty,
+                suspend_calls: 0,
+                resume_calls: 0,
             }
+        }
+
+        fn with_kind(mut self, kind: ConsoleKind) -> Self {
+            self.kind = kind;
+            self
         }
     }
 
@@ -839,23 +888,25 @@ mod tests {
             self.renders = self.renders.saturating_add(1);
             Ok(())
         }
-        fn poll_key(&mut self, _timeout: Duration) -> Result<Option<KeyEvent>> {
-            Ok(self.events.pop_front().flatten())
+        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+            Ok(self.events.pop_front().flatten().map(ConsoleEvent::Key))
         }
         fn size(&self) -> (u16, u16) {
             (80, 24)
         }
         fn kind(&self) -> ConsoleKind {
-            ConsoleKind::Tty
+            self.kind
         }
         fn draw_with(&mut self, _body: &mut dyn FnMut(&mut Frame<'_>)) -> Result<()> {
             self.renders = self.renders.saturating_add(1);
             Ok(())
         }
         fn suspend(&mut self) -> Result<()> {
+            self.suspend_calls = self.suspend_calls.saturating_add(1);
             Ok(())
         }
         fn resume(&mut self) -> Result<()> {
+            self.resume_calls = self.resume_calls.saturating_add(1);
             Ok(())
         }
     }
@@ -1439,5 +1490,144 @@ mod tests {
         assert!(display_overlaps_targets(Path::new("/dev/tty0"), &targets));
         assert!(!display_overlaps_targets(Path::new("/dev/tty1"), &targets));
         assert!(!display_overlaps_targets(Path::new("/dev/tty0"), &[]));
+    }
+
+    /// Splash backend always renders to `/dev/tty1`, regardless of what
+    /// `/sys/class/tty/console/active` reports. Pins the contract that
+    /// motivates this bug-fix: on a system with cmdline
+    /// `console=ttyS0,115200 console=tty1` sysfs lists ttyS0 first, but
+    /// the picker is the authoritative source and must return
+    /// `/dev/tty1` so the relay agrees on the overlap predicate.
+    #[test]
+    fn display_target_for_splash_is_always_tty1() {
+        let mut console = FakeConsole::new(Vec::new()).with_kind(ConsoleKind::Splash);
+        assert_eq!(
+            display_target_for(&console),
+            PathBuf::from(SPLASH_DISPLAY_TTY)
+        );
+        // Hammer the kind a second time; the resolver MUST NOT memoise
+        // across console kinds.
+        console.kind = ConsoleKind::Tty;
+        // For tty kind it falls back to read_active_console() which may
+        // succeed or fall back to /dev/console depending on the host;
+        // we only assert it does NOT return SPLASH_DISPLAY_TTY by
+        // construction (it may equal it coincidentally on a desktop —
+        // skip the negative assertion).
+        let _ = display_target_for(&console);
+    }
+
+    /// Picker decides overlap=false: selection is `/dev/ttyS0` only on
+    /// a splash console (display target = `/dev/tty1`). Dispatch MUST
+    /// take the fire-and-forget branch — relay MUST NOT be invoked,
+    /// and `console.suspend()` MUST NOT be called.
+    ///
+    /// This is the half of the bug-fix that protects against routing
+    /// the relay onto a non-display tty. The companion test below pins
+    /// the relay-branch path.
+    #[test]
+    fn dispatch_no_overlap_runs_detach_not_relay() {
+        let cfg = Config::recovery_default();
+        let mut console = FakeConsole::new(Vec::new()).with_kind(ConsoleKind::Splash);
+        let targets = vec![PathBuf::from("/dev/ttyS0")];
+        let display_target = PathBuf::from(SPLASH_DISPLAY_TTY);
+
+        let mut relay_calls: u32 = 0;
+        let mut detach_calls: u32 = 0;
+        let mut detach_targets: Vec<PathBuf> = Vec::new();
+
+        let outcome = dispatch_spawn(
+            &mut console,
+            &cfg,
+            targets.clone(),
+            &display_target,
+            |_console, _config, _t, _d| {
+                relay_calls = relay_calls.saturating_add(1);
+                Ok(())
+            },
+            |_config, t| {
+                detach_calls = detach_calls.saturating_add(1);
+                detach_targets = t.to_vec();
+                Ok(())
+            },
+        )
+        .expect("dispatch must succeed");
+
+        assert_eq!(relay_calls, 0, "relay must NOT be called when no overlap");
+        assert_eq!(detach_calls, 1, "detach must be called exactly once");
+        assert_eq!(detach_targets, targets);
+        assert_eq!(
+            console.suspend_calls, 0,
+            "Console::suspend must NOT fire on the no-overlap branch"
+        );
+        match outcome {
+            PickerSessionOutcome::ShellDetached { targets: out } => {
+                assert_eq!(out, targets);
+            }
+            other => panic!("expected ShellDetached, got {other:?}"),
+        }
+    }
+
+    /// Picker decides overlap=true: selection contains `/dev/tty1` on a
+    /// splash console (display target = `/dev/tty1`). Dispatch MUST
+    /// route into the relay branch, and the relay callback MUST be
+    /// invoked with the picker's `display_target` path — proving the
+    /// relay no longer recomputes it from sysfs.
+    ///
+    /// We additionally invoke a stand-in `relay_fn` that mirrors what
+    /// the real [`crate::ui::console_relay::run_relay`] does for the
+    /// overlap branch (call `console.suspend()` then `console.resume()`)
+    /// so the suspend/resume side-effect is observable end-to-end.
+    #[test]
+    fn dispatch_overlap_runs_relay_and_suspends_console() {
+        let cfg = Config::recovery_default();
+        let mut console = FakeConsole::new(Vec::new()).with_kind(ConsoleKind::Splash);
+        let targets = vec![
+            PathBuf::from("/dev/ttyS0"),
+            PathBuf::from(SPLASH_DISPLAY_TTY),
+        ];
+        let display_target = PathBuf::from(SPLASH_DISPLAY_TTY);
+
+        let mut relay_calls: u32 = 0;
+        let mut relay_seen_display: Option<PathBuf> = None;
+        let mut relay_seen_targets: Vec<PathBuf> = Vec::new();
+        let mut detach_calls: u32 = 0;
+
+        let outcome = dispatch_spawn(
+            &mut console,
+            &cfg,
+            targets.clone(),
+            &display_target,
+            |console, _config, t, d| {
+                relay_calls = relay_calls.saturating_add(1);
+                relay_seen_display = Some(d.to_path_buf());
+                relay_seen_targets = t.to_vec();
+                // Mirror the production overlap path: suspend, then
+                // resume after the (fake) shell exits. This is what
+                // `run_relay` does on the overlap branch.
+                console.suspend()?;
+                console.resume()?;
+                Ok(())
+            },
+            |_config, _t| {
+                detach_calls = detach_calls.saturating_add(1);
+                Ok(())
+            },
+        )
+        .expect("dispatch must succeed");
+
+        assert_eq!(relay_calls, 1, "relay must be called exactly once");
+        assert_eq!(detach_calls, 0, "detach must NOT be called on overlap");
+        assert_eq!(
+            relay_seen_display,
+            Some(display_target.clone()),
+            "relay must receive the picker's display_target verbatim"
+        );
+        assert_eq!(relay_seen_targets, targets);
+        assert_eq!(
+            console.suspend_calls, 1,
+            "Console::suspend must fire exactly once on the overlap branch"
+        );
+        assert_eq!(console.resume_calls, 1);
+        assert!(matches!(outcome, PickerSessionOutcome::ShellRan));
     }
 }

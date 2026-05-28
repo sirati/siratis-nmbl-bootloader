@@ -37,7 +37,7 @@ use ratatui::widgets::{Block, Gauge, Paragraph, Wrap};
 use crate::error::{NmblError, Result};
 use crate::rescue::net::{DownloadStatus, HashConfirmation, RescueSource, RescueUi};
 use crate::ui::POLL_SLICE;
-use crate::ui::console::Console;
+use crate::ui::console::{Console, ConsoleEvent};
 
 /// Throttle progress repaints so a multi-megabyte download doesn't
 /// burn the serial line at gigabyte-per-second redraw rates.
@@ -154,8 +154,13 @@ fn run_pick_source(
             console.draw_with(&mut |f| render_pick_source(f, disk_reason, highlight))?;
             dirty = false;
         }
-        let Some(key) = console.poll_key(POLL_SLICE)? else {
-            continue;
+        let key = match console.poll_event(POLL_SLICE)? {
+            Some(ConsoleEvent::Resize { .. }) => {
+                dirty = true;
+                continue;
+            }
+            Some(ConsoleEvent::Key(k)) => k,
+            None => continue,
         };
         if key.kind != KeyEventKind::Press {
             continue;
@@ -264,8 +269,13 @@ fn run_prompt_url(
             console.draw_with(&mut |f| render_prompt_url(f, &snapshot_buf, snapshot_cursor))?;
             dirty = false;
         }
-        let Some(key) = console.poll_key(POLL_SLICE)? else {
-            continue;
+        let key = match console.poll_event(POLL_SLICE)? {
+            Some(ConsoleEvent::Resize { .. }) => {
+                dirty = true;
+                continue;
+            }
+            Some(ConsoleEvent::Key(k)) => k,
+            None => continue,
         };
         if key.kind != KeyEventKind::Press {
             continue;
@@ -520,8 +530,13 @@ fn run_confirm_hash(
         console.draw_with(&mut |f| {
             render_confirm_hash(f, computed_hex, &snapshot_expected, snapshot_cursor);
         })?;
-        let Some(key) = console.poll_key(POLL_SLICE)? else {
-            continue;
+        let key = match console.poll_event(POLL_SLICE)? {
+            // A `dirty` flag is unnecessary here because every loop
+            // iteration already repaints from the latest state — just
+            // re-iterate so the new size lands in `console.size()`
+            // before the next paint reads it.
+            Some(ConsoleEvent::Resize { .. }) | None => continue,
+            Some(ConsoleEvent::Key(k)) => k,
         };
         if let Some(outcome) = handle_hash_key(key, &mut state, computed_hex) {
             return Ok((outcome, state.cursor));

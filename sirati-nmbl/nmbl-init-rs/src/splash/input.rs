@@ -2,39 +2,41 @@
 //!
 //! The splash renders to a DRM framebuffer (typically `/dev/dri/card0`)
 //! while the kernel's `console=` directive may point stdin at a serial
-//! line — so crossterm's `event::poll`, which reads stdin, never sees
-//! the operator's keypresses. This module opens `/dev/tty0` directly,
-//! puts it in raw mode, and synthesises [`crossterm::event::KeyEvent`]s
-//! by parsing the VT escape sequences the kernel's keyboard driver
-//! emits.
+//! line. This module opens `/dev/tty0` directly, puts it in raw mode,
+//! and synthesises [`crossterm::event::KeyEvent`]s by feeding the raw
+//! byte stream into [`TermwizToCrossterm`] (a thin translator over
+//! `termwiz::input::InputParser`).
 //!
 //! Bytes come in via `rustix::event::poll` + `rustix::io::read` so no
-//! new `unsafe` is introduced. The parser is split out as a pure
-//! function ([`parse_event`]) so it is exercised by unit tests without
-//! requiring a real tty fd.
+//! new `unsafe` is introduced; the byte parser itself lives in
+//! [`crate::ui::console::parser`] so the tty and splash backends share
+//! one parsing path (and one translation surface to crossterm's key
+//! types — see the module docs for the rationale on keeping
+//! crossterm as a leaf data-type dependency).
 //!
-//! Recognised sequences (covers what the boot menu binds):
-//! - Arrow keys, Home, End, Delete via the standard CSI forms.
-//! - Plain Enter (CR/LF), Tab, Backspace (0x7f), Esc.
-//! - Printable ASCII as `KeyCode::Char(c)`.
-//! - C0 controls 0x01..=0x1a (minus the named ones above) as
-//!   `KeyCode::Char((b | 0x60) as char)` with `CONTROL`.
+//! Recognised key set is whatever termwiz's `InputParser` produces;
+//! [`TermwizToCrossterm`] maps it onto the subset of
+//! [`crossterm::event::KeyCode`] the App state machine matches
+//! against.
 //!
-//! A bare `0x1b` is ambiguous (Esc vs. the lead byte of a CSI). The
+//! Bare `0x1b` is ambiguous (Esc vs. the lead byte of a CSI). The
 //! poller resolves this by re-polling for ~10 ms; if nothing follows,
-//! the byte was Esc.
+//! we commit the parser with `maybe_more = false` so termwiz emits
+//! `KeyCode::Escape`.
 
+use std::collections::VecDeque;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::termios::Termios;
 
 use crate::error::{NmblError, Result};
 use crate::nmbl_warn;
 use crate::sys::tty::{enter_raw, open_console, restore_termios};
+use crate::ui::console::parser::TermwizToCrossterm;
 
 /// Short follow-up wait used to disambiguate a bare Esc from the start
 /// of a CSI sequence. 10 ms is comfortably above any realistic inter-
@@ -54,6 +56,15 @@ const ESC_FOLLOWUP_MS: i32 = 10;
 pub struct SplashInput {
     fd: OwnedFd,
     saved_termios: Option<Termios>,
+    /// Termwiz-backed byte parser → crossterm `KeyEvent` translator.
+    /// Same path the tty backend uses; we don't need a CSI 8t resize
+    /// pre-filter here because the splash grid is fixed by the DRM
+    /// mode (the framebuffer doesn't resize at runtime).
+    parser: TermwizToCrossterm,
+    /// Keys emitted by `parser` but not yet returned to the caller.
+    /// `poll` pops one per call, mirroring the original 1-event-per-
+    /// poll contract.
+    pending: VecDeque<KeyEvent>,
 }
 
 impl SplashInput {
@@ -83,6 +94,8 @@ impl SplashInput {
         Ok(SplashInput {
             fd,
             saved_termios: Some(saved),
+            parser: TermwizToCrossterm::new(),
+            pending: VecDeque::new(),
         })
     }
 
@@ -124,27 +137,53 @@ impl SplashInput {
     /// follow-up poll to disambiguate a bare Esc from a CSI prefix.
     /// The `timeout` budgets only the *initial* wait for the first byte.
     pub fn poll(&mut self, timeout: Duration) -> Result<Option<KeyEvent>> {
-        let mut buf = [0u8; 16];
+        // Serve anything already classified from a previous call.
+        if let Some(k) = self.pending.pop_front() {
+            return Ok(Some(k));
+        }
+
+        let mut buf = [0u8; 64];
         let n = poll_read(self.fd.as_fd(), &mut buf, duration_to_ms(timeout))?;
         if n == 0 {
-            return Ok(None);
+            // Nothing arrived. Flush termwiz so any dangling ESC
+            // commits as a real Esc on the next call.
+            let mut out = Vec::new();
+            self.parser.feed(&[], /*maybe_more=*/ false, &mut out);
+            for k in out {
+                self.pending.push_back(k);
+            }
+            return Ok(self.pending.pop_front());
         }
+
+        let mut maybe_more = false;
 
         // Bare Esc disambiguation: if the first byte is 0x1b and that
         // was the only byte, give the kernel ~10 ms to deliver the
         // rest of a CSI; if nothing arrives, it's a real Esc.
-        if n == 1 && buf.first() == Some(&0x1b) {
+        let total = if n == 1 && buf.first() == Some(&0x1b) {
             let tail = buf.get_mut(1..).unwrap_or(&mut []);
             let extra = poll_read(self.fd.as_fd(), tail, ESC_FOLLOWUP_MS)?;
             if extra == 0 {
-                return Ok(Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+                // Treat as a final byte for termwiz so it commits Esc.
+                n
+            } else {
+                maybe_more = false;
+                n.saturating_add(extra)
             }
-            let total = n.saturating_add(extra);
-            let slice = buf.get(..total).unwrap_or(&[]);
-            return Ok(parse_event(slice).0);
-        }
+        } else {
+            // Plain reads — termwiz needs to know more bytes might
+            // arrive so it doesn't prematurely commit a dangling ESC.
+            maybe_more = false;
+            n
+        };
 
-        Ok(parse_event(buf.get(..n).unwrap_or(&[])).0)
+        let slice = buf.get(..total).unwrap_or(&[]);
+        let mut out = Vec::new();
+        self.parser.feed(slice, maybe_more, &mut out);
+        for k in out {
+            self.pending.push_back(k);
+        }
+        Ok(self.pending.pop_front())
     }
 }
 
@@ -289,167 +328,11 @@ fn errno_to_tui(e: rustix::io::Errno) -> NmblError {
     }
 }
 
-/// Parse a VT byte stream into the first complete key event.
-///
-/// Returns `(Some(event), consumed_bytes)` when a full sequence is
-/// recognised, or `(None, n)` to skip `n` bytes the parser could not
-/// classify (so callers can advance and re-try on the next chunk).
-///
-/// This function is intentionally pure: it has no fd or syscall
-/// dependencies and is unit-tested on canned byte sequences.
-pub(crate) fn parse_event(bytes: &[u8]) -> (Option<KeyEvent>, usize) {
-    let Some(&first) = bytes.first() else {
-        return (None, 0);
-    };
+// The byte parser and its unit tests now live in
+// `crate::ui::console::parser` (`TermwizToCrossterm`) so the tty and
+// splash backends share one parsing path. See that module for the
+// state machine and the canned-input tests.
 
-    match first {
-        0x1b => parse_escape(bytes),
-        0x0d | 0x0a => (Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), 1),
-        0x7f | 0x08 => (
-            Some(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
-            1,
-        ),
-        0x09 => (Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)), 1),
-        0x20..=0x7e => (
-            Some(KeyEvent::new(
-                KeyCode::Char(first as char),
-                KeyModifiers::NONE,
-            )),
-            1,
-        ),
-        0x01..=0x1a => {
-            // Ctrl+letter. 0x01 = Ctrl-A, 0x02 = Ctrl-B, …
-            let letter = (first | 0x60) as char;
-            (
-                Some(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::CONTROL)),
-                1,
-            )
-        }
-        _ => (None, 1),
-    }
-}
-
-/// Parse a byte sequence that begins with `0x1b`. Caller has already
-/// matched the lead byte.
-fn parse_escape(bytes: &[u8]) -> (Option<KeyEvent>, usize) {
-    // `bytes[0] == 0x1b`. We need at least 0x1b 0x5b X for any of the
-    // CSI forms; a bare Esc is handled by the poll layer.
-    let Some(&b1) = bytes.get(1) else {
-        return (None, 1);
-    };
-    if b1 != b'[' {
-        // ESC + non-CSI: treat as Esc and let the next call classify
-        // the leftover byte.
-        return (Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)), 1);
-    }
-
-    let Some(&b2) = bytes.get(2) else {
-        return (None, 2);
-    };
-    let key = match b2 {
-        b'A' => Some(KeyCode::Up),
-        b'B' => Some(KeyCode::Down),
-        b'C' => Some(KeyCode::Right),
-        b'D' => Some(KeyCode::Left),
-        b'H' => Some(KeyCode::Home),
-        b'F' => Some(KeyCode::End),
-        b'3' => {
-            // CSI 3 ~ → Delete
-            if bytes.get(3) == Some(&b'~') {
-                return (Some(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)), 4);
-            }
-            return (None, 3);
-        }
-        _ => None,
-    };
-    match key {
-        Some(code) => (Some(KeyEvent::new(code, KeyModifiers::NONE)), 3),
-        None => (None, 3),
-    }
-}
-
-#[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-    reason = "tests assert on contract failures"
-)]
-mod tests {
-    use super::*;
-
-    fn parse(bytes: &[u8]) -> KeyEvent {
-        parse_event(bytes).0.expect("expected a key event")
-    }
-
-    #[test]
-    fn arrows() {
-        assert_eq!(parse(b"\x1b[A").code, KeyCode::Up);
-        assert_eq!(parse(b"\x1b[B").code, KeyCode::Down);
-        assert_eq!(parse(b"\x1b[C").code, KeyCode::Right);
-        assert_eq!(parse(b"\x1b[D").code, KeyCode::Left);
-    }
-
-    #[test]
-    fn home_end_delete() {
-        assert_eq!(parse(b"\x1b[H").code, KeyCode::Home);
-        assert_eq!(parse(b"\x1b[F").code, KeyCode::End);
-        assert_eq!(parse(b"\x1b[3~").code, KeyCode::Delete);
-    }
-
-    #[test]
-    fn enter_tab_backspace() {
-        assert_eq!(parse(b"\r").code, KeyCode::Enter);
-        assert_eq!(parse(b"\n").code, KeyCode::Enter);
-        assert_eq!(parse(b"\t").code, KeyCode::Tab);
-        assert_eq!(parse(&[0x7f]).code, KeyCode::Backspace);
-    }
-
-    #[test]
-    fn printables() {
-        let e = parse(b"a");
-        assert_eq!(e.code, KeyCode::Char('a'));
-        assert_eq!(e.modifiers, KeyModifiers::NONE);
-
-        let space = parse(b" ");
-        assert_eq!(space.code, KeyCode::Char(' '));
-
-        let z = parse(b"Z");
-        assert_eq!(z.code, KeyCode::Char('Z'));
-    }
-
-    #[test]
-    fn ctrl_letters() {
-        let c = parse(&[0x03]);
-        assert_eq!(c.code, KeyCode::Char('c'));
-        assert!(c.modifiers.contains(KeyModifiers::CONTROL));
-
-        let l = parse(&[0x0c]);
-        assert_eq!(l.code, KeyCode::Char('l'));
-        assert!(l.modifiers.contains(KeyModifiers::CONTROL));
-    }
-
-    #[test]
-    fn esc_alone_via_parser_returns_none_on_short_buffer() {
-        // The parser refuses to commit to Esc on a bare 0x1b because
-        // it can't see the future; the poll layer disambiguates.
-        let (ev, n) = parse_event(&[0x1b]);
-        assert!(ev.is_none(), "bare 0x1b in parser must defer");
-        assert_eq!(n, 1);
-    }
-
-    #[test]
-    fn esc_plus_non_csi_commits_to_esc() {
-        let (ev, n) = parse_event(&[0x1b, b'x']);
-        let ev = ev.expect("esc + x → Esc, leftover x");
-        assert_eq!(ev.code, KeyCode::Esc);
-        assert_eq!(n, 1);
-    }
-
-    #[test]
-    fn empty_buffer_is_none() {
-        let (ev, n) = parse_event(&[]);
-        assert!(ev.is_none());
-        assert_eq!(n, 0);
-    }
-}
+// The byte parser tests live in `crate::ui::console::parser`
+// (`TermwizToCrossterm`) — the splash backend reuses that translator
+// verbatim, so there is nothing splash-specific left to unit-test here.
