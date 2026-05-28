@@ -17,11 +17,6 @@ use crate::error::{NmblError, Result};
 use crate::nmbl_info;
 use crate::ui::{BootReporter, ProgressSink, TickOutcome};
 
-/// Default per-device readiness deadline used by
-/// [`mount_system_filesystems`]. Held here (not in `Config`) until the
-/// schema grows a dedicated knob.
-const DEFAULT_DEVICE_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// Sleep granularity between polls. Matches the 100 ms cadence of the
 /// shell loop this module replaces.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -170,7 +165,8 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// `reporter` carries the live boot console; we surface the current
 /// device / mountpoint as the boot-status phase label so the operator
 /// sees what we're waiting on (especially when a slow device drags out
-/// the 30s budget).
+/// the configured per-device budget — see
+/// [`crate::config::General::device_timeout_secs`]).
 ///
 /// When Phase 0.5 (bootstrap) already mounted the boot partition at
 /// `config.runtime_boot_mountpoint`, a second `mount(2)` of the same
@@ -182,6 +178,7 @@ pub fn mount_system_filesystems(
     reporter: &mut BootReporter<'_, '_>,
 ) -> Result<()> {
     let system_root = config.paths.system_root.as_path();
+    let device_timeout = Duration::from_secs(config.general.device_timeout_secs);
     ensure_dir(system_root)?;
 
     let _ = reporter.set_phase("phase 3b: scanning /dev/disk/by-* symlinks");
@@ -203,7 +200,7 @@ pub fn mount_system_filesystems(
         // "elapsed / timeout" countdown) instead of a frozen phase label.
         wait_for(
             dev,
-            DEFAULT_DEVICE_TIMEOUT,
+            device_timeout,
             "phase 3b: waiting for",
             Some(&mut *reporter),
         )?;
