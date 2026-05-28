@@ -16,12 +16,6 @@
 //! - `modal-buttons <title> <body> <label1> [label2 …]`
 //! - `wrong-password <attempt>`
 //! - `boot-status <phase> [log_line …]`
-//! - `passphrase-verify [serial|tui] [tick_ms=150]` — drives the
-//!   verifying-spinner code path the activation runner uses while
-//!   cryptsetup runs. The `serial` variant exercises the
-//!   serial-console gate (no spinner, no render); the `tui` variant
-//!   (default) paints the spinner each tick the way the splash /
-//!   framebuffer-tty path does in production.
 //!
 //! Each scenario blocks until the operator closes the modal (Enter /
 //! Esc / hotkey) at which point the harness prints the outcome on
@@ -101,7 +95,6 @@ pub fn run(args: DebugTuiArgs) -> Result<()> {
             "modal-buttons" => run_modal_buttons(&mut console, &args.args),
             "wrong-password" => run_wrong_password(&mut console, &args.args),
             "boot-status" => run_boot_status(&mut console, &args.args),
-            "passphrase-verify" => run_passphrase_verify(&mut console, &args.args),
             other => Err(NmblError::Io {
                 source: std::io::Error::other(format!("unknown --debug-tui scenario {other:?}")),
                 context: "mocking harness dispatch".to_string(),
@@ -188,79 +181,6 @@ fn run_boot_status(console: &mut MockConsole, args: &[String]) -> Result<()> {
         }
     }
     eprintln!("[mocking] boot-status dismissed");
-    Ok(())
-}
-
-/// `passphrase-verify [serial|tui] [tick_ms=150]` — emulates the
-/// verifying-spinner phase of `activation::run_luks_with_spinner`
-/// without an actual cryptsetup child. `serial` reproduces the gated
-/// path (no render, no spinner ticks); `tui` (default) shows the
-/// modal updating each tick. In both cases the harness blocks until
-/// the operator presses any key so tmux can capture the rendered
-/// cells. On serial the surrounding stdout text mimics the plaintext
-/// LUKS prompt the operator would have seen seconds earlier.
-fn run_passphrase_verify(console: &mut MockConsole, args: &[String]) -> Result<()> {
-    use crate::ui::app::Screen;
-    let mode = arg_or_default(args, 0, "tui");
-    let serial = match mode.as_str() {
-        "serial" => true,
-        "tui" => false,
-        other => {
-            return Err(NmblError::Io {
-                source: std::io::Error::other(format!(
-                    "passphrase-verify mode must be 'serial' or 'tui', got {other:?}"
-                )),
-                context: "mocking harness".to_string(),
-            });
-        }
-    };
-    let tick_ms: u64 = arg_or_default(args, 1, "150").parse().unwrap_or(150);
-
-    if serial {
-        // Serial gate: do NOT render the App; emit plaintext that
-        // mirrors `serial_passphrase_prompt` plus a "verifying" notice,
-        // then block on a key press. The point is to demonstrate that
-        // NO ratatui escape sequences are emitted during the wait.
-        use std::io::Write;
-        let mut stdout = std::io::stdout();
-        writeln!(stdout, "[nmbl] Enter LUKS passphrase").map_err(io_err)?;
-        writeln!(stdout, "(verifying — no spinner on serial)").map_err(io_err)?;
-        stdout.flush().map_err(io_err)?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(3600);
-        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
-            let slice = remaining.min(POLL_SLICE);
-            if console.poll_key(slice)?.is_some() {
-                break;
-            }
-        }
-        eprintln!("[mocking] passphrase-verify (serial) dismissed");
-        return Ok(());
-    }
-
-    let empty: [crate::generations::Generation; 0] = [];
-    let mut app = App::new(&empty);
-    app.screen = Screen::Passphrase {
-        prompt_label: "Verifying passphrase".to_string(),
-        buffer: zeroize::Zeroizing::new("*".repeat(8)),
-        verifying: true,
-        spinner_frame: 0,
-    };
-    let tick = Duration::from_millis(tick_ms);
-    let mut next_tick = std::time::Instant::now() + tick;
-    console.render(&app)?;
-    let deadline = std::time::Instant::now() + Duration::from_secs(3600);
-    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
-        let slice = remaining.min(POLL_SLICE);
-        if console.poll_key(slice)?.is_some() {
-            break;
-        }
-        if std::time::Instant::now() >= next_tick {
-            app.tick_passphrase_spinner();
-            console.render(&app)?;
-            next_tick = std::time::Instant::now() + tick;
-        }
-    }
-    eprintln!("[mocking] passphrase-verify (tui) dismissed");
     Ok(())
 }
 
