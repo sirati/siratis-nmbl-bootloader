@@ -446,6 +446,13 @@ pub struct BootstrapSection {
 
     #[serde(default)]
     pub rescue: BootstrapRescue,
+
+    /// Optional read-write twin of [`BootstrapBootFs`] used by the
+    /// stateful runtime for `state.bin` I/O. Absent when the host has no
+    /// stateful storage configured; the bootstrap stage then skips the
+    /// extra mount entirely.
+    #[serde(default)]
+    pub state: Option<BootstrapStateMount>,
 }
 
 /// Boot-filesystem descriptor used by the bootstrap stage. Shape mirrors
@@ -461,6 +468,16 @@ pub struct BootstrapBootFs {
     #[serde(default)]
     pub options: String,
 
+    pub mountpoint: PathBuf,
+}
+
+/// Mountpoint of the read-write state filesystem used by the runtime to
+/// persist `state.bin`. Device, fstype and mount options come from the
+/// already-mounted [`BootstrapBootFs`] twin, so this descriptor only
+/// needs to know where to bind the writable view.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapStateMount {
     pub mountpoint: PathBuf,
 }
 
@@ -865,6 +882,72 @@ mountpoint = "/mnt/boot"
     }
 
     #[test]
+    fn bootstrap_state_section_absent_decodes_to_none() {
+        let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+"#;
+        let cfg: BootstrapConfig = toml::from_str(toml).expect("state must be optional");
+        assert!(cfg.bootstrap.state.is_none());
+    }
+
+    #[test]
+    fn bootstrap_state_section_present_parses_mountpoint() {
+        let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+
+[bootstrap.state]
+mountpoint = "/mnt/boot-state"
+"#;
+        let cfg: BootstrapConfig = toml::from_str(toml).expect("state must parse");
+        let state = cfg.bootstrap.state.expect("state should be Some");
+        assert_eq!(state.mountpoint, PathBuf::from("/mnt/boot-state"));
+    }
+
+    #[test]
+    fn bootstrap_state_rejects_unknown_field() {
+        let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+
+[bootstrap.state]
+mountpoint  = "/mnt/boot-state"
+extra_field = "x"
+"#;
+        let err = toml::from_str::<BootstrapConfig>(toml)
+            .expect_err("unknown field in [bootstrap.state] must be rejected");
+        assert!(
+            err.to_string().contains("extra_field"),
+            "error should mention the unknown field, got: {err}",
+        );
+    }
+
+    #[test]
+    fn bootstrap_state_rejects_missing_mountpoint() {
+        let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+
+[bootstrap.state]
+"#;
+        let err = toml::from_str::<BootstrapConfig>(toml)
+            .expect_err("missing bootstrap.state.mountpoint must be rejected");
+        assert!(
+            err.to_string().contains("mountpoint"),
+            "error should mention the missing field, got: {err}",
+        );
+    }
+
+    #[test]
     fn bootstrap_load_reads_from_disk() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("bootstrap.toml");
@@ -943,6 +1026,7 @@ mountpoint = "/mnt/boot"
                     default_url: "https://example.invalid/rescue.cpio".to_string(),
                     default_sha256: String::new(),
                 },
+                state: None,
             },
         };
         let err = cfg.validate().expect_err("url without sha must reject");
@@ -971,6 +1055,7 @@ mountpoint = "/mnt/boot"
                     default_url: String::new(),
                     default_sha256: "deadbeef".to_string(),
                 },
+                state: None,
             },
         };
         cfg.validate().expect_err("sha without url must reject");
@@ -1134,6 +1219,7 @@ mystery        = "boom"
                     default_url: url.to_string(),
                     default_sha256: sha.to_string(),
                 },
+                state: None,
             },
         };
         mk("", "").validate().expect("both empty must pass");
