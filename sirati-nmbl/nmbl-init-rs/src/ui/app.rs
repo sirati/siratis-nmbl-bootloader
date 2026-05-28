@@ -135,6 +135,17 @@ pub enum Screen<'a> {
     Passphrase {
         prompt_label: String,
         buffer: Zeroizing<String>,
+        /// `true` once the operator has submitted the buffer and the
+        /// activation runner is verifying it (cryptsetup is running).
+        /// Renderer overlays a spinner so the operator sees the boot
+        /// is alive rather than hung. Cleared back to `false` if the
+        /// activation reports a wrong-password retry and the prompt
+        /// re-opens for another attempt.
+        verifying: bool,
+        /// Spinner phase for the verifying overlay, cycled via
+        /// [`App::tick_passphrase_spinner`]. Indexes
+        /// [`SPINNER_GLYPHS`] modulo [`SPINNER_FRAMES`].
+        spinner_frame: u8,
     },
     /// Boot has failed. Show the error and let the operator pick
     /// between Reboot and Shell. Defaults are owned by the caller —
@@ -306,6 +317,60 @@ impl<'a> App<'a> {
             data.spinner_frame = data.spinner_frame.wrapping_add(1) % SPINNER_FRAMES;
         } else {
             debug_assert!(false, "tick_boot_spinner called on non-BootStatus screen");
+        }
+    }
+
+    /// Flip the passphrase modal into "verifying" mode (cryptsetup is
+    /// running). The renderer paints a spinner overlay so the operator
+    /// sees the boot is alive — closes the visual gap between Enter and
+    /// the LUKS-unlock result. No-op when the App is on another screen.
+    ///
+    /// Setting `verifying = false` also resets `spinner_frame` to 0 so
+    /// a subsequent re-verify starts from a known phase rather than
+    /// inheriting the last frame from the previous attempt.
+    pub fn set_passphrase_verifying(&mut self, verifying: bool) {
+        if let Screen::Passphrase {
+            verifying: v,
+            spinner_frame,
+            ..
+        } = &mut self.screen
+        {
+            *v = verifying;
+            if !verifying {
+                *spinner_frame = 0;
+            }
+        } else {
+            debug_assert!(false, "set_passphrase_verifying called on non-Passphrase screen");
+        }
+    }
+
+    /// Advance the passphrase verifying-spinner one frame. Wraps modulo
+    /// [`SPINNER_FRAMES`]. No-op when the App is on another screen.
+    pub fn tick_passphrase_spinner(&mut self) {
+        if let Screen::Passphrase { spinner_frame, .. } = &mut self.screen {
+            *spinner_frame = spinner_frame.wrapping_add(1) % SPINNER_FRAMES;
+        } else {
+            debug_assert!(false, "tick_passphrase_spinner called on non-Passphrase screen");
+        }
+    }
+
+    /// Clear the passphrase buffer (zeroizing it) and reset spinner /
+    /// verifying flags. Used by the wrong-password retry path so a
+    /// re-prompt starts from a clean slate. No-op when the App is on
+    /// another screen.
+    pub fn clear_passphrase_buffer(&mut self) {
+        if let Screen::Passphrase {
+            buffer,
+            verifying,
+            spinner_frame,
+            ..
+        } = &mut self.screen
+        {
+            buffer.clear();
+            *verifying = false;
+            *spinner_frame = 0;
+        } else {
+            debug_assert!(false, "clear_passphrase_buffer called on non-Passphrase screen");
         }
     }
 
@@ -879,6 +944,8 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new(String::new()),
+            verifying: false,
+            spinner_frame: 0,
         };
         for c in "hi".chars() {
             assert!(!app.on_key(press(KeyCode::Char(c))));
@@ -901,6 +968,8 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new(String::new()),
+            verifying: false,
+            spinner_frame: 0,
         };
         assert!(app.on_key(press(KeyCode::Esc)));
         assert!(matches!(app.decision, Some(Decision::Shell)));
@@ -913,9 +982,98 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new("secret".to_string()),
+            verifying: false,
+            spinner_frame: 0,
         };
         assert!(app.on_key(press(KeyCode::Enter)));
         assert!(app.decision.is_none(), "Enter must not set a Decision");
+    }
+
+    #[test]
+    fn passphrase_set_verifying_toggles_flag_and_resets_spinner_on_clear() {
+        // The verifying flag drives the overlay; clearing it must also
+        // reset the spinner frame so a re-verify starts from glyph 0.
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        app.screen = Screen::Passphrase {
+            prompt_label: "Unlock".to_string(),
+            buffer: Zeroizing::new(String::new()),
+            verifying: false,
+            spinner_frame: 0,
+        };
+        app.set_passphrase_verifying(true);
+        app.tick_passphrase_spinner();
+        app.tick_passphrase_spinner();
+        match &app.screen {
+            Screen::Passphrase {
+                verifying,
+                spinner_frame,
+                ..
+            } => {
+                assert!(*verifying, "verifying must be set");
+                assert_eq!(*spinner_frame, 2, "two ticks land on frame 2");
+            }
+            _ => panic!("expected Passphrase"),
+        }
+        app.set_passphrase_verifying(false);
+        match &app.screen {
+            Screen::Passphrase {
+                verifying,
+                spinner_frame,
+                ..
+            } => {
+                assert!(!*verifying, "verifying cleared");
+                assert_eq!(*spinner_frame, 0, "spinner reset on clear");
+            }
+            _ => panic!("expected Passphrase"),
+        }
+    }
+
+    #[test]
+    fn passphrase_tick_spinner_wraps_modulo_frame_count() {
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        app.screen = Screen::Passphrase {
+            prompt_label: "Unlock".to_string(),
+            buffer: Zeroizing::new(String::new()),
+            verifying: true,
+            spinner_frame: 0,
+        };
+        for _ in 0..SPINNER_FRAMES {
+            app.tick_passphrase_spinner();
+        }
+        match &app.screen {
+            Screen::Passphrase { spinner_frame, .. } => {
+                assert_eq!(*spinner_frame, 0, "SPINNER_FRAMES ticks wrap to 0");
+            }
+            _ => panic!("expected Passphrase"),
+        }
+    }
+
+    #[test]
+    fn passphrase_clear_buffer_resets_state() {
+        let gens: Vec<Generation> = vec![];
+        let mut app = App::new(&gens);
+        app.screen = Screen::Passphrase {
+            prompt_label: "Unlock".to_string(),
+            buffer: Zeroizing::new("typed".to_string()),
+            verifying: true,
+            spinner_frame: 3,
+        };
+        app.clear_passphrase_buffer();
+        match &app.screen {
+            Screen::Passphrase {
+                buffer,
+                verifying,
+                spinner_frame,
+                ..
+            } => {
+                assert!(buffer.is_empty());
+                assert!(!*verifying);
+                assert_eq!(*spinner_frame, 0);
+            }
+            _ => panic!("expected Passphrase"),
+        }
     }
 
     fn emergency_app() -> App<'static> {
