@@ -135,8 +135,8 @@ pub fn blit_cell(
 
     // Stage 2: glyph overlay positioned by the per-glyph offset.
     // The blend alpha combines glyph coverage with the foreground's
-    // own alpha (e.g. NamedColor::Foreground at 0x4D for the soft
-    // 30% white) so that an "unset fg" still respects the palette.
+    // own alpha (e.g. NamedColor::Foreground at 0x99 for the
+    // 60% white) so that an "unset fg" still respects the palette.
     let RgbaColor(fr, fg_g, fb_c, fa) = fg;
     if fa == 0 {
         return;
@@ -190,24 +190,33 @@ pub fn blit_cell(
     }
 }
 
-/// Standard src-over blend: `out = (src * a + dst * (255 - a) + 127) / 255`
-/// per channel, with the +127 rounding to nearest. Inputs are channel
-/// values in 0..=255 and an alpha in 0..=255; output channels stay in
-/// the same range.
+/// Perceptually-correct src-over blend using Oklab interpolation.
+///
+/// Alpha-weighted mix in Oklab space avoids the gamma-incorrect
+/// darkening that sRGB-linear math produces (e.g. white-at-30%-alpha
+/// over a mid-tone photo reading muddy instead of soft white).
+///
+/// Short-circuits for `a == 0` (fully transparent → dst unchanged) and
+/// `a == 255` (fully opaque → src replaces dst) to skip the round-trip.
 #[inline]
 fn src_over(sr: u8, sg: u8, sb: u8, a: u8, dr: u8, dg: u8, db: u8) -> (u8, u8, u8) {
-    let a = u16::from(a);
-    let inv = 255u16.saturating_sub(a);
-    let blend = |s: u8, d: u8| -> u8 {
-        let s = u16::from(s).saturating_mul(a);
-        let d = u16::from(d).saturating_mul(inv);
-        // +127 for round-to-nearest; the sum fits in u16 since
-        // s + d ≤ 255 * 255 + 255 * 255 = 130_050 ≤ u16::MAX.
-        let sum = s.saturating_add(d).saturating_add(127);
-        let q = sum / 255;
-        if q > 255 { 255 } else { q as u8 }
+    if a == 0 {
+        return (dr, dg, db);
+    }
+    if a == 255 {
+        return (sr, sg, sb);
+    }
+    let alpha = f32::from(a) / 255.0;
+    let inv = 1.0 - alpha;
+    let src_lab = oklab::srgb_to_oklab(oklab::Rgb { r: sr, g: sg, b: sb });
+    let dst_lab = oklab::srgb_to_oklab(oklab::Rgb { r: dr, g: dg, b: db });
+    let out_lab = oklab::Oklab {
+        l: dst_lab.l * inv + src_lab.l * alpha,
+        a: dst_lab.a * inv + src_lab.a * alpha,
+        b: dst_lab.b * inv + src_lab.b * alpha,
     };
-    (blend(sr, dr), blend(sg, dg), blend(sb, db))
+    let out_rgb = oklab::oklab_to_srgb(out_lab);
+    (out_rgb.r, out_rgb.g, out_rgb.b)
 }
 
 #[inline]
@@ -271,9 +280,9 @@ fn named_color(n: NamedColor) -> RgbaColor {
         NamedColor::BrightMagenta => RgbaColor(0xAD, 0x7F, 0xA8, 0xFF),
         NamedColor::BrightCyan => RgbaColor(0x34, 0xE2, 0xE2, 0xFF),
         NamedColor::BrightWhite | NamedColor::BrightForeground => RgbaColor(0xEE, 0xEE, 0xEC, 0xFF),
-        // Foreground: white at 30% alpha so unset-fg text sits softly
+        // Foreground: white at 60% alpha so unset-fg text sits clearly
         // on top of the background image instead of glaring fully opaque.
-        NamedColor::Foreground => RgbaColor(0xFF, 0xFF, 0xFF, 0x4D),
+        NamedColor::Foreground => RgbaColor(0xFF, 0xFF, 0xFF, 0x99),
         // Dim foreground: the Tango "white" tone.
         NamedColor::DimForeground => RgbaColor(0xD3, 0xD7, 0xCF, 0xFF),
         // Background: fully transparent so the PNG underneath shows
@@ -465,20 +474,17 @@ mod tests {
         assert_eq!(fb[p11 + 2], 200); // R = fg.r
         assert_eq!(fb[p11 + 3], 0); // X always 0
 
-        // Pixel (2, 1): coverage = 128. Compute expected channel value
-        // exactly the way the implementation does.
-        let blend = |s: u8, d: u8, a: u8| -> u8 {
-            let s = u16::from(s) * u16::from(a);
-            let d = u16::from(d) * (255u16 - u16::from(a));
-            ((s + d + 127) / 255) as u8
-        };
+        // Pixel (2, 1): coverage = 128, effective alpha ≈ 0.5. The Oklab
+        // blend must produce a value strictly between src and dst in each
+        // channel (perceptual interpolation cannot flip the ordering).
+        // fg = (r=200, g=100, b=50), dst = (r=10, g=20, b=30).
         let p21: usize = 16 + 2 * 4;
-        let exp_r = blend(200, 10, 128);
-        let exp_g = blend(100, 20, 128);
-        let exp_b = blend(50, 30, 128);
-        assert_eq!(fb[p21], exp_b, "B at (2,1)");
-        assert_eq!(fb[p21 + 1], exp_g, "G at (2,1)");
-        assert_eq!(fb[p21 + 2], exp_r, "R at (2,1)");
+        let got_b = fb[p21];
+        let got_g = fb[p21 + 1];
+        let got_r = fb[p21 + 2];
+        assert!(got_r > 10 && got_r < 200, "R at (2,1) should be between dst=10 and src=200, got {got_r}");
+        assert!(got_g > 20 && got_g < 100, "G at (2,1) should be between dst=20 and src=100, got {got_g}");
+        assert!(got_b > 30 && got_b < 50, "B at (2,1) should be between dst=30 and src=50, got {got_b}");
 
         // Pixel (0, 0): outside the glyph rect — must remain bg.
         let p00 = 0;
