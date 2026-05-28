@@ -10,6 +10,8 @@ pub mod mount;
 #[cfg(feature = "network-rescue")]
 pub mod net;
 pub mod panic;
+#[cfg(feature = "stateful")]
+pub mod state;
 pub mod rescue;
 pub mod shell;
 #[cfg(feature = "image-splash")]
