@@ -981,6 +981,8 @@ mod tests {
         let empty = PassphraseScreenData {
             prompt_label: "Unlock root",
             buffer_len: 0,
+            verifying: false,
+            spinner_frame: 0,
         };
         let mut term = new_term(80, 24);
         term.draw(|f| render_passphrase(f, &empty)).expect("draw");
@@ -993,6 +995,8 @@ mod tests {
         let filled = PassphraseScreenData {
             prompt_label: "Unlock root",
             buffer_len: 3,
+            verifying: false,
+            spinner_frame: 0,
         };
         let mut term2 = new_term(80, 24);
         term2
