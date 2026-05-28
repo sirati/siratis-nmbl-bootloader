@@ -118,6 +118,40 @@
         install-test-gpt-uefi-systemd-btrfs-raid1 = nixosAnywhereTest.apps.${system}.install-test-gpt-uefi-systemd-btrfs-raid1;
       };
 
+      # Aliases that surface the install orchestrators under the
+      # three-axis matrix's `nixos-anywhere-install-<target>-<interaction>`
+      # namespace. The `nixos-anywhere-install` start mode is special
+      # — its renderer IS the orchestrator (rescue VM + nixos-anywhere
+      # + stage-3 verify), so the matrix combos directly re-export the
+      # existing legacy apps rather than running through the generic
+      # interaction renderers.
+      #
+      # `-screen` is the operator-friendly alias for `-qemu-serial-rs`
+      # (matches the historical "GNU screen + vm-serial-man" path that
+      # the legacy `install-test-*` apps used).
+      nixosAnywhereInstallAliases =
+        let
+          a = nixosAnywhereTest.apps.${system};
+          # vnc-demo variant for the splash-luks path; only some
+          # configs have a noVNC bridge wired up.
+          alias = legacyName: a.${legacyName};
+        in
+        {
+          nixos-anywhere-install-plain-ext4-qemu-serial-rs = alias "install-test-gpt-uefi-grub";
+          nixos-anywhere-install-plain-ext4-screen = alias "install-test-gpt-uefi-grub";
+          nixos-anywhere-install-mdraid-qemu-serial-rs = alias "install-test-gpt-uefi-grub-raid1";
+          nixos-anywhere-install-mdraid-screen = alias "install-test-gpt-uefi-grub-raid1";
+          nixos-anywhere-install-btrfs-raid1-qemu-serial-rs = alias "install-test-gpt-uefi-grub-btrfs-raid1";
+          nixos-anywhere-install-btrfs-raid1-screen = alias "install-test-gpt-uefi-grub-btrfs-raid1";
+          # LUKS install: the existing splash-luks-serial-demo
+          # orchestrator does a full install onto the luks-password
+          # disko layout and exits cleanly, leaving disks at
+          # $WORK_DIR/disk1.qcow2 + $WORK_DIR/disk2.qcow2 — exactly
+          # what kvm-kexec-installed-luks-password-tmux needs as input.
+          nixos-anywhere-install-luks-password-qemu-serial-rs = alias "install-test-splash-luks-serial-demo";
+          nixos-anywhere-install-luks-password-screen = alias "install-test-splash-luks-serial-demo";
+        };
+
       # Build test runner apps for each configuration. Each entry
       # gets two apps:
       #   - `<name>`               → vm-serial-man + GNU screen (legacy)
@@ -161,6 +195,23 @@
           )
         )
       );
+
+      # Three-axis test matrix: start-mode × target × interaction.
+      # Generates apps named `<start>-<target>-<interaction>` (e.g.
+      # `kvm-kexec-installed-luks-password-tmux`). Adding a target,
+      # start mode, or interaction is one new file in
+      # testing/{targets,start-modes,interactions}/ + one line in
+      # the corresponding default.nix.
+      testMatrix = import ./testing/compose.nix {
+        inherit
+          self
+          nixpkgs
+          disko
+          nixos-anywhere
+          vmSerialMan
+          system
+          ;
+      };
     in
     {
       # The main NixOS module
@@ -210,9 +261,13 @@
       # Run with: nix run .#test-gpt-qemu-kernel-invoke -- --debug-shell  (drops to emergency shell)
       # Run with: nix run .#test-rescue-ssh -- [--pubkey-file PATH] [--port N]
       # Run with: nix run .#tmux-serial-test-gpt-uefi-grub-luks-password
+      # Apps: legacy names first, then the three-axis matrix grafted
+      # on. Legacy names keep working unchanged (operators may have
+      # them in muscle memory). New matrix apps use the dotted
+      # `<start>-<target>-<interaction>` naming.
       apps.${system} = testApps // {
         test-rescue-ssh = rescueVmTestApp;
-      } // nixosAnywhereTestApps;
+      } // nixosAnywhereTestApps // testMatrix.apps // nixosAnywhereInstallAliases;
 
       # Reusable library: external flakes (the LUKS install orchestrator,
       # rescue-vm-test, future variants) consume `testArtefact` to
@@ -235,6 +290,11 @@
           in
           tmuxSerial.mkTmuxSerialRunner { inherit artefact; }
         ) testing.configs;
+        # Three-axis test matrix surface: callers can reach the
+        # individual axis registries (targets / start-modes /
+        # interactions) and the precomputed cross product via
+        # legacyPackages.${system}.testMatrix.
+        testMatrix = testMatrix;
       };
     };
 }
