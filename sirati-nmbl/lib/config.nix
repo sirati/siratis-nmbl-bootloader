@@ -115,6 +115,23 @@ let
   rescuePacketModule =
     if cfg.rescue.network && cfg.rescue.mode == "external" then [ "af_packet" ] else [ ];
 
+  # overlay + ext4 back the full recovery system's writable overlays, the NIC
+  # drivers let its /init bring up DHCP after switch_root, and af_packet backs
+  # dhcpcd's AF_PACKET/BPF socket for the DHCPv4 exchange. The .ko files
+  # must be STAGED into the NMBL initramfs module tree (via makeModulesClosure
+  # below) so finit_module can find them; naming them in the runtime explicit
+  # list (options.nix) is not enough on its own. The full-system path is
+  # independent of cfg.rescue.network (which gates NMBL's own in-initramfs DHCP
+  # fetch), so its NIC drivers must be staged here rather than relying on
+  # rescueNicModules above. ext4's deps (mbcache, jbd2) are pulled into the
+  # closure automatically. Gated on the full-system external rescue so the
+  # default build's module set is unchanged.
+  rescueFullSystemModules =
+    if cfg.rescue.fullSystem.enable && cfg.rescue.mode == "external" then
+      cfg.rescue.nicDrivers ++ detectedNicModules ++ [ "overlay" "ext4" "af_packet" ]
+    else
+      [ ];
+
   # Import kernel modules management module
   kernelModulesManager = import ./modules/kernel-modules.nix {
     inherit
@@ -123,7 +140,9 @@ let
       config
       cfg
       ;
-    extraExplicitModules = lib.unique (rescueNicModules ++ rescueDiskModules ++ rescuePacketModule);
+    extraExplicitModules = lib.unique (
+      rescueNicModules ++ rescueDiskModules ++ rescuePacketModule ++ rescueFullSystemModules
+    );
   };
 
   # Import assertions module
@@ -178,6 +197,13 @@ let
   nmblRescueSquashfs = import ./rescue-sfs.nix {
     inherit pkgs lib;
     contents = cfg.rescue.squashfsContents;
+    fullSystem = {
+      inherit (cfg.rescue.fullSystem) enable packages sshdPort rootAuthorizedKeys;
+      # NIC drivers the recovery /init modprobes. NMBL preloads the same
+      # set into its kernel before switch_root (options.nix), so modprobe
+      # is a no-op fallback; passing them keeps the script self-describing.
+      nicDrivers = lib.unique (cfg.rescue.nicDrivers ++ detectedNicModules);
+    };
   };
 
   # Where the runtime config TOML lives at boot. In embedded mode it

@@ -115,6 +115,19 @@ let
         network = true;
         default_url = cfg.rescue.defaultUrl;
         default_sha256 = cfg.rescue.defaultSha256;
+      }
+      # The full recovery system bakes a bash PID-1 script at /init; the
+      # Rust loader execve's `entrypoint` after switch_root instead of the
+      # default /bin/sh. Omitted otherwise so the flat busybox image keeps
+      # the Rust-side default.
+      // lib.optionalAttrs (cfg.rescue.mode == "external" && cfg.rescue.fullSystem.enable) {
+        entrypoint = "/init";
+      }
+      # Deterministic rescue trigger. Emitted only when set so the wire
+      # shape stays unchanged for the common case; the Rust serde default
+      # is `false`.
+      // lib.optionalAttrs cfg.rescue.forceOnBoot {
+        force_on_boot = true;
       };
 
     # Operator-curated list of extra `/dev/<tty>` paths the picker

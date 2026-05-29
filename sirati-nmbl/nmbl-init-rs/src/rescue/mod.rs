@@ -35,10 +35,6 @@ use crate::error::{NmblError, Result};
 use crate::terminal::TerminalAction;
 use crate::ui::console::Console;
 
-/// Shell binary expected inside the rescue squashfs. The squashfs ships
-/// busybox under `/bin/sh`, so this path is the post-switch-root one.
-const RESCUE_SHELL: &str = "/bin/sh";
-
 /// Default basename of the rescue squashfs on the boot partition. Used
 /// when `[rescue].sfs_path` is absent from the operator's runtime
 /// config.
@@ -116,7 +112,7 @@ fn dispatch_external(
             // arm returns, so the backend's Drop runs (KD_TEXT
             // restore, termios reset) before the dispatcher in
             // `main` fires the execve.
-            return switch_root_and_exec(rescue_dir);
+            return switch_root_and_exec(rescue_dir, &config.rescue.entrypoint);
         }
         Err(e) => e,
     };
@@ -206,6 +202,7 @@ pub fn exec_embedded(config: &Config, cause: NmblError) -> Result<TerminalAction
         argv: vec![argv0_c],
         env: Vec::new(),
         banner: Some(crate::terminal::EmergencyBanner::new(config, cause)),
+        rescue_handoff: true,
     })
 }
 
@@ -233,7 +230,7 @@ pub fn halt_with_banner(cause: NmblError) -> TerminalAction {
 /// outgoing root is the initramfs rootfs pseudo-filesystem. After
 /// MS_MOVE the initramfs is detached and no longer reachable via any
 /// path.
-pub(crate) fn switch_root_and_exec(new_root: &Path) -> Result<TerminalAction> {
+pub(crate) fn switch_root_and_exec(new_root: &Path, entrypoint: &Path) -> Result<TerminalAction> {
     // Step 1: cd into the new root (the mounted squashfs).
     chdir(new_root).map_err(|source| NmblError::Rescue {
         stage: "switch-root",
@@ -278,34 +275,83 @@ pub(crate) fn switch_root_and_exec(new_root: &Path) -> Result<TerminalAction> {
         }),
     })?;
 
-    build_rescue_shell_action()
+    // Step 5: Populate /dev in the new root. The MS_MOVE above detached
+    // the initramfs devtmpfs, so the rescue root's /dev is an empty
+    // mountpoint with no /dev/console. The dispatcher in `main` re-opens
+    // /dev/console to redirect the child's stdio before execve, and the
+    // full-system entrypoint (`/init`) also does its own `exec bash <
+    // /dev/console` — both need a populated /dev. Mount devtmpfs here so
+    // the device nodes exist before either consumer runs. Non-fatal: the
+    // entrypoint's own `mount -t devtmpfs ... || true` tolerates a stale
+    // mount, and the dispatcher's stdio redirect is soft on this path.
+    mount_dev_in_new_root();
+
+    build_rescue_shell_action(entrypoint)
 }
 
-/// Construct the [`TerminalAction::Execve`] for `/bin/sh` inside the
-/// freshly switched-root rescue root with a minimal `TERM=linux` +
-/// `PATH` environment. Shared by the disk and network rescue paths.
-/// No banner: the rescue UI has already taken the operator through
-/// its own screens, so a second emergency banner would be redundant.
-fn build_rescue_shell_action() -> Result<TerminalAction> {
-    let path_c = CString::new(RESCUE_SHELL).map_err(|_| NmblError::Rescue {
+/// Mount `devtmpfs` at `/dev` in the freshly switched-root rescue root
+/// so `/dev/console` (and friends) exist before the dispatcher's stdio
+/// redirect and before the rescue entrypoint runs.
+///
+/// Best-effort by design: any failure is logged at warn level and the
+/// caller proceeds. The full-system `/init` re-mounts devtmpfs itself
+/// (`mount -t devtmpfs ... || true`), and the busybox image's stdio
+/// only needs the node to exist, so a partial setup here never strands
+/// the operator. `EBUSY` (already mounted) is treated as success.
+fn mount_dev_in_new_root() {
+    use crate::{nmbl_info, nmbl_warn};
+
+    let dev = Path::new("/dev");
+    match std::fs::create_dir_all(dev) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => nmbl_warn!("rescue: could not create /dev in new root: {e}"),
+    }
+    match crate::sys::mount::mount_fs(None, dev, "devtmpfs", "mode=755,nosuid") {
+        Ok(()) => nmbl_info!("rescue: mounted /dev in new root"),
+        Err(NmblError::Mount {
+            source: nix::errno::Errno::EBUSY,
+            ..
+        }) => nmbl_info!("rescue: /dev already mounted in new root (EBUSY)"),
+        Err(e) => nmbl_warn!("rescue: could not mount /dev in new root: {e}"),
+    }
+}
+
+/// Construct the [`TerminalAction::Execve`] for the rescue entrypoint
+/// inside the freshly switched-root rescue root with a minimal
+/// `TERM=linux` + `PATH` environment. Shared by the disk and network
+/// rescue paths. The entrypoint is `config.rescue.entrypoint`: the flat
+/// busybox image leaves it at the default `/bin/sh`; the full recovery
+/// system pins it to `/init` (a bash PID-1 script). No banner: the
+/// rescue UI has already taken the operator through its own screens, so
+/// a second emergency banner would be redundant.
+fn build_rescue_shell_action(entrypoint: &Path) -> Result<TerminalAction> {
+    let entry_bytes = entrypoint.as_os_str().as_encoded_bytes();
+    let path_c = CString::new(entry_bytes).map_err(|_| NmblError::Rescue {
         stage: "exec-shell",
         source: Box::new(NmblError::ConfigInvalid {
-            reason: "rescue shell path contains interior NUL".to_string(),
-            context: format!("preparing execve of {RESCUE_SHELL}"),
+            reason: "rescue entrypoint path contains interior NUL".to_string(),
+            context: format!("preparing execve of {}", entrypoint.display()),
         }),
     })?;
-    let argv0_c = CString::new("sh").map_err(|_| NmblError::Rescue {
+    // argv0 = basename of the entrypoint (e.g. "sh" or "init"), falling
+    // back to the full path if it has no file name component.
+    let argv0_bytes: Vec<u8> = entrypoint
+        .file_name()
+        .map(|n| n.as_encoded_bytes().to_vec())
+        .unwrap_or_else(|| entry_bytes.to_vec());
+    let argv0_c = CString::new(argv0_bytes).map_err(|_| NmblError::Rescue {
         stage: "exec-shell",
         source: Box::new(NmblError::ConfigInvalid {
             reason: "rescue argv0 contains interior NUL".to_string(),
-            context: format!("preparing execve of {RESCUE_SHELL}"),
+            context: format!("preparing execve of {}", entrypoint.display()),
         }),
     })?;
     let term_c = CString::new("TERM=linux").map_err(|_| NmblError::Rescue {
         stage: "exec-shell",
         source: Box::new(NmblError::ConfigInvalid {
             reason: "TERM environment string contains interior NUL".to_string(),
-            context: format!("preparing execve of {RESCUE_SHELL}"),
+            context: format!("preparing execve of {}", entrypoint.display()),
         }),
     })?;
     let path_env_c =
@@ -313,7 +359,7 @@ fn build_rescue_shell_action() -> Result<TerminalAction> {
             stage: "exec-shell",
             source: Box::new(NmblError::ConfigInvalid {
                 reason: "PATH environment string contains interior NUL".to_string(),
-                context: format!("preparing execve of {RESCUE_SHELL}"),
+                context: format!("preparing execve of {}", entrypoint.display()),
             }),
         })?;
 
@@ -322,6 +368,7 @@ fn build_rescue_shell_action() -> Result<TerminalAction> {
         argv: vec![argv0_c],
         env: vec![term_c, path_env_c],
         banner: None,
+        rescue_handoff: true,
     })
 }
 
@@ -478,6 +525,36 @@ mod tests {
     }
 
     #[test]
+    fn build_rescue_shell_action_honours_entrypoint() {
+        // The full recovery system pins /init; the default flat image
+        // leaves it at /bin/sh. argv0 is the basename in both cases.
+        for (entry, argv0) in [("/init", "init"), ("/bin/sh", "sh")] {
+            let action =
+                build_rescue_shell_action(Path::new(entry)).expect("action must build");
+            match action {
+                TerminalAction::Execve {
+                    path,
+                    argv,
+                    banner,
+                    rescue_handoff,
+                    ..
+                } => {
+                    assert_eq!(path.as_bytes(), entry.as_bytes());
+                    let argv0_c = argv.first().expect("argv must have argv0");
+                    assert_eq!(argv0_c.as_bytes(), argv0.as_bytes());
+                    assert!(banner.is_none(), "rescue exec carries no banner");
+                    assert!(
+                        rescue_handoff,
+                        "rescue exec must mark the handoff so a failed \
+                         /dev/console redirect is non-fatal",
+                    );
+                }
+                other => panic!("expected Execve, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn dispatch_embedded_returns_execve_action() {
         // mode=Embedded must yield TerminalAction::Execve pointed at
         // config.paths.shell. No syscall fires — this is the whole
@@ -493,12 +570,21 @@ mod tests {
 
         let action = dispatch(&cfg, console, cause).expect("embedded dispatch must succeed");
         match action {
-            TerminalAction::Execve { path, banner, .. } => {
+            TerminalAction::Execve {
+                path,
+                banner,
+                rescue_handoff,
+                ..
+            } => {
                 assert_eq!(path.as_bytes(), b"/bin/test-embedded-shell");
                 let banner = banner.expect("embedded execve must carry a banner");
                 assert_eq!(
                     banner.shell_path,
                     PathBuf::from("/bin/test-embedded-shell"),
+                );
+                assert!(
+                    rescue_handoff,
+                    "embedded rescue exec must also mark the handoff",
                 );
             }
             other => panic!("expected Execve from Embedded mode, got {other:?}"),

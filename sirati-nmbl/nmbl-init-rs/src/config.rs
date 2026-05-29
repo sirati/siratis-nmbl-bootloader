@@ -363,7 +363,7 @@ fn default_shell() -> PathBuf {
 /// path of `nmbl-rescue.sfs`. The network-rescue fields (Phase E.1)
 /// supply the disk-rescue fallback that fetches `nmbl-rescue.sfs`
 /// from an operator-pinned HTTP URL.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RescueConfig {
     /// Which rescue path [`crate::rescue::dispatch`] takes. Defaults to
@@ -402,6 +402,46 @@ pub struct RescueConfig {
     /// `boot.nmbl.rescue.defaultSha256`.
     #[serde(default)]
     pub default_sha256: String,
+
+    /// Absolute path INSIDE the rescue squashfs that the loader
+    /// `execve`s after switch_root. Defaults to `/bin/sh` (the flat
+    /// busybox image). The full recovery system (`fullSystem.enable`)
+    /// sets this to `/init`, a bash PID-1 script that brings up
+    /// pseudo-filesystems, an overlay'd writable store, networking, the
+    /// nix-daemon and sshd before dropping to a console shell. Matches
+    /// `boot.nmbl.rescue.fullSystem` wiring emitted by config-toml.nix.
+    #[serde(default = "default_rescue_entrypoint")]
+    pub entrypoint: PathBuf,
+
+    /// Test/recovery escape hatch: when `true`, NMBL skips the normal
+    /// generation-boot flow and goes straight to [`crate::rescue::dispatch`]
+    /// on every boot (only meaningful with `mode = "external"`). Defaults
+    /// to `false` so production boots are unaffected. The check runs right
+    /// after Phase 0.5 mounts the boot partition (so the runtime boot
+    /// mountpoint the disk-rescue path needs is already known) and before
+    /// any interactive console comes up — making it a fully deterministic,
+    /// no-input trigger for automated rescue verification. Matches
+    /// `boot.nmbl.rescue.forceOnBoot`.
+    #[serde(default)]
+    pub force_on_boot: bool,
+}
+
+fn default_rescue_entrypoint() -> PathBuf {
+    PathBuf::from("/bin/sh")
+}
+
+impl Default for RescueConfig {
+    fn default() -> Self {
+        Self {
+            mode: RescueMode::default(),
+            sfs_path: None,
+            network: false,
+            default_url: String::new(),
+            default_sha256: String::new(),
+            entrypoint: default_rescue_entrypoint(),
+            force_on_boot: false,
+        }
+    }
 }
 
 /// `[emergency_shell]` section of the runtime config. Controls which
@@ -1297,6 +1337,47 @@ mystery        = "boom"
         let cfg = RescueConfig::default();
         assert_eq!(cfg.mode, RescueMode::Embedded);
         assert!(cfg.sfs_path.is_none());
+    }
+
+    #[test]
+    fn rescue_entrypoint_defaults_to_bin_sh_when_absent() {
+        // Flat busybox image (and every legacy config) leaves the
+        // entrypoint unset; the loader must fall back to /bin/sh.
+        let cfg: Config = toml::from_str("[rescue]\nmode = \"external\"\n")
+            .expect("config without entrypoint must parse");
+        assert_eq!(cfg.rescue.entrypoint, PathBuf::from("/bin/sh"));
+        assert_eq!(RescueConfig::default().entrypoint, PathBuf::from("/bin/sh"));
+    }
+
+    #[test]
+    fn rescue_entrypoint_parses_init_override() {
+        // The full recovery system pins /init; config-toml.nix emits it
+        // only when fullSystem.enable is set.
+        let toml = r#"
+[rescue]
+mode       = "external"
+entrypoint = "/init"
+"#;
+        let cfg: Config = toml::from_str(toml).expect("entrypoint override must parse");
+        assert_eq!(cfg.rescue.entrypoint, PathBuf::from("/init"));
+    }
+
+    #[test]
+    fn rescue_force_on_boot_defaults_false_and_parses() {
+        // Absent → production-safe false; present → honoured. The test
+        // harness flips this to drive a deterministic rescue boot.
+        let cfg: Config = toml::from_str("[rescue]\nmode = \"external\"\n")
+            .expect("config without force_on_boot must parse");
+        assert!(!cfg.rescue.force_on_boot);
+        assert!(!RescueConfig::default().force_on_boot);
+
+        let toml = r#"
+[rescue]
+mode          = "external"
+force_on_boot = true
+"#;
+        let cfg: Config = toml::from_str(toml).expect("force_on_boot override must parse");
+        assert!(cfg.rescue.force_on_boot);
     }
 
     #[test]
