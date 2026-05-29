@@ -90,6 +90,15 @@ pub enum TerminalAction {
         /// so the operator sees the error chain and the suggested
         /// action; rescue paths that have their own UI pass `None`.
         banner: Option<EmergencyBanner>,
+        /// Whether this execve is a rescue handoff. When `true`, the
+        /// dispatcher treats a failed `/dev/console` stdio redirect as
+        /// non-fatal: it logs a warning and execve's anyway with the
+        /// inherited fds, because the rescue entrypoint (full-system
+        /// `/init` or busybox `sh`) manages its own console and halting
+        /// here would strand the operator. When `false` (reserved for a
+        /// future non-rescue execve, e.g. a direct re-exec), a redirect
+        /// failure stays fatal.
+        rescue_handoff: bool,
     },
 
     /// Fire the previously-loaded kexec image via

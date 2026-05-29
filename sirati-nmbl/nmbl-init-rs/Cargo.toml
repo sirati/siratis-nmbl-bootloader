@@ -42,7 +42,13 @@ print_stderr     = "allow"   # we _do_ print to stderr — that's our log channe
 print_stdout     = "allow"
 
 [features]
-default = []
+default = ["pretty-shell"]
+# In-process `alacritty_terminal`-backed PTY terminal hosted inside the
+# bordered TUI (the "Pretty Shell"). Backend-agnostic, so it renders fine
+# on the tty/serial Console as well as the splash framebuffer. Default-on
+# so the normal build offers it; `--no-default-features` drops back to the
+# bare `[Raw Shell]` busybox relay and the minimal closure.
+pretty-shell = ["dep:alacritty_terminal"]
 # Phase D rescue-fallback network primitives. When OFF the `src/net/`
 # tree is `#[cfg]`d out and the optional deps are not compiled, so
 # enabling this feature is purely additive — the default build is
@@ -60,7 +66,7 @@ stateful = ["dep:ciborium", "dep:nonmax"]
 # Opt-in graphical boot splash. Adds DRM mode-set on simpledrm, a PNG
 # background, and a fontdue-rasterized overlay of the ratatui menu.
 # Any failure of the splash path falls back to today's tty UI.
-image-splash = ["dep:drm", "dep:png", "dep:fontdue", "dep:alacritty_terminal", "rustix/event", "dep:oklab"]
+image-splash = ["dep:drm", "dep:png", "dep:fontdue", "pretty-shell", "rustix/event", "dep:oklab"]
 # Opt-in TUI mocking harness. Adds a `--debug-tui -- <scenario> [args…]`
 # entrypoint that runs a single modal flow on the current terminal
 # (stdin/stdout via crossterm) instead of executing the PID-1 boot

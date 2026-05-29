@@ -198,6 +198,7 @@ let
         QEMU_LOG="$WORK_DIR/qemu.log"
         SER_SOCK="$WORK_DIR/serial.sock"
         SER_LOG="$WORK_DIR/serial.log"
+        MON_SOCK="$WORK_DIR/monitor.sock"
         NOVNC_PIDFILE="$WORK_DIR/novnc.pid"
 
         if [ -f "$QEMU_PIDFILE" ]; then
@@ -215,7 +216,7 @@ let
                 kill "$old_pid" 2>/dev/null || true
             fi
         fi
-        rm -f "$QEMU_PIDFILE" "$NOVNC_PIDFILE" "$SER_SOCK" "$SER_LOG" "$QEMU_LOG"
+        rm -f "$QEMU_PIDFILE" "$NOVNC_PIDFILE" "$SER_SOCK" "$SER_LOG" "$QEMU_LOG" "$MON_SOCK"
 
         echo "[harness] starting QEMU..."
         # shellcheck disable=SC2086
@@ -228,6 +229,7 @@ let
             -display "vnc=:$VNC_DISPLAY" \
             -chardev "socket,id=ser0,path=$SER_SOCK,server=on,wait=off" \
             -serial chardev:ser0 \
+            -monitor "unix:$MON_SOCK,server=on,wait=off" \
             -nodefaults \
             -daemonize \
             -pidfile "$QEMU_PIDFILE" \
@@ -258,6 +260,8 @@ let
           vnc:       localhost:$VNC_PORT
           serial:    socat - UNIX-CONNECT:$SER_SOCK
                      (mirror at $SER_LOG)
+          monitor:   socat - UNIX-CONNECT:$MON_SOCK
+                     (e.g. echo "screendump shot.ppm" | socat - UNIX-CONNECT:$MON_SOCK)
           logs:      $QEMU_LOG
           shutdown:  kill \$(cat $QEMU_PIDFILE)
         EOF

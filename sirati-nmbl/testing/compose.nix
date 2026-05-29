@@ -57,8 +57,14 @@ let
   # namespace as `nixos-anywhere-install-<target>-{screen,qemu-serial-rs}`.
   # Long-term we could refactor that flake to emit artefacts here, but
   # for now the alias path keeps the install behaviour unchanged.
+  # The `luks-password-splash` target renders the GRAPHICAL splash to a
+  # DRM framebuffer, so it only makes sense paired with the `vnc`
+  # interaction (a serial/tmux UART can't show what NMBL draws on
+  # /dev/dri/card0). Constrain it to vnc; leave every other target's
+  # interaction set untouched.
   invalidCombo = startMode: target: interaction:
-    startMode == "nixos-anywhere-install";
+    startMode == "nixos-anywhere-install"
+    || (target == "luks-password-splash" && interaction != "vnc");
 
   # Build artefact for a (start-mode, target, bootstrapper) triple.
   mkArtefactFor =

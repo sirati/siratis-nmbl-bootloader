@@ -226,6 +226,48 @@ let
       ];
     };
 
+    # Splash background sidecar variant: same UEFI+GRUB chain as
+    # test-external-config, but the graphical splash is enabled with the
+    # background staged on the boot partition (`nmblsplash.png` next to
+    # the initrd) instead of embedded in the initramfs. Requires
+    # bootstrap mode so Phase 0.5 mounts /boot before the splash comes
+    # up. Used to verify the image lands on /boot and is NOT in the
+    # initrd.
+    test-external-splash-bg = {
+      name = "test-external-splash-bg";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "uefi";
+        loader = "grub";
+        loader_extra_args = {
+          timeout = 0;
+          extraConfig = ''
+            serial --unit=0 --speed=115200
+            terminal_input serial
+            terminal_output serial
+          '';
+        };
+      };
+      extraModules = [
+        ({ ... }: {
+          boot.nmbl.splash.enable = true;
+          boot.nmbl.splash.backgroundLocation = "boot-partition";
+          # Sidecar background requires bootstrap mode so Phase 0.5
+          # mounts /boot and sets runtime_boot_mountpoint, which the
+          # splash loader needs to find nmblsplash.png.
+          boot.nmbl.configLocation = "external";
+          boot.nmbl.bootstrap.bootFs.device = "/dev/vda1";
+          boot.nmbl.bootstrap.kernelModules.explicit = [
+            "virtio_pci"
+            "virtio_blk"
+            "vfat"
+            "nls_cp437"
+            "nls_iso8859_1"
+          ];
+        })
+      ];
+    };
+
   } // nixpkgs.lib.optionalAttrs (disko != null) {
     # LUKS-password variant: same UEFI+GRUB chain as test-gpt-uefi-grub,
     # but vda3 is a LUKS container that NMBL unlocks via the TUI passphrase

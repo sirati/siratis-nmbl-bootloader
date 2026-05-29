@@ -140,6 +140,29 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     ''
   )}
 
+  ${lib.optionalString (cfg.splash.enable && cfg.splash.backgroundLocation == "boot-partition") (
+    let
+      # Splash background sidecar mode: the PNG is NOT embedded in the
+      # initramfs (see lib/config.nix `splashBackgroundContents`).
+      # Instead it lives on the boot partition next to the initrd at a
+      # FIXED basename (`nmblsplash.png`, mirrored by the Rust constant
+      # `SIDECAR_SPLASH_BG_BASENAME`), which the Rust /init reads at
+      # runtime from the Phase-0.5 boot mountpoint. The name is not
+      # configurable, so this destination is constant.
+      escapedDest = lib.escapeShellArg "/boot/nmblsplash.png";
+    in ''
+      # Boot-partition splash mode: stage the background PNG on /boot at
+      # the fixed basename the Rust splash loader reads from. The
+      # initramfs carries only the font in this mode; the background is
+      # read on demand once Phase 0.5 has mounted the boot partition. A
+      # missing file degrades to a solid background at runtime — it never
+      # blocks boot — but we still install it here so the image renders.
+      echo "Staging NMBL splash background to ${escapedDest}..."
+      install -D -m 0644 ${cfg.splash.backgroundImage} ${escapedDest}
+      echo "✓ Splash background installed: ${escapedDest}"
+    ''
+  )}
+
   ${lib.optionalString (bootstrapper.bootMode == "bios" && actualLoader == "grub") ''
         echo "Configuring GPT+BIOS bootloader with GRUB..."
         mkdir -p /boot/grub

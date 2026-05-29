@@ -251,7 +251,7 @@ fn run_network_attempt<R: RescueUi>(
 
     // From here on we are committed to the rescue shell — any error
     // is fatal because we've already switched root (or are about to).
-    mount_and_switch_root(&memfd).map_err(NetAttemptOutcome::Fatal)
+    mount_and_switch_root(&memfd, &config.rescue.entrypoint).map_err(NetAttemptOutcome::Fatal)
 }
 
 // ---------------------------------------------------------------------------
@@ -610,7 +610,10 @@ fn write_all_to_fd<F: rustix::fd::AsFd>(fd: F, mut buf: &[u8]) -> Result<()> {
 /// Loop-mount the memfd at `/rescue`, then hand off to the shared
 /// [`super::switch_root_and_exec`] helper to produce the
 /// [`TerminalAction`] the dispatcher will execve.
-fn mount_and_switch_root(backing: &rustix::fd::OwnedFd) -> Result<TerminalAction> {
+fn mount_and_switch_root(
+    backing: &rustix::fd::OwnedFd,
+    entrypoint: &Path,
+) -> Result<TerminalAction> {
     let index = allocate_loop_device().map_err(|source| NmblError::Rescue {
         stage: "loop-alloc",
         source: Box::new(source),
@@ -640,7 +643,7 @@ fn mount_and_switch_root(backing: &rustix::fd::OwnedFd) -> Result<TerminalAction
         }
     })?;
 
-    super::switch_root_and_exec(rescue_dir)
+    super::switch_root_and_exec(rescue_dir, entrypoint)
 }
 
 // ---------------------------------------------------------------------------
