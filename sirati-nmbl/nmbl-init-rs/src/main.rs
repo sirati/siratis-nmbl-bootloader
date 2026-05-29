@@ -36,6 +36,8 @@ use nmbl_init::{log, nmbl_info, nmbl_warn};
 mod args;
 #[path = "main_parts/dispatch.rs"]
 mod dispatch;
+#[path = "main_parts/early_exit.rs"]
+mod early_exit;
 #[path = "main_parts/phases.rs"]
 mod phases;
 #[cfg(feature = "stateful")]
@@ -44,6 +46,7 @@ mod stateful;
 
 use args::{Args, parse_args};
 use dispatch::{execute_terminal_action, run_tui_session};
+use early_exit::handle_early_exit_modes;
 #[cfg(feature = "stateful")]
 use phases::mount_state_twin;
 use phases::{run_bootstrap_phase, run_phase_1, run_phase_2a};
@@ -331,53 +334,10 @@ fn main() -> ExitCode {
         }
     };
 
-    // Build-time validation hook: load and validate the given config
-    // file, print the outcome, and exit.
-    if let Some(path) = args.validate_config.as_deref() {
-        return match Config::load(path) {
-            Ok(_) => {
-                println!("nmbl-init: config OK: {}", path.display());
-                ExitCode::from(0)
-            }
-            Err(err) => {
-                eprintln!("nmbl-init: config invalid at {}: {err}", path.display());
-                ExitCode::from(1)
-            }
-        };
-    }
-
-    // Installer and systemd-unit early-exit dispatches.
-    #[cfg(feature = "stateful")]
-    {
-        if let Some(dir) = args.init_state_dir.as_deref() {
-            return match nmbl_init::state::init_or_validate(dir) {
-                Ok(_) => {
-                    println!("nmbl-init: state.bin OK under {}", dir.display());
-                    ExitCode::from(0)
-                }
-                Err(err) => {
-                    eprintln!(
-                        "nmbl-init: --init-state failed for {}: {}",
-                        dir.display(),
-                        format_chain(&err as &dyn std::error::Error),
-                    );
-                    ExitCode::from(1)
-                }
-            };
-        }
-        if let Some(dir) = args.boot_succeeded_dir.as_deref() {
-            return match nmbl_init::state::mark_boot_succeeded(dir) {
-                Ok(()) => ExitCode::from(0),
-                Err(err) => {
-                    eprintln!(
-                        "nmbl-init: --boot-succeeded failed for {}: {}",
-                        dir.display(),
-                        format_chain(&err as &dyn std::error::Error),
-                    );
-                    ExitCode::from(1)
-                }
-            };
-        }
+    // Build-time validation and installer/systemd-unit early-exit
+    // dispatches; each prints its outcome and exits.
+    if let Some(code) = handle_early_exit_modes(&args) {
+        return code;
     }
 
     if let Some(report_path) = args.errored_report.clone() {

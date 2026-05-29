@@ -76,52 +76,80 @@ pub fn cover_scale_nearest(src: &[u8], src_w: u32, src_h: u32, dst: FramebufferD
 
     let mut out = vec![0u8; dst_bytes];
 
+    let geom = RowGeometry {
+        src_x0,
+        src_y0,
+        inv_scale,
+        src_w_usize,
+        src_h_usize,
+        dst_w_usize,
+    };
     for y in 0..dst.h {
-        let sy_f = src_y0 + f64::from(y) * inv_scale;
-        // Clamp to [0, src_h - 1]. Truncation matches the task's
-        // "nearest-neighbor (truncation, no interpolation)" spec.
-        let sy = clamp_to_usize_index(sy_f, src_h_usize);
-        let src_row_start = match sy.checked_mul(src_w_usize).and_then(|p| p.checked_mul(4)) {
-            Some(n) => n,
-            None => return Vec::new(),
-        };
-        let dst_row_start = match (y as usize)
-            .checked_mul(dst_w_usize)
-            .and_then(|p| p.checked_mul(4))
-        {
-            Some(n) => n,
-            None => return Vec::new(),
-        };
-
-        for x in 0..dst.w {
-            let sx_f = src_x0 + f64::from(x) * inv_scale;
-            let sx = clamp_to_usize_index(sx_f, src_w_usize);
-
-            let s_off = match src_row_start.checked_add(sx.saturating_mul(4)) {
-                Some(n) => n,
-                None => return Vec::new(),
-            };
-            let d_off = match dst_row_start.checked_add((x as usize).saturating_mul(4)) {
-                Some(n) => n,
-                None => return Vec::new(),
-            };
-
-            // Bounds-checked four-byte copy. If either window is short
-            // for any reason, bail out with an empty result rather
-            // than emit a half-filled buffer.
-            let src_pixel = match src.get(s_off..s_off.saturating_add(4)) {
-                Some(p) => p,
-                None => return Vec::new(),
-            };
-            let dst_pixel = match out.get_mut(d_off..d_off.saturating_add(4)) {
-                Some(p) => p,
-                None => return Vec::new(),
-            };
-            dst_pixel.copy_from_slice(src_pixel);
+        if !fill_dst_row(&mut out, src, dst.w, y, &geom) {
+            return Vec::new();
         }
     }
 
     out
+}
+
+/// Per-row scaling parameters shared across every destination row;
+/// bundled into a struct so [`fill_dst_row`] stays under the argument
+/// count clippy is happy with.
+struct RowGeometry {
+    src_x0: f64,
+    src_y0: f64,
+    inv_scale: f64,
+    src_w_usize: usize,
+    src_h_usize: usize,
+    dst_w_usize: usize,
+}
+
+/// Fill destination row `y` of `out` by nearest-neighbor sampling from
+/// `src`. Returns `false` (caller bails with an empty buffer) on any
+/// arithmetic overflow or short window, exactly matching the inline
+/// `return Vec::new()` early-exits this was extracted from.
+fn fill_dst_row(out: &mut [u8], src: &[u8], dst_w: u32, y: u32, geom: &RowGeometry) -> bool {
+    let sy_f = geom.src_y0 + f64::from(y) * geom.inv_scale;
+    // Clamp to [0, src_h - 1]. Truncation matches the task's
+    // "nearest-neighbor (truncation, no interpolation)" spec.
+    let sy = clamp_to_usize_index(sy_f, geom.src_h_usize);
+    let Some(src_row_start) = sy
+        .checked_mul(geom.src_w_usize)
+        .and_then(|p| p.checked_mul(4))
+    else {
+        return false;
+    };
+    let Some(dst_row_start) = (y as usize)
+        .checked_mul(geom.dst_w_usize)
+        .and_then(|p| p.checked_mul(4))
+    else {
+        return false;
+    };
+
+    for x in 0..dst_w {
+        let sx_f = geom.src_x0 + f64::from(x) * geom.inv_scale;
+        let sx = clamp_to_usize_index(sx_f, geom.src_w_usize);
+
+        let Some(s_off) = src_row_start.checked_add(sx.saturating_mul(4)) else {
+            return false;
+        };
+        let Some(d_off) = dst_row_start.checked_add((x as usize).saturating_mul(4)) else {
+            return false;
+        };
+
+        // Bounds-checked four-byte copy. If either window is short
+        // for any reason, bail out with an empty result rather
+        // than emit a half-filled buffer.
+        let Some(src_pixel) = src.get(s_off..s_off.saturating_add(4)) else {
+            return false;
+        };
+        let Some(dst_pixel) = out.get_mut(d_off..d_off.saturating_add(4)) else {
+            return false;
+        };
+        dst_pixel.copy_from_slice(src_pixel);
+    }
+    true
 }
 
 /// Clamp a source coordinate to `[0, limit - 1]` (or 0 if `limit` is

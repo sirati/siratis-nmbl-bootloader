@@ -110,25 +110,27 @@ pub(super) async fn select_with_stateful(
                 cmdline_override: None,
             })
         }
-        nmbl_init::state::StatefulDecision::Exhausted => {
-            // The emergency menu reads the source chain via
-            // `format_chain`, so wrap a leaf error that explains *why*
-            // the rescue arm fired. There's no `NmblError::Other`
-            // variant; the existing pattern (e.g. `select_and_act`'s
-            // `Decision::Shell` arm) wraps a free-form message in
-            // `NmblError::Io` via `io::Error::other`. Reusing that here
-            // keeps the chain walker happy and the operator-facing
-            // string clear.
-            Err(NmblError::Rescue {
-                stage: "stateful-exhausted",
-                source: Box::new(NmblError::Io {
-                    source: std::io::Error::other(
-                        "max recovery attempts exceeded; no known-good generation left to try",
-                    ),
-                    context: "stateful dispatch".to_string(),
-                }),
-            })
-        }
+        nmbl_init::state::StatefulDecision::Exhausted => Err(exhausted_rescue_error()),
+    }
+}
+
+/// Build the `NmblError::Rescue` that the `Exhausted` decision surfaces.
+///
+/// The emergency menu reads the source chain via `format_chain`, so wrap
+/// a leaf error that explains *why* the rescue arm fired. There's no
+/// `NmblError::Other` variant; the existing pattern (e.g.
+/// `select_and_act`'s `Decision::Shell` arm) wraps a free-form message in
+/// `NmblError::Io` via `io::Error::other`. Reusing that here keeps the
+/// chain walker happy and the operator-facing string clear.
+fn exhausted_rescue_error() -> NmblError {
+    NmblError::Rescue {
+        stage: "stateful-exhausted",
+        source: Box::new(NmblError::Io {
+            source: std::io::Error::other(
+                "max recovery attempts exceeded; no known-good generation left to try",
+            ),
+            context: "stateful dispatch".to_string(),
+        }),
     }
 }
 
