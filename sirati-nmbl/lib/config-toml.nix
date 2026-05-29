@@ -28,6 +28,9 @@ let
     general = {
       verbosity = cfg.verbosity;
       timeout_secs = cfg.timeoutSecs;
+      # Sub-second selector override; honoured over `timeout_secs` by the
+      # Rust runtime. Always emitted (defaults to timeoutSeconds * 1000).
+      timeout_ms = cfg.timeoutMs;
       device_timeout_secs = cfg.deviceTimeoutSecs;
       panic_report_dir = toString cfg.panicReportDir;
       # cfg.serialConsole drives kernel cmdline tagging at the Nix
@@ -37,6 +40,11 @@ let
       # boolean toggle. We omit the (formerly required) field
       # entirely — `General::_serial_console_compat` accepts it as a
       # no-op if a legacy TOML still sets it.
+    }
+    # Emergency-screen auto-reboot override. Emitted only when the
+    # operator set it so absent configs keep the Rust-side 30 s default.
+    // lib.optionalAttrs (cfg.emergencyTimeoutSecs != null) {
+      emergency_timeout_secs = cfg.emergencyTimeoutSecs;
     };
 
     kernel_modules = {
