@@ -142,7 +142,7 @@ pub fn verify_kexec_readiness(
         ConfirmOutcome::Yes => {
             // No passphrase injection: the operator skipped phase 3.
             let injections: Vec<KeyInjection> = Vec::new();
-            let decision = run_selector(config, &generations, console)?;
+            let decision = run_selector(config, &generations, console, &app.interaction)?;
             Ok(Some(decision_to_action(config, &generations, &injections, decision)?))
         }
         ConfirmOutcome::No | ConfirmOutcome::Cancelled => Ok(None),
@@ -163,7 +163,7 @@ fn run_selector_and_dispatch(
             BootReporter::overlay(console, app, "phase 4: scan generations (retry)");
         scan_generations(config, &mut reporter)?
     };
-    let decision = run_selector(config, &generations, console)?;
+    let decision = run_selector(config, &generations, console, &app.interaction)?;
     decision_to_action(config, &generations, injections, decision)
 }
 
