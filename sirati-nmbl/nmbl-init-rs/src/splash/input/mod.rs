@@ -24,12 +24,15 @@
 //! we commit the parser with `maybe_more = false` so termwiz emits
 //! `KeyCode::Escape`.
 
+mod nav;
+mod vt;
+
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::termios::Termios;
 
@@ -37,6 +40,9 @@ use crate::error::{NmblError, Result};
 use crate::nmbl_warn;
 use crate::sys::tty::{enter_raw, open_console, restore_termios};
 use crate::ui::console::parser::TermwizToCrossterm;
+
+use nav::{is_navigation_key, merge_recovered_mods, read_shift_state};
+use vt::{activate_vt, set_kbd_xlate};
 
 /// Short follow-up wait used to disambiguate a bare Esc from the start
 /// of a CSI sequence. 10 ms is comfortably above any realistic inter-
@@ -250,165 +256,14 @@ impl Drop for SplashInput {
     }
 }
 
-/// Force the VT bound to `fd` into the foreground via `VT_ACTIVATE`,
-/// then block until the switch completes via `VT_WAITACTIVE`.
-///
-/// `VT_ACTIVATE` is asynchronous: the kernel schedules the switch but
-/// returns immediately. PS/2 / VNC keystrokes get demultiplexed to the
-/// *currently foreground* VT at delivery time, so the first reads on
-/// the splash fd race the switch and the early keys land on whichever
-/// VT was foreground before us. `VT_WAITACTIVE` blocks until VT 1 is
-/// actually the active VT, after which every subsequent keystroke
-/// arrives on this fd.
-///
-/// On x86 the constants are `VT_ACTIVATE = 0x5606` and `VT_WAITACTIVE
-/// = 0x5607`, with the third ioctl arg the 1-based VT number. Both
-/// failures are non-fatal: we log and continue — the worst case is the
-/// pre-fix behaviour where the operator sees the splash but can't drive
-/// it. The two unsafe calls are documented in docs/architecture.md
-/// alongside the other accepted ioctls (finit_module, kexec_file_load).
-fn activate_vt(fd: &OwnedFd) {
-    use std::os::fd::AsRawFd as _;
-    const VT_ACTIVATE: libc::Ioctl = 0x5606;
-    const VT_WAITACTIVE: libc::Ioctl = 0x5607;
-    // /dev/tty1 → VT 1. We always open VT1 (see splash::INPUT_TTY_PATH)
-    // so the VT number is fixed.
-    let vt_number: libc::c_int = 1;
-    // SAFETY: VT_ACTIVATE takes an integer argument as the third ioctl
-    // parameter; the kernel reads `vt_number` by value. The fd is a
-    // live, open tty char device per the contract on this function.
-    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), VT_ACTIVATE, vt_number) };
-    if rc < 0 {
-        let err = std::io::Error::last_os_error();
-        nmbl_warn!(
-            "VT_ACTIVATE({vt_number}) on splash input fd failed: {err}; \
-             keystrokes may not reach the splash"
-        );
-        // No point waiting for a switch we couldn't schedule.
-        return;
-    }
-    // SAFETY: VT_WAITACTIVE has the same ABI as VT_ACTIVATE — third arg
-    // is the target VT number as an integer value. The kernel blocks
-    // until that VT is the foreground console (or returns EINTR on a
-    // pending signal — early userspace has no async signal sources we
-    // care about, but a stray EINTR is non-fatal and just collapses to
-    // the warning path below).
-    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), VT_WAITACTIVE, vt_number) };
-    if rc < 0 {
-        let err = std::io::Error::last_os_error();
-        nmbl_warn!(
-            "VT_WAITACTIVE({vt_number}) on splash input fd failed: {err}; \
-             early keystrokes may race the VT switch"
-        );
-    }
-}
-
-/// Pin the VT keyboard layer to `K_XLATE` (the default mode that
-/// translates scancodes to ANSI escape sequences). Defensive: an
-/// earlier boot stage that left the line in `K_RAW` / `K_MEDIUMRAW`
-/// would feed raw scancodes to our parser, which expects the ANSI
-/// CSI forms (see [`parse_event`]) and would silently drop them.
-///
-/// Failure is non-fatal: on a non-VT fd `KDSKBMODE` returns `ENOTTY`,
-/// which is the expected behaviour on serial consoles — log and move
-/// on. Other failures (EPERM, EINVAL) are likewise tolerated because
-/// the most common state is already-K_XLATE.
-fn set_kbd_xlate(fd: &OwnedFd) {
-    use std::os::fd::AsRawFd as _;
-    const KDSKBMODE: libc::Ioctl = 0x4B45;
-    const K_XLATE: libc::c_long = 0x01;
-    // SAFETY: KDSKBMODE (linux/kd.h) takes its third argument as an
-    // `unsigned long` value (not a pointer). The kernel validates the
-    // mode against the K_* set. The fd is a live open tty char device
-    // by the function contract; non-VT fds return ENOTTY which we
-    // tolerate below.
-    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), KDSKBMODE, K_XLATE) };
-    if rc < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ENOTTY) {
-            nmbl_warn!(
-                "KDSKBMODE(K_XLATE) on splash input fd failed: {err}; \
-                 keystrokes may arrive as raw scancodes the parser ignores"
-            );
-        }
-    }
-}
-
-/// True for the cursor / paging keys whose Ctrl/Shift chords the kernel
-/// VT collapses onto the bare CSI form (see [`SplashInput::poll`]).
-/// These are exactly the keys the pretty shell binds to scrollback in
-/// `pretty_shell::handle_key`; recovering modifiers for anything else
-/// would risk mis-tagging keys whose `K_XLATE` byte already encodes the
-/// modifier (e.g. `0x03` → Ctrl+C, capital letters → Shift).
-fn is_navigation_key(k: &KeyEvent) -> bool {
-    matches!(
-        k.code,
-        KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::PageUp
-            | KeyCode::PageDown
-            | KeyCode::Home
-            | KeyCode::End
-    )
-}
-
-/// Merge `recovered` modifiers onto every navigation key in `keys`.
-/// Non-navigation keys are left untouched (their `K_XLATE` byte already
-/// carries any modifier the parser could derive). Pure so it can be
-/// unit-tested without a VT fd.
-fn merge_recovered_mods(keys: &mut [KeyEvent], recovered: KeyModifiers) {
-    for k in keys {
-        if is_navigation_key(k) {
-            k.modifiers |= recovered;
-        }
-    }
-}
-
-/// Recover the live Ctrl/Shift modifier state from the kernel VT via
-/// `TIOCLINUX` subcode 6 (`TIOCL_GETSHIFTSTATE`).
-///
-/// The ioctl writes a single-byte bitmask back through the buffer whose
-/// first byte we seed with the subcode. The kernel's `shift_state` bits
-/// are `1=Shift`, `2=AltGr`, `4=Control`, `8=Alt` (linux/keyboard.h
-/// `KG_*`). We map Shift and Control onto crossterm; AltGr/Alt are not
-/// bound by the pretty shell and are ignored.
-///
-/// Failure is non-fatal and common (serial lines / non-VT fds return
-/// `ENOTTY`, an unprivileged caller may get `EPERM`): we return
-/// `KeyModifiers::NONE`, leaving the key unmodified exactly as before
-/// this fix. No warning is logged because this runs on every navigation
-/// keypress and a non-VT line would spam the log.
-fn read_shift_state(fd: &OwnedFd) -> KeyModifiers {
-    use std::os::fd::AsRawFd as _;
-    const TIOCL_GETSHIFTSTATE: u8 = 6;
-    const KG_SHIFT: u8 = 0x01;
-    const KG_CTRL: u8 = 0x04;
-    // The buffer doubles as input (subcode in byte 0) and output (the
-    // kernel overwrites byte 0 with the shift-state bitmask).
-    let mut arg: [u8; 1] = [TIOCL_GETSHIFTSTATE];
-    // SAFETY: TIOCLINUX (linux/tiocl.h) takes a pointer to a buffer in
-    // the third ioctl argument; for subcode 6 the kernel reads the
-    // subcode from byte 0 and writes the 1-byte shift-state result back
-    // into the same byte. `arg` is a live, properly-aligned 1-byte
-    // buffer that outlives the call. The fd is a live open char device
-    // by the function contract; non-VT fds return ENOTTY which we
-    // tolerate below.
-    let rc = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCLINUX, arg.as_mut_ptr()) };
-    if rc < 0 {
-        return KeyModifiers::NONE;
-    }
-    let bits = arg.first().copied().unwrap_or(0);
-    let mut out = KeyModifiers::NONE;
-    if bits & KG_SHIFT != 0 {
-        out |= KeyModifiers::SHIFT;
-    }
-    if bits & KG_CTRL != 0 {
-        out |= KeyModifiers::CONTROL;
-    }
-    out
-}
+// The byte parser and its unit tests now live in
+// `crate::ui::console::parser` (`TermwizToCrossterm`) so the tty and
+// splash backends share one parsing path. See that module for the
+// state machine and the canned-input tests.
+//
+// The splash-specific logic still worth pinning is the modifier
+// recovery: the kernel VT collapses Ctrl/Shift+cursor onto the bare
+// CSI, so we re-attach the shift-state to navigation keys.
 
 /// Wrap a rustix poll/read into a single call that returns the number
 /// of bytes read (0 on timeout).
@@ -448,90 +303,5 @@ fn duration_to_ms(d: Duration) -> i32 {
 fn errno_to_tui(e: rustix::io::Errno) -> NmblError {
     NmblError::Tui {
         source: std::io::Error::from(e),
-    }
-}
-
-// The byte parser and its unit tests now live in
-// `crate::ui::console::parser` (`TermwizToCrossterm`) so the tty and
-// splash backends share one parsing path. See that module for the
-// state machine and the canned-input tests.
-//
-// The splash-specific logic still worth pinning is the modifier
-// recovery: the kernel VT collapses Ctrl/Shift+cursor onto the bare
-// CSI, so we re-attach the shift-state to navigation keys.
-
-#[cfg(test)]
-#[allow(
-    clippy::expect_used,
-    clippy::panic,
-    reason = "tests assert on contract failures"
-)]
-mod tests {
-    use super::*;
-
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    #[test]
-    fn navigation_keys_are_recognised() {
-        for code in [
-            KeyCode::Up,
-            KeyCode::Down,
-            KeyCode::Left,
-            KeyCode::Right,
-            KeyCode::PageUp,
-            KeyCode::PageDown,
-            KeyCode::Home,
-            KeyCode::End,
-        ] {
-            assert!(is_navigation_key(&press(code)), "{code:?} must be nav");
-        }
-        for code in [KeyCode::Char('a'), KeyCode::Enter, KeyCode::Esc] {
-            assert!(!is_navigation_key(&press(code)), "{code:?} must not be nav");
-        }
-    }
-
-    /// The regression: Ctrl+Shift+Up arrives off the kernel VT as the
-    /// bare `ESC [ A` (`KeyCode::Up` + NONE — see the captured bytes in
-    /// the commit message). Merging the recovered shift-state must
-    /// reattach CONTROL|SHIFT so `pretty_shell::handle_key`'s scroll
-    /// binding fires.
-    #[test]
-    fn merge_reattaches_ctrl_shift_to_arrow() {
-        let mut keys = vec![press(KeyCode::Up)];
-        merge_recovered_mods(&mut keys, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
-        assert_eq!(
-            keys.first().expect("one key").modifiers,
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT
-        );
-    }
-
-    /// Recovered modifiers must NOT leak onto non-navigation keys: a
-    /// typed character whose `K_XLATE` byte already encodes the shift
-    /// (capital letter) must keep the parser's own modifiers.
-    #[test]
-    fn merge_leaves_char_keys_untouched() {
-        let mut keys = vec![press(KeyCode::Char('a')), press(KeyCode::Down)];
-        merge_recovered_mods(&mut keys, KeyModifiers::CONTROL);
-        assert_eq!(
-            keys.first().expect("char key").modifiers,
-            KeyModifiers::NONE,
-            "char key must be untouched"
-        );
-        assert_eq!(
-            keys.get(1).expect("arrow key").modifiers,
-            KeyModifiers::CONTROL,
-            "arrow key must gain the recovered modifier"
-        );
-    }
-
-    /// No recovered modifiers (the unmodified-Up case, or a non-VT fd
-    /// where `read_shift_state` returns NONE) must leave keys as-is.
-    #[test]
-    fn merge_none_is_identity() {
-        let mut keys = vec![press(KeyCode::Up)];
-        merge_recovered_mods(&mut keys, KeyModifiers::NONE);
-        assert_eq!(keys.first().expect("one key").modifiers, KeyModifiers::NONE);
     }
 }
