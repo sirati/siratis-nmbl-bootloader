@@ -269,6 +269,28 @@ fn render_frame(
 
     drm.render(|fb, fb_dims| {
         compositor::blit_background(fb, fb_dims, bg_scaled);
+        // Pass 1: dark contrast halo behind default-foreground glyphs,
+        // painted first so it only darkens the background photo and
+        // never bleeds onto adjacent already-drawn text.
+        term_pipe.for_each_cell(|col, row, cell| {
+            if !compositor::wants_halo(cell.fg) {
+                return;
+            }
+            let bold = cell.flags.contains(Flags::BOLD);
+            let Some(glyph) = cache.get(cell.c, bold) else {
+                return;
+            };
+            let x = u32::from(col).saturating_mul(cell_dims.cell_w);
+            let y = u32::from(row).saturating_mul(cell_dims.cell_h);
+            let rect = compositor::CellRect {
+                x,
+                y,
+                w: cell_dims.cell_w,
+                h: cell_dims.cell_h,
+            };
+            compositor::blit_halo(fb, fb_dims, glyph, rect);
+        });
+        // Pass 2: cell backgrounds + glyphs.
         term_pipe.for_each_cell(|col, row, cell| {
             if cell.c == ' ' && cell.bg == AnsiColor::Named(NamedColor::Background) {
                 return;

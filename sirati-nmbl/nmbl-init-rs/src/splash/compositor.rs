@@ -28,6 +28,28 @@ pub struct CellRect {
     pub h: u32,
 }
 
+/// Maximum alpha (0..255) of the pure-black halo composited behind
+/// default-foreground glyphs. It feeds [`src_over`], whose Oklab mix
+/// toward black scales the destination lightness by `(1 - alpha)`. Two
+/// consequences fall out of that "multiply toward black" formulation:
+///
+///   * the absolute darkening is `L_bg * alpha`, so it shrinks to zero
+///     as the background approaches black — the haze is invisible on
+///     dark areas and strongest on bright ones (not a fixed-colour
+///     linear-transparency overlay, which would lighten/flatten dark
+///     pixels instead);
+///   * the result lightness `L_bg * (1 - alpha)` is monotonic in the
+///     background lightness, so at any fixed halo strength a darker
+///     background can never end up brighter than a lighter one.
+///
+/// ~0.63 keeps the strongest core a deep grey rather than full black.
+const HALO_MAX_ALPHA: u8 = 160;
+
+/// Blur radius (per pass) of the halo spread, in pixels. Two separable
+/// box passes give a soft, quickly-fading Gaussian-ish falloff; the
+/// canvas is padded by `2 * HALO_RADIUS` so the full spread fits.
+const HALO_RADIUS: u32 = 2;
+
 /// Copy the scaled background RGBA buffer into the framebuffer,
 /// respecting `fb_dims.stride`. The input is tight RGBA8 of exactly
 /// `fb_dims.w * fb_dims.h * 4` bytes; rows shorter than that are
@@ -186,6 +208,171 @@ pub fn blit_cell(
             let (dr, dg, db) = read_bgrx(dst);
             let (nr, ng, nb) = src_over(fr, fg_g, fb_c, effective, dr, dg, db);
             write_bgrx(dst, nr, ng, nb);
+        }
+    }
+}
+
+/// Whether a cell's foreground should get the dark contrast halo.
+///
+/// Only the terminal *default* foreground qualifies — that's the soft
+/// 60%-white [`named_color`] resolves [`NamedColor::Foreground`] to,
+/// used for all unset-fg text. Explicitly-coloured text (named colours,
+/// indexed, or `Spec`) is left alone, and the halo is keyed off the
+/// glyph's foreground only, so a cell whose *background* happens to be
+/// that same colour never triggers it.
+pub fn wants_halo(fg: Color) -> bool {
+    matches!(fg, Color::Named(NamedColor::Foreground))
+}
+
+/// Paint a dark, quickly-fading contrast halo behind a glyph.
+///
+/// The halo is a blurred, gained copy of the glyph coverage composited
+/// as pure black through the Oklab [`src_over`] blend, so it darkens
+/// the background image proportionally to that pixel's own lightness
+/// (see [`HALO_MAX_ALPHA`]). Drawn in a pass *before* any glyph so it
+/// only ever darkens the background photo, never adjacent text.
+///
+/// Out-of-framebuffer pixels are clipped without overflow; an empty
+/// glyph (a space) is a no-op.
+pub fn blit_halo(fb: &mut [u8], fb_dims: FramebufferDims, glyph: &GlyphBitmap, cell: CellRect) {
+    let gw = glyph.width as usize;
+    let gh = glyph.height as usize;
+    if gw == 0 || gh == 0 {
+        return;
+    }
+    let r = HALO_RADIUS as usize;
+    let pad = r.saturating_mul(2);
+    // Halo canvas: glyph bbox padded by `pad` on every side so the full
+    // two-pass blur spread fits without clipping at the canvas edge.
+    let hw = gw.saturating_add(pad.saturating_mul(2));
+    let hh = gh.saturating_add(pad.saturating_mul(2));
+    let Some(area) = hw.checked_mul(hh) else {
+        return;
+    };
+
+    // Seed the glyph coverage into the centre of a zero-padded canvas.
+    let mut field = vec![0u8; area];
+    for gy in 0..gh {
+        for gx in 0..gw {
+            let cov = glyph
+                .coverage
+                .get(gy.saturating_mul(gw).saturating_add(gx))
+                .copied()
+                .unwrap_or(0);
+            if cov == 0 {
+                continue;
+            }
+            let idx = (gy.saturating_add(pad))
+                .saturating_mul(hw)
+                .saturating_add(gx.saturating_add(pad));
+            if let Some(slot) = field.get_mut(idx) {
+                *slot = cov;
+            }
+        }
+    }
+
+    // Two separable box passes ≈ Gaussian spread.
+    let mut scratch = vec![0u8; area];
+    box_blur_h(&field, &mut scratch, hw, hh, r);
+    box_blur_v(&scratch, &mut field, hw, hh, r);
+    box_blur_h(&field, &mut scratch, hw, hh, r);
+    box_blur_v(&scratch, &mut field, hw, hh, r);
+
+    // Composite black over the framebuffer, per-pixel alpha from the
+    // (gained) blurred coverage. The canvas top-left maps to the glyph
+    // origin shifted back by `pad`.
+    let base_x = i64::from(cell.x) + i64::from(glyph.offset_x) - pad as i64;
+    let base_y = i64::from(cell.y) + i64::from(glyph.offset_y) - pad as i64;
+    let stride = fb_dims.stride as usize;
+    for fy in 0..hh {
+        let dy = base_y + fy as i64;
+        if dy < 0 {
+            continue;
+        }
+        let dy = dy as u64;
+        if dy >= u64::from(fb_dims.h) {
+            continue;
+        }
+        let row_off = (dy as usize).saturating_mul(stride);
+        for fx in 0..hw {
+            let v = field
+                .get(fy.saturating_mul(hw).saturating_add(fx))
+                .copied()
+                .unwrap_or(0);
+            if v == 0 {
+                continue;
+            }
+            // Gain ×2 (clamped) sharpens the core so thin strokes still
+            // get a solid backing, then scale by the max halo alpha.
+            let gained = u16::from(v).saturating_mul(2).min(255);
+            let alpha = (gained.saturating_mul(u16::from(HALO_MAX_ALPHA)) + 127) / 255;
+            let alpha = if alpha > 255 { 255u8 } else { alpha as u8 };
+            if alpha == 0 {
+                continue;
+            }
+            let dx = base_x + fx as i64;
+            if dx < 0 {
+                continue;
+            }
+            let dx = dx as u64;
+            if dx >= u64::from(fb_dims.w) {
+                continue;
+            }
+            let pix_off = row_off.saturating_add((dx as usize).saturating_mul(4));
+            let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
+                continue;
+            };
+            let (dr, dg, db) = read_bgrx(dst);
+            let (nr, ng, nb) = src_over(0, 0, 0, alpha, dr, dg, db);
+            write_bgrx(dst, nr, ng, nb);
+        }
+    }
+}
+
+/// Horizontal box blur of radius `r`: each output pixel is the mean of
+/// `[x - r, x + r]` clamped to the row. Edge samples outside the canvas
+/// are simply not counted (the canvas is zero-padded, so this is a
+/// faithful clamp-to-edge of near-zero values).
+fn box_blur_h(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    for y in 0..h {
+        let row = y.saturating_mul(w);
+        for x in 0..w {
+            let lo = x.saturating_sub(r);
+            let hi = (x.saturating_add(r)).min(w.saturating_sub(1));
+            let mut sum: u32 = 0;
+            let mut n: u32 = 0;
+            for xx in lo..=hi {
+                sum = sum.saturating_add(u32::from(
+                    src.get(row.saturating_add(xx)).copied().unwrap_or(0),
+                ));
+                n = n.saturating_add(1);
+            }
+            if let Some(slot) = dst.get_mut(row.saturating_add(x)) {
+                *slot = sum.checked_div(n).unwrap_or(0) as u8;
+            }
+        }
+    }
+}
+
+/// Vertical counterpart to [`box_blur_h`].
+fn box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    for x in 0..w {
+        for y in 0..h {
+            let lo = y.saturating_sub(r);
+            let hi = (y.saturating_add(r)).min(h.saturating_sub(1));
+            let mut sum: u32 = 0;
+            let mut n: u32 = 0;
+            for yy in lo..=hi {
+                sum = sum.saturating_add(u32::from(
+                    src.get(yy.saturating_mul(w).saturating_add(x))
+                        .copied()
+                        .unwrap_or(0),
+                ));
+                n = n.saturating_add(1);
+            }
+            if let Some(slot) = dst.get_mut(y.saturating_mul(w).saturating_add(x)) {
+                *slot = sum.checked_div(n).unwrap_or(0) as u8;
+            }
         }
     }
 }
@@ -671,6 +858,147 @@ mod tests {
         // Row 1: glyph row 2 would land at framebuffer row 1 → off the
         // glyph extent (height 2). Stays zero.
         assert_eq!(&fb[8..16], &[0u8; 8]);
+    }
+
+    /// Build a `dim × dim` framebuffer (stride = dim*4) filled with an
+    /// opaque grey `v` in BGRX order, plus its dims.
+    fn grey_fb(dim: u32, v: u8) -> (Vec<u8>, FramebufferDims) {
+        let dims = FramebufferDims {
+            w: dim,
+            h: dim,
+            stride: dim * 4,
+        };
+        let mut fb = vec![0u8; (dims.stride * dims.h) as usize];
+        for px in fb.chunks_exact_mut(4) {
+            px[0] = v;
+            px[1] = v;
+            px[2] = v;
+            px[3] = 0;
+        }
+        (fb, dims)
+    }
+
+    /// Read the R channel (BGRX index 2) of pixel (x, y).
+    fn pixel_r(fb: &[u8], dims: FramebufferDims, x: u32, y: u32) -> u8 {
+        let off = (y as usize) * (dims.stride as usize) + (x as usize) * 4;
+        fb.get(off + 2).copied().unwrap_or(0)
+    }
+
+    /// A solid `n × n` fully-opaque glyph at cell-relative offset (0, 0).
+    fn solid_glyph(n: u32) -> GlyphBitmap {
+        GlyphBitmap {
+            width: n,
+            height: n,
+            coverage: vec![255u8; (n * n) as usize],
+            offset_x: 0,
+            offset_y: 0,
+        }
+    }
+
+    #[test]
+    fn wants_halo_only_default_foreground() {
+        assert!(wants_halo(Color::Named(NamedColor::Foreground)));
+        assert!(!wants_halo(Color::Named(NamedColor::White)));
+        assert!(!wants_halo(Color::Named(NamedColor::BrightWhite)));
+        assert!(!wants_halo(Color::Indexed(15)));
+        assert!(!wants_halo(Color::Spec(Rgb {
+            r: 0xFF,
+            g: 0xFF,
+            b: 0xFF
+        })));
+    }
+
+    #[test]
+    fn blit_halo_darkens_glyph_and_leaves_distant_pixels() {
+        // 24×24 bright-grey fb, 5×5 solid glyph at cell (10, 10).
+        let (mut fb, dims) = grey_fb(24, 200);
+        let glyph = solid_glyph(5);
+        let rect = CellRect {
+            x: 10,
+            y: 10,
+            w: 5,
+            h: 5,
+        };
+        blit_halo(&mut fb, dims, &glyph, rect);
+
+        // Glyph core (12, 12) sits inside the solid ink → darkened.
+        assert!(
+            pixel_r(&fb, dims, 12, 12) < 200,
+            "halo must darken the glyph core"
+        );
+        // Corner (0, 0) is far outside the padded halo canvas → pristine.
+        assert_eq!(
+            pixel_r(&fb, dims, 0, 0),
+            200,
+            "distant pixel must be untouched"
+        );
+    }
+
+    #[test]
+    fn blit_halo_empty_glyph_is_noop() {
+        let (mut fb, dims) = grey_fb(16, 123);
+        let before = fb.clone();
+        let glyph = GlyphBitmap {
+            width: 0,
+            height: 0,
+            coverage: Vec::new(),
+            offset_x: 0,
+            offset_y: 0,
+        };
+        let rect = CellRect {
+            x: 8,
+            y: 8,
+            w: 8,
+            h: 8,
+        };
+        blit_halo(&mut fb, dims, &glyph, rect);
+        assert_eq!(fb, before, "empty glyph must not touch the framebuffer");
+    }
+
+    #[test]
+    fn blit_halo_less_visible_on_dark_and_monotonic() {
+        // Same glyph + cell + halo strength over a bright vs a dark
+        // background. The Oklab multiply-toward-black means:
+        //   * the bright pixel is darkened by a larger absolute amount
+        //     (the haze is "less visible" on dark backgrounds), and
+        //   * the darker background can never end up brighter than the
+        //     lighter one (monotonic in background brightness).
+        const BRIGHT: u8 = 200;
+        const DARK: u8 = 40;
+        let glyph = solid_glyph(5);
+        let rect = CellRect {
+            x: 10,
+            y: 10,
+            w: 5,
+            h: 5,
+        };
+
+        let (mut fb_bright, dims) = grey_fb(24, BRIGHT);
+        blit_halo(&mut fb_bright, dims, &glyph, rect);
+        let bright_after = pixel_r(&fb_bright, dims, 12, 12);
+
+        let (mut fb_dark, _) = grey_fb(24, DARK);
+        blit_halo(&mut fb_dark, dims, &glyph, rect);
+        let dark_after = pixel_r(&fb_dark, dims, 12, 12);
+
+        // Both darkened.
+        assert!(bright_after < BRIGHT, "bright bg must darken");
+        assert!(dark_after <= DARK, "dark bg must not brighten");
+
+        // Less visible on dark: absolute darkening is smaller.
+        let bright_drop = u32::from(BRIGHT) - u32::from(bright_after);
+        let dark_drop = u32::from(DARK) - u32::from(dark_after);
+        assert!(
+            bright_drop > dark_drop,
+            "haze must darken the bright bg more in absolute terms \
+             (bright_drop={bright_drop}, dark_drop={dark_drop})"
+        );
+
+        // Monotonic: darker bg stays no brighter than the lighter one.
+        assert!(
+            dark_after <= bright_after,
+            "result on dark bg ({dark_after}) must be <= result on bright bg ({bright_after})"
+        );
     }
 
     #[test]
