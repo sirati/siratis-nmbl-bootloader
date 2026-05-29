@@ -159,6 +159,46 @@ fn peercred_reports_self_uid() {
     assert_eq!(cred.uid.as_raw(), nix::unistd::getuid().as_raw());
 }
 
+/// `verify_run_dir` must reject a path that is not a directory.
+#[test]
+fn verify_run_dir_rejects_non_directory() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let path = tmp.path().to_str().expect("utf8 path");
+    let err = verify_run_dir(path).expect_err("a file is not a dir");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+/// `verify_run_dir` must reject a directory whose mode is not exactly
+/// 0700 (here, group/other-accessible 0755).
+#[test]
+fn verify_run_dir_rejects_wrong_mode() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_str().expect("utf8 path");
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod 0755");
+    let err = verify_run_dir(path).expect_err("0755 must be rejected");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+/// A directory with exactly mode 0700 owned by the test's own uid passes
+/// the mode/type checks. (When run as non-root the owner is the test uid,
+/// not 0; the uid==0 branch is only reachable in the real PID-1 context,
+/// so we accept this check only when running as root.)
+#[test]
+fn verify_run_dir_accepts_0700_dir_when_root() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_str().expect("utf8 path");
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .expect("chmod 0700");
+    if nix::unistd::getuid().is_root() {
+        verify_run_dir(path).expect("root-owned 0700 dir must pass");
+    } else {
+        // Non-root: the owner check fires; mode/type already passed.
+        let err = verify_run_dir(path).expect_err("non-root owner rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+}
+
 fn write_blocking(fd: BorrowedFd<'_>, data: &[u8]) {
     let mut off = 0;
     while off < data.len() {
