@@ -22,42 +22,20 @@ pub mod disk;
 #[cfg(feature = "network-rescue")]
 pub mod net;
 
-use std::ffi::CString;
-use std::io;
-use std::path::{Path, PathBuf};
+mod embedded;
+mod locate;
+mod switch_root;
+mod types;
 
-use nix::mount::MsFlags;
-use nix::unistd::{chdir, chroot};
-use serde::Deserialize;
+pub use embedded::{exec_embedded, halt_with_banner};
+pub use locate::locate_sfs;
+pub(crate) use switch_root::switch_root_and_exec;
+pub use types::RescueMode;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::terminal::TerminalAction;
 use crate::ui::console::Console;
-
-/// Default basename of the rescue squashfs on the boot partition. Used
-/// when `[rescue].sfs_path` is absent from the operator's runtime
-/// config.
-const DEFAULT_SFS_BASENAME: &str = "nmbl-rescue.sfs";
-
-/// How [`crate::shell::drop_to_emergency`] reaches the operator. Comes
-/// from the runtime [`Config`]'s `[rescue]` section; persists to TOML
-/// as kebab-case strings (`"embedded"`, `"external"`, `"none"`).
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RescueMode {
-    /// Legacy: busybox baked into the initramfs.
-    /// [`crate::shell::drop_to_emergency`] execs `cfg.paths.shell`
-    /// directly via [`exec_embedded`].
-    #[default]
-    Embedded,
-    /// `nmbl-rescue.sfs` on the boot partition; loop-mounted on demand
-    /// by [`disk::try_disk_rescue`].
-    External,
-    /// No rescue tools shipped; halt with a structured banner via
-    /// [`halt_with_banner`].
-    None,
-}
 
 /// Decide whether to drop into the embedded shell, mount the external
 /// squashfs, or halt. `cause` is the error that triggered the rescue
@@ -158,267 +136,6 @@ fn dispatch_external(
     }))
 }
 
-/// Build a [`TerminalAction::Execve`] for the operator-configured
-/// shell (`cfg.paths.shell`) with an empty environment. Mirrors the
-/// pre-refactor `exec_embedded` body byte-for-byte in terms of which
-/// argv/env it constructs — the only difference is that the syscall
-/// itself is deferred to the dispatcher in `main`.
-///
-/// The `cause` is moved into the [`crate::terminal::EmergencyBanner`]
-/// so the dispatcher can render the operator-facing banner
-/// immediately before the execve.
-///
-/// Returns `Err(NmblError::Rescue { stage, ... })` on the rare path
-/// where the configured shell path or argv contains an interior NUL
-/// — execve cannot proceed and the caller halts with a banner.
-pub fn exec_embedded(config: &Config, cause: NmblError) -> Result<TerminalAction> {
-    let shell_path = config.paths.shell.as_path();
-    let argv0_bytes: Vec<u8> = shell_path
-        .file_name()
-        .map(|n| n.as_encoded_bytes().to_vec())
-        .unwrap_or_else(|| shell_path.as_os_str().as_encoded_bytes().to_vec());
-
-    // Interior NUL in a config-supplied path is astronomically unlikely
-    // but still has to be handled. Surface as Rescue{stage:"shell-path-nul"}
-    // so the banner makes the failure mode obvious.
-    let path_c =
-        CString::new(shell_path.as_os_str().as_encoded_bytes()).map_err(|_| NmblError::Rescue {
-            stage: "shell-path-nul",
-            source: Box::new(NmblError::ConfigInvalid {
-                reason: "shell path contains interior NUL".to_string(),
-                context: format!("preparing execve of {}", shell_path.display()),
-            }),
-        })?;
-    let argv0_c = CString::new(argv0_bytes).map_err(|_| NmblError::Rescue {
-        stage: "shell-argv0-nul",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "shell argv0 contains interior NUL".to_string(),
-            context: format!("preparing execve of {}", shell_path.display()),
-        }),
-    })?;
-
-    Ok(TerminalAction::Execve {
-        path: path_c,
-        argv: vec![argv0_c],
-        env: Vec::new(),
-        banner: Some(crate::terminal::EmergencyBanner::new(config, cause)),
-        rescue_handoff: true,
-    })
-}
-
-/// Build a [`TerminalAction::HaltWithBanner`] for the no-rescue path.
-/// Used for [`RescueMode::None`] installs where no toolkit ships and
-/// the kindest UX is to stop — rather than leave the operator at an
-/// inert PID 1.
-///
-/// The banner text is rendered by the dispatcher; this constructor
-/// only packages the cause so every halt-with-banner producer goes
-/// through the same code path.
-pub fn halt_with_banner(cause: NmblError) -> TerminalAction {
-    TerminalAction::HaltWithBanner { cause }
-}
-
-/// Switch from the initramfs root into `new_root` and produce a
-/// [`TerminalAction::Execve`] for `/bin/sh`.
-///
-/// Mirrors the busybox `switch_root(8)` dance: `chdir(new_root)` →
-/// `mount --move . /` (MS_MOVE) → `chroot(.)` → `chdir(/)`. The
-/// actual `execve` is deferred to the dispatcher in `main` so any
-/// console handles still on the stack have been dropped first.
-///
-/// Replaces `pivot_root(2)`, which always returns `EINVAL` when the
-/// outgoing root is the initramfs rootfs pseudo-filesystem. After
-/// MS_MOVE the initramfs is detached and no longer reachable via any
-/// path.
-pub(crate) fn switch_root_and_exec(new_root: &Path, entrypoint: &Path) -> Result<TerminalAction> {
-    // Step 1: cd into the new root (the mounted squashfs).
-    chdir(new_root).map_err(|source| NmblError::Rescue {
-        stage: "switch-root",
-        source: Box::new(NmblError::Io {
-            source: io::Error::from_raw_os_error(source as i32),
-            context: format!("chdir({})", new_root.display()),
-        }),
-    })?;
-
-    // Step 2: Move the new-root mount to /, replacing the initramfs
-    // rootfs. MS_MOVE reassigns the mount point atomically.
-    nix::mount::mount(
-        Some("."),
-        "/",
-        Option::<&str>::None,
-        MsFlags::MS_MOVE,
-        Option::<&str>::None,
-    )
-    .map_err(|source| NmblError::Rescue {
-        stage: "switch-root",
-        source: Box::new(NmblError::Io {
-            source: io::Error::from_raw_os_error(source as i32),
-            context: "mount --move . /".to_string(),
-        }),
-    })?;
-
-    // Step 3: chroot into the new `/` (the squashfs).
-    chroot(".").map_err(|source| NmblError::Rescue {
-        stage: "switch-root",
-        source: Box::new(NmblError::Io {
-            source: io::Error::from_raw_os_error(source as i32),
-            context: "chroot(.)".to_string(),
-        }),
-    })?;
-
-    // Step 4: Update the cwd to the new root.
-    chdir("/").map_err(|source| NmblError::Rescue {
-        stage: "switch-root",
-        source: Box::new(NmblError::Io {
-            source: io::Error::from_raw_os_error(source as i32),
-            context: "chdir(/) after chroot".to_string(),
-        }),
-    })?;
-
-    // Step 5: Populate /dev in the new root. The MS_MOVE above detached
-    // the initramfs devtmpfs, so the rescue root's /dev is an empty
-    // mountpoint with no /dev/console. The dispatcher in `main` re-opens
-    // /dev/console to redirect the child's stdio before execve, and the
-    // full-system entrypoint (`/init`) also does its own `exec bash <
-    // /dev/console` — both need a populated /dev. Mount devtmpfs here so
-    // the device nodes exist before either consumer runs. Non-fatal: the
-    // entrypoint's own `mount -t devtmpfs ... || true` tolerates a stale
-    // mount, and the dispatcher's stdio redirect is soft on this path.
-    mount_dev_in_new_root();
-
-    build_rescue_shell_action(entrypoint)
-}
-
-/// Mount `devtmpfs` at `/dev` in the freshly switched-root rescue root
-/// so `/dev/console` (and friends) exist before the dispatcher's stdio
-/// redirect and before the rescue entrypoint runs.
-///
-/// Best-effort by design: any failure is logged at warn level and the
-/// caller proceeds. The full-system `/init` re-mounts devtmpfs itself
-/// (`mount -t devtmpfs ... || true`), and the busybox image's stdio
-/// only needs the node to exist, so a partial setup here never strands
-/// the operator. `EBUSY` (already mounted) is treated as success.
-fn mount_dev_in_new_root() {
-    use crate::{nmbl_info, nmbl_warn};
-
-    let dev = Path::new("/dev");
-    match std::fs::create_dir_all(dev) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => nmbl_warn!("rescue: could not create /dev in new root: {e}"),
-    }
-    match crate::sys::mount::mount_fs(None, dev, "devtmpfs", "mode=755,nosuid") {
-        Ok(()) => nmbl_info!("rescue: mounted /dev in new root"),
-        Err(NmblError::Mount {
-            source: nix::errno::Errno::EBUSY,
-            ..
-        }) => nmbl_info!("rescue: /dev already mounted in new root (EBUSY)"),
-        Err(e) => nmbl_warn!("rescue: could not mount /dev in new root: {e}"),
-    }
-}
-
-/// Construct the [`TerminalAction::Execve`] for the rescue entrypoint
-/// inside the freshly switched-root rescue root with a minimal
-/// `TERM=linux` + `PATH` environment. Shared by the disk and network
-/// rescue paths. The entrypoint is `config.rescue.entrypoint`: the flat
-/// busybox image leaves it at the default `/bin/sh`; the full recovery
-/// system pins it to `/init` (a bash PID-1 script). No banner: the
-/// rescue UI has already taken the operator through its own screens, so
-/// a second emergency banner would be redundant.
-fn build_rescue_shell_action(entrypoint: &Path) -> Result<TerminalAction> {
-    let entry_bytes = entrypoint.as_os_str().as_encoded_bytes();
-    let path_c = CString::new(entry_bytes).map_err(|_| NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "rescue entrypoint path contains interior NUL".to_string(),
-            context: format!("preparing execve of {}", entrypoint.display()),
-        }),
-    })?;
-    // argv0 = basename of the entrypoint (e.g. "sh" or "init"), falling
-    // back to the full path if it has no file name component.
-    let argv0_bytes: Vec<u8> = entrypoint
-        .file_name()
-        .map(|n| n.as_encoded_bytes().to_vec())
-        .unwrap_or_else(|| entry_bytes.to_vec());
-    let argv0_c = CString::new(argv0_bytes).map_err(|_| NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "rescue argv0 contains interior NUL".to_string(),
-            context: format!("preparing execve of {}", entrypoint.display()),
-        }),
-    })?;
-    let term_c = CString::new("TERM=linux").map_err(|_| NmblError::Rescue {
-        stage: "exec-shell",
-        source: Box::new(NmblError::ConfigInvalid {
-            reason: "TERM environment string contains interior NUL".to_string(),
-            context: format!("preparing execve of {}", entrypoint.display()),
-        }),
-    })?;
-    let path_env_c =
-        CString::new("PATH=/bin:/sbin:/usr/bin:/usr/sbin").map_err(|_| NmblError::Rescue {
-            stage: "exec-shell",
-            source: Box::new(NmblError::ConfigInvalid {
-                reason: "PATH environment string contains interior NUL".to_string(),
-                context: format!("preparing execve of {}", entrypoint.display()),
-            }),
-        })?;
-
-    Ok(TerminalAction::Execve {
-        path: path_c,
-        argv: vec![argv0_c],
-        env: vec![term_c, path_env_c],
-        banner: None,
-        rescue_handoff: true,
-    })
-}
-
-/// Resolve the on-disk path of the external rescue squashfs.
-///
-/// `rescue.sfs_path` is interpreted as a path RELATIVE TO THE BOOT
-/// PARTITION ROOT; a leading `/` is tolerated and stripped so the
-/// mountpoint join keeps the runtime mountpoint instead of replacing
-/// it. When `sfs_path` is absent the basename
-/// [`DEFAULT_SFS_BASENAME`] is used.
-///
-/// The runtime mountpoint comes from
-/// [`Config::runtime_boot_mountpoint`], which Phase 0.5 populates after
-/// `mount_boot` succeeds. In legacy embedded-config mode that field is
-/// `None` — there is no NMBL-mounted boot partition, so external rescue
-/// is not supported and this function surfaces a
-/// `NmblError::Rescue { stage: "locate-sfs", … }` instead of fabricating
-/// a path that would not resolve.
-pub fn locate_sfs(config: &Config) -> Result<PathBuf> {
-    let mountpoint =
-        config
-            .runtime_boot_mountpoint
-            .as_deref()
-            .ok_or_else(|| NmblError::Rescue {
-                stage: "locate-sfs",
-                source: Box::new(NmblError::ConfigInvalid {
-                    reason:
-                        "external rescue requires bootstrap mode: the runtime boot mountpoint is \
-                         only known after Phase 0.5 mounts the boot partition, but this NMBL \
-                         instance is running in legacy embedded-config mode"
-                            .to_string(),
-                    context: "resolving rescue.sfs_path against the runtime boot mountpoint"
-                        .to_string(),
-                }),
-            })?;
-
-    let relative: PathBuf = match config.rescue.sfs_path.as_deref() {
-        Some(p) => strip_leading_slash(p).to_path_buf(),
-        None => PathBuf::from(DEFAULT_SFS_BASENAME),
-    };
-    Ok(mountpoint.join(relative))
-}
-
-/// Strip a single leading `/` so [`Path::join`] keeps the mountpoint
-/// instead of replacing it. Mirrors the helper in
-/// [`crate::config::resolve_full_config_path`].
-fn strip_leading_slash(p: &Path) -> &Path {
-    p.strip_prefix("/").unwrap_or(p)
-}
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -428,7 +145,8 @@ fn strip_leading_slash(p: &Path) -> &Path {
 mod tests {
     use super::*;
     use crate::config::RescueConfig;
-    use std::path::Path;
+    use serde::Deserialize;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn rescue_mode_default_is_embedded() {
@@ -529,7 +247,8 @@ mod tests {
         // The full recovery system pins /init; the default flat image
         // leaves it at /bin/sh. argv0 is the basename in both cases.
         for (entry, argv0) in [("/init", "init"), ("/bin/sh", "sh")] {
-            let action = build_rescue_shell_action(Path::new(entry)).expect("action must build");
+            let action = switch_root::build_rescue_shell_action(Path::new(entry))
+                .expect("action must build");
             match action {
                 TerminalAction::Execve {
                     path,
