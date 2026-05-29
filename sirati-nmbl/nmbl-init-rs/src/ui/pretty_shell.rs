@@ -80,6 +80,12 @@ const CHROME_COLS: u16 = 2;
 /// parser handles partial sequences across feeds.
 const PTY_READ_CHUNK: usize = 4096;
 
+/// Scrollback rows moved per mouse-wheel notch, matching a typical
+/// terminal-emulator wheel step. Ctrl+Shift+Up/Down still step one row
+/// at a time; the wheel scrolls a few rows per detent so a flick covers
+/// ground.
+const WHEEL_SCROLL_STEP: i32 = 3;
+
 /// `Dimensions` impl for the pretty-shell grid. Local copy of the same
 /// trait impl used by `splash::terminal::SplashTerminal` — the upstream
 /// crate's `TermSize` is `cfg(test)`-gated and not reusable.
@@ -233,6 +239,14 @@ fn drive(state: &mut PtyShellState, console: &mut dyn Console) -> Result<()> {
             // grid geometry and push it to the emulator + child. The guard
             // applies the resize and only marks dirty when geometry changed.
             Some(ConsoleEvent::Resize { .. }) if apply_resize(state, console) => {
+                dirty = true;
+            }
+            // Mouse wheel drives NMBL's scrollback exactly like
+            // Ctrl+Shift+Up/Down — a few rows per notch. A wheel notch is
+            // a scroll, not a keystroke, so it must NOT snap the view to
+            // the bottom and is never forwarded to the child PTY.
+            Some(ConsoleEvent::Scroll { up }) => {
+                handle_scroll(state, up);
                 dirty = true;
             }
             _ => {}
@@ -480,6 +494,29 @@ fn handle_key(state: &mut PtyShellState, key: KeyEvent) -> Result<KeyOutcome> {
     // The terminal grid won't change until the shell echoes the byte
     // back; let the read pump trigger the next repaint.
     Ok(KeyOutcome::Noop)
+}
+
+/// The signed `Scroll::Delta` for one mouse-wheel notch. Wheel-up is a
+/// positive delta (toward older scrollback); wheel-down is negative
+/// (toward the live tail). Pure so the sign mapping is unit-testable
+/// without a live PTY.
+fn wheel_scroll_delta(up: bool) -> i32 {
+    if up {
+        WHEEL_SCROLL_STEP
+    } else {
+        -WHEEL_SCROLL_STEP
+    }
+}
+
+/// Scroll the scrollback in response to one mouse-wheel notch. Uses the
+/// same `scroll_display` path as the Ctrl+Shift+Up/Down key bindings;
+/// `scroll_display` clamps the offset to the history size, so
+/// over-scrolling at either end is a no-op.
+fn handle_scroll(state: &mut PtyShellState, up: bool) {
+    state
+        .term
+        .grid_mut()
+        .scroll_display(Scroll::Delta(wheel_scroll_delta(up)));
 }
 
 /// Compute the escape line-state implied by having just sent byte `b`:
@@ -812,6 +849,48 @@ mod tests {
         assert_ne!(
             scrolled, tail,
             "scrolled view must differ from the live tail"
+        );
+    }
+
+    #[test]
+    fn wheel_scroll_delta_sign_matches_direction() {
+        assert!(
+            wheel_scroll_delta(true) > 0,
+            "wheel-up must scroll toward older scrollback (positive delta)"
+        );
+        assert!(
+            wheel_scroll_delta(false) < 0,
+            "wheel-down must scroll toward the live tail (negative delta)"
+        );
+    }
+
+    /// One wheel-up notch moves the scrollback offset off the live tail
+    /// (by `WHEEL_SCROLL_STEP` rows), and a wheel-down notch brings it
+    /// back. Exercises the exact `scroll_display` path `handle_scroll`
+    /// drives, without a live PTY.
+    #[test]
+    fn wheel_notches_move_scroll_offset() {
+        let lines: Vec<String> = (0..30).map(|i| format!("line{i}")).collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut term = term_with_lines(20, 6, &refs);
+        assert_eq!(term.grid().display_offset(), 0, "starts at live tail");
+
+        // Wheel up one notch.
+        term.grid_mut()
+            .scroll_display(Scroll::Delta(wheel_scroll_delta(true)));
+        assert_eq!(
+            term.grid().display_offset(),
+            WHEEL_SCROLL_STEP as usize,
+            "wheel-up moves the offset up by one step"
+        );
+
+        // Wheel down one notch returns to the live tail.
+        term.grid_mut()
+            .scroll_display(Scroll::Delta(wheel_scroll_delta(false)));
+        assert_eq!(
+            term.grid().display_offset(),
+            0,
+            "wheel-down snaps back to the live tail"
         );
     }
 
