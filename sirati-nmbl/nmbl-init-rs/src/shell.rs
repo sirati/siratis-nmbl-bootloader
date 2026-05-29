@@ -69,8 +69,8 @@ use crate::ui::console::{Console, open_console};
 use crate::ui::emergency_actions::{retry_boot, surface_action_failure, verify_kexec_readiness};
 use crate::ui::app::App;
 use crate::ui::{
-    EmergencyChoice, TuiPasswordSupplier, build_emergency_app, build_message, default_items,
-    run_emergency_screen_with_app,
+    EmergencyChoice, SessionInteraction, TuiPasswordSupplier, build_emergency_app, build_message,
+    default_items, run_emergency_screen_with_app,
 };
 
 /// Print the operator-facing emergency banner and drive the
@@ -96,6 +96,7 @@ pub fn drop_to_emergency(
     console: Box<dyn Console>,
     config: &Config,
     err: NmblError,
+    session: &SessionInteraction,
 ) -> TerminalAction {
     let mut console = console;
 
@@ -119,7 +120,7 @@ pub fn drop_to_emergency(
     // bound. `build_emergency_app(&[])` uses an empty generations
     // slice which is `'static`, so the inferred lifetime here is
     // already `'static` — the explicit annotation merely pins it.
-    let mut app: App<'static> = build_emergency_app(&message, &items);
+    let mut app: App<'static> = build_emergency_app(&message, &items, session);
 
     // Re-entrant picker. The Raw Shell, Pretty Shell, Retry boot, and
     // Verify kexec readiness branches all return control to this loop
@@ -196,7 +197,7 @@ pub fn drop_to_emergency(
                 continue;
             }
             EmergencyChoice::RetryBoot => {
-                let mut supplier = TuiPasswordSupplier::new(config);
+                let mut supplier = TuiPasswordSupplier::new(config, session);
                 match retry_boot(config, &mut *console, &mut app, &mut supplier) {
                     Ok(action) => return action,
                     Err(e) => {
@@ -246,8 +247,12 @@ pub fn drop_to_emergency(
 /// return [`TerminalAction::Reboot`] so the dispatcher reboots
 /// instead of leaving the operator at an inert PID 1.
 pub fn open_console_and_drop_to_emergency(config: &Config, err: NmblError) -> TerminalAction {
+    // These call sites have no prior boot session (initial bring-up
+    // failure, panic-recovery re-exec, pre-console phases), so no
+    // keypress could have happened yet — a fresh latch is correct.
+    let session = SessionInteraction::new();
     match open_console(config, true) {
-        Ok(c) => drop_to_emergency(c, config, err),
+        Ok(c) => drop_to_emergency(c, config, err, &session),
         Err(open_err) => {
             nmbl_warn!(
                 "emergency console bring-up failed: {}; defaulting to reboot",
@@ -513,7 +518,12 @@ mod tests {
             Some(press(KeyCode::Char('r'))),
         ]));
 
-        let action = drop_to_emergency(console, &config, io_err("synthetic boot failure"));
+        let action = drop_to_emergency(
+            console,
+            &config,
+            io_err("synthetic boot failure"),
+            &SessionInteraction::new(),
+        );
         assert!(
             matches!(action, TerminalAction::Reboot),
             "Raw Shell choice must NOT produce a TerminalAction::Execve any more; \
@@ -532,7 +542,12 @@ mod tests {
         let console: Box<dyn Console> =
             Box::new(ScriptedConsole::new(vec![Some(press(KeyCode::Char('r')))]));
 
-        let action = drop_to_emergency(console, &config, io_err("synthetic"));
+        let action = drop_to_emergency(
+            console,
+            &config,
+            io_err("synthetic"),
+            &SessionInteraction::new(),
+        );
 
         match action {
             TerminalAction::Reboot => {}

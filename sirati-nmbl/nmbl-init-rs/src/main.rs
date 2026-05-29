@@ -45,7 +45,7 @@ use nmbl_init::sys::{blkid, mount as sys_mount};
 use nmbl_init::terminal::{TerminalAction, redirect_stdio_for_execve};
 use nmbl_init::ui::console::{Console, NoopConsole, open_console};
 use nmbl_init::ui::key_echo::run_key_echo_loop;
-use nmbl_init::ui::{BootReporter, Decision, TuiPasswordSupplier, run_selector};
+use nmbl_init::ui::{BootReporter, Decision, SessionInteraction, TuiPasswordSupplier, run_selector};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/nmbl/config.toml";
@@ -310,6 +310,7 @@ fn run_phase_2a(config: &Config, reporter: &mut BootReporter<'_, '_>) -> Result<
 fn run_phases_post_console(
     config: &Config,
     console: &mut dyn Console,
+    session: &SessionInteraction,
 ) -> Result<Vec<KeyInjection>> {
     let mut reporter = BootReporter::new(console, "phase 2b: loading kernel modules");
     // Paint the first frame so the operator sees a populated screen
@@ -328,7 +329,7 @@ fn run_phases_post_console(
     // Neither path needs an extra VT switch here.
 
     nmbl_info!("phase 3: storage activations");
-    let mut supplier = TuiPasswordSupplier::new(config);
+    let mut supplier = TuiPasswordSupplier::new(config, session);
     let injections = run_all_activations(config, &mut reporter, Some(&mut supplier))?;
 
     nmbl_info!("phase 3b: mount system filesystems");
@@ -494,6 +495,7 @@ fn select_and_act(
     config: &Config,
     console: &mut dyn Console,
     key_injections: &[KeyInjection],
+    session: &SessionInteraction,
 ) -> Result<TerminalAction> {
     nmbl_info!("phase 4: scan generations");
     let generations = {
@@ -509,11 +511,11 @@ fn select_and_act(
     // other case (no feature, no opt-in, missing/unsupported state.bin,
     // IO failure) the call collapses to the legacy `run_selector` path.
     #[cfg(feature = "stateful")]
-    let decision = select_with_stateful(config, &generations, console)?;
+    let decision = select_with_stateful(config, &generations, console, session)?;
     #[cfg(not(feature = "stateful"))]
     let decision = {
         nmbl_info!("phase 5: TUI generation selector");
-        run_selector(config, &generations, console)?
+        run_selector(config, &generations, console, session)?
     };
 
     match decision {
@@ -564,6 +566,7 @@ fn select_with_stateful(
     config: &Config,
     generations: &[Generation],
     console: &mut dyn Console,
+    session: &SessionInteraction,
 ) -> Result<Decision> {
     // No opt-in: legacy path verbatim.
     let (Some(_stateful), Some(state_mp)) = (
@@ -571,7 +574,7 @@ fn select_with_stateful(
         config.runtime_state_mountpoint.as_deref(),
     ) else {
         nmbl_info!("phase 5: TUI generation selector");
-        return run_selector(config, generations, console);
+        return run_selector(config, generations, console, session);
     };
 
     let state_path = state_mp.join("nmbl").join("state.bin");
@@ -587,7 +590,7 @@ fn select_with_stateful(
                 state_path.display(),
             );
             nmbl_info!("phase 5: TUI generation selector");
-            return run_selector(config, generations, console);
+            return run_selector(config, generations, console, session);
         }
         Err(err) => {
             // IO error other than NotFound (which `read` already maps to
@@ -600,7 +603,7 @@ fn select_with_stateful(
                 state_path.display(),
             );
             nmbl_info!("phase 5: TUI generation selector");
-            return run_selector(config, generations, console);
+            return run_selector(config, generations, console, session);
         }
     };
 
@@ -615,7 +618,7 @@ fn select_with_stateful(
                 "phase 5: TUI generation selector (stateful: honour operator choice, recovery_attempt={})",
                 state.recovery_attempt,
             );
-            let decision = run_selector(config, generations, console)?;
+            let decision = run_selector(config, generations, console, session)?;
             if let Decision::Boot {
                 generation_index,
                 cmdline_override: _,
@@ -1179,12 +1182,24 @@ fn run_inner(
             context: "key-echo".to_string(),
         };
         // Hand the live console down to drop_to_emergency so the
-        // emergency UI paints through the same backend.
-        return Ok(drop_to_emergency(console, &config, err));
+        // emergency UI paints through the same backend. The key-echo
+        // diagnostic owns its own App, so a fresh session is correct.
+        return Ok(drop_to_emergency(
+            console,
+            &config,
+            err,
+            &SessionInteraction::new(),
+        ));
     }
 
-    match run_phases_post_console(&config, &mut *console)
-        .and_then(|injections| select_and_act(&config, &mut *console, &injections))
+    // One interaction latch for the whole boot session: a keypress on
+    // the LUKS passphrase prompt or the selector marks the boot as
+    // attended so the emergency screen below skips its auto-reboot
+    // countdown. The same handle reaches all three Apps.
+    let session = SessionInteraction::new();
+
+    match run_phases_post_console(&config, &mut *console, &session)
+        .and_then(|injections| select_and_act(&config, &mut *console, &injections, &session))
     {
         Ok(action) => {
             // `console` falls out of scope on this return, running
@@ -1214,7 +1229,7 @@ fn run_inner(
             // — its [Retry boot from config] re-runs phase 3 and re-
             // prompts for the passphrase, which is exactly what the
             // operator wants after a shell detour.
-            Ok(drop_to_emergency(console, &config, err))
+            Ok(drop_to_emergency(console, &config, err, &session))
         }
     }
 }

@@ -423,6 +423,50 @@ pub fn render_boot_status(frame: &mut Frame<'_>, data: &BootStatusData<'_>) {
     frame.render_widget(status_para, status);
 }
 
+/// Render the full boot-transcript log viewer ([`crate::ui::app::Screen::Log`]).
+///
+/// `lines` is the snapshot (oldest first) and `offset` is the operator's
+/// scroll position from the top; it is clamped here to
+/// `total - visible_rows` so an over-scroll (e.g. `End` setting
+/// `u16::MAX`) lands on the last full page rather than off the end.
+/// A bordered "boot log" block fills `area` above a single dim footer
+/// hint row.
+pub fn render_log(frame: &mut Frame<'_>, area: Rect, lines: &[String], offset: u16) {
+    // Reserve the bottom row for the footer hint; the rest is the box.
+    let [body, footer] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas::<2>(area);
+
+    let block = Block::bordered().title("boot log");
+    let inner = block.inner(body);
+    let visible = inner.height;
+    let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_off = total.saturating_sub(visible);
+    let clamped = offset.min(max_off);
+
+    let start = clamped as usize;
+    let end = start
+        .saturating_add(visible as usize)
+        .min(lines.len());
+    let visible_lines: Vec<Line<'_>> = lines
+        .get(start..end)
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| Line::raw(s.clone()))
+        .collect();
+
+    let para = Paragraph::new(Text::from(visible_lines))
+        .block(block)
+        .wrap(Wrap { trim: false });
+    frame.render_widget(para, body);
+
+    let hint = Paragraph::new(Span::styled(
+        "\u{2191}/\u{2193} PgUp/PgDn  Esc/Ctrl+L close",
+        Style::default().add_modifier(Modifier::DIM),
+    ))
+    .alignment(Alignment::Right);
+    frame.render_widget(hint, footer);
+}
+
 /// State needed to render the [`Screen::KeyEcho`] diagnostic view.
 ///
 /// Both ring buffers are caller-owned (`App` holds the
