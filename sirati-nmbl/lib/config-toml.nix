@@ -27,9 +27,8 @@ let
   tomlValue = {
     general = {
       verbosity = cfg.verbosity;
-      timeout_secs = cfg.timeoutSecs;
-      # Sub-second selector override; honoured over `timeout_secs` by the
-      # Rust runtime. Always emitted (defaults to timeoutSeconds * 1000).
+      # Selector auto-boot countdown in milliseconds (defaults to
+      # timeoutSeconds * 1000; set timeoutMillis for sub-second delays).
       timeout_ms = cfg.timeoutMs;
       device_timeout_secs = cfg.deviceTimeoutSecs;
       panic_report_dir = toString cfg.panicReportDir;

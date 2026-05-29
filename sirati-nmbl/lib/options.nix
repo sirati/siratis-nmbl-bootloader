@@ -506,17 +506,6 @@ in
       '';
     };
 
-    timeoutSecs = lib.mkOption {
-      type = lib.types.int;
-      default = cfg.timeoutSeconds;
-      defaultText = lib.literalMD "inherits from `boot.nmbl.timeoutSeconds`.";
-      description = lib.mdDoc ''
-        Alias for `boot.nmbl.timeoutSeconds` matching the snake_case
-        `timeout_secs` key in the runtime TOML config consumed by
-        nmbl-init-rs.
-      '';
-    };
-
     timeoutMs = lib.mkOption {
       type = lib.types.int;
       default = cfg.timeoutMillis;
@@ -524,7 +513,9 @@ in
       description = lib.mdDoc ''
         Alias for `boot.nmbl.timeoutMillis` matching the snake_case
         `timeout_ms` key in the runtime TOML config consumed by
-        nmbl-init-rs. When set it overrides `timeout_secs` at runtime.
+        nmbl-init-rs. This is the single selector countdown knob; set
+        `boot.nmbl.timeoutSeconds` for whole seconds or
+        `boot.nmbl.timeoutMillis` for sub-second delays.
       '';
     };
 

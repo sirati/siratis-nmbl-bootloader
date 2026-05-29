@@ -89,7 +89,7 @@ fn device_timeout_secs_defaults_to_thirty_when_absent() {
     // External TOMLs predating the knob must keep parsing cleanly
     // and observe the historic 30 s budget so the boot UX doesn't
     // silently regress on upgrade.
-    let toml_text = "[general]\ntimeout_secs = 3\n";
+    let toml_text = "[general]\ntimeout_ms = 3000\n";
     let config: Config = toml::from_str(toml_text).expect("config must parse");
     assert_eq!(config.general.device_timeout_secs, 30);
 }
@@ -102,26 +102,28 @@ fn device_timeout_secs_is_honoured_when_present() {
 }
 
 #[test]
-fn timeout_ms_defaults_to_none_when_absent() {
-    // Configs predating the knob must keep parsing cleanly and leave
-    // the whole-second `timeout_secs` path in charge.
-    let toml_text = "[general]\ntimeout_secs = 3\n";
+fn timeout_ms_defaults_to_builtin_when_absent() {
+    // Configs that omit the knob fall back to the built-in default.
+    let toml_text = "[general]\nverbosity = \"info\"\n";
     let config: Config = toml::from_str(toml_text).expect("config must parse");
-    assert_eq!(config.general.timeout_ms, None);
+    assert_eq!(
+        config.general.timeout_ms,
+        crate::config::general::default_timeout_ms()
+    );
 }
 
 #[test]
 fn timeout_ms_is_honoured_when_present() {
     let toml_text = "[general]\ntimeout_ms = 500\n";
     let config: Config = toml::from_str(toml_text).expect("config must parse");
-    assert_eq!(config.general.timeout_ms, Some(500));
+    assert_eq!(config.general.timeout_ms, 500);
 }
 
 #[test]
 fn emergency_timeout_secs_defaults_to_none_when_absent() {
     // Absent → the Rust-side 30 s default applies; existing TOMLs
     // must not observe a behaviour change on upgrade.
-    let toml_text = "[general]\ntimeout_secs = 3\n";
+    let toml_text = "[general]\ntimeout_ms = 3000\n";
     let config: Config = toml::from_str(toml_text).expect("config must parse");
     assert_eq!(config.general.emergency_timeout_secs, None);
 }
@@ -139,7 +141,7 @@ fn config_parses_without_splash_table() {
     // A config that doesn't mention [splash] at all must still parse,
     // because the feature defaults to off and existing on-disk configs
     // predate the new table.
-    let toml_text = "[general]\ntimeout_secs = 3\n";
+    let toml_text = "[general]\ntimeout_ms = 3000\n";
     let config: Config = toml::from_str(toml_text).expect("config must parse");
     assert!(!config.splash.enable, "splash must default to disabled");
     assert_eq!(
@@ -373,7 +375,7 @@ fn stateful_section_absent_decodes_to_none() {
     // Configs that predate the stateful knob must still parse and
     // produce `stateful = None`; the rollback flow only engages when
     // the operator opts in.
-    let toml = "[general]\ntimeout_secs = 3\n";
+    let toml = "[general]\ntimeout_ms = 3000\n";
     let cfg: Config = toml::from_str(toml).expect("config must parse");
     assert!(cfg.stateful.is_none());
 }

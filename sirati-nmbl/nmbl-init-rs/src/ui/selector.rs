@@ -47,13 +47,10 @@ async fn run_selector_on_console(
     app.selected_index = default_index;
     app.show_kernel_params = config.tui.show_kernel_params;
 
-    // 1. Countdown phase. A `timeout_ms` override (when set) wins over
-    //    the whole-second `timeout_secs`, enabling sub-second auto-boot
-    //    delays; absent it falls back to the historic seconds budget.
-    let countdown = match config.general.timeout_ms {
-        Some(ms) => Duration::from_millis(u64::from(ms)),
-        None => Duration::from_secs(u64::from(config.general.timeout_secs)),
-    };
+    // 1. Countdown phase. `timeout_ms` is the auto-boot budget in
+    //    milliseconds; sub-second values are supported and the display
+    //    rounds up so it never reads a misleading "0s".
+    let countdown = Duration::from_millis(u64::from(config.general.timeout_ms));
     let outcome = run_console_countdown(console, &mut app, countdown).await?;
     app.countdown_remaining_secs = None;
 

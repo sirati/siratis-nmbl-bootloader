@@ -10,16 +10,12 @@ pub struct General {
     #[serde(default)]
     pub verbosity: Verbosity,
 
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u32,
-
-    /// Optional selector-TUI countdown override in milliseconds. When
-    /// `Some(ms)` it takes precedence over `timeout_secs`, letting the
-    /// operator pick a sub-second auto-boot delay. Hand-written TOML may
-    /// omit it to fall back to whole-second `timeout_secs`; NixOS-generated
-    /// configs always emit it (defaulting to `timeout_secs * 1000`).
-    #[serde(default)]
-    pub timeout_ms: Option<u32>,
+    /// Selector-TUI countdown before auto-booting the default entry, in
+    /// milliseconds. A sub-second value (e.g. `500`) is supported; the
+    /// display still rounds up so it never shows a misleading "0s".
+    /// NixOS-generated configs derive this from `timeoutSeconds * 1000`.
+    #[serde(default = "default_timeout_ms")]
+    pub timeout_ms: u32,
 
     /// Optional override (seconds) for the emergency/error screen's
     /// auto-reboot countdown. When `Some(s)` it replaces the built-in
@@ -53,8 +49,7 @@ impl Default for General {
     fn default() -> Self {
         Self {
             verbosity: Verbosity::default(),
-            timeout_secs: default_timeout_secs(),
-            timeout_ms: None,
+            timeout_ms: default_timeout_ms(),
             emergency_timeout_secs: None,
             device_timeout_secs: default_device_timeout_secs(),
             panic_report_dir: default_panic_report_dir(),
@@ -63,8 +58,8 @@ impl Default for General {
     }
 }
 
-pub(super) fn default_timeout_secs() -> u32 {
-    5
+pub(super) fn default_timeout_ms() -> u32 {
+    5000
 }
 
 pub(super) fn default_device_timeout_secs() -> u64 {
