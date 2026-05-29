@@ -26,12 +26,14 @@
 //!
 //! ## Shutdown
 //!
-//! The shutdown signal is an [`Rc<Cell<bool>>`] ([`Shutdown`]) polled in
-//! the accept multiplexer — NOT a `tokio::sync` primitive (banned). When
-//! the local operator picks a terminal action (or a remote session
-//! produces one) the recovery wiring flips the cell; the server unlinks
-//! the socket and returns. In-flight sessions are dropped, which drops
-//! their `UnixStream`/pty fds → the clients hit EOF and exit 0.
+//! The shutdown signal is a wakeable [`Shutdown`] (an `Rc<RefCell<…>>`
+//! flag plus a stored waker) registered and polled in the accept
+//! multiplexer — NOT a `tokio::sync` primitive (banned). When the local
+//! operator picks a terminal action (or a remote session produces one)
+//! the recovery wiring flips the flag and wakes the parked multiplexer;
+//! the server unlinks the socket and returns. In-flight sessions are
+//! dropped, which drops their `UnixStream`/pty fds → the clients hit EOF
+//! and exit 0.
 //!
 //! ## Session end → client EOF → client exit 0
 //!
@@ -42,7 +44,7 @@
 //! drop, closing the server's ends. The client's blocking
 //! `stream.read` then returns `Ok(0)` and `connect_and_serve` exits 0.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use tokio::net::UnixStream;
@@ -69,28 +71,67 @@ mod driver;
 )]
 mod tests;
 
+/// Interior state of a [`Shutdown`]: the signal flag plus an optional
+/// waker the multiplexer parks on. `Rc<RefCell<…>>`, NOT a `tokio::sync`
+/// primitive (those are banned on the single-thread fork-safe runtime).
+#[derive(Default)]
+struct ShutdownState {
+    signalled: bool,
+    waker: Option<std::task::Waker>,
+}
+
 /// Cooperative shutdown signal shared between the recovery wiring and the
-/// remote accept loop. A plain `Rc<Cell<bool>>` (NOT a `tokio::sync`
-/// channel — those are banned on the single-thread fork-safe runtime).
+/// remote accept loop. Wakeable: the multiplexer [`register`]s its waker
+/// each poll, and [`signal`] wakes it — so the accept `poll_fn` observes
+/// shutdown promptly even with no other event in flight.
+///
+/// [`register`]: Shutdown::register
+/// [`signal`]: Shutdown::signal
 #[derive(Clone, Default)]
-pub struct Shutdown(Rc<Cell<bool>>);
+pub struct Shutdown(Rc<RefCell<ShutdownState>>);
 
 impl Shutdown {
     /// Create a fresh, un-signalled shutdown handle.
     #[must_use]
     pub fn new() -> Self {
-        Self(Rc::new(Cell::new(false)))
+        Self(Rc::new(RefCell::new(ShutdownState::default())))
     }
 
-    /// Request shutdown. Idempotent.
+    /// Request shutdown and wake any parked multiplexer. Idempotent.
     pub fn signal(&self) {
-        self.0.set(true);
+        let waker = {
+            let mut state = self.0.borrow_mut();
+            state.signalled = true;
+            state.waker.take()
+        };
+        // Wake AFTER releasing the borrow so the woken task can re-borrow
+        // (e.g. to `register` again) without a `RefCell` double-borrow.
+        if let Some(waker) = waker {
+            waker.wake();
+        }
     }
 
     /// Whether shutdown has been requested.
     #[must_use]
     pub fn is_signalled(&self) -> bool {
-        self.0.get()
+        self.0.borrow().signalled
+    }
+
+    /// Stash the current task's waker so a later [`signal`] wakes it.
+    /// Called by the multiplexer each poll. Re-stashes only when the
+    /// stored waker would not already wake this task, avoiding a clone
+    /// per poll.
+    ///
+    /// [`signal`]: Shutdown::signal
+    pub(crate) fn register(&self, cx: &std::task::Context<'_>) {
+        let mut state = self.0.borrow_mut();
+        if state
+            .waker
+            .as_ref()
+            .is_none_or(|w| !w.will_wake(cx.waker()))
+        {
+            state.waker = Some(cx.waker().clone());
+        }
     }
 }
 
@@ -205,6 +246,16 @@ async fn serve_session(
     // its own emergency App. We render the boot error the same way the
     // local menu does so the operator sees identical context.
     let session = SessionInteraction::new();
+    // A remote operator is ATTENDED by virtue of having connected over the
+    // socket, so mark the session attended immediately. This disarms the
+    // unattended auto-reboot countdown for THIS session — otherwise its
+    // timeout would commit a machine-wide Reboot through the shared sink,
+    // potentially rebooting the box while a LOCAL operator is actively
+    // using the local menu. The remote menu still lets the operator
+    // EXPLICITLY pick Reboot/Shell/Kexec; only the automatic countdown is
+    // suppressed. The LOCAL console keeps its own unattended-reboot safety
+    // net (it runs its own countdown concurrently).
+    session.set();
     let err = NmblError::Io {
         source: std::io::Error::other("remote recovery session"),
         context: "remote-tui".to_string(),
