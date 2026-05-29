@@ -553,7 +553,10 @@ c.ko:
         let entries: Vec<ModuleEntry> = Vec::new();
         let idx = index_by_name(&entries);
         let order = resolve_load_order("ghost", &idx).expect("must not error");
-        assert!(order.is_empty(), "built-in modules produce empty load order");
+        assert!(
+            order.is_empty(),
+            "built-in modules produce empty load order"
+        );
     }
 
     #[test]

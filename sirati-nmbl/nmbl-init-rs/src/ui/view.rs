@@ -9,9 +9,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 
 use crate::generations::Generation;
 use crate::ui::app::{BootStatusData, EmergencyItem, SPINNER_FRAMES, SPINNER_GLYPHS};
-use crate::ui::modal_layout::{
-    ModalLayout, SCROLL_HINT, compute_modal_layout_with_button_width,
-};
+use crate::ui::modal_layout::{ModalLayout, SCROLL_HINT, compute_modal_layout_with_button_width};
 
 /// Char-width of the rendered button row: sum of `[Label]` cells plus
 /// the 2-col gutters between buttons. Used as a width floor by the
@@ -115,7 +113,9 @@ fn paint_modal_text(frame: &mut Frame<'_>, layout: &ModalLayout, scroll_offset: 
         0
     };
     let start = offset as usize;
-    let end = start.saturating_add(visible as usize).min(layout.wrapped_lines.len());
+    let end = start
+        .saturating_add(visible as usize)
+        .min(layout.wrapped_lines.len());
     let lines: Vec<Line<'_>> = layout
         .wrapped_lines
         .get(start..end)
@@ -166,7 +166,10 @@ fn paint_scroll_hint(frame: &mut Frame<'_>, layout: &ModalLayout) {
 
 fn render_header(frame: &mut Frame<'_>, area: Rect, countdown: Option<u64>) {
     let mut spans = vec![
-        Span::styled("sirati's NMBL ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "sirati's NMBL ",
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::raw("— bootloader"),
     ];
     if let Some(secs) = countdown {
@@ -200,7 +203,11 @@ pub fn char_column_for_byte_cursor(s: &str, byte_idx: usize) -> usize {
     s.get(..safe).map_or(0, |prefix| prefix.chars().count())
 }
 
-fn generation_item<'a>(g: &'a Generation, show_kernel_params: bool, body_width: u16) -> ListItem<'a> {
+fn generation_item<'a>(
+    g: &'a Generation,
+    show_kernel_params: bool,
+    body_width: u16,
+) -> ListItem<'a> {
     let head = if g.label.is_empty() {
         format!("#{}", g.number)
     } else {
@@ -300,9 +307,7 @@ pub fn render_emergency(frame: &mut Frame<'_>, data: &EmergencyScreenData<'_>) {
     // Header: red bold "boot failed". Plus optional countdown.
     let mut header_spans = vec![Span::styled(
         "boot failed",
-        Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
     )];
     if let Some(secs) = data.countdown_remaining_secs {
         header_spans.push(Span::raw("   "));
@@ -453,9 +458,7 @@ pub fn render_log(frame: &mut Frame<'_>, area: Rect, lines: &[String], offset: u
     let clamped = offset.min(max_off);
 
     let start = clamped as usize;
-    let end = start
-        .saturating_add(visible as usize)
-        .min(lines.len());
+    let end = start.saturating_add(visible as usize).min(lines.len());
     let visible_lines: Vec<Line<'_>> = lines
         .get(start..end)
         .unwrap_or(&[])
@@ -648,8 +651,7 @@ pub fn render_modal_buttons(frame: &mut Frame<'_>, data: &ModalButtonsScreenData
 
     let btn_count = u16::try_from(data.labels.len()).unwrap_or(u16::MAX);
     let btn_w = button_row_width(data.labels);
-    let layout =
-        compute_modal_layout_with_button_width(data.message, true, btn_count, btn_w, body);
+    let layout = compute_modal_layout_with_button_width(data.message, true, btn_count, btn_w, body);
     frame.render_widget(Clear, layout.box_rect);
     let block = Block::bordered().title(data.title.to_owned());
     frame.render_widget(block, layout.box_rect);
@@ -727,9 +729,7 @@ pub fn render_modal_error(frame: &mut Frame<'_>, data: &ModalErrorScreenData<'_>
     frame.render_widget(Clear, layout.box_rect);
     let block = Block::bordered().title(Span::styled(
         data.title.to_owned(),
-        Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
     ));
     frame.render_widget(block, layout.box_rect);
     paint_modal_text(frame, &layout, data.scroll_offset);
@@ -1160,9 +1160,7 @@ mod tests {
             spinner_frame: 0,
         };
         let mut term2 = new_term(80, 24);
-        term2
-            .draw(|f| render_passphrase(f, &filled))
-            .expect("draw");
+        term2.draw(|f| render_passphrase(f, &filled)).expect("draw");
         let style_filled = style_under_first_match(&term2, "Enter=submit");
         assert!(
             !style_filled.add_modifier.contains(Modifier::DIM),
@@ -1269,10 +1267,7 @@ mod tests {
         );
         assert!(text.contains("[Yes]"), "yes button missing in:\n{text}");
         assert!(text.contains("[Back]"), "no button missing in:\n{text}");
-        assert!(
-            text.contains("Enter confirm"),
-            "hint missing in:\n{text}"
-        );
+        assert!(text.contains("Enter confirm"), "hint missing in:\n{text}");
     }
 
     #[test]
@@ -1366,7 +1361,10 @@ mod tests {
             text.contains("Pretty Shell failed to start"),
             "title missing in:\n{text}"
         );
-        assert!(text.contains("openpty failed"), "message missing in:\n{text}");
+        assert!(
+            text.contains("openpty failed"),
+            "message missing in:\n{text}"
+        );
         assert!(text.contains("press any key"), "hint missing in:\n{text}");
     }
 

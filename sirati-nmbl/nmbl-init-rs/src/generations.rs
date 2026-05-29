@@ -144,7 +144,10 @@ pub fn scan_generations(
     reporter: &mut BootReporter<'_, '_>,
 ) -> Result<Vec<Generation>> {
     let dir = config.paths.nix_profiles_dir.clone();
-    let _ = reporter.set_phase(format!("phase 4: scanning generations in {}", dir.display()));
+    let _ = reporter.set_phase(format!(
+        "phase 4: scanning generations in {}",
+        dir.display()
+    ));
     let mount_prefix = config.paths.system_root.as_path();
     let entries = match std::fs::read_dir(&dir) {
         Ok(it) => it,
@@ -311,10 +314,7 @@ mod tests {
         fn kind(&self) -> ConsoleKind {
             ConsoleKind::Tty
         }
-        fn draw_with(
-            &mut self,
-            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
-        ) -> Result<()> {
+        fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
             Ok(())
         }
         fn suspend(&mut self) -> Result<()> {
@@ -454,8 +454,9 @@ mod tests {
         symlink(format!("/{store_rel}"), profiles_dir.join("system-3-link"))
             .expect("profile symlink");
 
-        let gens = with_reporter(|r| scan_generations(&config_for(&profiles_dir, &mount_prefix), r))
-            .expect("scan ok");
+        let gens =
+            with_reporter(|r| scan_generations(&config_for(&profiles_dir, &mount_prefix), r))
+                .expect("scan ok");
         assert_eq!(gens.len(), 1);
         assert_eq!(
             gens[0].kernel,
@@ -482,8 +483,8 @@ mod tests {
             make_profile(&backing, *n, "quiet");
             link_profile_relative(&profiles, *n, &format!("../backing/profile-{n}"));
         }
-        let gens = with_reporter(|r| scan_generations(&config_for(&profiles, tmp), r))
-            .expect("scan ok");
+        let gens =
+            with_reporter(|r| scan_generations(&config_for(&profiles, tmp), r)).expect("scan ok");
         (profiles, gens)
     }
 

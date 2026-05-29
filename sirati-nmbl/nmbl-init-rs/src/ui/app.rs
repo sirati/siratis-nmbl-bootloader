@@ -154,7 +154,10 @@ pub enum Screen<'a> {
     /// and popped back via Esc / Ctrl+L. `lines` is the snapshot
     /// (oldest first) and `offset` is the scroll position; the renderer
     /// clamps `offset` so over-scroll is harmless.
-    Log { lines: Vec<String>, offset: u16 },
+    Log {
+        lines: Vec<String>,
+        offset: u16,
+    },
     Editing {
         /// Index into the generations slice.
         generation_index: usize,
@@ -452,7 +455,10 @@ impl<'a> App<'a> {
         if let Screen::Emergency { message, .. } = &mut self.screen {
             *message = new_message.into();
         } else {
-            debug_assert!(false, "set_emergency_message called on non-Emergency screen");
+            debug_assert!(
+                false,
+                "set_emergency_message called on non-Emergency screen"
+            );
         }
     }
 
@@ -536,7 +542,10 @@ impl<'a> App<'a> {
                 *spinner_frame = 0;
             }
         } else {
-            debug_assert!(false, "set_passphrase_verifying called on non-Passphrase screen");
+            debug_assert!(
+                false,
+                "set_passphrase_verifying called on non-Passphrase screen"
+            );
         }
     }
 
@@ -546,7 +555,10 @@ impl<'a> App<'a> {
         if let Screen::Passphrase { spinner_frame, .. } = &mut self.screen {
             *spinner_frame = spinner_frame.wrapping_add(1) % SPINNER_FRAMES;
         } else {
-            debug_assert!(false, "tick_passphrase_spinner called on non-Passphrase screen");
+            debug_assert!(
+                false,
+                "tick_passphrase_spinner called on non-Passphrase screen"
+            );
         }
     }
 
@@ -568,7 +580,10 @@ impl<'a> App<'a> {
             *verifying = false;
             *spinner_frame = 0;
         } else {
-            debug_assert!(false, "clear_passphrase_buffer called on non-Passphrase screen");
+            debug_assert!(
+                false,
+                "clear_passphrase_buffer called on non-Passphrase screen"
+            );
         }
     }
 
@@ -1365,8 +1380,14 @@ mod tests {
                     message.contains("Latest error (#1)"),
                     "message not updated: {message}"
                 );
-                assert!(message.contains("Raw Shell failed"), "missing title: {message}");
-                assert!(!message.contains("boot failed: test"), "stale first error retained");
+                assert!(
+                    message.contains("Raw Shell failed"),
+                    "missing title: {message}"
+                );
+                assert!(
+                    !message.contains("boot failed: test"),
+                    "stale first error retained"
+                );
             }
             _ => panic!("expected Emergency screen"),
         }
@@ -1375,7 +1396,10 @@ mod tests {
         app.set_emergency_message("Latest error (#2): Retry failed\n\nENOENT");
         match &app.screen {
             Screen::Emergency { message, .. } => {
-                assert!(message.contains("Latest error (#2)"), "second update lost: {message}");
+                assert!(
+                    message.contains("Latest error (#2)"),
+                    "second update lost: {message}"
+                );
                 assert!(!message.contains("(#1)"), "stale #1 retained: {message}");
             }
             _ => panic!("expected Emergency screen"),
@@ -1746,7 +1770,13 @@ mod tests {
         assert!(matches!(app.screen, Screen::Log { offset, .. } if offset == 1 + LOG_PAGE));
         // End jumps to u16::MAX (renderer clamps for display).
         app.on_key(press(KeyCode::End));
-        assert!(matches!(app.screen, Screen::Log { offset: u16::MAX, .. }));
+        assert!(matches!(
+            app.screen,
+            Screen::Log {
+                offset: u16::MAX,
+                ..
+            }
+        ));
         // Home returns to 0.
         app.on_key(press(KeyCode::Home));
         assert!(matches!(app.screen, Screen::Log { offset: 0, .. }));

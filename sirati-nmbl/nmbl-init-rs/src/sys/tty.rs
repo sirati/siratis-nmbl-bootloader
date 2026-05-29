@@ -127,10 +127,7 @@ pub fn read_active_console_from(path: &Path) -> Result<PathBuf> {
         context: format!("reading active console listing {}", path.display()),
     })?;
     parse_active_console(&text).ok_or_else(|| NmblError::Tui {
-        source: std::io::Error::other(format!(
-            "{} contains no console names",
-            path.display()
-        )),
+        source: std::io::Error::other(format!("{} contains no console names", path.display())),
     })
 }
 

@@ -411,8 +411,11 @@ mod tests {
     #[test]
     fn sidecar_loader_reads_png_from_boot_partition() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join(SIDECAR_SPLASH_BG_BASENAME), ONE_BY_ONE_RED_RGBA)
-            .expect("stage sidecar png");
+        std::fs::write(
+            dir.path().join(SIDECAR_SPLASH_BG_BASENAME),
+            ONE_BY_ONE_RED_RGBA,
+        )
+        .expect("stage sidecar png");
         let c = cfg_with_mountpoint(Some(dir.path().to_path_buf()));
 
         let fb = dims(4, 4);
@@ -448,8 +451,11 @@ mod tests {
     #[test]
     fn sidecar_loader_falls_back_on_corrupt_png() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join(SIDECAR_SPLASH_BG_BASENAME), b"not a png at all")
-            .expect("stage corrupt sidecar");
+        std::fs::write(
+            dir.path().join(SIDECAR_SPLASH_BG_BASENAME),
+            b"not a png at all",
+        )
+        .expect("stage corrupt sidecar");
         let c = cfg_with_mountpoint(Some(dir.path().to_path_buf()));
 
         let fb = dims(4, 4);

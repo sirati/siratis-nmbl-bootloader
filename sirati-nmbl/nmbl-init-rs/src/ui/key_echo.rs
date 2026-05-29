@@ -89,9 +89,7 @@ fn synthesise_bytes(key: &KeyEvent) -> String {
         KeyCode::Char(c) if c.is_ascii() => {
             // Ctrl+letter collapses to a C0 control byte; otherwise the
             // ASCII codepoint is the byte value.
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                && c.is_ascii_alphabetic()
-            {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && c.is_ascii_alphabetic() {
                 let lc = c.to_ascii_lowercase() as u8;
                 vec![lc.wrapping_sub(0x60)]
             } else {

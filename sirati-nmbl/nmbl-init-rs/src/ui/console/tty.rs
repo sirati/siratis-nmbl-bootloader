@@ -245,9 +245,7 @@ impl TtyConsole {
                         continue;
                     }
                 }
-                Err(e)
-                    if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::WOULDBLOCK =>
-                {
+                Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::WOULDBLOCK => {
                     return self.drain_after_eagain();
                 }
                 Err(e) => return Err(rustix_io_err(e)),
@@ -334,10 +332,7 @@ impl Console for TtyConsole {
     }
 
     fn draw_with(&mut self, body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
-        self.terminal
-            .draw(|f| body(f))
-            .map(|_| ())
-            .map_err(tui_err)
+        self.terminal.draw(|f| body(f)).map(|_| ()).map_err(tui_err)
     }
 
     fn suspend(&mut self) -> Result<()> {

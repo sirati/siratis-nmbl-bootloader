@@ -137,7 +137,10 @@ impl Drop for PrintkQuiet {
 /// must not append a second write because the kernel parses each one
 /// independently.
 fn write_atomically(path: &str, body: &[u8]) -> std::io::Result<()> {
-    let mut f = fs::OpenOptions::new().write(true).truncate(true).open(path)?;
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?;
     f.write_all(body)
 }
 

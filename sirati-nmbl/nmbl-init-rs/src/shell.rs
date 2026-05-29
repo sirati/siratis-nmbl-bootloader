@@ -65,9 +65,9 @@ use crate::config::Config;
 use crate::error::{NmblError, format_chain};
 use crate::nmbl_warn;
 use crate::terminal::{EmergencyBanner, TerminalAction};
+use crate::ui::app::App;
 use crate::ui::console::{Console, open_console};
 use crate::ui::emergency_actions::{retry_boot, surface_action_failure, verify_kexec_readiness};
-use crate::ui::app::App;
 use crate::ui::{
     EmergencyChoice, SessionInteraction, TuiPasswordSupplier, build_emergency_app, build_message,
     default_items, run_emergency_screen_with_app,
@@ -269,16 +269,10 @@ pub fn drop_to_emergency(
 ///
 /// `count` is bumped per call and rendered so repeated failures are
 /// visible at a glance; the freshest chain is shown in full underneath.
-fn update_latest_error(
-    app: &mut App<'static>,
-    count: &mut u32,
-    title: &str,
-    chain: &str,
-) {
+fn update_latest_error(app: &mut App<'static>, count: &mut u32, title: &str, chain: &str) {
     *count = count.saturating_add(1);
-    let message = format!(
-        "Latest error (#{count}): {title}\n\n{chain}\n\nChoose what to do next.",
-    );
+    let message =
+        format!("Latest error (#{count}): {title}\n\n{chain}\n\nChoose what to do next.",);
     app.set_emergency_message(message);
 }
 
@@ -328,10 +322,7 @@ pub fn print_banner(banner: &EmergencyBanner) {
         eprintln!("  {line}");
     }
     eprintln!();
-    eprintln!(
-        "Shell: {}  (will execve next)",
-        banner.shell_path.display()
-    );
+    eprintln!("Shell: {}  (will execve next)", banner.shell_path.display());
     eprintln!("Type `exit` to reboot, or fix the issue and re-exec /init.");
     eprintln!("{separator}");
 }

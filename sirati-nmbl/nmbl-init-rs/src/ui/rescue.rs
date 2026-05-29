@@ -142,12 +142,13 @@ impl RescueUi for RatatuiRescueUi<'_> {
 /// Drive the source-picker screen in a poll-input + render loop until
 /// the operator commits with N/R/H (or arrow + Enter). All paint and
 /// input goes through the orchestrator-held [`Console`].
-fn run_pick_source(
-    console: &mut dyn Console,
-    disk_reason: &str,
-) -> Result<RescueSource> {
+fn run_pick_source(console: &mut dyn Console, disk_reason: &str) -> Result<RescueSource> {
     let mut highlight: usize = 0;
-    let options = [RescueSource::Network, RescueSource::Reboot, RescueSource::Halt];
+    let options = [
+        RescueSource::Network,
+        RescueSource::Reboot,
+        RescueSource::Halt,
+    ];
     let mut dirty = true;
     loop {
         if dirty {
@@ -173,9 +174,7 @@ fn run_pick_source(
                 highlight = highlight.saturating_sub(1);
                 dirty = true;
             }
-            KeyCode::Down | KeyCode::Char('j')
-                if highlight < options.len().saturating_sub(1) =>
-            {
+            KeyCode::Down | KeyCode::Char('j') if highlight < options.len().saturating_sub(1) => {
                 highlight = highlight.saturating_add(1);
                 dirty = true;
             }
@@ -240,10 +239,7 @@ pub(crate) fn render_pick_source(frame: &mut Frame<'_>, disk_reason: &str, highl
     frame.render_widget(choices, body);
 
     let hint = "N/R/H select  Up/Down move  Enter confirm";
-    frame.render_widget(
-        Paragraph::new(hint).alignment(Alignment::Right),
-        footer,
-    );
+    frame.render_widget(Paragraph::new(hint).alignment(Alignment::Right), footer);
 }
 
 // ---------------------------------------------------------------------------
@@ -283,9 +279,7 @@ fn run_prompt_url(
 
         // Ctrl-U clears the buffer (matches readline muscle memory and
         // makes "wipe the prefill" a one-shot operation).
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('u'))
-        {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('u')) {
             buffer.clear();
             cursor = 0;
             dirty = true;
@@ -363,10 +357,7 @@ pub(crate) fn render_prompt_url(frame: &mut Frame<'_>, buffer: &str, cursor: usi
     frame.render_widget(para, body);
 
     let hint = "type/edit URL  Enter=confirm  Esc=abort  Ctrl-U=clear";
-    frame.render_widget(
-        Paragraph::new(hint).alignment(Alignment::Right),
-        footer,
-    );
+    frame.render_widget(Paragraph::new(hint).alignment(Alignment::Right), footer);
 }
 
 // ---------------------------------------------------------------------------
@@ -403,20 +394,21 @@ pub(crate) fn render_progress(frame: &mut Frame<'_>, status: DownloadStatus, spi
         }
         _ => {
             const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
-            let glyph = SPINNER.get(spinner_phase % SPINNER.len()).copied().unwrap_or("|");
-            let text = Text::from(vec![
-                Line::raw(format!("{glyph} {} bytes (Content-Length unknown)", status.bytes)),
-            ]);
+            let glyph = SPINNER
+                .get(spinner_phase % SPINNER.len())
+                .copied()
+                .unwrap_or("|");
+            let text = Text::from(vec![Line::raw(format!(
+                "{glyph} {} bytes (Content-Length unknown)",
+                status.bytes
+            ))]);
             let para = Paragraph::new(text).block(Block::bordered().title("Progress"));
             frame.render_widget(para, body);
         }
     }
 
     let hint = "downloading…  hash confirmation follows";
-    frame.render_widget(
-        Paragraph::new(hint).alignment(Alignment::Right),
-        footer,
-    );
+    frame.render_widget(Paragraph::new(hint).alignment(Alignment::Right), footer);
 }
 
 // ---------------------------------------------------------------------------
@@ -576,8 +568,9 @@ pub(crate) fn render_confirm_hash(
     render_banner(frame, header, "Hash confirmation", Color::Cyan);
     render_banner(frame, banner, banner_text, banner_colour);
 
-    let [left, right] = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .areas::<2>(body);
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .areas::<2>(body);
 
     let computed_lines: Vec<Line<'_>> = group_hex(computed_hex, 4)
         .into_iter()
@@ -604,10 +597,7 @@ pub(crate) fn render_confirm_hash(
     frame.render_widget(expected_para, right);
 
     let hint = "Y=confirm  N=mismatch  A/Esc=abort  Enter=auto  edit expected to override";
-    frame.render_widget(
-        Paragraph::new(hint).alignment(Alignment::Right),
-        footer,
-    );
+    frame.render_widget(Paragraph::new(hint).alignment(Alignment::Right), footer);
 }
 
 // ---------------------------------------------------------------------------
@@ -772,7 +762,10 @@ mod tests {
         term.draw(|f| render_pick_source(f, "loop_dev: ENOSPC", 0))
             .expect("draw");
         let text = buffer_text(&term);
-        assert!(text.contains("Disk rescue unavailable"), "missing header in:\n{text}");
+        assert!(
+            text.contains("Disk rescue unavailable"),
+            "missing header in:\n{text}"
+        );
         assert!(text.contains("loop_dev: ENOSPC"), "missing disk reason");
         assert!(text.contains("[N]"), "missing N hotkey");
         assert!(text.contains("[R]"), "missing R hotkey");
@@ -784,7 +777,8 @@ mod tests {
     fn render_prompt_url_shows_prefill_and_caret() {
         let mut term = new_term(80, 12);
         let url = "https://example.invalid/rescue.sfs";
-        term.draw(|f| render_prompt_url(f, url, url.len())).expect("draw");
+        term.draw(|f| render_prompt_url(f, url, url.len()))
+            .expect("draw");
         let text = buffer_text(&term);
         assert!(text.contains("Rescue URL"), "missing header");
         assert!(text.contains(url), "missing prefill in:\n{text}");
@@ -808,7 +802,10 @@ mod tests {
         .expect("draw");
         let text = buffer_text(&term);
         assert!(text.contains("Downloading rescue blob"), "missing banner");
-        assert!(text.contains("50 / 200 bytes"), "missing byte counter in:\n{text}");
+        assert!(
+            text.contains("50 / 200 bytes"),
+            "missing byte counter in:\n{text}"
+        );
         assert!(text.contains("25%"), "missing percentage label in:\n{text}");
     }
 
@@ -827,21 +824,37 @@ mod tests {
         })
         .expect("draw");
         let text = buffer_text(&term);
-        assert!(text.contains("1234 bytes"), "missing byte count in:\n{text}");
-        assert!(text.contains("Content-Length unknown"), "missing fallback label");
+        assert!(
+            text.contains("1234 bytes"),
+            "missing byte count in:\n{text}"
+        );
+        assert!(
+            text.contains("Content-Length unknown"),
+            "missing fallback label"
+        );
     }
 
     #[test]
     fn render_confirm_hash_shows_both_panes_and_match_banner() {
         let mut term = new_term(120, 24);
         let h = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-        term.draw(|f| render_confirm_hash(f, h, h, h.len())).expect("draw");
+        term.draw(|f| render_confirm_hash(f, h, h, h.len()))
+            .expect("draw");
         let text = buffer_text(&term);
         assert!(text.contains("Computed (SHA-256)"), "missing computed pane");
-        assert!(text.contains("Expected (editable)"), "missing expected pane");
-        assert!(text.contains("Hash matches expected"), "missing match banner in:\n{text}");
+        assert!(
+            text.contains("Expected (editable)"),
+            "missing expected pane"
+        );
+        assert!(
+            text.contains("Hash matches expected"),
+            "missing match banner in:\n{text}"
+        );
         // First 4-char chunk of the canonical empty digest.
-        assert!(text.contains("e3b0"), "missing grouped hex chunk in:\n{text}");
+        assert!(
+            text.contains("e3b0"),
+            "missing grouped hex chunk in:\n{text}"
+        );
     }
 
     #[test]
@@ -852,14 +865,18 @@ mod tests {
         term.draw(|f| render_confirm_hash(f, computed, expected, expected.len()))
             .expect("draw");
         let text = buffer_text(&term);
-        assert!(text.contains("MISMATCH"), "missing MISMATCH banner in:\n{text}");
+        assert!(
+            text.contains("MISMATCH"),
+            "missing MISMATCH banner in:\n{text}"
+        );
     }
 
     #[test]
     fn render_confirm_hash_shows_no_prefill_banner_when_expected_empty() {
         let mut term = new_term(120, 24);
         let computed = "abcd1234";
-        term.draw(|f| render_confirm_hash(f, computed, "", 0)).expect("draw");
+        term.draw(|f| render_confirm_hash(f, computed, "", 0))
+            .expect("draw");
         let text = buffer_text(&term);
         assert!(
             text.contains("No expected hash pre-filled"),

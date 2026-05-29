@@ -305,7 +305,6 @@ where
     }
 }
 
-
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -366,10 +365,7 @@ mod tests {
         fn kind(&self) -> ConsoleKind {
             ConsoleKind::Tty
         }
-        fn draw_with(
-            &mut self,
-            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
-        ) -> Result<()> {
+        fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
             Ok(())
         }
         fn suspend(&mut self) -> Result<()> {
@@ -492,7 +488,11 @@ mod tests {
         let staggered_now = || {
             let n = calls.get();
             calls.set(n.saturating_add(1));
-            if n < 2 { t_before2 } else { t_before2 + Duration::from_secs(120) }
+            if n < 2 {
+                t_before2
+            } else {
+                t_before2 + Duration::from_secs(120)
+            }
         };
         let mut console2 = TestConsole::new(vec![None]);
         let outcome =
@@ -557,10 +557,7 @@ mod tests {
             fn kind(&self) -> ConsoleKind {
                 ConsoleKind::Tty
             }
-            fn draw_with(
-                &mut self,
-                _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
-            ) -> Result<()> {
+            fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
                 Ok(())
             }
             fn suspend(&mut self) -> Result<()> {
@@ -630,7 +627,11 @@ mod tests {
         let staggered_now = || {
             let n = calls.get();
             calls.set(n.saturating_add(1));
-            if n < 2 { start } else { start + Duration::from_secs(120) }
+            if n < 2 {
+                start
+            } else {
+                start + Duration::from_secs(120)
+            }
         };
 
         let mut app = fresh_emergency_app("boot failed");
@@ -644,8 +645,9 @@ mod tests {
             Some(press(KeyCode::Char('r'))),
         ]);
 
-        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, staggered_now, &mut console)
-            .expect("loop must succeed");
+        let outcome =
+            drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, staggered_now, &mut console)
+                .expect("loop must succeed");
         // Outcome is Reboot only because we explicitly pressed 'r',
         // NOT because the timer fired. The deadline was disarmed by
         // the earlier Down keypress and never re-armed.
@@ -668,7 +670,11 @@ mod tests {
         let staggered_now = || {
             let n = calls.get();
             calls.set(n.saturating_add(1));
-            if n < 1 { start } else { start + Duration::from_secs(120) }
+            if n < 1 {
+                start
+            } else {
+                start + Duration::from_secs(120)
+            }
         };
 
         // Set the shared session latch to mark the boot as attended.
@@ -677,12 +683,7 @@ mod tests {
         let mut app = build_emergency_app("boot failed", &default_items(), &session);
         // A few empty polls (which would have tripped a timeout reboot
         // if a deadline were armed) then an explicit 'r' to exit.
-        let mut console = TestConsole::new(vec![
-            None,
-            None,
-            None,
-            Some(press(KeyCode::Char('r'))),
-        ]);
+        let mut console = TestConsole::new(vec![None, None, None, Some(press(KeyCode::Char('r')))]);
 
         let outcome =
             drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, staggered_now, &mut console)
@@ -719,10 +720,7 @@ mod tests {
             fn kind(&self) -> ConsoleKind {
                 ConsoleKind::Tty
             }
-            fn draw_with(
-                &mut self,
-                _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
-            ) -> Result<()> {
+            fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
                 Err(NmblError::Tui {
                     source: std::io::Error::other("backend dead"),
                 })
