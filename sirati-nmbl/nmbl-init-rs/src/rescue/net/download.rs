@@ -14,10 +14,10 @@ use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop
 use super::NetAttemptOutcome;
 use super::types::{DownloadStatus, RescueUi};
 
-/// Mountpoint where the downloaded squashfs is staged before the
-/// `switch_root`. Mirrors `rescue::disk::RESCUE_MOUNT` so the operator
-/// experience is identical whether the rescue blob came from disk
-/// or from the network.
+/// Mountpoint where the downloaded squashfs's writable overlay is
+/// staged before the chrooted rescue child is forked. Mirrors
+/// `rescue::disk::RESCUE_MOUNT` so the operator experience is identical
+/// whether the rescue blob came from disk or from the network.
 pub(super) const RESCUE_MOUNT: &str = "/rescue";
 
 /// Stream the HTTP body into a `memfd_create(2)` in-RAM fd while
