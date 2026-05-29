@@ -70,7 +70,7 @@ pub fn run_emergency_screen(console: &mut dyn Console, err: &NmblError) -> Emerg
     // Convenience wrapper: no prior session to inherit, so start fresh.
     let session = SessionInteraction::new();
     let mut app = build_emergency_app(&message, &items, &session);
-    run_emergency_screen_with_app(console, &mut app)
+    run_emergency_screen_with_app(console, &mut app, EMERGENCY_TIMEOUT)
 }
 
 /// Same as [`run_emergency_screen`] but reuses an externally-owned
@@ -82,19 +82,34 @@ pub fn run_emergency_screen(console: &mut dyn Console, err: &NmblError) -> Emerg
 /// any key this session; once they have (including on the LUKS
 /// passphrase screen), re-entries to the error screen show no countdown
 /// and wait indefinitely. On a fully unattended first call the helper
-/// latches the deadline at `now + 30s`; on re-entry the existing
+/// latches the deadline at `now + timeout`; on re-entry the existing
 /// deadline is preserved. If the deadline has already elapsed on
 /// re-entry the loop reboots immediately.
+///
+/// `timeout` is the resolved auto-reboot budget — callers pass
+/// [`EMERGENCY_TIMEOUT`] for the historic 30 s default or an
+/// operator-configured override (see `boot.nmbl.emergencyTimeoutSecs`).
 pub fn run_emergency_screen_with_app(
     console: &mut dyn Console,
     app: &mut App<'_>,
+    timeout: Duration,
 ) -> EmergencyChoice {
     // The loop itself latches on first entry — subsequent calls find
     // Some(_) and keep the original deadline. Re-entry after an
     // elapsed deadline trips the "remaining = None" branch inside the
     // loop and returns Reboot at once.
-    drive_emergency_loop(app, EMERGENCY_TIMEOUT, Instant::now, console)
+    drive_emergency_loop(app, timeout, Instant::now, console)
         .unwrap_or(EmergencyChoice::Reboot)
+}
+
+/// Resolve the emergency auto-reboot timeout from runtime config,
+/// falling back to the built-in [`EMERGENCY_TIMEOUT`] default when the
+/// operator has not set `general.emergency_timeout_secs`.
+pub fn resolve_emergency_timeout(config: &crate::config::Config) -> Duration {
+    config
+        .general
+        .emergency_timeout_secs
+        .map_or(EMERGENCY_TIMEOUT, Duration::from_secs)
 }
 
 /// Build the message string shown to the operator. Includes the
@@ -374,6 +389,19 @@ mod tests {
         fn resume(&mut self) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn resolve_emergency_timeout_uses_default_when_absent() {
+        let config = crate::config::Config::recovery_default();
+        assert_eq!(resolve_emergency_timeout(&config), EMERGENCY_TIMEOUT);
+    }
+
+    #[test]
+    fn resolve_emergency_timeout_honours_override() {
+        let mut config = crate::config::Config::recovery_default();
+        config.general.emergency_timeout_secs = Some(1);
+        assert_eq!(resolve_emergency_timeout(&config), Duration::from_secs(1));
     }
 
     #[test]

@@ -404,6 +404,33 @@ in
       '';
     };
 
+    timeoutMillis = lib.mkOption {
+      type = lib.types.int;
+      default = cfg.timeoutSeconds * 1000;
+      defaultText = lib.literalMD "`boot.nmbl.timeoutSeconds * 1000`.";
+      description = lib.mdDoc ''
+        Timeout in milliseconds before auto-selecting the default boot
+        entry. Overrides `boot.nmbl.timeoutSeconds` at runtime, enabling
+        sub-second auto-boot delays (e.g. `500` for a near-instant
+        selector). Defaults to the whole-second `timeoutSeconds`
+        converted to milliseconds, so leaving it unset preserves the
+        historic behaviour.
+        Note: This is for NMBL's own menu, not the underlying bootloader.
+      '';
+    };
+
+    emergencyTimeoutSecs = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+      description = lib.mdDoc ''
+        Auto-reboot countdown (seconds) shown on NMBL's emergency/error
+        screen when a boot phase fails and the operator is not present.
+        When `null` (the default) the built-in 30 s budget applies; set
+        a positive integer to override it (e.g. `1` for fast reboot
+        loops on a headless test host).
+      '';
+    };
+
     deviceTimeoutSeconds = lib.mkOption {
       type = lib.types.ints.positive;
       default = 30;
@@ -487,6 +514,17 @@ in
         Alias for `boot.nmbl.timeoutSeconds` matching the snake_case
         `timeout_secs` key in the runtime TOML config consumed by
         nmbl-init-rs.
+      '';
+    };
+
+    timeoutMs = lib.mkOption {
+      type = lib.types.int;
+      default = cfg.timeoutMillis;
+      defaultText = lib.literalMD "inherits from `boot.nmbl.timeoutMillis`.";
+      description = lib.mdDoc ''
+        Alias for `boot.nmbl.timeoutMillis` matching the snake_case
+        `timeout_ms` key in the runtime TOML config consumed by
+        nmbl-init-rs. When set it overrides `timeout_secs` at runtime.
       '';
     };
 
