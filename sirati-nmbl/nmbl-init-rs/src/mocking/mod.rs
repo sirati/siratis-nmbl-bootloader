@@ -345,7 +345,8 @@ fn run_emergency(_console: &mut MockConsole, args: &[String]) -> Result<()> {
         source: std::io::Error::other("synthetic boot failure (mocking harness)"),
         context: "phase-3 generation discovery".to_string(),
     };
-    let action = crate::shell::drop_to_emergency(boxed, &config, err);
+    let session = crate::ui::app::SessionInteraction::new();
+    let action = crate::shell::drop_to_emergency(boxed, &config, err, &session);
     eprintln!("[mocking] emergency action={action:?}");
     Ok(())
 }
