@@ -792,6 +792,7 @@ fn execute_terminal_action(action: TerminalAction) -> ! {
             }
             let argv_refs: Vec<&CString> = argv.iter().collect();
             let env_refs: Vec<&CString> = env.iter().collect();
+            // execve safety: single PID1 handoff point — every console/DRM Drop has run via stack unwinding, so the framebuffer/tty is back in the state the target program expects.
             let _ = execve(&path, &argv_refs, &env_refs);
             halt_final("execve returned; halting")
         }

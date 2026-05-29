@@ -357,6 +357,7 @@ pub fn spawn_shell(shell_path: &Path, cols: u16, rows: u16) -> Result<PtyChild> 
             // SAFETY: libc::execve is async-signal-safe. On success it
             // does not return; on failure errno is set and we _exit
             // with the conventional 127 (command-not-found) code.
+            // execve safety: we are a forked child process, not PID 1; our job is to replace ourselves with the requested shell.
             let _ = unsafe { libc::execve(path_c.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
 
             // SAFETY: Unavoidable. Post-fork child must use _exit; no
@@ -497,6 +498,7 @@ pub fn spawn_shell_on_tty(shell_path: &Path, tty_path: &Path) -> Result<Detached
 
             // SAFETY: libc::execve is async-signal-safe. On success it
             // does not return.
+            // execve safety: we are a forked child process, not PID 1; our job is to replace ourselves with the requested shell.
             let _ = unsafe { libc::execve(path_c.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
 
             // SAFETY: Unavoidable. Post-fork child must use _exit (the

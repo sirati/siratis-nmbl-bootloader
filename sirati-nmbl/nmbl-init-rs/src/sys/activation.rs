@@ -184,7 +184,7 @@ pub fn run_with_tick<F: FnMut() + ?Sized>(
                 std::mem::forget(write_end);
             }
 
-            // execve does not return on success.
+            // execve safety: we are a forked child, not PID 1; our job is to run the activation helper. execve does not return on success.
             let _ = execve(&binary_c, &full_argv, &env);
 
             // execve failed (binary missing, permission denied,
@@ -294,7 +294,7 @@ pub fn run_capture(binary: &Path, argv: &[String]) -> Result<(ProcessOutcome, Ve
             std::mem::forget(read_end);
             std::mem::forget(write_end);
 
-            // execve does not return on success.
+            // execve safety: we are a forked child, not PID 1; our job is to run the activation helper. execve does not return on success.
             let _ = execve(&binary_c, &full_argv, &env);
 
             // SAFETY: see the analogous comment in `run`.
