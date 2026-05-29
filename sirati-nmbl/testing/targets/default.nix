@@ -13,6 +13,7 @@ in
 {
   plain-ext4 = callTarget ./plain-ext4.nix;
   luks-password = callTarget ./luks-password.nix;
+  luks-password-splash = callTarget ./luks-password-splash.nix;
   luks-tpm = callTarget ./luks-tpm.nix;
   mdraid = callTarget ./mdraid.nix;
   btrfs = callTarget ./btrfs.nix;
