@@ -615,7 +615,8 @@ fn drive_picker_loop(state: &mut PickerState, console: &mut dyn Console) -> Resu
                     return Ok(());
                 }
             }
-            None => {}
+            // No scrollback in the console picker; ignore wheel notches.
+            Some(crate::ui::console::ConsoleEvent::Scroll { .. }) | None => {}
         }
     }
 }
