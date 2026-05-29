@@ -37,13 +37,28 @@ mod types;
 pub use console_ui::ConsoleRescueUi;
 pub use types::{DownloadStatus, HashConfirmation, RescueSource, RescueUi};
 
+use std::path::Path;
+
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::net::http::HttpUrl;
 use crate::terminal::TerminalAction;
 
-use download::{download_to_memfd, mount_and_switch_root};
+use download::{download_to_memfd, mount_overlay_for_child};
 use netup::{apply_lease, bring_up_and_dhcp};
+
+/// Outcome of the network-rescue flow. Either a terminal action the
+/// operator chose at the source picker (reboot / halt), or a prepared
+/// writable `/rescue` overlay the caller should hand to the chrooted
+/// child runner — the same runner the disk path uses, so NMBL stays
+/// PID 1 and reaps the rescue system rather than execve'ing into it.
+#[derive(Debug)]
+pub enum NetOutcome {
+    /// Perform this terminal action directly (reboot / halt).
+    Action(TerminalAction),
+    /// Run the chrooted rescue child against this writable `/rescue`.
+    RunChild(&'static Path),
+}
 
 // ---------------------------------------------------------------------------
 // Public entrypoint
@@ -64,7 +79,7 @@ pub fn try_network_rescue<R: RescueUi>(
     config: &Config,
     ui: &mut R,
     disk_reason: &str,
-) -> Result<TerminalAction> {
+) -> Result<NetOutcome> {
     if !config.rescue.network {
         return Err(NmblError::Rescue {
             stage: "net-disabled",
@@ -80,9 +95,9 @@ pub fn try_network_rescue<R: RescueUi>(
     let mut latest_reason = disk_reason.to_string();
     loop {
         match ui.pick_source(&latest_reason)? {
-            RescueSource::Reboot => return Ok(TerminalAction::Reboot),
+            RescueSource::Reboot => return Ok(NetOutcome::Action(TerminalAction::Reboot)),
             RescueSource::Halt => {
-                return Ok(TerminalAction::HaltWithBanner {
+                return Ok(NetOutcome::Action(TerminalAction::HaltWithBanner {
                     cause: NmblError::Rescue {
                         stage: "operator-halt",
                         source: Box::new(NmblError::ConfigInvalid {
@@ -90,13 +105,13 @@ pub fn try_network_rescue<R: RescueUi>(
                             context: "network-rescue UI".to_string(),
                         }),
                     },
-                });
+                }));
             }
             RescueSource::Network => {}
         }
 
         match run_network_attempt(config, ui) {
-            Ok(action) => return Ok(action),
+            Ok(rescue_dir) => return Ok(NetOutcome::RunChild(rescue_dir)),
             Err(NetAttemptOutcome::Restart(reason)) => {
                 // Mismatched hash / operator-aborted download — show
                 // the picker again with the updated reason so they
@@ -127,16 +142,15 @@ impl From<NmblError> for NetAttemptOutcome {
     }
 }
 
-/// One trip through "bring up NIC + DHCP + download + verify + pivot".
-/// Returns a [`TerminalAction`] on the success path (the dispatcher
-/// in `main` performs the execve after every stack-allocated
-/// resource has been dropped), `NetAttemptOutcome::Restart` on
-/// operator-driven retries, and `NetAttemptOutcome::Fatal` for
-/// non-recoverable errors.
+/// One trip through "bring up NIC + DHCP + download + verify + mount".
+/// Returns the prepared writable `/rescue` overlay on the success path
+/// (the caller funnels it into the chrooted child runner),
+/// `NetAttemptOutcome::Restart` on operator-driven retries, and
+/// `NetAttemptOutcome::Fatal` for non-recoverable errors.
 fn run_network_attempt<R: RescueUi>(
     config: &Config,
     ui: &mut R,
-) -> std::result::Result<TerminalAction, NetAttemptOutcome> {
+) -> std::result::Result<&'static Path, NetAttemptOutcome> {
     let (iface, lease) = bring_up_and_dhcp()?;
     apply_lease(&iface, &lease)?;
 
@@ -170,9 +184,9 @@ fn run_network_attempt<R: RescueUi>(
         }
     }
 
-    // From here on we are committed to the rescue shell — any error
-    // is fatal because we've already switched root (or are about to).
-    mount_and_switch_root(&memfd, &config.rescue.entrypoint).map_err(NetAttemptOutcome::Fatal)
+    // Mount the downloaded squashfs as a writable overlay at /rescue and
+    // hand the path back; the caller runs the chrooted child against it.
+    mount_overlay_for_child(&memfd).map_err(NetAttemptOutcome::Fatal)
 }
 
 // ---------------------------------------------------------------------------

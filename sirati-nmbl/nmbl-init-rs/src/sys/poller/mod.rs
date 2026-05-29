@@ -30,6 +30,7 @@ mod driver;
 mod pacer;
 mod shared;
 mod types;
+mod waitpid;
 
 #[cfg(test)]
 mod tests;
@@ -38,3 +39,4 @@ pub use driver::{LocalPoller, build};
 pub use pacer::{Pacer, TokioPacer, YieldPacer};
 pub use shared::LocalSender;
 pub use types::{SysCallPoll, SysCallState};
+pub use waitpid::{ReapFuture, reap_child};

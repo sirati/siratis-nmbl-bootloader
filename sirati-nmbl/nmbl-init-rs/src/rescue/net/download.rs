@@ -10,7 +10,6 @@ use sha2::{Digest, Sha256};
 use crate::error::{NmblError, Result};
 use crate::net::http::{self, HttpUrl};
 use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
-use crate::sys::mount::mount_fs;
 
 use super::NetAttemptOutcome;
 use super::types::{DownloadStatus, RescueUi};
@@ -123,13 +122,16 @@ fn write_all_to_fd<F: rustix::fd::AsFd>(fd: F, mut buf: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Loop-mount the memfd at `/rescue`, then hand off to the shared
-/// [`super::super::switch_root_and_exec`] helper to produce the
-/// [`TerminalAction`] the dispatcher will execve.
-pub(super) fn mount_and_switch_root(
+/// Loop-mount the downloaded memfd squashfs and layer the same writable
+/// overlay at `/rescue` the disk path uses, returning the mount path.
+/// The caller funnels this into the shared chrooted child runner
+/// ([`crate::rescue::child::run_external_rescue_child`]) so the
+/// network and disk paths land on an identical writable rescue root —
+/// the chrooted rescue `/init` needs to write into the root, which a
+/// bare read-only squashfs mount cannot support.
+pub(super) fn mount_overlay_for_child(
     backing: &rustix::fd::OwnedFd,
-    entrypoint: &std::path::Path,
-) -> Result<crate::terminal::TerminalAction> {
+) -> Result<&'static std::path::Path> {
     use std::path::{Path, PathBuf};
 
     let index = allocate_loop_device().map_err(|source| NmblError::Rescue {
@@ -147,21 +149,10 @@ pub(super) fn mount_and_switch_root(
         source: Box::new(source),
     })?;
 
-    let rescue_dir = Path::new(RESCUE_MOUNT);
-    ensure_dir(rescue_dir).map_err(|source| NmblError::Rescue {
-        stage: "mount-rescue",
-        source: Box::new(source),
-    })?;
-
     let loop_dev = PathBuf::from(format!("/dev/loop{index}"));
-    mount_fs(Some(&loop_dev), rescue_dir, "squashfs", "ro").map_err(|source| {
-        NmblError::Rescue {
-            stage: "mount-rescue",
-            source: Box::new(source),
-        }
-    })?;
+    crate::rescue::disk::mount_overlay_root(&loop_dev)?;
 
-    super::super::switch_root_and_exec(rescue_dir, entrypoint)
+    Ok(Path::new(RESCUE_MOUNT))
 }
 
 /// Lowercase hex encoder for SHA-256 digests. Avoids pulling in the
@@ -187,18 +178,6 @@ pub(super) fn compute_hex_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex_lower(&hasher.finalize())
-}
-
-/// Create `path` (and parents). Mirrors `rescue::disk::ensure_dir`.
-fn ensure_dir(path: &std::path::Path) -> Result<()> {
-    match std::fs::create_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(NmblError::Io {
-            source: e,
-            context: format!("creating {}", path.display()),
-        }),
-    }
 }
 
 /// Bridge `rustix::io::Errno` → `std::io::Error`. Same shape as the

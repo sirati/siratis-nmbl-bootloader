@@ -77,3 +77,21 @@ where
         fut.await
     }))
 }
+
+/// Like [`block_on_tui`] but hands the poller's [`LocalSender`] to the
+/// session future. The chrooted external-rescue runner needs it to
+/// submit the non-blocking `waitpid(WNOHANG)` op that reaps the rescue
+/// child while NMBL stays PID 1 — the poller's first real consumer.
+///
+/// [`LocalSender`]: crate::sys::poller::LocalSender
+pub fn block_on_tui_with_poller<B, F, T>(build: B) -> Result<T>
+where
+    B: FnOnce(crate::sys::poller::LocalSender) -> F,
+    F: std::future::Future<Output = T>,
+{
+    let rt = build_local_runtime()?;
+    Ok(rt.block_on(async move {
+        let sender = spawn_poller();
+        build(sender).await
+    }))
+}

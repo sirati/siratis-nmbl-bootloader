@@ -18,18 +18,18 @@
 //! Phase E.1 (`net::try_network_rescue`) build against, so the shapes
 //! must not change without orchestrator coordination.
 
+pub mod child;
 pub mod disk;
 #[cfg(feature = "network-rescue")]
 pub mod net;
 
 mod embedded;
 mod locate;
-mod switch_root;
 mod types;
 
+pub use child::run_external_rescue_child;
 pub use embedded::{exec_embedded, halt_with_banner};
 pub use locate::locate_sfs;
-pub(crate) use switch_root::switch_root_and_exec;
 pub use types::RescueMode;
 
 use crate::config::Config;
@@ -81,16 +81,17 @@ fn dispatch_external(
     console: Box<dyn Console>,
     cause: NmblError,
 ) -> Result<TerminalAction> {
-    // Phase 1: mount the rescue squashfs. We hold onto the console
-    // across this call so a mount failure can fall through to the
-    // network-rescue UI without re-opening /dev/console.
+    // Phase 1: mount the rescue squashfs as a writable overlay. We hold
+    // onto the console across this call so a mount failure can fall
+    // through to the network-rescue UI without re-opening /dev/console.
     let disk_err = match disk::prepare_disk_rescue(config, &cause) {
         Ok(rescue_dir) => {
-            // Mount succeeded. `console` falls out of scope when this
-            // arm returns, so the backend's Drop runs (KD_TEXT
-            // restore, termios reset) before the dispatcher in
-            // `main` fires the execve.
-            return switch_root_and_exec(rescue_dir, &config.rescue.entrypoint);
+            // Mount succeeded. Run the rescue system as a CHROOTED CHILD
+            // while NMBL stays PID 1: no execve handoff, so the console's
+            // Drop must NOT run yet (the child opens /dev/console itself,
+            // and PID 1 keeps serving). Hand the live console down so the
+            // runner can restore it after the child exits.
+            return run_chrooted_external(config, console, rescue_dir);
         }
         Err(e) => e,
     };
@@ -99,23 +100,29 @@ fn dispatch_external(
     {
         if config.rescue.network {
             // Bind `console` into this arm so it drops on the closing
-            // brace below — after the rescue UI finishes, before we
-            // evaluate the halt-with-banner branch. The same ratatui
-            // screens drive the rescue flow on every console kind:
-            // serial UARTs receive the same vt100/xterm output as the
-            // framebuffer console, and terminal emulators (tmux,
+            // brace below — after the rescue UI finishes. The same
+            // ratatui screens drive the rescue flow on every console
+            // kind: serial UARTs receive the same vt100/xterm output as
+            // the framebuffer console, and terminal emulators (tmux,
             // xterm, picocom) render it identically.
             let mut console = console;
-            let mut ui = crate::ui::rescue::make_rescue_ui(&mut *console);
-            let net_result = net::try_network_rescue(config, &mut ui, &disk_err.to_string());
-            let net_err = match net_result {
-                Ok(action) => return Ok(action),
+            let net_outcome = {
+                let mut ui = crate::ui::rescue::make_rescue_ui(&mut *console);
+                net::try_network_rescue(config, &mut ui, &disk_err.to_string())
+            };
+            let net_err = match net_outcome {
+                // Operator chose reboot/halt at the source picker.
+                Ok(net::NetOutcome::Action(action)) => return Ok(action),
+                // Squashfs downloaded + overlaid — funnel through the
+                // SAME chrooted child runner the disk path uses.
+                Ok(net::NetOutcome::RunChild(rescue_dir)) => {
+                    return run_chrooted_external(config, console, rescue_dir);
+                }
                 Err(e) => e,
             };
-            // Both disk AND network paths failed. Surface the
-            // network error (it's the more recent attempt) chained
-            // under the original `cause` so the banner shows every
-            // step.
+            // Both disk AND network paths failed. Surface the network
+            // error (the more recent attempt) chained under the original
+            // `cause` so the banner shows every step.
             return Ok(halt_with_banner(NmblError::Rescue {
                 stage: "network-rescue-failed",
                 source: Box::new(net_err),
@@ -134,6 +141,46 @@ fn dispatch_external(
         stage: "disk-rescue-failed",
         source: Box::new(disk_err),
     }))
+}
+
+/// Run the prepared writable `/rescue` overlay as a chrooted child while
+/// NMBL stays PID 1, then return a [`TerminalAction`] for the recovery
+/// flow. Crosses into the async [`crate::ui::block_on_tui_with_poller`]
+/// runtime so the child is reaped via the poller's non-blocking
+/// `waitpid` op CONCURRENTLY with the remote-attach server.
+///
+/// The live `console` is dropped here (before entering the runtime): the
+/// chrooted child opens its own `/dev/console`, and the boot console's
+/// Drop must run so KD_TEXT/termios are restored before the child paints.
+/// On child exit we reboot — the configured post-rescue default — so the
+/// system does not sit at an idle PID 1.
+fn run_chrooted_external(
+    config: &Config,
+    console: Box<dyn Console>,
+    rescue_dir: &'static std::path::Path,
+) -> Result<TerminalAction> {
+    // Drop the boot console so its backend Drop (KD_TEXT, termios) runs
+    // before the chrooted child claims /dev/console.
+    drop(console);
+    let entrypoint = config.rescue.entrypoint.clone();
+    let run = crate::ui::block_on_tui_with_poller(move |sender| async move {
+        run_external_rescue_child(config, rescue_dir, &entrypoint, sender).await
+    });
+    match run {
+        // Runtime built and the child ran to completion (or the bind /
+        // fork failed and was reported). Either way NMBL stayed PID 1;
+        // reboot back into the normal flow.
+        Ok(Ok(())) => Ok(TerminalAction::Reboot),
+        Ok(Err(e)) => Ok(halt_with_banner(NmblError::Rescue {
+            stage: "rescue-child-failed",
+            source: Box::new(e),
+        })),
+        // Runtime build failed: surface a structured halt.
+        Err(rt_err) => Ok(halt_with_banner(NmblError::Rescue {
+            stage: "rescue-child-runtime",
+            source: Box::new(rt_err),
+        })),
+    }
 }
 
 #[cfg(test)]
@@ -242,35 +289,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_rescue_shell_action_honours_entrypoint() {
-        // The full recovery system pins /init; the default flat image
-        // leaves it at /bin/sh. argv0 is the basename in both cases.
-        for (entry, argv0) in [("/init", "init"), ("/bin/sh", "sh")] {
-            let action = switch_root::build_rescue_shell_action(Path::new(entry))
-                .expect("action must build");
-            match action {
-                TerminalAction::Execve {
-                    path,
-                    argv,
-                    banner,
-                    rescue_handoff,
-                    ..
-                } => {
-                    assert_eq!(path.as_bytes(), entry.as_bytes());
-                    let argv0_c = argv.first().expect("argv must have argv0");
-                    assert_eq!(argv0_c.as_bytes(), argv0.as_bytes());
-                    assert!(banner.is_none(), "rescue exec carries no banner");
-                    assert!(
-                        rescue_handoff,
-                        "rescue exec must mark the handoff so a failed \
-                         /dev/console redirect is non-fatal",
-                    );
-                }
-                other => panic!("expected Execve, got {other:?}"),
-            }
-        }
-    }
+    // The chrooted-child entrypoint/argv construction (basename argv0
+    // for `/init` vs `/bin/sh`) is now covered by `child::tests`; the
+    // External path no longer builds a `switch_root` Execve action.
 
     #[test]
     fn dispatch_embedded_returns_execve_action() {
