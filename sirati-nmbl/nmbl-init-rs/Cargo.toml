@@ -121,7 +121,7 @@ rustix = { version = "0.38", default-features = false, features = ["fs", "termio
 # so every task runs via `spawn_local` on a `LocalRuntime`. `net` pulls
 # `mio` (expected, needed by the later socket phases). The runtime + async
 # migration is the new base and is intentionally not feature-gated.
-tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net", "io-util", "sync"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net", "io-util"] }
 # Pure-Rust decompression for kernel modules. NixOS kernels are built
 # without CONFIG_MODULE_DECOMPRESS, so userspace must decompress
 # .ko.{xz,zst,gz} before calling init_module(2). C-FFI crates (xz2,
