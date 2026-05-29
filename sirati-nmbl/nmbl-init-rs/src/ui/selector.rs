@@ -51,7 +51,18 @@ async fn run_selector_on_console(
     //    milliseconds; sub-second values are supported and the display
     //    rounds up so it never reads a misleading "0s".
     let countdown = Duration::from_millis(u64::from(config.general.timeout_ms));
-    let outcome = run_console_countdown(console, &mut app, countdown).await?;
+    // Arm the auto-boot countdown ONLY on a fully unattended boot. If the
+    // operator has pressed any key this session (e.g. a LUKS passphrase
+    // before the menu) the shared latch is set, so we skip the countdown
+    // entirely and fall through to the event loop to wait indefinitely
+    // for an explicit choice — the same presence gate the emergency
+    // screen applies before arming its auto-reboot timer.
+    let outcome = if app.interaction.get() {
+        app.countdown_remaining_secs = None;
+        TimeoutOutcome::Cancelled
+    } else {
+        run_console_countdown(console, &mut app, countdown).await?
+    };
     app.countdown_remaining_secs = None;
 
     if matches!(outcome, TimeoutOutcome::Expired) && app.decision.is_none() {
@@ -140,6 +151,10 @@ async fn run_console_countdown(
         // count as the operator cancelling, matching the prior
         // `poll_key` semantics which silently dropped resizes.
         if let Some(crate::ui::console::ConsoleEvent::Key(_)) = console.poll_event(slice).await? {
+            // Cancelling the countdown is operator presence too — latch
+            // it just like `App::on_key` does, so a later screen this
+            // session sees the boot as attended.
+            app.interaction.set();
             return Ok(TimeoutOutcome::Cancelled);
         }
 
@@ -153,5 +168,159 @@ async fn run_console_countdown(
             console.render(app)?;
             last_reported = secs;
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests assert on contract failures"
+)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{Decision, run_console_countdown, run_selector_on_console};
+    use crate::config::Config;
+    use crate::error::Result;
+    use crate::generations::Generation;
+    use crate::ui::app::{App, SessionInteraction};
+    use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
+    use crate::ui::timeout::TimeoutOutcome;
+
+    /// Console double that replays canned key events; once drained it
+    /// yields `None` so the countdown loop relies on its own deadline.
+    struct ScriptedConsole {
+        keys: VecDeque<KeyEvent>,
+    }
+
+    impl ScriptedConsole {
+        fn new(keys: Vec<KeyEvent>) -> Self {
+            Self { keys: keys.into() }
+        }
+    }
+
+    impl Console for ScriptedConsole {
+        fn render(&mut self, _app: &App<'_>) -> Result<()> {
+            Ok(())
+        }
+        fn poll_event<'a>(
+            &'a mut self,
+            timeout: std::time::Duration,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>> {
+            Box::pin(async move { self.poll_event_blocking(timeout) })
+        }
+        fn poll_event_blocking(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<ConsoleEvent>> {
+            Ok(self.keys.pop_front().map(ConsoleEvent::Key))
+        }
+        fn size(&self) -> (u16, u16) {
+            (80, 24)
+        }
+        fn kind(&self) -> ConsoleKind {
+            ConsoleKind::Tty
+        }
+        fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
+            Ok(())
+        }
+        fn suspend(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn block<F: std::future::Future>(fut: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build_local(tokio::runtime::LocalOptions::default())
+            .expect("test runtime");
+        rt.block_on(fut)
+    }
+
+    fn sel_gen(number: u32) -> Generation {
+        Generation {
+            number,
+            profile_link: std::path::PathBuf::from(format!("/p/system-{number}-link")),
+            kernel: std::path::PathBuf::from("/p/kernel"),
+            initrd: std::path::PathBuf::from("/p/initrd"),
+            init_path: std::path::PathBuf::from(format!("/p/system-{number}-link/init")),
+            kernel_params: Vec::new(),
+            label: String::new(),
+        }
+    }
+
+    #[test]
+    fn selector_skips_auto_boot_when_session_already_interacted() {
+        // Attended boot: the operator pressed a key earlier this session
+        // (e.g. a LUKS passphrase) so the shared latch is already set.
+        // The selector must NOT arm the auto-boot countdown and must NOT
+        // boot the default on timeout — it waits for an explicit choice.
+        let cfg: Config = toml::from_str("").expect("default cfg");
+        let gens = vec![sel_gen(2), sel_gen(1)];
+        let session = SessionInteraction::new();
+        session.set();
+
+        // Default highlight is index 0. Move down then confirm: an Enter
+        // on index 1. A timeout auto-boot would instead emit index 0, so
+        // the booted index proves the choice came from the event loop and
+        // not the (skipped) countdown.
+        let mut console = ScriptedConsole::new(vec![press(KeyCode::Down), press(KeyCode::Enter)]);
+        let decision = block(run_selector_on_console(
+            &cfg,
+            &gens,
+            &mut console,
+            0,
+            &session,
+        ))
+        .expect("selector returns the explicit choice");
+        match decision {
+            Decision::Boot {
+                generation_index,
+                cmdline_override,
+            } => {
+                assert_eq!(
+                    generation_index, 1,
+                    "must boot the operator's explicit choice, not the timeout default (index 0)"
+                );
+                assert!(cmdline_override.is_none());
+            }
+            other => panic!("expected explicit Boot decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn countdown_cancel_records_operator_presence() {
+        // A keypress that cancels the countdown is operator presence and
+        // must latch it (mirrors App::on_key) so later screens this
+        // session treat the boot as attended.
+        let gens = vec![sel_gen(1)];
+        let session = SessionInteraction::new();
+        let mut app = App::new_in_session(&gens, &session);
+        assert!(!session.get());
+
+        let mut console = ScriptedConsole::new(vec![press(KeyCode::Char('x'))]);
+        let outcome = block(run_console_countdown(
+            &mut console,
+            &mut app,
+            std::time::Duration::from_secs(60),
+        ))
+        .expect("countdown polls the console");
+        assert_eq!(outcome, TimeoutOutcome::Cancelled);
+        assert!(
+            session.get(),
+            "cancelling the countdown must latch operator presence"
+        );
     }
 }
