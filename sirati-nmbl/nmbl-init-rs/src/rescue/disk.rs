@@ -72,10 +72,12 @@ pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'stati
         });
     }
 
-    // loop + squashfs are loaded during Phase 0.5 from the Nix-side
-    // initramfs module list (see `extraExplicitModules` /
-    // `rescueDiskModules` in lib/config.nix); no on-demand insmod is
-    // needed here.
+    // loop + squashfs are auto-added to the explicit module list for
+    // `rescue.mode == external` (see `rescueDiskModules` in
+    // lib/config.nix) and loaded in phase 2b on the normal boot path, or
+    // by the force_on_boot branch in `main::run_inner` before this runs.
+    // `allocate_loop_device` additionally mknods `/dev/loop-control` if
+    // devtmpfs didn't, so no on-demand insmod is needed here.
 
     let index = allocate_loop_device().map_err(|source| NmblError::Rescue {
         stage: "loop-alloc",

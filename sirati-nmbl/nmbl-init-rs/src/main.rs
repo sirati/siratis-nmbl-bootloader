@@ -37,6 +37,7 @@ use nmbl_init::generations::scan_generations;
 use nmbl_init::modules::{load_early_modules, load_explicit_modules, load_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
 use nmbl_init::panic::install_panic_hook;
+use nmbl_init::rescue::{self, RescueMode};
 use nmbl_init::shell::{
     drop_to_emergency, open_console_and_drop_to_emergency, print_banner, print_halt_banner,
 };
@@ -375,11 +376,28 @@ fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
     })?;
 
     let boot_fs = &section.boot_fs;
+    // When stateful storage is configured the runtime needs to rewrite
+    // `state.bin` on this same device. We mount the boot fs read-write
+    // ONCE here and later bind a writable view at the state mountpoint;
+    // mounting the same block device twice fails with EBUSY on vfat. The
+    // operator's `ro` default is only honoured when no state mount is
+    // configured.
+    let stateful_rw = section.state.is_some();
+    let boot_options = if stateful_rw {
+        if boot_fs.options.is_empty() {
+            "rw,nosuid,noexec,nodev".to_string()
+        } else {
+            format!("{},rw,nosuid,noexec,nodev", boot_fs.options)
+        }
+    } else {
+        boot_fs.options.clone()
+    };
     nmbl_info!(
-        "phase 0.5: mounting boot fs {} at {} (type {})",
+        "phase 0.5: mounting boot fs {} at {} (type {}, options {})",
         boot_fs.device,
         boot_fs.mountpoint.display(),
         boot_fs.fstype,
+        boot_options,
     );
     std::fs::create_dir_all(&boot_fs.mountpoint).map_err(|source| NmblError::Bootstrap {
         stage: "mount-boot",
@@ -392,7 +410,7 @@ fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
         Some(Path::new(&boot_fs.device)),
         &boot_fs.mountpoint,
         &boot_fs.fstype,
-        &boot_fs.options,
+        &boot_options,
     )
     .map_err(|source| NmblError::Bootstrap {
         stage: "mount-boot",
@@ -413,51 +431,55 @@ fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
 
     // Hand the runtime boot mountpoint to the rescue dispatcher so
     // `rescue::locate_sfs` can resolve `sfs_path` against it instead of
-    // the build-time `/boot` convention.
+    // the build-time `/boot` convention. This must be set before
+    // `run_inner` evaluates the `force_on_boot` rescue trigger, which
+    // only needs the boot mount — never the stateful state bind below.
     config.runtime_boot_mountpoint = Some(boot_fs.mountpoint.clone());
 
-    // When the operator opted into stateful storage AND this binary was
-    // built with the `stateful` feature, mount the same boot device a
-    // second time RW at `state.mountpoint`. The RO mount above keeps the
-    // operator's "read-only by default" expectation for the boot
-    // partition; the RW twin is the narrow window we use to rewrite
-    // `state.bin` between boots. We append `rw,nosuid,noexec,nodev` to
-    // the operator's original options so the RW twin is no more
-    // privileged than the RO mount needs to be.
-    #[cfg(feature = "stateful")]
-    if let Some(state_mount) = &section.state {
-        let mp = &state_mount.mountpoint;
-        nmbl_info!(
-            "phase 0.5: mounting boot fs {} at {} (rw twin for state.bin)",
-            boot_fs.device,
-            mp.display(),
-        );
-        std::fs::create_dir_all(mp).map_err(|source| NmblError::Bootstrap {
-            stage: "mount-state",
-            source: Box::new(NmblError::Io {
-                source,
-                context: format!("creating state mountpoint {}", mp.display()),
-            }),
-        })?;
-        let rw_options = if boot_fs.options.is_empty() {
-            "rw,nosuid,noexec,nodev".to_string()
-        } else {
-            format!("{},rw,nosuid,noexec,nodev", boot_fs.options)
-        };
-        sys_mount::mount_fs(
-            Some(Path::new(&boot_fs.device)),
-            mp,
-            &boot_fs.fstype,
-            &rw_options,
-        )
-        .map_err(|source| NmblError::Bootstrap {
+    Ok(config)
+}
+
+/// Stateful side of Phase 0.5: expose a writable view of the boot fs at
+/// `state.mountpoint` so `state.bin` can be rewritten between boots. The
+/// boot device is already mounted read-write at `boot_fs.mountpoint` by
+/// [`run_bootstrap_phase`] when stateful is enabled; we `MS_BIND` that
+/// mount here rather than mounting the block device a second time, which
+/// fails with EBUSY on vfat. A bind shares the existing RW mount, so the
+/// state view is writable without re-opening the device.
+///
+/// Split out of `run_bootstrap_phase` so `run_inner` can evaluate the
+/// `force_on_boot` rescue trigger BEFORE this mount runs: the force path
+/// skips generation boot entirely, so it never touches `state.bin` and
+/// must not be blocked by a state-mount failure.
+#[cfg(feature = "stateful")]
+fn mount_state_twin(config: &mut Config, bootstrap_path: &Path) -> Result<()> {
+    let bootstrap = BootstrapConfig::load(bootstrap_path)?;
+    let section = &bootstrap.bootstrap;
+    let boot_fs = &section.boot_fs;
+    let Some(state_mount) = &section.state else {
+        return Ok(());
+    };
+    let mp = &state_mount.mountpoint;
+    nmbl_info!(
+        "phase 0.5: bind-mounting {} at {} for state.bin",
+        boot_fs.mountpoint.display(),
+        mp.display(),
+    );
+    std::fs::create_dir_all(mp).map_err(|source| NmblError::Bootstrap {
+        stage: "mount-state",
+        source: Box::new(NmblError::Io {
+            source,
+            context: format!("creating state mountpoint {}", mp.display()),
+        }),
+    })?;
+    sys_mount::mount_fs(Some(&boot_fs.mountpoint), mp, &boot_fs.fstype, "bind").map_err(
+        |source| NmblError::Bootstrap {
             stage: "mount-state",
             source: Box::new(source),
-        })?;
-        config.runtime_state_mountpoint = Some(mp.clone());
-    }
-
-    Ok(config)
+        },
+    )?;
+    config.runtime_state_mountpoint = Some(mp.clone());
+    Ok(())
 }
 
 /// Run phases 4→6 (generation discovery, UI, decision dispatch). Kept
@@ -732,6 +754,7 @@ fn execute_terminal_action(action: TerminalAction) -> ! {
             argv,
             env,
             banner,
+            rescue_handoff,
         } => {
             if let Some(b) = banner {
                 print_banner(&b);
@@ -741,16 +764,29 @@ fn execute_terminal_action(action: TerminalAction) -> ! {
             // console (framebuffer for head, ttyS0 for serial). Every
             // boot-console `Drop` has already fired by now via normal
             // stack unwinding, so the fds we just opened are the ones
-            // the shell will inherit. On failure we cannot recover —
-            // an execve into invisibility is worse than halting with a
-            // banner — so we surface the redirect error through
-            // halt_final instead of charging ahead.
+            // the shell will inherit.
+            //
+            // On the rescue handoff this is best-effort: the rescue
+            // root's /dev may not be fully populated (the full-system
+            // `/init` mounts devtmpfs itself as its first step), so a
+            // failed redirect must NOT halt — the entrypoint manages
+            // its own console (`exec bash < /dev/console`) and halting
+            // here would strand the operator. We log and execve anyway
+            // with the inherited fds. For a non-rescue execve a redirect
+            // failure stays fatal: an execve into invisibility is worse
+            // than halting with a banner.
             if let Err(err) = redirect_stdio_for_execve() {
                 eprintln!(
                     "[nmbl] cannot redirect stdio before execve: {}",
                     format_chain(&err as &dyn std::error::Error)
                 );
-                halt_final("stdio redirect failed; halting")
+                if rescue_handoff {
+                    eprintln!(
+                        "[nmbl] rescue: stdio redirect unavailable, proceeding with inherited fds"
+                    );
+                } else {
+                    halt_final("stdio redirect failed; halting")
+                }
             }
             let argv_refs: Vec<&CString> = argv.iter().collect();
             let env_refs: Vec<&CString> = env.iter().collect();
@@ -953,6 +989,16 @@ fn main() -> ExitCode {
     execute_terminal_action(action);
 }
 
+/// Whether the deterministic force-rescue trigger should fire: the
+/// operator set `rescue.force_on_boot` AND the rescue mode is
+/// `external`. Factored out of `run_inner` so the guard is unit-testable
+/// without driving the full PID-1 boot flow. `force_on_boot` on any
+/// other mode is a no-op (only the external squashfs path is a
+/// no-input, deterministic rescue).
+fn should_force_external_rescue(config: &Config) -> bool {
+    config.rescue.force_on_boot && config.rescue.mode == RescueMode::External
+}
+
 /// Helper: run the boot phases and return the resulting
 /// [`TerminalAction`]. On phase failure returns
 /// `Err(Box::new((err, config)))` so the caller can hand the live
@@ -1017,6 +1063,77 @@ fn run_inner(
             // this path.
             Err(err) => return Err(Box::new((err, config))),
         }
+    }
+
+    // Deterministic rescue trigger. When the operator (or the test
+    // harness) set `rescue.force_on_boot` AND the rescue mode is
+    // `external`, skip the entire generation-boot flow and switch_root
+    // straight into the rescue squashfs. This runs after Phase 0.5 has
+    // mounted the boot partition (so `runtime_boot_mountpoint` — which
+    // `rescue::locate_sfs` needs — is populated) but BEFORE the stateful
+    // state bind mount and before any console is opened, so no
+    // interactive input is required: a single config bool fully
+    // determines the path. Crucially it must run before `mount_state_twin`
+    // so a state-mount failure cannot block the rescue
+    // boot — the force path never touches `state.bin`. `dispatch` takes
+    // the console by ownership; the disk-rescue arm never paints to it, so
+    // a NoopConsole is sufficient. Production boots leave
+    // `force_on_boot = false` and never enter this branch.
+    if should_force_external_rescue(&config) {
+        nmbl_info!("force_on_boot: entering external rescue");
+        // The rescue-required kernel modules (`loop`, `squashfs`, the
+        // rescue `nicDrivers` and `af_packet`) are auto-added to
+        // `config.kernel_modules.explicit` for `rescue.mode == external`
+        // (see lib/config.nix `rescueDiskModules`/`rescueNicModules`),
+        // which is normally loaded in phase 2b. The force path
+        // short-circuits before phase 2b, so without loading them here
+        // `allocate_loop_device` would fail with ENOENT on
+        // `/dev/loop-control` (the `loop` module was never inserted, so
+        // devtmpfs never created the node) and `/init`'s DHCP would have
+        // no NIC driver after switch_root. Load the explicit set now —
+        // before `rescue::dispatch` — using the pre-console NoopConsole
+        // reporter exactly as phase 2a does.
+        {
+            let mut reporter =
+                BootReporter::new(&mut noop, "force_on_boot: load rescue kernel modules");
+            if let Err(err) = load_explicit_modules(&config, &mut reporter) {
+                nmbl_warn!("force_on_boot: loading rescue modules failed: {err}");
+                return Err(Box::new((err, config)));
+            }
+        }
+        nmbl_info!("force_on_boot: loaded rescue modules");
+        let cause = NmblError::Rescue {
+            stage: "force-on-boot",
+            source: Box::new(NmblError::Io {
+                source: std::io::Error::other(
+                    "rescue.force_on_boot requested an unconditional external rescue boot",
+                ),
+                context: "force-on-boot rescue trigger".to_string(),
+            }),
+        };
+        let console: Box<dyn Console> = Box::new(NoopConsole::new());
+        return match rescue::dispatch(&config, console, cause) {
+            Ok(action) => Ok(action),
+            Err(err) => {
+                nmbl_warn!(
+                    "force_on_boot: external rescue dispatch failed: {}",
+                    format_chain(&err as &dyn std::error::Error)
+                );
+                Err(Box::new((err, config)))
+            }
+        };
+    }
+
+    // Stateful state bind mount (Phase 0.5, stateful side). Deferred
+    // to here — after the `force_on_boot` short-circuit — so the force
+    // rescue path is never blocked by a state-mount failure. On the
+    // normal boot path a failure still routes through the emergency
+    // screen exactly as before.
+    #[cfg(feature = "stateful")]
+    if bootstrap_mode
+        && let Err(err) = mount_state_twin(&mut config, bootstrap_path)
+    {
+        return Err(Box::new((err, config)));
     }
 
     // Phase 2a runs BEFORE the real console is opened: the splash
@@ -1216,6 +1333,74 @@ mod tests {
         assert_eq!(args.config_path, PathBuf::from(DEFAULT_CONFIG_PATH));
         assert!(args.errored_report.is_none());
         assert!(args.validate_config.is_none());
+    }
+
+    #[test]
+    fn force_on_boot_external_selects_rescue() {
+        // The regression: force_on_boot=true + mode=external must select
+        // the deterministic external-rescue path. Both conditions are
+        // required — neither alone fires the trigger.
+        let mut cfg = Config::recovery_default();
+        cfg.rescue.force_on_boot = true;
+        cfg.rescue.mode = RescueMode::External;
+        assert!(should_force_external_rescue(&cfg));
+    }
+
+    #[test]
+    fn force_on_boot_requires_external_mode() {
+        // force_on_boot with a non-external mode is a no-op: embedded and
+        // none are not no-input deterministic rescue targets.
+        for mode in [RescueMode::Embedded, RescueMode::None] {
+            let mut cfg = Config::recovery_default();
+            cfg.rescue.force_on_boot = true;
+            cfg.rescue.mode = mode;
+            assert!(
+                !should_force_external_rescue(&cfg),
+                "force_on_boot must not fire for mode {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_mode_without_force_does_not_trigger() {
+        // Production default: external rescue configured but not forced
+        // must leave the normal generation-boot flow untouched.
+        let mut cfg = Config::recovery_default();
+        cfg.rescue.force_on_boot = false;
+        cfg.rescue.mode = RescueMode::External;
+        assert!(!should_force_external_rescue(&cfg));
+    }
+
+    #[test]
+    fn force_path_loads_explicit_set_before_dispatch() {
+        // Contract for the ordering fix: the force_on_boot branch must
+        // run the EXPLICIT module set (which carries the auto-added
+        // `loop`/`squashfs`/nicDrivers for mode==external) before
+        // `rescue::dispatch`. We can't drive `run_inner` (it is PID-1
+        // flow), but we can lock in that the explicit list — not the
+        // early list — is the one a forced external rescue depends on,
+        // and that the loader is a no-op when that list is empty (so the
+        // pre-dispatch call never spuriously fails a forced boot on a
+        // platform with built-in loop/squashfs).
+        let mut cfg = Config::recovery_default();
+        cfg.rescue.force_on_boot = true;
+        cfg.rescue.mode = RescueMode::External;
+        cfg.kernel_modules.explicit =
+            vec!["loop".to_owned(), "squashfs".to_owned(), "virtio_net".to_owned()];
+        assert!(should_force_external_rescue(&cfg));
+        // The force path loads `config.kernel_modules.explicit`; confirm
+        // the rescue-critical names live there and not in `early`.
+        assert!(cfg.kernel_modules.explicit.iter().any(|m| m == "loop"));
+        assert!(cfg.kernel_modules.explicit.iter().any(|m| m == "squashfs"));
+        assert!(cfg.kernel_modules.early.is_empty());
+
+        // Empty explicit list -> loader short-circuits Ok (no modules
+        // tree parse), so a forced boot is never blocked by an empty set.
+        let mut empty = Config::recovery_default();
+        empty.kernel_modules.explicit.clear();
+        let mut noop = NoopConsole::new();
+        let mut reporter = BootReporter::new(&mut noop, "test");
+        load_explicit_modules(&empty, &mut reporter).expect("empty explicit set must be a no-op");
     }
 
     #[test]

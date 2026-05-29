@@ -478,6 +478,27 @@ in
             # call fails with EAFNOSUPPORT before any packet leaves the NIC.
             ++ [ "af_packet" ]
           )
+          # The full recovery system runs its own dhcpcd + sshd after
+          # switch_root, so the NIC drivers must be loaded into NMBL's
+          # kernel before handoff (the squashfs has no kmod-loadable
+          # modules of its own for NMBL's kernel). modprobe inside /init
+          # is then a no-op. Independent of rescue.network, which gates
+          # NMBL's own in-initramfs DHCP/HTTP fetch path.
+          #
+          # overlay + ext4 back the full recovery system's writable
+          # overlays: its /init formats an ext4 image on a loop device and
+          # layers a writable overlay over the read-only squashfs store,
+          # /etc and /var. NMBL has no udev to auto-load filesystem drivers
+          # on mount(2), so both must be loaded into NMBL's kernel before
+          # switch_root or the overlay/ext4 mounts fail with "unknown
+          # filesystem type". ext4's deps (mbcache, jbd2) are pulled in
+          # automatically by the loader's modules.dep resolution.
+          # af_packet backs dhcpcd's AF_PACKET/BPF socket for the DHCPv4
+          # exchange the recovery /init runs after switch_root; without it
+          # dhcp_openbpf fails with EAFNOSUPPORT and no IPv4 lease is acquired.
+          ++ lib.optionals (cfg.rescue.fullSystem.enable && cfg.rescue.mode == "external") (
+            cfg.rescue.nicDrivers ++ nicDetectedKernelModules ++ [ "overlay" "ext4" "af_packet" ]
+          )
         )
       );
       defaultText = lib.literalMD ''
@@ -783,10 +804,78 @@ in
         defaultText = lib.literalExpression "with pkgs; [ busybox-sandbox-shell cryptsetup lvm2 mdadm ]";
         description = lib.mdDoc ''
           Packages bundled into `nmbl-rescue.sfs` when
-          `rescue.mode = "external"`. The Rust loader expects
-          `/bin/sh` to exist in the resulting tree (provided by
-          busybox).
+          `rescue.mode = "external"` and `rescue.fullSystem.enable =
+          false`. The Rust loader expects `/bin/sh` to exist in the
+          resulting tree (provided by busybox).
         '';
+      };
+
+      # --- Full recovery system (closure-store squashfs) ---------------
+      # When `rescue.fullSystem.enable = true` (and `rescue.mode =
+      # "external"`), the rescue squashfs is built with a real
+      # /nix/store + nix-db instead of the flat busybox buildEnv tree.
+      # The image then carries bash, btop, a root nix-daemon (flakes on),
+      # and sshd — enough for `nix-shell -p` and remote recovery.
+      fullSystem = {
+        enable = lib.mkEnableOption "the closure-store minimal recovery system for external rescue";
+
+        packages = lib.mkOption {
+          type = lib.types.listOf lib.types.package;
+          default = with pkgs; [
+            bashInteractive
+            btop
+            nixVersions.stable
+            openssh
+            cacert
+            btrfs-progs
+            cryptsetup
+            lvm2
+            mdadm
+            coreutils-full
+            util-linux
+            e2fsprogs
+            iproute2
+            dhcpcd
+            gnugrep
+            gnused
+            gawk
+            procps
+            kmod
+          ];
+          defaultText = lib.literalExpression ''
+            with pkgs; [ bashInteractive btop nixVersions.stable openssh
+              cacert btrfs-progs cryptsetup lvm2 mdadm coreutils-full
+              util-linux e2fsprogs iproute2 dhcpcd gnugrep gnused gawk procps kmod ]
+          '';
+          description = lib.mdDoc ''
+            Packages whose closures are baked into the full recovery
+            squashfs. Every store path in the combined closure is copied
+            into the image's `/nix/store` and registered in the nix DB so
+            `nix-shell -p` and `nix run` work offline against what is
+            present (and online against substituters once DHCP is up).
+          '';
+        };
+
+        sshdPort = lib.mkOption {
+          type = lib.types.port;
+          default = 22222;
+          description = lib.mdDoc ''
+            TCP port the recovery sshd listens on. Baked into the image's
+            `/etc/ssh/sshd_config` as the `Port` directive.
+          '';
+        };
+
+        rootAuthorizedKeys = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          example = [ "ssh-ed25519 AAAA... operator@host" ];
+          description = lib.mdDoc ''
+            SSH public-key lines baked into the recovery image's
+            `/root/.ssh/authorized_keys` (mode 600). With
+            `PermitRootLogin prohibit-password` these are the only way to
+            log in remotely as root.
+          '';
+        };
       };
 
       sfsPath = lib.mkOption {
@@ -799,6 +888,21 @@ in
           stripped at install time and at runtime. The Rust disk-rescue
           path joins this against the runtime boot mountpoint
           (`bootstrap.bootFs.mountpoint` in bootstrap mode).
+        '';
+      };
+
+      forceOnBoot = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = lib.mdDoc ''
+          Test/recovery escape hatch. When true (and
+          `rescue.mode = "external"`), NMBL skips the normal
+          generation-boot flow and switch_roots straight into the rescue
+          squashfs on every boot. The decision is made right after the
+          boot partition is mounted and before any interactive console
+          comes up, so it is a fully deterministic, no-input trigger —
+          intended for automated rescue verification, not production.
+          Leave `false` for normal installs.
         '';
       };
 
