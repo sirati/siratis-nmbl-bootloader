@@ -185,6 +185,7 @@ fn try_reexec(report_path: Option<PathBuf>) {
 
     let argv: [&CString; 2] = [&argv0_c, &arg_c];
     let env: [&CString; 0] = [];
+    // execve safety: panic-recovery re-exec of our own binary to resume init with a clean stack.
     let _ = execve(&exe_c, &argv, &env);
     // Fall through — execve only returns on failure.
 }

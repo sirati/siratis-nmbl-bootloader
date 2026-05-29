@@ -204,17 +204,34 @@
             src = commonArgs.src;
           };
 
-          # Enforce that the only sites that may exec a new process or
-          # invoke std::process::Command are the allow-listed files:
-          # the emergency-shell exec site, the panic-recovery re-exec
-          # site, the activation-runner fork/exec helper, the rescue
-          # dispatcher's embedded execve, and the disk/network rescue
-          # pivot-into-shell sites.
-          nmbl-init-no-exec = pkgs.runCommand "nmbl-init-no-exec" { } ''
+          # Replacing our own process (execve) or spawning one
+          # (std::process::Command) is only sound at a handful of sites:
+          # the single PID1 handoff, post-fork children, the panic
+          # re-exec. Instead of an allow-list of whole files, require an
+          # in-context justification on (or directly above) every real
+          # use — a `// execve safety: <why>` comment, mirroring the
+          # `// SAFETY:` convention for `unsafe`. Lines that are
+          # themselves comments (e.g. doc-comments mentioning `execve(2)`)
+          # are ignored, so prose about exec never trips the guard.
+          nmbl-init-no-exec = pkgs.runCommand "nmbl-init-no-exec" {
+            nativeBuildInputs = [ pkgs.gawk ];
+          } ''
             cd ${./.}
-            if grep -RIn -E '\bCommand::|\bexecve\(' src/ \
-                 | grep -v -E '^src/(shell\.rs|panic\.rs|sys/activation\.rs|rescue/(mod|disk|net)\.rs)'; then
-              echo "ERROR: Command:: or execve() found outside allowlisted files"
+            rc=0
+            for f in $(find src -name '*.rs'); do
+              awk -v file="$f" '
+                ($0 ~ /\<execve\(/ || $0 ~ /\<Command::/) && $0 !~ /^[[:space:]]*\/\// {
+                  if (prev !~ /execve safety:/ && $0 !~ /execve safety:/) {
+                    printf "%s:%d:%s\n", file, FNR, $0
+                    bad = 1
+                  }
+                }
+                { prev = $0 }
+                END { exit bad }
+              ' "$f" || rc=1
+            done
+            if [ "$rc" -ne 0 ]; then
+              echo "ERROR: every execve()/Command:: needs a '// execve safety: <why>' comment on or directly above it"
               exit 1
             fi
             touch $out
