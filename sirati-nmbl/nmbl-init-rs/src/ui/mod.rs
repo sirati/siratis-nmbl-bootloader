@@ -52,7 +52,7 @@ use zeroize::Zeroizing;
 use crate::activation::PasswordSupplier;
 use crate::config::Config;
 use crate::error::{NmblError, Result};
-use crate::generations::Generation;
+use crate::generations::{Generation, active_generation_index};
 use crate::ui::console::Console;
 use crate::ui::timeout::TimeoutOutcome;
 use crate::ui::view::{
@@ -748,18 +748,25 @@ pub fn run_selector(
     generations: &[Generation],
     console: &mut dyn Console,
 ) -> Result<Decision> {
-    run_selector_on_console(config, generations, console)
+    // The pre-selected entry must match the active `system` profile so
+    // an operator who ran `nixos-rebuild --rollback` sees (and on
+    // timeout boots) the generation they rolled back to — not the
+    // higher-numbered one they rolled away from.
+    let default_index = active_generation_index(generations, &config.paths.nix_profiles_dir);
+    run_selector_on_console(config, generations, console, default_index)
 }
 
 /// TUI event loop. Backend-agnostic: every render and key-poll goes
 /// through the [`Console`] trait. Hosts the countdown, the List/Editing
-/// state machine, and the timeout-defaults-to-first-generation rule.
+/// state machine, and the timeout-defaults-to-active-profile rule.
 fn run_selector_on_console(
     config: &Config,
     generations: &[Generation],
     console: &mut dyn Console,
+    default_index: usize,
 ) -> Result<Decision> {
     let mut app = App::new(generations);
+    app.selected_index = default_index;
     app.show_kernel_params = config.tui.show_kernel_params;
 
     // 1. Countdown phase.
@@ -768,8 +775,10 @@ fn run_selector_on_console(
     app.countdown_remaining_secs = None;
 
     if matches!(outcome, TimeoutOutcome::Expired) && app.decision.is_none() {
+        // Countdown reached zero without input — boot the same entry
+        // the list was highlighting (the active profile).
         return Ok(Decision::Boot {
-            generation_index: 0,
+            generation_index: default_index,
             cmdline_override: None,
         });
     }

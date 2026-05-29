@@ -35,8 +35,6 @@ pub struct KeyInjection {
 }
 
 const PROC_MODULES: &str = "/proc/modules";
-/// Per-device wait budget; matches the Phase 3 loop.
-const DEVICE_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Pluggable passphrase prompt; TUI implements it, tests mock it.
 /// `Zeroizing` wipes the buffer on drop, including on error paths.
@@ -161,12 +159,13 @@ pub fn run_all_activations(
 
         let device_count = activation.produces_devices.len();
         let wait_operation = format!("phase 3: {} waiting for", kind_label(activation.kind));
+        let device_timeout = Duration::from_secs(config.general.device_timeout_secs);
         for device in &activation.produces_devices {
             // Drive the spinner / status line while we wait so a slow
             // activation (LUKS unlock, LVM scan) doesn't look frozen.
             wait_for(
                 device,
-                DEVICE_WAIT_TIMEOUT,
+                device_timeout,
                 &wait_operation,
                 Some(&mut *reporter),
             )?;
