@@ -83,7 +83,9 @@ use crate::splash::terminal::SplashTerminal;
 use crate::splash::types::CellDims;
 
 pub use app::{App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, ModalKind, Screen};
-pub use emergency::{run_emergency_screen, run_emergency_screen_with_app};
+pub use emergency::{
+    resolve_emergency_timeout, run_emergency_screen, run_emergency_screen_with_app,
+};
 pub(crate) use emergency::{build_emergency_app, build_message, default_items};
 pub use reporter::{BootReporter, ProgressSink, TickOutcome};
 
@@ -769,8 +771,13 @@ fn run_selector_on_console(
     app.selected_index = default_index;
     app.show_kernel_params = config.tui.show_kernel_params;
 
-    // 1. Countdown phase.
-    let countdown = Duration::from_secs(u64::from(config.general.timeout_secs));
+    // 1. Countdown phase. A `timeout_ms` override (when set) wins over
+    //    the whole-second `timeout_secs`, enabling sub-second auto-boot
+    //    delays; absent it falls back to the historic seconds budget.
+    let countdown = match config.general.timeout_ms {
+        Some(ms) => Duration::from_millis(u64::from(ms)),
+        None => Duration::from_secs(u64::from(config.general.timeout_secs)),
+    };
     let outcome = run_console_countdown(console, &mut app, countdown)?;
     app.countdown_remaining_secs = None;
 
@@ -818,6 +825,18 @@ fn run_selector_on_console(
 
 /// Countdown driver that polls the [`Console`] for keys instead of
 /// stdin, so cancel-on-keypress works on both the splash framebuffer
+/// Remaining whole seconds, rounded UP, for the countdown header.
+/// A non-zero sub-second remainder still reads as at least "1s" so a
+/// sub-second `timeout_ms` never displays a misleading "0s".
+fn ceil_secs(d: Duration) -> u64 {
+    let secs = d.as_secs();
+    if d.subsec_nanos() > 0 {
+        secs.saturating_add(1)
+    } else {
+        secs
+    }
+}
+
 /// (input via `/dev/tty1`) and the raw-mode tty.
 fn run_console_countdown(
     console: &mut dyn Console,
@@ -827,7 +846,10 @@ fn run_console_countdown(
     let start = Instant::now();
     let deadline = start.checked_add(duration).unwrap_or(start);
 
-    let initial = duration.as_secs();
+    // Round the displayed remaining time UP so a sub-second budget
+    // (e.g. a 500 ms `timeout_ms`) shows "1s" rather than a misleading
+    // "0s". Whole-second budgets are unaffected.
+    let initial = ceil_secs(duration);
     app.countdown_remaining_secs = Some(initial);
     console.render(app)?;
     let mut last_reported = initial;
@@ -847,7 +869,7 @@ fn run_console_countdown(
         let Some(remaining) = deadline.checked_duration_since(now) else {
             return Ok(TimeoutOutcome::Expired);
         };
-        let secs = remaining.as_secs();
+        let secs = ceil_secs(remaining);
         if secs != last_reported {
             app.countdown_remaining_secs = Some(secs);
             console.render(app)?;
