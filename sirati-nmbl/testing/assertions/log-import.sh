@@ -26,9 +26,12 @@ CONFIG_NAME="test-gpt-qemu-kernel-invoke"
 JOURNAL_TAG="nmbl-init"
 PHASE_MARKER="phase 1"
 # Per-attempt wait (seconds) for the post-kexec shell after pressing Enter
-# in the selector. Covers kexec + NixOS stage-1 (incl. nmbl-log-import) +
-# stage-2 + autologin. The flake app's wall-clock cap is the hard backstop.
-SHELL_TIMEOUT="${NMBL_SHELL_TIMEOUT:-90}"
+# in the selector. Covers kexec + NixOS systemd stage-1 (incl.
+# nmbl-log-import) + stage-2 + autologin. The systemd initrd is heavier
+# than the scripted one and can take well over a minute on a loaded host,
+# so the default is generous; the flake app's wall-clock cap is the hard
+# backstop against a genuinely wedged VM.
+SHELL_TIMEOUT="${NMBL_SHELL_TIMEOUT:-240}"
 
 # Resolve this script's directory so we can source the shared helpers
 # regardless of the cwd nix run drops us in.
@@ -81,30 +84,51 @@ fi
 # bare send emits just the newline vm-serial-man appends = an Enter key.
 # Bounded by attempts so a genuinely wedged VM still fails instead of
 # hanging (the outer wall-clock cap in the flake app is the backstop).
+# Catch the phase-5 selector, then press Enter EXACTLY ONCE to boot the
+# default (top) generation. Re-pressing Enter is harmful: a spare keystroke
+# that lands back on the selector triggers a second kexec and the boot
+# never settles. So we commit to a single boot and then watch the system
+# come up.
 echo "=== driving NMBL phase-5 generation selector (Enter = boot) ===" >&2
+if ! wait_for "Generations|Enter boot" 90; then
+  echo "FAIL: NMBL never reached the phase-5 generation selector" >&2
+  exit 1
+fi
+echo "=== selector up — pressing Enter to boot the default generation ===" >&2
+send_cmd ""
+
+# The booted autologin prompt renders once and then sits idle, so a trigger
+# that only watches NEW output races against it. Poll the captured HISTORY
+# for the prompt instead (seen_in_history), WITHOUT sending any more keys.
+echo "=== waiting up to ${SHELL_TIMEOUT}s for the post-kexec root shell ===" >&2
 booted=false
-for attempt in 1 2 3 4 5 6; do
-  if wait_for "Generations|Enter boot" 45; then
-    echo "=== selector up (attempt ${attempt}) — pressing Enter to boot ===" >&2
-    send_cmd ""
-  fi
-  # Did pressing Enter get us into the booted NixOS root shell?
-  if wait_for "root@${CONFIG_NAME}" "${SHELL_TIMEOUT}"; then
+for _ in $(seq 1 "$((SHELL_TIMEOUT / 5))"); do
+  if seen_in_history "root@${CONFIG_NAME}"; then
     booted=true
     break
   fi
-  echo "WARN: no shell after attempt ${attempt}; retrying selector" >&2
+  sleep 5
 done
 if [ "$booted" != true ]; then
   echo "FAIL: never reached the booted root shell" >&2
   exit 1
 fi
 
-# Settle the prompt with a sentinel round-trip before issuing journalctl,
-# so our command is not swallowed by late boot chatter.
-send_cmd "echo NMBL_SHELL_READY"
-if ! wait_for "NMBL_SHELL_READY" 30; then
-  echo "FAIL: shell did not echo readiness sentinel" >&2
+# `seen_in_history` only proves the autologin banner scrolled past; the
+# shell may still be wiring up its line discipline and would silently drop
+# the first command(s). Confirm it is actually reading stdin by bouncing a
+# sentinel echo until it round-trips, retrying a few times so a slow getty
+# doesn't fail the run.
+ready=false
+for _ in $(seq 1 12); do
+  send_cmd "echo NMBL_SHELL_READY"
+  if wait_for "NMBL_SHELL_READY" 10; then
+    ready=true
+    break
+  fi
+done
+if [ "$ready" != true ]; then
+  echo "FAIL: booted shell never became interactive" >&2
   exit 1
 fi
 
