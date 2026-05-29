@@ -333,19 +333,26 @@ in
           }
         ];
 
-        # When the splash UI is enabled, ship the background image and
-        # the menu font at the fixed paths the Rust /init expects (see
-        # lib/config-toml.nix `splash.background_image`/`splash.font_path`).
+        # When the splash UI is enabled, ship the menu font at the fixed
+        # path the Rust /init expects (see lib/config-toml.nix
+        # `splash.font_path`). The background image is embedded too ONLY
+        # in `backgroundLocation = "initrd"` mode; in `"boot-partition"`
+        # mode it is staged on the boot partition by
+        # install-bootloader.nix and read at runtime, so we keep it OUT
+        # of the initramfs to stay lean.
+        splashBackgroundContents =
+          lib.optionals (cfg.splash.enable && cfg.splash.backgroundLocation == "initrd") [
+            {
+              object = cfg.splash.backgroundImage;
+              symlink = "/etc/splash/image.png";
+            }
+          ];
         splashContents = lib.optionals cfg.splash.enable [
-          {
-            object = cfg.splash.backgroundImage;
-            symlink = "/etc/splash/image.png";
-          }
           {
             object = cfg.splash.fontPath;
             symlink = "/etc/splash/font.ttf";
           }
-        ];
+        ] ++ splashBackgroundContents;
 
         initramfs = pkgs.makeInitrd {
           contents = baseContents ++ splashContents ++ activationExtraContents;

@@ -11,10 +11,10 @@
 //! No new `unsafe` is introduced; all syscalls flow through the splash
 //! primitives' existing rustix-based wrappers.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::config::Config;
+use crate::config::{Config, SplashBackgroundLocation};
 use crate::error::{NmblError, Result};
 use crate::log;
 use crate::nmbl_warn;
@@ -23,7 +23,7 @@ use crate::splash::glyph_cache::{self, GlyphCache};
 use crate::splash::input::SplashInput;
 use crate::splash::png;
 use crate::splash::scale;
-use crate::splash::types::CellDims;
+use crate::splash::types::{CellDims, FramebufferDims};
 use crate::ui::POLL_SLICE;
 use crate::ui::app::App;
 use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
@@ -38,6 +38,95 @@ const INPUT_TTY_PATH: &str = "/dev/tty1";
 /// Font size, in pixels, used to rasterise the splash glyph cache.
 /// Same value as the existing `crate::ui::SPLASH_FONT_PX`.
 const SPLASH_FONT_PX: f32 = 16.0;
+
+/// FIXED basename of the sidecar splash background on the boot
+/// partition, used when
+/// `splash.background_location = "boot-partition"`. Deliberately NOT
+/// configurable — the file is always staged next to the initrd
+/// (`nmbl-initrd`) at the boot-partition root. The name omits a dash
+/// to stay FAT-friendly. Mirrors the rescue-sfs sidecar precedent,
+/// which keys off [`crate::config::Config::runtime_boot_mountpoint`].
+pub const SIDECAR_SPLASH_BG_BASENAME: &str = "nmblsplash.png";
+
+/// Solid fallback background colour (RGBA8) painted across the whole
+/// framebuffer when the sidecar background cannot be loaded. A dark
+/// slate so the menu chrome stays legible without an image. Matches
+/// the "render splash with a solid background" graceful-degradation
+/// contract.
+const FALLBACK_BG_RGBA: [u8; 4] = [0x1e, 0x1e, 0x2e, 0xff];
+
+/// Resolve the on-disk path of the sidecar splash background.
+///
+/// The background lives at the FIXED basename
+/// [`SIDECAR_SPLASH_BG_BASENAME`] under the boot-partition root, joined
+/// against [`Config::runtime_boot_mountpoint`] (populated by Phase 0.5
+/// after the boot partition is mounted). Returns `None` in legacy
+/// embedded-config mode where no NMBL-mounted boot partition exists —
+/// the caller then degrades to the solid fallback background. Mirrors
+/// `rescue::locate_sfs`'s "no runtime mountpoint" handling, minus the
+/// hard error: a missing splash background must never block boot.
+fn locate_sidecar_background(config: &Config) -> Option<PathBuf> {
+    config
+        .runtime_boot_mountpoint
+        .as_deref()
+        .map(|mp| mp.join(SIDECAR_SPLASH_BG_BASENAME))
+}
+
+/// Build a tight RGBA8 buffer of `dims.w * dims.h` pixels filled with a
+/// solid colour. Used as the last-resort background when the sidecar
+/// PNG is missing or unreadable so the whole framebuffer is painted
+/// (an empty buffer would leave the dumb buffer's prior contents
+/// showing through between cell fills).
+fn solid_background(dims: FramebufferDims, rgba: [u8; 4]) -> Vec<u8> {
+    let pixels = (dims.w as usize).saturating_mul(dims.h as usize);
+    let mut buf = Vec::with_capacity(pixels.saturating_mul(4));
+    for _ in 0..pixels {
+        buf.extend_from_slice(&rgba);
+    }
+    buf
+}
+
+/// Load the sidecar background PNG from the boot partition and
+/// cover-scale it to `fb_dims`. On ANY failure — unknown mountpoint,
+/// missing file, decode error, or a scaler that rejects the decoded
+/// dimensions — emit a single `nmbl_warn!` and return a solid-colour
+/// fallback buffer so the splash chrome still renders. Never returns
+/// an error: a sidecar background is best-effort and must not block
+/// boot.
+fn load_sidecar_background_or_fallback(config: &Config, fb_dims: FramebufferDims) -> Vec<u8> {
+    let Some(path) = locate_sidecar_background(config) else {
+        nmbl_warn!(
+            "splash: background_location=boot-partition but the boot partition mountpoint is \
+             unknown (legacy embedded-config mode); using solid fallback background"
+        );
+        return solid_background(fb_dims, FALLBACK_BG_RGBA);
+    };
+
+    let image = match png::decode_rgba(&path) {
+        Ok(img) => img,
+        Err(e) => {
+            nmbl_warn!(
+                "splash: sidecar background {} could not be loaded ({e}); using solid fallback \
+                 background",
+                path.display(),
+            );
+            return solid_background(fb_dims, FALLBACK_BG_RGBA);
+        }
+    };
+
+    let scaled = scale::cover_scale_nearest(&image.rgba, image.width, image.height, fb_dims);
+    if scaled.is_empty() {
+        nmbl_warn!(
+            "splash: sidecar background {} decoded to unusable dimensions ({}x{}); using solid \
+             fallback background",
+            path.display(),
+            image.width,
+            image.height,
+        );
+        return solid_background(fb_dims, FALLBACK_BG_RGBA);
+    }
+    scaled
+}
 
 /// DRM-backed console. Constructed via [`SplashConsole::open`].
 pub struct SplashConsole {
@@ -66,13 +155,32 @@ impl SplashConsole {
         let fb_dims = drm.dims();
 
         // 2. Load the background PNG and cover-scale it to the framebuffer.
-        let bg_image = png::decode_rgba(&config.splash.background_image)?;
-        let bg_scaled = scale::cover_scale_nearest(
-            &bg_image.rgba,
-            bg_image.width,
-            bg_image.height,
-            fb_dims,
-        );
+        //
+        //    Two sources, selected by `splash.background_location`:
+        //    * `Initrd` (default): decode the embedded PNG at
+        //      `splash.background_image`. A decode failure here is a
+        //      real bring-up error (the asset is baked into the
+        //      initramfs and must be present) and propagates as today.
+        //    * `BootPartition`: decode the sidecar PNG staged next to
+        //      the initrd on the boot partition, resolved against the
+        //      Phase-0.5 mountpoint. Phase ordering: in bootstrap mode
+        //      `run_bootstrap_phase` mounts the boot partition and sets
+        //      `runtime_boot_mountpoint` BEFORE `open_console` runs, so
+        //      the file is reachable here. If the mountpoint is unknown
+        //      (legacy embedded-config mode) or the PNG is
+        //      missing/unreadable/corrupt, we WARN and fall back to a
+        //      solid background — never panic, never block boot. This
+        //      mirrors how `rescue::disk` treats a missing
+        //      `nmbl-rescue.sfs` on the boot partition.
+        let bg_scaled = match config.splash.background_location {
+            SplashBackgroundLocation::Initrd => {
+                let bg_image = png::decode_rgba(&config.splash.background_image)?;
+                scale::cover_scale_nearest(&bg_image.rgba, bg_image.width, bg_image.height, fb_dims)
+            }
+            SplashBackgroundLocation::BootPartition => {
+                load_sidecar_background_or_fallback(config, fb_dims)
+            }
+        };
 
         // 3. Load the font and derive grid dimensions from the cell size.
         let cache = glyph_cache::load(&config.splash.font_path, SPLASH_FONT_PX)?;
@@ -211,5 +319,129 @@ impl Drop for SplashConsole {
         // chains (SplashDrm, SplashInput) handle KD mode and termios
         // restoration on their own.
         log::clear_tui_active();
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "tests can panic on assertion failure"
+)]
+mod tests {
+    use super::*;
+    use crate::config::SplashBackgroundLocation;
+
+    /// Smallest valid RGBA8 PNG: a 1x1 opaque-red pixel. Reused from
+    /// the `splash::png` decode tests so the sidecar loader exercises
+    /// the real decode path without touching a build asset.
+    const ONE_BY_ONE_RED_RGBA: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x56, 0xc7, 0x2f, 0x0d, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fn dims(w: u32, h: u32) -> FramebufferDims {
+        FramebufferDims {
+            w,
+            h,
+            stride: w.saturating_mul(4),
+        }
+    }
+
+    fn cfg_with_mountpoint(mp: Option<PathBuf>) -> Config {
+        let mut c = Config::recovery_default();
+        c.splash.background_location = SplashBackgroundLocation::BootPartition;
+        c.runtime_boot_mountpoint = mp;
+        c
+    }
+
+    #[test]
+    fn locate_sidecar_joins_fixed_basename_under_mountpoint() {
+        let c = cfg_with_mountpoint(Some(PathBuf::from("/mnt/boot")));
+        assert_eq!(
+            locate_sidecar_background(&c).expect("mountpoint present resolves a path"),
+            PathBuf::from("/mnt/boot/nmblsplash.png"),
+        );
+    }
+
+    #[test]
+    fn locate_sidecar_is_none_without_mountpoint() {
+        // Legacy embedded-config mode: no NMBL-mounted boot partition,
+        // so the sidecar cannot be resolved and the loader must fall
+        // back to the solid background.
+        let c = cfg_with_mountpoint(None);
+        assert!(locate_sidecar_background(&c).is_none());
+    }
+
+    #[test]
+    fn solid_background_fills_every_pixel() {
+        let buf = solid_background(dims(2, 3), FALLBACK_BG_RGBA);
+        assert_eq!(buf.len(), 2 * 3 * 4);
+        for px in buf.chunks_exact(4) {
+            assert_eq!(px, FALLBACK_BG_RGBA);
+        }
+    }
+
+    #[test]
+    fn sidecar_loader_reads_png_from_boot_partition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(SIDECAR_SPLASH_BG_BASENAME), ONE_BY_ONE_RED_RGBA)
+            .expect("stage sidecar png");
+        let c = cfg_with_mountpoint(Some(dir.path().to_path_buf()));
+
+        let fb = dims(4, 4);
+        let scaled = load_sidecar_background_or_fallback(&c, fb);
+        // A real decode+scale of the 1x1 red PNG to 4x4 yields a tight
+        // 4*4*4 buffer of opaque-red pixels — distinct from the solid
+        // fallback colour, proving the sidecar path was taken.
+        assert_eq!(scaled.len(), 4 * 4 * 4);
+        assert_eq!(
+            scaled.get(0..4),
+            Some([0xff, 0x00, 0x00, 0xff].as_slice()),
+            "first pixel must be the decoded red, not the fallback",
+        );
+    }
+
+    #[test]
+    fn sidecar_loader_falls_back_when_file_missing() {
+        // Mountpoint is set but the sidecar file is absent: the loader
+        // must degrade to the solid fallback, never error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let c = cfg_with_mountpoint(Some(dir.path().to_path_buf()));
+
+        let fb = dims(4, 4);
+        let scaled = load_sidecar_background_or_fallback(&c, fb);
+        assert_eq!(scaled.len(), 4 * 4 * 4);
+        assert_eq!(
+            scaled.get(0..4),
+            Some(FALLBACK_BG_RGBA.as_slice()),
+            "missing sidecar must yield the solid fallback colour",
+        );
+    }
+
+    #[test]
+    fn sidecar_loader_falls_back_on_corrupt_png() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(SIDECAR_SPLASH_BG_BASENAME), b"not a png at all")
+            .expect("stage corrupt sidecar");
+        let c = cfg_with_mountpoint(Some(dir.path().to_path_buf()));
+
+        let fb = dims(4, 4);
+        let scaled = load_sidecar_background_or_fallback(&c, fb);
+        assert_eq!(scaled.len(), 4 * 4 * 4);
+        assert_eq!(scaled.get(0..4), Some(FALLBACK_BG_RGBA.as_slice()));
+    }
+
+    #[test]
+    fn sidecar_loader_falls_back_without_mountpoint() {
+        let c = cfg_with_mountpoint(None);
+        let fb = dims(4, 4);
+        let scaled = load_sidecar_background_or_fallback(&c, fb);
+        assert_eq!(scaled.len(), 4 * 4 * 4);
+        assert_eq!(scaled.get(0..4), Some(FALLBACK_BG_RGBA.as_slice()));
     }
 }

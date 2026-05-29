@@ -245,6 +245,29 @@ fn default_true() -> bool {
     true
 }
 
+/// Where the splash background PNG lives. Mirrors [`RescueMode`]'s
+/// naming/shape: `"initrd"` (the default) keeps today's embedded
+/// behaviour — the background is baked into the initramfs at
+/// [`Splash::background_image`]; `"boot-partition"` reads the PNG from
+/// the mounted boot partition at runtime (a sidecar next to the
+/// initrd), resolved against [`Config::runtime_boot_mountpoint`] the
+/// same way `rescue::locate_sfs` resolves `nmbl-rescue.sfs`. Persists
+/// to TOML as kebab-case strings (`"initrd"`, `"boot-partition"`).
+#[cfg(feature = "image-splash")]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SplashBackgroundLocation {
+    /// Legacy: the background PNG is embedded in the initramfs at
+    /// [`Splash::background_image`]. Loaded directly from that path.
+    #[default]
+    Initrd,
+    /// Sidecar: the background PNG is staged on the boot partition next
+    /// to the initrd and read at runtime, resolved against the runtime
+    /// boot mountpoint (Phase 0.5). Falls back to a solid background if
+    /// missing/unreadable.
+    BootPartition,
+}
+
 #[cfg(feature = "image-splash")]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -254,6 +277,16 @@ pub struct Splash {
 
     #[serde(default = "default_splash_background")]
     pub background_image: PathBuf,
+
+    /// Selects where the background PNG lives. Defaults to
+    /// [`SplashBackgroundLocation::Initrd`] so configs predating this
+    /// knob keep the embedded behaviour. In
+    /// [`SplashBackgroundLocation::BootPartition`] mode the PNG is read
+    /// from a FIXED basename next to the initrd on the boot partition
+    /// (see `crate::ui::console::splash::SIDECAR_SPLASH_BG_BASENAME`);
+    /// the name is intentionally not configurable.
+    #[serde(default)]
+    pub background_location: SplashBackgroundLocation,
 
     #[serde(default = "default_splash_font")]
     pub font_path: PathBuf,
@@ -268,6 +301,7 @@ impl Default for Splash {
         Self {
             enable: false,
             background_image: default_splash_background(),
+            background_location: SplashBackgroundLocation::default(),
             font_path: default_splash_font(),
             dri_path: default_dri_path(),
         }
@@ -756,6 +790,40 @@ mod tests {
             PathBuf::from("/etc/splash/font.ttf"),
         );
         assert_eq!(config.splash.dri_path, PathBuf::from("/dev/dri/card0"));
+    }
+
+    #[cfg(feature = "image-splash")]
+    #[test]
+    fn splash_background_location_defaults_to_initrd_when_absent() {
+        // Configs predating the sidecar knob must keep parsing and
+        // observe the embedded (initrd) behaviour so the boot UX does
+        // not silently change on upgrade.
+        let toml_text = "[splash]\nenable = true\n";
+        let config: Config = toml::from_str(toml_text).expect("config must parse");
+        assert_eq!(
+            config.splash.background_location,
+            SplashBackgroundLocation::Initrd,
+        );
+    }
+
+    #[cfg(feature = "image-splash")]
+    #[test]
+    fn splash_background_location_parses_both_modes() {
+        for (raw, expected) in [
+            ("initrd", SplashBackgroundLocation::Initrd),
+            ("boot-partition", SplashBackgroundLocation::BootPartition),
+        ] {
+            let toml_text = format!("[splash]\nbackground_location = \"{raw}\"\n");
+            let config: Config = toml::from_str(&toml_text).expect("mode value must parse");
+            assert_eq!(config.splash.background_location, expected, "mode={raw}");
+        }
+    }
+
+    #[cfg(feature = "image-splash")]
+    #[test]
+    fn splash_background_location_rejects_unknown_value() {
+        let toml_text = "[splash]\nbackground_location = \"sd-card\"\n";
+        toml::from_str::<Config>(toml_text).expect_err("unknown location value must reject");
     }
 
     #[cfg(feature = "image-splash")]
