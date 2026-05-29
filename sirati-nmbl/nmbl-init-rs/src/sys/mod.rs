@@ -6,6 +6,7 @@ pub mod kexec;
 pub mod loopdev;
 pub mod module;
 pub mod mount;
+pub mod poller;
 pub mod printk;
 // Pseudo-terminal helpers are also used by the no-feature build's
 // console-picker shell-relay path, so `pty` is unconditionally
