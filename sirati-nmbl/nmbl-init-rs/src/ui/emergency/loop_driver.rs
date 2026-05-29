@@ -93,6 +93,39 @@ pub(crate) async fn drive_emergency_loop<N>(
 where
     N: Fn() -> Instant,
 {
+    drive_emergency_loop_inner(app, timeout, now, console, false).await
+}
+
+/// Like [`drive_emergency_loop`] but, when `exit_on_ctrl_e` is `true`,
+/// the loop also returns as soon as the operator presses Ctrl+E
+/// (`app.exit_session`). The returned [`EmergencyChoice`] is then
+/// irrelevant — the caller inspects `app.exit_session` and ends the
+/// session — so it is left at the default. Local callers pass `false`
+/// (Ctrl+E keeps its historic no-op meaning); the remote-TUI per-session
+/// loop passes `true` so Ctrl+E closes the remote session.
+#[cfg(feature = "remote-tui")]
+pub(crate) async fn drive_emergency_loop_exitable<N>(
+    app: &mut App<'_>,
+    timeout: Duration,
+    now: N,
+    console: &mut dyn Console,
+) -> Result<EmergencyChoice>
+where
+    N: Fn() -> Instant,
+{
+    drive_emergency_loop_inner(app, timeout, now, console, true).await
+}
+
+async fn drive_emergency_loop_inner<N>(
+    app: &mut App<'_>,
+    timeout: Duration,
+    now: N,
+    console: &mut dyn Console,
+    exit_on_ctrl_e: bool,
+) -> Result<EmergencyChoice>
+where
+    N: Fn() -> Instant,
+{
     // Arm the auto-reboot countdown ONLY on a fully unattended boot. If
     // the operator has pressed any key this session (boot menu, LUKS
     // passphrase, a prior visit to this screen) they are present, so we
@@ -148,6 +181,12 @@ where
                 app.countdown_remaining_secs = None;
                 app.error_countdown_deadline = None;
                 if app.on_key(key) {
+                    break;
+                }
+                // Remote sessions end on Ctrl+E. Local callers
+                // (`exit_on_ctrl_e == false`) keep ignoring it, so this
+                // is a no-op for the local emergency menu.
+                if exit_on_ctrl_e && app.exit_session {
                     break;
                 }
                 dirty = true;

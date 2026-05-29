@@ -62,6 +62,7 @@
 //! not to the dispatcher.
 
 mod banner;
+mod recovery;
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -81,7 +82,7 @@ use crate::ui::console::{Console, open_console};
 use crate::ui::emergency_actions::{retry_boot, surface_action_failure, verify_kexec_readiness};
 use crate::ui::{
     EmergencyChoice, SessionInteraction, TuiPasswordSupplier, build_emergency_app, build_message,
-    default_items, resolve_emergency_timeout, run_emergency_screen_with_app,
+    default_items, resolve_emergency_timeout,
 };
 
 /// Print the operator-facing emergency banner and drive the
@@ -131,74 +132,52 @@ pub async fn drop_to_emergency(
     // bound. `build_emergency_app(&[])` uses an empty generations
     // slice which is `'static`, so the inferred lifetime here is
     // already `'static` — the explicit annotation merely pins it.
-    let mut app: App<'static> = build_emergency_app(&message, &items, session);
-
-    // Count of distinct failures surfaced this session. Used so the
-    // persistent emergency-screen "error" box can show the LATEST
-    // failure (not just the original boot error it latched on entry)
-    // along with how many have been seen — see `update_latest_error`.
-    let mut error_count: u32 = 0;
+    let app: App<'static> = build_emergency_app(&message, &items, session);
 
     // Resolve the auto-reboot countdown once: an operator-configured
     // `emergency_timeout_secs` overrides the built-in 30 s default.
     let emergency_timeout = resolve_emergency_timeout(config);
 
-    // Re-entrant picker. The Raw Shell, Pretty Shell, Retry boot, and
-    // Verify kexec readiness branches all return control to this loop
-    // on exit (sub-shell ended, retry failed, operator picked Back).
-    // The Reboot branch — and the success arms of Retry/Verify —
-    // diverge into a `TerminalAction` and break out via `return`.
-    //
-    // The Raw Shell branch now runs the in-process picker + multiplexed
-    // PTY relay (`crate::ui::console_picker::run_picker_session`);
-    // it never produces a `TerminalAction::Execve`. NMBL stays at
-    // PID 1 across the shell session.
-    loop {
-        // Modal state from the prior iteration (if any) must be
-        // cleared before re-entering the picker; otherwise a stale
-        // overlay would obscure the menu.
-        app.modal = None;
-        let choice =
-            run_emergency_screen_with_app(&mut *console, &mut app, emergency_timeout).await;
+    recovery::drive_recovery(&mut *console, app, config, session, emergency_timeout).await
+}
 
-        match choice {
-            EmergencyChoice::Reboot => {
-                eprintln!("[nmbl] operator (or timeout) chose reboot");
-                return TerminalAction::Reboot;
-            }
-            EmergencyChoice::RawShell => {
-                run_raw_shell_choice(&mut *console, &mut app, &mut error_count, config).await;
-                // Picker session done (shell exited, detached, or cancelled); re-show menu.
-                continue;
-            }
-            #[cfg(feature = "pretty-shell")]
-            EmergencyChoice::PrettyShell => {
-                run_pretty_shell_choice(&mut *console, &mut app, &mut error_count, config).await;
-                continue;
-            }
-            EmergencyChoice::RetryBoot => {
-                let mut supplier = TuiPasswordSupplier::new(config, session);
-                if let Some(action) = run_retry_boot_arm(
-                    config,
-                    &mut *console,
-                    &mut app,
-                    &mut error_count,
-                    &mut supplier,
-                )
-                .await
-                {
-                    return action;
-                }
-                continue;
-            }
-            EmergencyChoice::VerifyKexecReadiness => {
-                if let Some(action) =
-                    run_verify_kexec_arm(config, &mut *console, &mut app, &mut error_count).await
-                {
-                    return action;
-                }
-                continue;
-            }
+/// Run one emergency-menu choice. Returns `Some(action)` when the choice
+/// is terminal (the caller should return it) or `None` when the sub-flow
+/// returned control to the menu (the caller should re-show it).
+///
+/// Shared by the local re-entrant picker ([`drop_to_emergency`]) and the
+/// remote-TUI per-session loop (`crate::ui::remote`) so both paths drive
+/// exactly the same dispatch — only the [`Console`] differs (the live
+/// boot console vs. the remote operator's pty).
+pub(crate) async fn dispatch_emergency_choice(
+    choice: EmergencyChoice,
+    console: &mut dyn Console,
+    app: &mut App<'static>,
+    error_count: &mut u32,
+    config: &Config,
+    session: &SessionInteraction,
+) -> Option<TerminalAction> {
+    match choice {
+        EmergencyChoice::Reboot => {
+            eprintln!("[nmbl] operator (or timeout) chose reboot");
+            Some(TerminalAction::Reboot)
+        }
+        EmergencyChoice::RawShell => {
+            run_raw_shell_choice(console, app, error_count, config).await;
+            // Picker session done (shell exited, detached, or cancelled); re-show menu.
+            None
+        }
+        #[cfg(feature = "pretty-shell")]
+        EmergencyChoice::PrettyShell => {
+            run_pretty_shell_choice(console, app, error_count, config).await;
+            None
+        }
+        EmergencyChoice::RetryBoot => {
+            let mut supplier = TuiPasswordSupplier::new(config, session);
+            run_retry_boot_arm(config, console, app, error_count, &mut supplier).await
+        }
+        EmergencyChoice::VerifyKexecReadiness => {
+            run_verify_kexec_arm(config, console, app, error_count).await
         }
     }
 }
