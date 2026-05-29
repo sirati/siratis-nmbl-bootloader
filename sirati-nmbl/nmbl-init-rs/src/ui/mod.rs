@@ -57,7 +57,7 @@ use crate::ui::console::Console;
 use crate::ui::timeout::TimeoutOutcome;
 use crate::ui::view::{
     EditScreenData, EmergencyScreenData, KeyEchoScreenData, ListScreenData, PassphraseScreenData,
-    render_boot_status, render_edit, render_emergency, render_key_echo, render_list,
+    render_boot_status, render_edit, render_emergency, render_key_echo, render_list, render_log,
     render_passphrase,
 };
 
@@ -82,7 +82,10 @@ use crate::splash::terminal::SplashTerminal;
 #[cfg(feature = "image-splash")]
 use crate::splash::types::CellDims;
 
-pub use app::{App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, ModalKind, Screen};
+pub use app::{
+    App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, ModalKind, Screen,
+    SessionInteraction,
+};
 pub use emergency::{run_emergency_screen, run_emergency_screen_with_app};
 pub(crate) use emergency::{build_emergency_app, build_message, default_items};
 pub use reporter::{BootReporter, ProgressSink, TickOutcome};
@@ -747,13 +750,14 @@ pub fn run_selector(
     config: &Config,
     generations: &[Generation],
     console: &mut dyn Console,
+    session: &SessionInteraction,
 ) -> Result<Decision> {
     // The pre-selected entry must match the active `system` profile so
     // an operator who ran `nixos-rebuild --rollback` sees (and on
     // timeout boots) the generation they rolled back to — not the
     // higher-numbered one they rolled away from.
     let default_index = active_generation_index(generations, &config.paths.nix_profiles_dir);
-    run_selector_on_console(config, generations, console, default_index)
+    run_selector_on_console(config, generations, console, default_index, session)
 }
 
 /// TUI event loop. Backend-agnostic: every render and key-poll goes
@@ -764,8 +768,9 @@ fn run_selector_on_console(
     generations: &[Generation],
     console: &mut dyn Console,
     default_index: usize,
+    session: &SessionInteraction,
 ) -> Result<Decision> {
-    let mut app = App::new(generations);
+    let mut app = App::new_in_session(generations, session);
     app.selected_index = default_index;
     app.show_kernel_params = config.tui.show_kernel_params;
 
@@ -1016,6 +1021,7 @@ fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind, scrol
 fn render_screen_body(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
     match &app.screen {
         Screen::List => render_list(frame, &list_data(app)),
+        Screen::Log { lines, offset } => render_log(frame, frame.area(), lines, *offset),
         Screen::Editing {
             generation_index,
             buffer,
@@ -1093,22 +1099,29 @@ fn list_data<'a>(app: &'a App<'a>) -> ListScreenData<'a> {
 /// passphrase modal renders on the same backend as the surrounding
 /// boot-status screen.
 #[derive(Default)]
-pub struct TuiPasswordSupplier;
+pub struct TuiPasswordSupplier {
+    /// Shared per-boot interaction latch. The passphrase modal joins
+    /// this session so a typed passphrase counts as "operator present"
+    /// for the emergency screen's countdown decision.
+    session: SessionInteraction,
+}
 
 impl TuiPasswordSupplier {
     #[must_use]
-    pub fn new(_config: &Config) -> Self {
+    pub fn new(_config: &Config, session: &SessionInteraction) -> Self {
         // `_config` is accepted for forward-compatibility with
         // future per-config passphrase policy (retry counts, masking
         // toggles, …). Today the supplier is uniform — the same
         // ratatui modal everywhere.
-        Self
+        Self {
+            session: session.clone(),
+        }
     }
 }
 
 impl PasswordSupplier for TuiPasswordSupplier {
     fn prompt(&mut self, console: &mut dyn Console, label: &str) -> Result<Zeroizing<String>> {
-        passphrase_prompt_on_console(console, label)
+        passphrase_prompt_on_console(console, label, &self.session)
     }
 }
 
@@ -1122,11 +1135,12 @@ impl PasswordSupplier for TuiPasswordSupplier {
 pub(crate) fn passphrase_prompt_on_console(
     console: &mut dyn Console,
     label: &str,
+    session: &SessionInteraction,
 ) -> Result<Zeroizing<String>> {
     // No generations to render — pass an empty slice. The App is
     // only used here for its Passphrase screen state.
     let empty: [Generation; 0] = [];
-    let mut app = App::new(&empty);
+    let mut app = App::new_in_session(&empty, session);
     app.screen = Screen::Passphrase {
         prompt_label: label.to_string(),
         buffer: Zeroizing::new(String::new()),
@@ -1202,7 +1216,8 @@ mod tests {
         // that coercion so a future signature drift on either side
         // breaks the build instead of breaking at boot.
         let cfg: Config = toml::from_str("").expect("default cfg");
-        let mut sup = TuiPasswordSupplier::new(&cfg);
+        let session = SessionInteraction::new();
+        let mut sup = TuiPasswordSupplier::new(&cfg, &session);
         let _coerced: &mut dyn PasswordSupplier = &mut sup;
     }
 
@@ -1284,7 +1299,7 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let secret = passphrase_prompt_on_console(&mut console, "Unlock root")
+        let secret = passphrase_prompt_on_console(&mut console, "Unlock root", &SessionInteraction::new())
             .expect("Enter submits the buffer");
         assert_eq!(&**secret, "ok");
         // Initial render + 2 char-keys + 1 Enter = 4 dirty repaints.
@@ -1312,7 +1327,7 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let secret = passphrase_prompt_on_console(&mut console, "Unlock")
+        let secret = passphrase_prompt_on_console(&mut console, "Unlock", &SessionInteraction::new())
             .expect("Enter after a char submits the buffer");
         assert_eq!(&**secret, "p");
     }
@@ -1326,7 +1341,7 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let secret = passphrase_prompt_on_console(&mut console, "Unlock")
+        let secret = passphrase_prompt_on_console(&mut console, "Unlock", &SessionInteraction::new())
             .expect("Enter submits the buffer");
         assert_eq!(&**secret, "a", "backspace must drop the last char");
     }
@@ -1335,7 +1350,7 @@ mod tests {
     fn passphrase_prompt_esc_returns_tui_error() {
         let keys = vec![press(KeyCode::Char('x')), press(KeyCode::Esc)];
         let mut console = ScriptedConsole::new(keys);
-        let err = passphrase_prompt_on_console(&mut console, "Unlock")
+        let err = passphrase_prompt_on_console(&mut console, "Unlock", &SessionInteraction::new())
             .expect_err("Esc must propagate as a Tui error");
         assert!(matches!(err, NmblError::Tui { .. }));
     }
