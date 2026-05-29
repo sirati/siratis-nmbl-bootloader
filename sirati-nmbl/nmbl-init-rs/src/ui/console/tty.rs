@@ -369,6 +369,14 @@ impl Console for TtyConsole {
         self.terminal.clear().map_err(tui_err)?;
         Ok(())
     }
+
+    fn caps_lock_active(&self) -> Option<bool> {
+        // `/dev/console` is a VT in the framebuffer case and a serial
+        // line otherwise. `caps_lock_active` returns `None` on the
+        // latter (ENOTTY), so the passphrase warning is shown only when
+        // a real VT keyboard reports Caps Lock.
+        crate::sys::vt::caps_lock_active(self.fd.as_fd())
+    }
 }
 
 impl Drop for TtyConsole {

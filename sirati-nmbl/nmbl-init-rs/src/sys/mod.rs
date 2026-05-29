@@ -14,3 +14,4 @@ pub mod printk;
 pub mod pty;
 pub mod tty;
 pub mod uname;
+pub mod vt;
