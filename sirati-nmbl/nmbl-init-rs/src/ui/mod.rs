@@ -88,7 +88,9 @@ pub use app::{
     SessionInteraction,
 };
 pub(crate) use emergency::{build_emergency_app, build_message, default_items};
-pub use emergency::{resolve_emergency_timeout, run_emergency_screen, run_emergency_screen_with_app};
+pub use emergency::{
+    resolve_emergency_timeout, run_emergency_screen, run_emergency_screen_with_app,
+};
 pub use reporter::{BootReporter, ProgressSink, TickOutcome};
 
 /// Slice we wait on input per iteration. Shared by the event loop and

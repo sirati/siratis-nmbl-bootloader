@@ -98,8 +98,7 @@ pub fn run_emergency_screen_with_app(
     // Some(_) and keep the original deadline. Re-entry after an
     // elapsed deadline trips the "remaining = None" branch inside the
     // loop and returns Reboot at once.
-    drive_emergency_loop(app, timeout, Instant::now, console)
-        .unwrap_or(EmergencyChoice::Reboot)
+    drive_emergency_loop(app, timeout, Instant::now, console).unwrap_or(EmergencyChoice::Reboot)
 }
 
 /// Resolve the emergency auto-reboot timeout from runtime config,
