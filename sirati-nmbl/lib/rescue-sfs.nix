@@ -150,6 +150,14 @@ let
     # the pinned nixpkgs fetched on demand — matches nix.conf nix-path and
     # the registry pin. Not baked into the squashfs (ESP size).
     export NIX_PATH=nixpkgs=flake:nixpkgs
+    # NMBL stays PID 1 OUTSIDE this chroot and bind-mounts its own root into
+    # the chroot at /nmbl-root, so its root-only TUI control socket is visible
+    # here at /nmbl-root/nmbl-run/tui.sock. Export the path so the console
+    # shell (and anything it spawns) can attach to NMBL's TUI; the matching
+    # /bin/nmbl-tui shim (see fullSquashfs) points at NMBL's own static binary
+    # (/nmbl-root/init) which auto-detects getpid()!=1 → client mode and honours
+    # NMBL_TUI_SOCK as the socket path override.
+    export NMBL_TUI_SOCK=/nmbl-root/nmbl-run/tui.sock
 
     log() { echo "[nmbl-rescue] $*" > /dev/console 2>&1 || true; }
 
@@ -556,7 +564,9 @@ ${nicModprobes}
     # NIX_PATH makes <nixpkgs> resolvable for non-interactive
     # `ssh host 'nix-shell -p hello --run hello'` (no /etc/profile sourced);
     # it points at the pinned nixpkgs fetched on demand (not baked in).
-    SetEnv PATH=/bin:/sbin:/usr/bin:/usr/sbin NIX_PATH=nixpkgs=flake:nixpkgs
+    # NMBL_TUI_SOCK lets a non-interactive `ssh host nmbl-tui` find NMBL's
+    # TUI socket, bind-mounted in via NMBL's root at /nmbl-root.
+    SetEnv PATH=/bin:/sbin:/usr/bin:/usr/sbin NIX_PATH=nixpkgs=flake:nixpkgs NMBL_TUI_SOCK=/nmbl-root/nmbl-run/tui.sock
     Subsystem sftp ${openssh}/libexec/sftp-server
     # VERBOSE so every connection/auth attempt is logged to the console
     # (-E /dev/console in /init); the minimal env has no syslog.
@@ -573,6 +583,10 @@ ${nicModprobes}
     # login shells. Matches nix-path/registry in nix.conf — points at the
     # pinned nixpkgs fetched on demand (not baked into the squashfs).
     export NIX_PATH=nixpkgs=flake:nixpkgs
+    # NMBL's TUI control socket, visible here because NMBL (still PID 1 outside
+    # the chroot) bind-mounts its own root at /nmbl-root. `nmbl-tui` (a /bin
+    # shim onto NMBL's own static binary) honours this as its socket override.
+    export NMBL_TUI_SOCK=/nmbl-root/nmbl-run/tui.sock
   '';
 
   nixConf = pkgs.writeText "nix.conf" ''
@@ -666,6 +680,16 @@ ${nicModprobes}
       ln -s ${bash}/bin/bash             root/bin/bash
       ln -s ${bash}/bin/bash             root/bin/sh
       ln -s ${bash}/bin/bash             root/usr/bin/bash
+
+      # nmbl-tui: a client onto NMBL's TUI. NMBL stays PID 1 OUTSIDE this
+      # chroot and bind-mounts its own root in at /nmbl-root, so NMBL's own
+      # static binary is reachable here at /nmbl-root/init. Symlink it onto
+      # PATH as `nmbl-tui`; run from a non-PID-1 process it auto-detects
+      # getpid()!=1 → client mode and connects to NMBL_TUI_SOCK (exported in
+      # /init, /etc/profile and sshd_config → /nmbl-root/nmbl-run/tui.sock).
+      # The link target only resolves once NMBL has set up the /nmbl-root
+      # bind mount; that is expected — the squashfs just provides the alias.
+      ln -s /nmbl-root/init              root/bin/nmbl-tui
       for tool in ${coreutils}/bin/* ${utilLinux}/bin/* ${iproute2}/bin/* \
                   ${procps}/bin/* ${kmod}/bin/* ${btrfs}/bin/* \
                   ${cryptsetup}/bin/* ${btop}/bin/* ${e2fsprogs}/bin/* \
