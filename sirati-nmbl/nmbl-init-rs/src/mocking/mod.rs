@@ -61,8 +61,8 @@ use crate::ui::console::parser::TermwizToCrossterm;
 use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
 use crate::ui::render_current_screen;
 use crate::ui::{
-    passphrase_prompt_on_console, show_modal_buttons, show_modal_confirm, show_modal_error,
-    show_wrong_password_modal,
+    SessionInteraction, passphrase_prompt_on_console, show_modal_buttons, show_modal_confirm,
+    show_modal_error, show_wrong_password_modal,
 };
 
 /// Parsed `--debug-tui -- <scenario> [args...]` invocation.
@@ -92,11 +92,7 @@ where
     let mut rest = argv.into_iter().skip(pos.saturating_add(1));
     let first = rest.next()?;
     // Allow `--debug-tui -- <scenario>` and `--debug-tui <scenario>`.
-    let scenario = if first == "--" {
-        rest.next()?
-    } else {
-        first
-    };
+    let scenario = if first == "--" { rest.next()? } else { first };
     let args: Vec<String> = rest.collect();
     Some(DebugTuiArgs { scenario, args })
 }
@@ -182,10 +178,7 @@ fn run_modal_buttons(console: &mut MockConsole, args: &[String]) -> Result<()> {
 }
 
 fn run_wrong_password(console: &mut MockConsole, args: &[String]) -> Result<()> {
-    let attempt: u32 = args
-        .first()
-        .map(|s| s.parse().unwrap_or(1))
-        .unwrap_or(1);
+    let attempt: u32 = args.first().map(|s| s.parse().unwrap_or(1)).unwrap_or(1);
     let outcome = show_wrong_password_modal(console, attempt)?;
     eprintln!("[mocking] wrong-password outcome={outcome:?}");
     Ok(())
@@ -201,7 +194,7 @@ fn run_wrong_password(console: &mut MockConsole, args: &[String]) -> Result<()> 
 /// test harness can distinguish the two outcomes from the exit code.
 fn run_passphrase(console: &mut MockConsole, args: &[String]) -> Result<()> {
     let label = arg_or_default(args, 0, "Unlock root");
-    match passphrase_prompt_on_console(console, &label) {
+    match passphrase_prompt_on_console(console, &label, &SessionInteraction::new()) {
         Ok(secret) => {
             eprintln!("[mocking] passphrase entered='{}'", &**secret);
             Ok(())
@@ -240,28 +233,25 @@ fn run_resize(console: &mut MockConsole, args: &[String]) -> Result<()> {
 
     // Stage 1: paint at the harness's current size.
     paint_resize_stage(console, title, &body, &labels, hint)?;
-    eprintln!(
-        "[mocking] resize stage=0 size={:?}",
-        Console::size(console)
-    );
+    eprintln!("[mocking] resize stage=0 size={:?}", Console::size(console));
 
     // Stage 2: fire the first synthetic resize then re-paint.
-    console.script(ConsoleEvent::Resize { rows: rows1, cols: cols1 });
+    console.script(ConsoleEvent::Resize {
+        rows: rows1,
+        cols: cols1,
+    });
     drain_one_event(console)?;
     paint_resize_stage(console, title, &body, &labels, hint)?;
-    eprintln!(
-        "[mocking] resize stage=1 size={:?}",
-        Console::size(console)
-    );
+    eprintln!("[mocking] resize stage=1 size={:?}", Console::size(console));
 
     // Stage 3: second resize.
-    console.script(ConsoleEvent::Resize { rows: rows2, cols: cols2 });
+    console.script(ConsoleEvent::Resize {
+        rows: rows2,
+        cols: cols2,
+    });
     drain_one_event(console)?;
     paint_resize_stage(console, title, &body, &labels, hint)?;
-    eprintln!(
-        "[mocking] resize stage=2 size={:?}",
-        Console::size(console)
-    );
+    eprintln!("[mocking] resize stage=2 size={:?}", Console::size(console));
 
     // Stage 4: wait for a real key press so tmux captures can land.
     let deadline = std::time::Instant::now() + Duration::from_secs(3600);
@@ -361,7 +351,9 @@ fn run_emergency(_console: &mut MockConsole, args: &[String]) -> Result<()> {
 }
 
 fn arg_or_default(args: &[String], idx: usize, default: &str) -> String {
-    args.get(idx).cloned().unwrap_or_else(|| default.to_string())
+    args.get(idx)
+        .cloned()
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Console backend for the mocking harness. termwiz drives both
@@ -393,8 +385,7 @@ impl MockConsole {
         let saved = save_termios(stdin_fd.as_fd())?;
 
         let caps = caps_with_fallback()?;
-        let unix_term =
-            UnixTerminal::new_with(caps, &stdin_fd, &stdout_fd).map_err(tw_err)?;
+        let unix_term = UnixTerminal::new_with(caps, &stdin_fd, &stdout_fd).map_err(tw_err)?;
         let buf = BufferedTerminal::new(unix_term).map_err(tw_err)?;
         let backend = TermwizBackend::with_buffered_terminal(buf);
         let terminal = Terminal::new(backend).map_err(io_err)?;
@@ -456,9 +447,7 @@ impl MockConsole {
                 }
                 Ok(())
             }
-            Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::WOULDBLOCK => {
-                Ok(())
-            }
+            Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::WOULDBLOCK => Ok(()),
             Err(e) => Err(rustix_err(e)),
         }
     }
@@ -500,10 +489,7 @@ impl Console for MockConsole {
     }
 
     fn draw_with(&mut self, body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
-        self.terminal
-            .draw(|f| body(f))
-            .map(|_| ())
-            .map_err(io_err)
+        self.terminal.draw(|f| body(f)).map(|_| ()).map_err(io_err)
     }
 
     fn suspend(&mut self) -> Result<()> {
@@ -610,7 +596,10 @@ mod tests {
 
     #[test]
     fn parse_debug_tui_returns_none_without_marker() {
-        let argv = vec!["nmbl-init".to_string(), "--config=/etc/nmbl/c.toml".to_string()];
+        let argv = vec![
+            "nmbl-init".to_string(),
+            "--config=/etc/nmbl/c.toml".to_string(),
+        ];
         assert!(parse_debug_tui_args(argv).is_none());
     }
 

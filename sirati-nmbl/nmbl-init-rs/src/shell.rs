@@ -65,12 +65,12 @@ use crate::config::Config;
 use crate::error::{NmblError, format_chain};
 use crate::nmbl_warn;
 use crate::terminal::{EmergencyBanner, TerminalAction};
+use crate::ui::app::App;
 use crate::ui::console::{Console, open_console};
 use crate::ui::emergency_actions::{retry_boot, surface_action_failure, verify_kexec_readiness};
-use crate::ui::app::App;
 use crate::ui::{
-    EmergencyChoice, TuiPasswordSupplier, build_emergency_app, build_message, default_items,
-    run_emergency_screen_with_app,
+    EmergencyChoice, SessionInteraction, TuiPasswordSupplier, build_emergency_app, build_message,
+    default_items, run_emergency_screen_with_app,
 };
 
 /// Print the operator-facing emergency banner and drive the
@@ -96,6 +96,7 @@ pub fn drop_to_emergency(
     console: Box<dyn Console>,
     config: &Config,
     err: NmblError,
+    session: &SessionInteraction,
 ) -> TerminalAction {
     let mut console = console;
 
@@ -119,7 +120,7 @@ pub fn drop_to_emergency(
     // bound. `build_emergency_app(&[])` uses an empty generations
     // slice which is `'static`, so the inferred lifetime here is
     // already `'static` — the explicit annotation merely pins it.
-    let mut app: App<'static> = build_emergency_app(&message, &items);
+    let mut app: App<'static> = build_emergency_app(&message, &items, session);
 
     // Count of distinct failures surfaced this session. Used so the
     // persistent emergency-screen "error" box can show the LATEST
@@ -214,7 +215,7 @@ pub fn drop_to_emergency(
                 continue;
             }
             EmergencyChoice::RetryBoot => {
-                let mut supplier = TuiPasswordSupplier::new(config);
+                let mut supplier = TuiPasswordSupplier::new(config, session);
                 match retry_boot(config, &mut *console, &mut app, &mut supplier) {
                     Ok(action) => return action,
                     Err(e) => {
@@ -268,16 +269,10 @@ pub fn drop_to_emergency(
 ///
 /// `count` is bumped per call and rendered so repeated failures are
 /// visible at a glance; the freshest chain is shown in full underneath.
-fn update_latest_error(
-    app: &mut App<'static>,
-    count: &mut u32,
-    title: &str,
-    chain: &str,
-) {
+fn update_latest_error(app: &mut App<'static>, count: &mut u32, title: &str, chain: &str) {
     *count = count.saturating_add(1);
-    let message = format!(
-        "Latest error (#{count}): {title}\n\n{chain}\n\nChoose what to do next.",
-    );
+    let message =
+        format!("Latest error (#{count}): {title}\n\n{chain}\n\nChoose what to do next.",);
     app.set_emergency_message(message);
 }
 
@@ -290,8 +285,12 @@ fn update_latest_error(
 /// return [`TerminalAction::Reboot`] so the dispatcher reboots
 /// instead of leaving the operator at an inert PID 1.
 pub fn open_console_and_drop_to_emergency(config: &Config, err: NmblError) -> TerminalAction {
+    // These call sites have no prior boot session (initial bring-up
+    // failure, panic-recovery re-exec, pre-console phases), so no
+    // keypress could have happened yet — a fresh latch is correct.
+    let session = SessionInteraction::new();
     match open_console(config, true) {
-        Ok(c) => drop_to_emergency(c, config, err),
+        Ok(c) => drop_to_emergency(c, config, err, &session),
         Err(open_err) => {
             nmbl_warn!(
                 "emergency console bring-up failed: {}; defaulting to reboot",
@@ -323,10 +322,7 @@ pub fn print_banner(banner: &EmergencyBanner) {
         eprintln!("  {line}");
     }
     eprintln!();
-    eprintln!(
-        "Shell: {}  (will execve next)",
-        banner.shell_path.display()
-    );
+    eprintln!("Shell: {}  (will execve next)", banner.shell_path.display());
     eprintln!("Type `exit` to reboot, or fix the issue and re-exec /init.");
     eprintln!("{separator}");
 }
@@ -557,7 +553,12 @@ mod tests {
             Some(press(KeyCode::Char('r'))),
         ]));
 
-        let action = drop_to_emergency(console, &config, io_err("synthetic boot failure"));
+        let action = drop_to_emergency(
+            console,
+            &config,
+            io_err("synthetic boot failure"),
+            &SessionInteraction::new(),
+        );
         assert!(
             matches!(action, TerminalAction::Reboot),
             "Raw Shell choice must NOT produce a TerminalAction::Execve any more; \
@@ -576,7 +577,12 @@ mod tests {
         let console: Box<dyn Console> =
             Box::new(ScriptedConsole::new(vec![Some(press(KeyCode::Char('r')))]));
 
-        let action = drop_to_emergency(console, &config, io_err("synthetic"));
+        let action = drop_to_emergency(
+            console,
+            &config,
+            io_err("synthetic"),
+            &SessionInteraction::new(),
+        );
 
         match action {
             TerminalAction::Reboot => {}

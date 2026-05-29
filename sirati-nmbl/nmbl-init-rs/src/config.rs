@@ -1328,8 +1328,7 @@ extra_consoles = ["/dev/ttyS0", "/dev/tty1"]
 extra_consoles = []
 mystery        = "boom"
 "#;
-        toml::from_str::<Config>(toml)
-            .expect_err("unknown emergency_shell field must be rejected");
+        toml::from_str::<Config>(toml).expect_err("unknown emergency_shell field must be rejected");
     }
 
     #[test]

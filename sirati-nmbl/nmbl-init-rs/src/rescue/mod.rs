@@ -529,8 +529,7 @@ mod tests {
         // The full recovery system pins /init; the default flat image
         // leaves it at /bin/sh. argv0 is the basename in both cases.
         for (entry, argv0) in [("/init", "init"), ("/bin/sh", "sh")] {
-            let action =
-                build_rescue_shell_action(Path::new(entry)).expect("action must build");
+            let action = build_rescue_shell_action(Path::new(entry)).expect("action must build");
             match action {
                 TerminalAction::Execve {
                     path,
@@ -578,10 +577,7 @@ mod tests {
             } => {
                 assert_eq!(path.as_bytes(), b"/bin/test-embedded-shell");
                 let banner = banner.expect("embedded execve must carry a banner");
-                assert_eq!(
-                    banner.shell_path,
-                    PathBuf::from("/bin/test-embedded-shell"),
-                );
+                assert_eq!(banner.shell_path, PathBuf::from("/bin/test-embedded-shell"),);
                 assert!(
                     rescue_handoff,
                     "embedded rescue exec must also mark the handoff",

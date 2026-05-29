@@ -4,7 +4,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use serde::Deserialize;
 
@@ -67,29 +67,43 @@ pub fn current() -> Verbosity {
 /// `/dev/kmsg` writes are still performed so the kernel ring buffer (and
 /// any console the operator picked up via `console=` cmdline) keeps a
 /// timestamped record — only the userspace stderr duplicate is silenced.
-/// On `suspend` / handover to kexec/execve the flag is cleared so the
+/// On `suspend` / handover to kexec/execve the count is decremented so the
 /// post-handover path sees normal eprintln output again.
-static TUI_OWNED_CONSOLE: AtomicBool = AtomicBool::new(false);
+///
+/// A refcount rather than a bool so nested/overlapping console owners
+/// (e.g. a screen suspending to spawn a sub-console, or two paired
+/// open/drop scopes) compose correctly: stderr stays suppressed as long
+/// as *any* owner holds the console, and resumes only when the last one
+/// releases it.
+static TUI_CONSOLE_REFCOUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Mark the console as TUI-owned: the `nmbl_*!` macros stop writing to
-/// stderr until [`clear_tui_active`] runs. Idempotent; cheap; safe to
-/// call from any code path that brings up a [`crate::ui::console::Console`].
+/// stderr until the matching [`clear_tui_active`] runs. Each call
+/// increments a refcount, so every `set` must be paired with exactly one
+/// `clear`. Cheap; safe to call from any code path that brings up a
+/// [`crate::ui::console::Console`].
 pub fn set_tui_active() {
-    TUI_OWNED_CONSOLE.store(true, Ordering::SeqCst);
+    TUI_CONSOLE_REFCOUNT.fetch_add(1, Ordering::SeqCst);
 }
 
 /// Inverse of [`set_tui_active`]. Called when the TUI hands the screen
 /// back to the kernel/foreign userspace (suspend, kexec handoff,
-/// emergency-shell relay, drop on scope exit).
+/// emergency-shell relay, drop on scope exit). Decrements the refcount;
+/// stderr output resumes once it reaches zero.
 pub fn clear_tui_active() {
-    TUI_OWNED_CONSOLE.store(false, Ordering::SeqCst);
+    // saturating_sub semantics via fetch_update so an unpaired clear can
+    // never wrap the count around to a huge value (which would wedge
+    // stderr off forever).
+    let _ = TUI_CONSOLE_REFCOUNT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+        Some(n.saturating_sub(1))
+    });
 }
 
 /// Internal helper for the `nmbl_*!` macros so the macro body stays
 /// short and the gating logic has a single home.
 #[doc(hidden)]
 pub fn tui_active() -> bool {
-    TUI_OWNED_CONSOLE.load(Ordering::SeqCst)
+    TUI_CONSOLE_REFCOUNT.load(Ordering::SeqCst) > 0
 }
 
 /// `/dev/kmsg` accepts writes from userspace and routes the resulting
@@ -285,6 +299,54 @@ pub fn flush_to(path: &Path) -> std::io::Result<()> {
     write_truncated(path, header.as_deref(), &body)
 }
 
+/// Snapshot the FULL buffered boot transcript as lines (oldest first).
+///
+/// Unlike [`snapshot`] — which only returns the 256-line tail of the
+/// string ring — this drains the ~1 MiB `BYTE_LOG` byte ring, so it
+/// covers the complete NMBL transcript (modulo any bytes already dropped
+/// off the front under overflow). Intended for the in-process log viewer
+/// that wants the whole boot, not just the visible tail.
+///
+/// When the byte ring overflowed (`dropped_bytes > 0`), a single note
+/// line is prepended naming how many bytes were lost off the front, so a
+/// reader does not mistake the remainder for the entire boot.
+///
+/// The `BYTE_LOG` mutex is held only long enough to clone the bytes out
+/// (mirroring `flush_to`); the UTF-8 split happens after the guard drops.
+#[must_use]
+pub fn snapshot_full() -> Vec<String> {
+    let (dropped, body) = {
+        let Ok(guard) = BYTE_LOG.lock() else {
+            return Vec::new();
+        };
+        match guard.as_ref() {
+            // Clone bytes out under the lock so we release it before the
+            // (potentially large) UTF-8 decode + split — same access
+            // pattern as `flush_to`.
+            Some(log) => (
+                log.dropped_bytes,
+                log.buf.iter().copied().collect::<Vec<u8>>(),
+            ),
+            None => return Vec::new(),
+        }
+    };
+
+    let text = String::from_utf8_lossy(&body);
+    // `lines()` would swallow a meaningful trailing empty line and also
+    // strip the final `\n`; splitting on '\n' keeps the round-trip
+    // predictable. Each emitted body was stored with a trailing '\n', so
+    // the split yields a trailing empty element we drop.
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    if lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+
+    if dropped > 0 {
+        lines.insert(0, format!("… {dropped} earlier bytes truncated …"));
+    }
+    lines
+}
+
 /// Open `path` truncated and write the optional header + body, then
 /// fsync. Split out so `flush_to` can short-circuit when the ring is
 /// uninitialised without duplicating the I/O path.
@@ -375,10 +437,15 @@ mod tests {
         let _guard = ring_test_guard();
         // Hold the LOG_RING mutex across the body — see the comment in
         // `snapshot_caps_at_ring_capacity` for why.
-        let mut guard = LOG_RING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = LOG_RING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(VecDeque::with_capacity(LOG_RING_CAPACITY));
         for i in 0..10 {
-            push_inner(guard.as_mut().expect("ring just initialised"), &format!("line {i}"));
+            push_inner(
+                guard.as_mut().expect("ring just initialised"),
+                &format!("line {i}"),
+            );
         }
         let snap = snapshot_inner(guard.as_ref().expect("ring still initialised"), 5);
         assert_eq!(snap.len(), 5);
@@ -397,10 +464,15 @@ mod tests {
         // to the ring, shifts what the FIFO evicts, and our oldest /
         // newest entry assertions become flaky under cargo's parallel
         // test execution.
-        let mut guard = LOG_RING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = LOG_RING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(VecDeque::with_capacity(LOG_RING_CAPACITY));
         for i in 0..300 {
-            push_inner(guard.as_mut().expect("ring just initialised"), &format!("entry {i}"));
+            push_inner(
+                guard.as_mut().expect("ring just initialised"),
+                &format!("entry {i}"),
+            );
         }
         let snap = snapshot_inner(guard.as_ref().expect("ring still initialised"), usize::MAX);
         assert_eq!(snap.len(), LOG_RING_CAPACITY);
@@ -441,7 +513,9 @@ mod tests {
         let _guard = ring_test_guard();
         // Hold the LOG_RING mutex across the body — see the comment in
         // `snapshot_caps_at_ring_capacity` for why.
-        let mut guard = LOG_RING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = LOG_RING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(VecDeque::new());
         let ring = guard.as_ref().expect("ring just initialised");
         assert!(snapshot_inner(ring, 10).is_empty());
@@ -564,6 +638,98 @@ mod tests {
         assert_eq!(text, "hello\nworld\n");
 
         reset_rings();
+    }
+
+    #[test]
+    fn snapshot_full_returns_all_emitted_lines() {
+        let _outer = byte_log_test_guard();
+        let _inner = ring_test_guard();
+        reset_rings();
+
+        let lines = ["alpha", "beta", "gamma"];
+        for l in &lines {
+            emit_kmsg(l);
+        }
+
+        let snap = snapshot_full();
+        assert_eq!(
+            snap,
+            lines.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()
+        );
+
+        reset_rings();
+    }
+
+    #[test]
+    fn snapshot_full_prepends_truncation_note_when_dropped() {
+        let _outer = byte_log_test_guard();
+        let _inner = ring_test_guard();
+        reset_rings();
+
+        // Force overflow so dropped_bytes > 0.
+        let line = "z".repeat(1024);
+        for _ in 0..(3 * 1024) {
+            emit_kmsg(&line);
+        }
+
+        let dropped = {
+            let g = BYTE_LOG
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.as_ref().expect("byte log").dropped_bytes
+        };
+        assert!(dropped > 0, "test precondition: expected dropped_bytes > 0");
+
+        let snap = snapshot_full();
+        assert_eq!(
+            snap.first().map(String::as_str),
+            Some(format!("… {dropped} earlier bytes truncated …").as_str())
+        );
+
+        reset_rings();
+    }
+
+    #[test]
+    fn snapshot_full_empty_when_uninitialised() {
+        let _outer = byte_log_test_guard();
+        let _inner = ring_test_guard();
+        reset_rings();
+
+        assert!(snapshot_full().is_empty());
+
+        reset_rings();
+    }
+
+    #[test]
+    fn tui_refcount_tracks_nested_owners() {
+        // No shared ring statics involved, but the refcount is a process
+        // global; serialise against other tests that may toggle it via
+        // the string-ring lock to keep the inc/dec sequence observable.
+        let _guard = ring_test_guard();
+        // Start from a known-zero baseline regardless of prior tests.
+        while tui_active() {
+            clear_tui_active();
+        }
+        assert!(!tui_active());
+
+        set_tui_active();
+        set_tui_active();
+        assert!(tui_active(), "two owners: still active");
+
+        clear_tui_active();
+        assert!(tui_active(), "one owner left: still active");
+
+        clear_tui_active();
+        assert!(!tui_active(), "last owner released: inactive");
+
+        // An unpaired extra clear must not wrap the count or wedge stderr
+        // off; it saturates at zero.
+        clear_tui_active();
+        assert!(!tui_active());
+        set_tui_active();
+        assert!(tui_active(), "active again after a single set");
+        clear_tui_active();
+        assert!(!tui_active());
     }
 
     #[test]

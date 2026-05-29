@@ -58,10 +58,16 @@ use crate::ui::console::Console;
 use crate::ui::timeout::TimeoutOutcome;
 use crate::ui::view::{
     EditScreenData, EmergencyScreenData, KeyEchoScreenData, ListScreenData, PassphraseScreenData,
-    render_boot_status, render_edit, render_emergency, render_key_echo, render_list,
+    render_boot_status, render_edit, render_emergency, render_key_echo, render_list, render_log,
     render_passphrase,
 };
 
+#[cfg(feature = "image-splash")]
+use crate::splash::terminal::SplashTerminal;
+#[cfg(feature = "image-splash")]
+use crate::splash::types::CellDims;
+#[cfg(feature = "image-splash")]
+use crate::splash::{compositor, drm, glyph_cache};
 #[cfg(feature = "image-splash")]
 use alacritty_terminal::term::cell::Flags;
 #[cfg(feature = "image-splash")]
@@ -76,16 +82,13 @@ use ratatui::Viewport;
 use ratatui::backend::CrosstermBackend;
 #[cfg(feature = "image-splash")]
 use ratatui::layout::Rect;
-#[cfg(feature = "image-splash")]
-use crate::splash::{compositor, drm, glyph_cache};
-#[cfg(feature = "image-splash")]
-use crate::splash::terminal::SplashTerminal;
-#[cfg(feature = "image-splash")]
-use crate::splash::types::CellDims;
 
-pub use app::{App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, ModalKind, Screen};
-pub use emergency::{run_emergency_screen, run_emergency_screen_with_app};
+pub use app::{
+    App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, ModalKind, Screen,
+    SessionInteraction,
+};
 pub(crate) use emergency::{build_emergency_app, build_message, default_items};
+pub use emergency::{run_emergency_screen, run_emergency_screen_with_app};
 pub use reporter::{BootReporter, ProgressSink, TickOutcome};
 
 /// Slice we wait on input per iteration. Shared by the event loop and
@@ -289,7 +292,9 @@ pub fn show_modal_confirm(
             }
             ModalPollOutcome::Idle => continue,
         };
-        if let Some(new_off) = handle_modal_scroll_key(key, message, true, 2, console, scroll_offset) {
+        if let Some(new_off) =
+            handle_modal_scroll_key(key, message, true, 2, console, scroll_offset)
+        {
             scroll_offset = new_off;
             dirty = true;
             continue;
@@ -435,8 +440,7 @@ pub fn show_modal_error(
                 hint,
                 scroll_offset,
             };
-            if let Err(e) = console.draw_with(&mut |frame| view::render_modal_error(frame, &data))
-            {
+            if let Err(e) = console.draw_with(&mut |frame| view::render_modal_error(frame, &data)) {
                 eprintln!("[nmbl] {title}: {message}");
                 crate::nmbl_warn!("modal-error render failed: {e}");
                 return Ok(());
@@ -460,7 +464,9 @@ pub fn show_modal_error(
         };
         // Scroll keys advance the viewport instead of dismissing; any
         // other key dismisses the modal.
-        if let Some(new_off) = handle_modal_scroll_key(key, message, false, 0, console, scroll_offset) {
+        if let Some(new_off) =
+            handle_modal_scroll_key(key, message, false, 0, console, scroll_offset)
+        {
             scroll_offset = new_off;
             dirty = true;
             continue;
@@ -574,8 +580,7 @@ pub fn show_wrong_password_modal(
                 hint,
                 scroll_offset,
             };
-            if let Err(e) =
-                console.draw_with(&mut |frame| view::render_modal_buttons(frame, &data))
+            if let Err(e) = console.draw_with(&mut |frame| view::render_modal_buttons(frame, &data))
             {
                 eprintln!("[nmbl] {title}: {message}");
                 crate::nmbl_warn!("wrong-password modal render failed: {e}");
@@ -666,8 +671,7 @@ pub fn show_modal_buttons(
                 hint,
                 scroll_offset,
             };
-            if let Err(e) =
-                console.draw_with(&mut |frame| view::render_modal_buttons(frame, &data))
+            if let Err(e) = console.draw_with(&mut |frame| view::render_modal_buttons(frame, &data))
             {
                 eprintln!("[nmbl] {title}: {message}");
                 crate::nmbl_warn!("modal-buttons render failed: {e}");
@@ -748,13 +752,14 @@ pub fn run_selector(
     config: &Config,
     generations: &[Generation],
     console: &mut dyn Console,
+    session: &SessionInteraction,
 ) -> Result<Decision> {
     // The pre-selected entry must match the active `system` profile so
     // an operator who ran `nixos-rebuild --rollback` sees (and on
     // timeout boots) the generation they rolled back to — not the
     // higher-numbered one they rolled away from.
     let default_index = active_generation_index(generations, &config.paths.nix_profiles_dir);
-    run_selector_on_console(config, generations, console, default_index)
+    run_selector_on_console(config, generations, console, default_index, session)
 }
 
 /// TUI event loop. Backend-agnostic: every render and key-poll goes
@@ -765,8 +770,9 @@ fn run_selector_on_console(
     generations: &[Generation],
     console: &mut dyn Console,
     default_index: usize,
+    session: &SessionInteraction,
 ) -> Result<Decision> {
-    let mut app = App::new(generations);
+    let mut app = App::new_in_session(generations, session);
     app.selected_index = default_index;
     app.show_kernel_params = config.tui.show_kernel_params;
 
@@ -993,7 +999,11 @@ fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind, scrol
             };
             view::render_modal_confirm(frame, &data);
         }
-        ModalKind::Error { title, message, hint } => {
+        ModalKind::Error {
+            title,
+            message,
+            hint,
+        } => {
             let data = view::ModalErrorScreenData {
                 title,
                 message,
@@ -1044,6 +1054,7 @@ fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind, scrol
 fn render_screen_body(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
     match &app.screen {
         Screen::List => render_list(frame, &list_data(app)),
+        Screen::Log { lines, offset } => render_log(frame, frame.area(), lines, *offset),
         Screen::Editing {
             generation_index,
             line,
@@ -1126,22 +1137,29 @@ fn list_data<'a>(app: &'a App<'a>) -> ListScreenData<'a> {
 /// passphrase modal renders on the same backend as the surrounding
 /// boot-status screen.
 #[derive(Default)]
-pub struct TuiPasswordSupplier;
+pub struct TuiPasswordSupplier {
+    /// Shared per-boot interaction latch. The passphrase modal joins
+    /// this session so a typed passphrase counts as "operator present"
+    /// for the emergency screen's countdown decision.
+    session: SessionInteraction,
+}
 
 impl TuiPasswordSupplier {
     #[must_use]
-    pub fn new(_config: &Config) -> Self {
+    pub fn new(_config: &Config, session: &SessionInteraction) -> Self {
         // `_config` is accepted for forward-compatibility with
         // future per-config passphrase policy (retry counts, masking
         // toggles, …). Today the supplier is uniform — the same
         // ratatui modal everywhere.
-        Self
+        Self {
+            session: session.clone(),
+        }
     }
 }
 
 impl PasswordSupplier for TuiPasswordSupplier {
     fn prompt(&mut self, console: &mut dyn Console, label: &str) -> Result<Zeroizing<String>> {
-        passphrase_prompt_on_console(console, label)
+        passphrase_prompt_on_console(console, label, &self.session)
     }
 }
 
@@ -1155,11 +1173,12 @@ impl PasswordSupplier for TuiPasswordSupplier {
 pub(crate) fn passphrase_prompt_on_console(
     console: &mut dyn Console,
     label: &str,
+    session: &SessionInteraction,
 ) -> Result<Zeroizing<String>> {
     // No generations to render — pass an empty slice. The App is
     // only used here for its Passphrase screen state.
     let empty: [Generation; 0] = [];
-    let mut app = App::new(&empty);
+    let mut app = App::new_in_session(&empty, session);
     app.screen = Screen::Passphrase {
         prompt_label: label.to_string(),
         buffer: Zeroizing::new(String::new()),
@@ -1247,7 +1266,8 @@ mod tests {
         // that coercion so a future signature drift on either side
         // breaks the build instead of breaking at boot.
         let cfg: Config = toml::from_str("").expect("default cfg");
-        let mut sup = TuiPasswordSupplier::new(&cfg);
+        let session = SessionInteraction::new();
+        let mut sup = TuiPasswordSupplier::new(&cfg, &session);
         let _coerced: &mut dyn PasswordSupplier = &mut sup;
     }
 
@@ -1300,10 +1320,7 @@ mod tests {
         fn kind(&self) -> ConsoleKind {
             ConsoleKind::Tty
         }
-        fn draw_with(
-            &mut self,
-            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
-        ) -> Result<()> {
+        fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
             self.renders = self.renders.saturating_add(1);
             Ok(())
         }
@@ -1329,8 +1346,9 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let secret = passphrase_prompt_on_console(&mut console, "Unlock root")
-            .expect("Enter submits the buffer");
+        let secret =
+            passphrase_prompt_on_console(&mut console, "Unlock root", &SessionInteraction::new())
+                .expect("Enter submits the buffer");
         assert_eq!(&**secret, "ok");
         // Initial render + 2 char-keys + 1 Enter = 4 dirty repaints.
         assert!(
@@ -1357,8 +1375,9 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let secret = passphrase_prompt_on_console(&mut console, "Unlock")
-            .expect("Enter after a char submits the buffer");
+        let secret =
+            passphrase_prompt_on_console(&mut console, "Unlock", &SessionInteraction::new())
+                .expect("Enter after a char submits the buffer");
         assert_eq!(&**secret, "p");
     }
 
@@ -1371,8 +1390,9 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let secret = passphrase_prompt_on_console(&mut console, "Unlock")
-            .expect("Enter submits the buffer");
+        let secret =
+            passphrase_prompt_on_console(&mut console, "Unlock", &SessionInteraction::new())
+                .expect("Enter submits the buffer");
         assert_eq!(&**secret, "a", "backspace must drop the last char");
     }
 
@@ -1380,7 +1400,7 @@ mod tests {
     fn passphrase_prompt_esc_returns_tui_error() {
         let keys = vec![press(KeyCode::Char('x')), press(KeyCode::Esc)];
         let mut console = ScriptedConsole::new(keys);
-        let err = passphrase_prompt_on_console(&mut console, "Unlock")
+        let err = passphrase_prompt_on_console(&mut console, "Unlock", &SessionInteraction::new())
             .expect_err("Esc must propagate as a Tui error");
         assert!(matches!(err, NmblError::Tui { .. }));
     }
@@ -1534,8 +1554,7 @@ mod tests {
         // (operator mistyped, just wants to retry).
         let keys = vec![press(KeyCode::Enter)];
         let mut console = ScriptedConsole::new(keys);
-        let out =
-            show_wrong_password_modal(&mut console, 1).expect("modal must succeed on Enter");
+        let out = show_wrong_password_modal(&mut console, 1).expect("modal must succeed on Enter");
         assert_eq!(out, WrongPasswordOutcome::TryAgain);
     }
 
@@ -1544,8 +1563,7 @@ mod tests {
         // Right toggles to [Reboot]; Enter commits.
         let keys = vec![press(KeyCode::Right), press(KeyCode::Enter)];
         let mut console = ScriptedConsole::new(keys);
-        let out =
-            show_wrong_password_modal(&mut console, 1).expect("modal must succeed");
+        let out = show_wrong_password_modal(&mut console, 1).expect("modal must succeed");
         assert_eq!(out, WrongPasswordOutcome::Reboot);
     }
 
@@ -1605,8 +1623,8 @@ mod tests {
             (KeyCode::Char('s'), WrongPasswordOutcome::RawShell),
         ] {
             let mut console = ScriptedConsole::new(vec![press(code)]);
-            let out = show_wrong_password_modal(&mut console, 1)
-                .expect("modal must succeed on hotkey");
+            let out =
+                show_wrong_password_modal(&mut console, 1).expect("modal must succeed on hotkey");
             assert_eq!(out, expected, "hotkey {code:?} should yield {expected:?}");
         }
         #[cfg(feature = "pretty-shell")]
@@ -1624,8 +1642,7 @@ mod tests {
         // wiping out the boot. Spec: Esc = Try again.
         let keys = vec![press(KeyCode::Esc)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_wrong_password_modal(&mut console, 3)
-            .expect("modal must succeed on Esc");
+        let out = show_wrong_password_modal(&mut console, 3).expect("modal must succeed on Esc");
         assert_eq!(out, WrongPasswordOutcome::TryAgain);
     }
 
@@ -1662,7 +1679,8 @@ mod tests {
             scroll_offset: 0,
         };
         let mut term = Terminal::new(TestBackend::new(80, 16)).expect("test terminal");
-        term.draw(|f| view::render_modal_buttons(f, &data)).expect("draw");
+        term.draw(|f| view::render_modal_buttons(f, &data))
+            .expect("draw");
         let buf = term.backend().buffer();
         let dump: String = (0..buf.area.height)
             .map(|y| {
@@ -1676,9 +1694,15 @@ mod tests {
             dump.contains("attempt 3"),
             "title must surface the attempt counter:\n{dump}"
         );
-        assert!(dump.contains("[Try again]"), "Try again button visible:\n{dump}");
+        assert!(
+            dump.contains("[Try again]"),
+            "Try again button visible:\n{dump}"
+        );
         assert!(dump.contains("[Reboot]"), "Reboot button visible:\n{dump}");
-        assert!(dump.contains("[Raw Shell]"), "Raw Shell button visible:\n{dump}");
+        assert!(
+            dump.contains("[Raw Shell]"),
+            "Raw Shell button visible:\n{dump}"
+        );
         #[cfg(feature = "pretty-shell")]
         assert!(
             dump.contains("[Pretty Shell]"),
@@ -1700,16 +1724,9 @@ mod tests {
         app.selected_index = 4;
         let keys = vec![press(KeyCode::Char('y'))];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_modal_confirm_over(
-            &mut console,
-            &mut app,
-            "title",
-            "body",
-            "Yes",
-            "No",
-            true,
-        )
-        .expect("overlay modal must succeed on 'y'");
+        let out =
+            show_modal_confirm_over(&mut console, &mut app, "title", "body", "Yes", "No", true)
+                .expect("overlay modal must succeed on 'y'");
         assert_eq!(out, ConfirmOutcome::Yes);
         assert!(app.modal.is_none(), "modal must be cleared on exit");
         assert_eq!(
@@ -1753,16 +1770,8 @@ mod tests {
         };
         let keys = vec![press(KeyCode::Esc)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_modal_confirm_over(
-            &mut console,
-            &mut app,
-            "t",
-            "b",
-            "Yes",
-            "Back",
-            true,
-        )
-        .expect("modal must succeed on Esc");
+        let out = show_modal_confirm_over(&mut console, &mut app, "t", "b", "Yes", "Back", true)
+            .expect("modal must succeed on Esc");
         assert_eq!(out, ConfirmOutcome::Cancelled);
         assert!(app.modal.is_none());
         match &app.screen {

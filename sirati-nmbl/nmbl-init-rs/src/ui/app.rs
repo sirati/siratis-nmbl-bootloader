@@ -22,13 +22,38 @@
 //! returns it without exiting the App), and only Esc on the passphrase
 //! modal sets a [`Decision::Shell`] exit.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::time::Instant;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use zeroize::Zeroizing;
 
 use crate::generations::Generation;
+
+/// Per-boot-session latch: set the first time the operator presses any
+/// key, shared (cloned) across every App of one session so "already
+/// attended" spans the selector, LUKS prompt, and emergency screen.
+/// Independent between sessions (each remote TUI session gets its own).
+#[derive(Clone, Default)]
+pub struct SessionInteraction(Rc<Cell<bool>>);
+impl SessionInteraction {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[must_use]
+    pub fn get(&self) -> bool {
+        self.0.get()
+    }
+    pub fn set(&self) {
+        self.0.set(true);
+    }
+}
+
+/// Page size (in rows) for [`Screen::Log`] PageUp/PageDown scrolling.
+const LOG_PAGE: u16 = 20;
 
 /// Maximum number of entries retained in each [`Screen::KeyEcho`] ring
 /// buffer. Old entries are evicted from the front when full. ~20 keeps
@@ -125,6 +150,14 @@ pub struct BootStatusData<'a> {
 /// Which screen the App is currently presenting.
 pub enum Screen<'a> {
     List,
+    /// Full boot-transcript viewer, opened with Ctrl+L from any screen
+    /// and popped back via Esc / Ctrl+L. `lines` is the snapshot
+    /// (oldest first) and `offset` is the scroll position; the renderer
+    /// clamps `offset` so over-scroll is harmless.
+    Log {
+        lines: Vec<String>,
+        offset: u16,
+    },
     Editing {
         /// Index into the generations slice.
         generation_index: usize,
@@ -258,6 +291,17 @@ pub struct App<'a> {
     /// modal's scroll position. Ctrl+Shift+Up/Down advance by 1;
     /// Ctrl+Shift+PageUp/PageDown advance by visible_lines - 1.
     pub modal_scroll_offset: u16,
+    /// Per-boot-session interaction latch shared across every App of a
+    /// session. Set on the first keypress; read by the emergency screen
+    /// to decide whether to arm the auto-reboot countdown.
+    pub interaction: SessionInteraction,
+    /// Set when the operator presses Ctrl+E asking to leave the current
+    /// (remote) session. Local run loops ignore it today; a future
+    /// phase makes the remote loops honour it.
+    pub exit_session: bool,
+    /// Screen stashed while the log viewer ([`Screen::Log`]) is open, so
+    /// Esc / Ctrl+L can pop back to exactly where the operator was.
+    pub return_screen: Option<Box<Screen<'a>>>,
     /// Live Caps-Lock state, polled each render tick by the passphrase
     /// prompt loop. `true` paints the (reserved, non-resizing) warning
     /// row on the passphrase modal; `false` leaves it blank. Only the
@@ -295,8 +339,19 @@ impl<'a> App<'a> {
             modal: None,
             error_countdown_deadline: None,
             modal_scroll_offset: 0,
+            interaction: SessionInteraction::new(),
+            exit_session: false,
+            return_screen: None,
             caps_lock_warning: false,
         }
+    }
+
+    /// Same as [`App::new`] but joins an existing session so the
+    /// interaction latch is shared with the other Apps of this boot.
+    pub fn new_in_session(generations: &'a [Generation], session: &SessionInteraction) -> Self {
+        let mut app = Self::new(generations);
+        app.interaction = session.clone();
+        app
     }
 
     /// Construct an App parked on the [`Screen::BootStatus`] view with
@@ -321,6 +376,9 @@ impl<'a> App<'a> {
             modal: None,
             error_countdown_deadline: None,
             modal_scroll_offset: 0,
+            interaction: SessionInteraction::new(),
+            exit_session: false,
+            return_screen: None,
             caps_lock_warning: false,
         }
     }
@@ -343,6 +401,9 @@ impl<'a> App<'a> {
             modal: None,
             error_countdown_deadline: None,
             modal_scroll_offset: 0,
+            interaction: SessionInteraction::new(),
+            exit_session: false,
+            return_screen: None,
             caps_lock_warning: false,
         }
     }
@@ -394,7 +455,10 @@ impl<'a> App<'a> {
         if let Screen::Emergency { message, .. } = &mut self.screen {
             *message = new_message.into();
         } else {
-            debug_assert!(false, "set_emergency_message called on non-Emergency screen");
+            debug_assert!(
+                false,
+                "set_emergency_message called on non-Emergency screen"
+            );
         }
     }
 
@@ -478,7 +542,10 @@ impl<'a> App<'a> {
                 *spinner_frame = 0;
             }
         } else {
-            debug_assert!(false, "set_passphrase_verifying called on non-Passphrase screen");
+            debug_assert!(
+                false,
+                "set_passphrase_verifying called on non-Passphrase screen"
+            );
         }
     }
 
@@ -488,7 +555,10 @@ impl<'a> App<'a> {
         if let Screen::Passphrase { spinner_frame, .. } = &mut self.screen {
             *spinner_frame = spinner_frame.wrapping_add(1) % SPINNER_FRAMES;
         } else {
-            debug_assert!(false, "tick_passphrase_spinner called on non-Passphrase screen");
+            debug_assert!(
+                false,
+                "tick_passphrase_spinner called on non-Passphrase screen"
+            );
         }
     }
 
@@ -510,7 +580,10 @@ impl<'a> App<'a> {
             *verifying = false;
             *spinner_frame = 0;
         } else {
-            debug_assert!(false, "clear_passphrase_buffer called on non-Passphrase screen");
+            debug_assert!(
+                false,
+                "clear_passphrase_buffer called on non-Passphrase screen"
+            );
         }
     }
 
@@ -523,10 +596,68 @@ impl<'a> App<'a> {
             return self.decision.is_some();
         }
 
+        // Record that the operator is present. Per-session latch
+        // consulted by the emergency screen to suppress the auto-reboot
+        // countdown once any key has been pressed.
+        self.interaction.set();
+
         // Any keypress cancels the countdown — even one we ignore later.
         self.countdown_remaining_secs = None;
 
+        // Global Ctrl shortcuts, handled before the per-screen dispatch
+        // so they work from every screen. Plain `e` / `l` keep their
+        // per-screen meanings because these require the CONTROL modifier.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('e') => {
+                    // Ask to leave this (remote) session. Local loops
+                    // ignore the flag today; just record it.
+                    self.exit_session = true;
+                    return false;
+                }
+                KeyCode::Char('l') => {
+                    if matches!(self.screen, Screen::Log { .. }) {
+                        // Toggle closed: pop back to the stashed screen.
+                        if let Some(prev) = self.return_screen.take() {
+                            self.screen = *prev;
+                        }
+                    } else {
+                        // Stash the current screen and open the log viewer.
+                        self.return_screen = Some(Box::new(std::mem::replace(
+                            &mut self.screen,
+                            Screen::Log {
+                                lines: crate::log::snapshot_full(),
+                                offset: 0,
+                            },
+                        )));
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+        }
+
         match &mut self.screen {
+            Screen::Log { offset, .. } => {
+                // Esc closes the viewer (Ctrl+L is handled above). Other
+                // keys scroll; the renderer clamps the offset so
+                // over-scroll here is harmless. No Decision is produced.
+                match key.code {
+                    KeyCode::Esc => {
+                        if let Some(prev) = self.return_screen.take() {
+                            self.screen = *prev;
+                        }
+                    }
+                    KeyCode::Up => *offset = offset.saturating_sub(1),
+                    KeyCode::Down => *offset = offset.saturating_add(1),
+                    KeyCode::PageUp => *offset = offset.saturating_sub(LOG_PAGE),
+                    KeyCode::PageDown => *offset = offset.saturating_add(LOG_PAGE),
+                    KeyCode::Home => *offset = 0,
+                    KeyCode::End => *offset = u16::MAX,
+                    _ => {}
+                }
+                false
+            }
             Screen::List => Self::handle_list_key(
                 key.code,
                 &mut self.selected_index,
@@ -895,6 +1026,15 @@ mod tests {
     }
 
     #[test]
+    fn any_keypress_sets_user_interacted_latch() {
+        let gens = vec![fake_gen(1, &[])];
+        let mut app = App::new(&gens);
+        assert!(!app.interaction.get());
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(app.interaction.get());
+    }
+
+    #[test]
     fn editing_typing_appends_and_backspace_removes() {
         let gens = vec![fake_gen(1, &["foo"])];
         let mut app = App::new(&gens);
@@ -1240,8 +1380,14 @@ mod tests {
                     message.contains("Latest error (#1)"),
                     "message not updated: {message}"
                 );
-                assert!(message.contains("Raw Shell failed"), "missing title: {message}");
-                assert!(!message.contains("boot failed: test"), "stale first error retained");
+                assert!(
+                    message.contains("Raw Shell failed"),
+                    "missing title: {message}"
+                );
+                assert!(
+                    !message.contains("boot failed: test"),
+                    "stale first error retained"
+                );
             }
             _ => panic!("expected Emergency screen"),
         }
@@ -1250,7 +1396,10 @@ mod tests {
         app.set_emergency_message("Latest error (#2): Retry failed\n\nENOENT");
         match &app.screen {
             Screen::Emergency { message, .. } => {
-                assert!(message.contains("Latest error (#2)"), "second update lost: {message}");
+                assert!(
+                    message.contains("Latest error (#2)"),
+                    "second update lost: {message}"
+                );
                 assert!(!message.contains("(#1)"), "stale #1 retained: {message}");
             }
             _ => panic!("expected Emergency screen"),
@@ -1557,5 +1706,98 @@ mod tests {
         );
         assert!(!app.on_key(release));
         assert!(app.decision.is_none());
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_e_sets_exit_session() {
+        let gens = vec![fake_gen(1, &[])];
+        let mut app = App::new(&gens);
+        assert!(!app.exit_session);
+        // Ctrl+E sets the flag, produces no Decision, and does not exit.
+        assert!(!app.on_key(ctrl(KeyCode::Char('e'))));
+        assert!(app.exit_session);
+        assert!(app.decision.is_none());
+        // Plain 'e' from the list still opens the editor — proving the
+        // global handler only fires with CONTROL held.
+        let mut app2 = App::new(&gens);
+        app2.on_key(press(KeyCode::Char('e')));
+        assert!(matches!(app2.screen, Screen::Editing { .. }));
+        assert!(!app2.exit_session);
+    }
+
+    #[test]
+    fn ctrl_l_opens_log_and_esc_returns() {
+        let gens = vec![fake_gen(1, &[])];
+        let mut app = App::new(&gens);
+        assert!(matches!(app.screen, Screen::List));
+
+        // Ctrl+L opens the log viewer.
+        assert!(!app.on_key(ctrl(KeyCode::Char('l'))));
+        assert!(matches!(app.screen, Screen::Log { .. }));
+
+        // Esc pops back to the List.
+        assert!(!app.on_key(press(KeyCode::Esc)));
+        assert!(matches!(app.screen, Screen::List));
+
+        // Re-open then close via a second Ctrl+L.
+        app.on_key(ctrl(KeyCode::Char('l')));
+        assert!(matches!(app.screen, Screen::Log { .. }));
+        app.on_key(ctrl(KeyCode::Char('l')));
+        assert!(matches!(app.screen, Screen::List));
+    }
+
+    #[test]
+    fn log_scroll_offset_moves_and_saturates() {
+        let gens = vec![fake_gen(1, &[])];
+        let mut app = App::new(&gens);
+        app.screen = Screen::Log {
+            lines: vec!["a".into(), "b".into(), "c".into()],
+            offset: 0,
+        };
+
+        // Up at 0 saturates at 0.
+        app.on_key(press(KeyCode::Up));
+        assert!(matches!(app.screen, Screen::Log { offset: 0, .. }));
+        // Down advances by 1.
+        app.on_key(press(KeyCode::Down));
+        assert!(matches!(app.screen, Screen::Log { offset: 1, .. }));
+        // PageDown advances by a page.
+        app.on_key(press(KeyCode::PageDown));
+        assert!(matches!(app.screen, Screen::Log { offset, .. } if offset == 1 + LOG_PAGE));
+        // End jumps to u16::MAX (renderer clamps for display).
+        app.on_key(press(KeyCode::End));
+        assert!(matches!(
+            app.screen,
+            Screen::Log {
+                offset: u16::MAX,
+                ..
+            }
+        ));
+        // Home returns to 0.
+        app.on_key(press(KeyCode::Home));
+        assert!(matches!(app.screen, Screen::Log { offset: 0, .. }));
+    }
+
+    #[test]
+    fn shared_session_latch_spans_two_apps() {
+        // A keypress on one App built from a session must be visible to
+        // a second App built via new_in_session — proving the emergency
+        // screen sees interaction from the selector / passphrase prompt.
+        let session = SessionInteraction::new();
+        let gens = vec![fake_gen(1, &[])];
+        let mut first = App::new_in_session(&gens, &session);
+        assert!(!session.get());
+        first.on_key(press(KeyCode::Char('p')));
+        assert!(session.get());
+
+        let second = App::new_in_session(&[], &session);
+        assert!(
+            second.interaction.get(),
+            "second App must observe the shared latch"
+        );
     }
 }

@@ -142,8 +142,13 @@ pub fn verify_kexec_readiness(
         ConfirmOutcome::Yes => {
             // No passphrase injection: the operator skipped phase 3.
             let injections: Vec<KeyInjection> = Vec::new();
-            let decision = run_selector(config, &generations, console)?;
-            Ok(Some(decision_to_action(config, &generations, &injections, decision)?))
+            let decision = run_selector(config, &generations, console, &app.interaction)?;
+            Ok(Some(decision_to_action(
+                config,
+                &generations,
+                &injections,
+                decision,
+            )?))
         }
         ConfirmOutcome::No | ConfirmOutcome::Cancelled => Ok(None),
     }
@@ -159,11 +164,10 @@ fn run_selector_and_dispatch(
     injections: &[KeyInjection],
 ) -> Result<TerminalAction> {
     let generations = {
-        let mut reporter =
-            BootReporter::overlay(console, app, "phase 4: scan generations (retry)");
+        let mut reporter = BootReporter::overlay(console, app, "phase 4: scan generations (retry)");
         scan_generations(config, &mut reporter)?
     };
-    let decision = run_selector(config, &generations, console)?;
+    let decision = run_selector(config, &generations, console, &app.interaction)?;
     decision_to_action(config, &generations, injections, decision)
 }
 
@@ -295,7 +299,10 @@ mod tests {
                     context.contains("emergency-retry"),
                     "context must name the dispatcher: {context}"
                 );
-                assert!(reason.contains("42"), "reason must mention bad index: {reason}");
+                assert!(
+                    reason.contains("42"),
+                    "reason must mention bad index: {reason}"
+                );
             }
             other => panic!("expected ConfigInvalid, got {other:?}"),
         }

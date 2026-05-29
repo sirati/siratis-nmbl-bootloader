@@ -26,8 +26,8 @@ use drm::control::{
 };
 
 use crate::error::{NmblError, Result};
-use crate::{nmbl_info, nmbl_warn};
 use crate::splash::types::FramebufferDims;
+use crate::{nmbl_info, nmbl_warn};
 
 /// Thin newtype wrapper around an `OwnedFd` so we can implement the
 /// `drm` crate's `Device` traits on it. The fd is closed automatically

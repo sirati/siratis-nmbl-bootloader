@@ -267,8 +267,7 @@ fn write_phase(
                     *l = lines;
                 }
                 if spinner_advance {
-                    *spinner_frame =
-                        spinner_frame.wrapping_add(1) % crate::ui::app::SPINNER_FRAMES;
+                    *spinner_frame = spinner_frame.wrapping_add(1) % crate::ui::app::SPINNER_FRAMES;
                 }
             } else {
                 // Defence-in-depth: a caller that swapped the modal out
@@ -289,8 +288,7 @@ fn tick_spinner(app: &mut ReporterApp<'_>) {
         ReporterApp::Owned(a) => a.tick_boot_spinner(),
         ReporterApp::Overlay(a) => {
             if let Some(ModalKind::Status { spinner_frame, .. }) = &mut a.modal {
-                *spinner_frame =
-                    spinner_frame.wrapping_add(1) % crate::ui::app::SPINNER_FRAMES;
+                *spinner_frame = spinner_frame.wrapping_add(1) % crate::ui::app::SPINNER_FRAMES;
             }
         }
     }
@@ -404,10 +402,7 @@ mod tests {
             // No "mock" variant exists; tests don't branch on kind.
             ConsoleKind::Tty
         }
-        fn draw_with(
-            &mut self,
-            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
-        ) -> Result<()> {
+        fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
             Ok(())
         }
         fn suspend(&mut self) -> Result<()> {
@@ -494,10 +489,8 @@ mod tests {
         // Operator presses Esc on the boot-status screen while a wait
         // is in flight: tick must surface TickOutcome::Aborted so the
         // caller can convert it into an `OperatorAborted` error.
-        let mut console = MockConsole::with_keys(vec![Some(KeyEvent::new(
-            KeyCode::Esc,
-            KeyModifiers::NONE,
-        ))]);
+        let mut console =
+            MockConsole::with_keys(vec![Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))]);
         let mut reporter = BootReporter::new(&mut console, "phase 3b: waiting");
         let outcome = ProgressSink::tick(&mut reporter, "phase 3b: waiting for /dev/sda1");
         assert_eq!(
@@ -555,7 +548,10 @@ mod tests {
             }
             other => panic!("expected ModalKind::Status, got {other:?}"),
         }
-        assert!(matches!(app.screen, Screen::List), "screen must be untouched");
+        assert!(
+            matches!(app.screen, Screen::List),
+            "screen must be untouched"
+        );
     }
 
     #[test]
@@ -568,7 +564,9 @@ mod tests {
         let mut app: App<'static> = App::new(&[]);
         {
             let mut reporter = BootReporter::overlay(&mut console, &mut app, "initial");
-            reporter.set_phase("phase 2").expect("set_phase must succeed");
+            reporter
+                .set_phase("phase 2")
+                .expect("set_phase must succeed");
         }
         match &app.modal {
             Some(ModalKind::Status { phase, .. }) => {
@@ -592,7 +590,11 @@ mod tests {
             let _ = ProgressSink::tick(&mut reporter, "still waiting");
         }
         match &app.modal {
-            Some(ModalKind::Status { spinner_frame, phase, .. }) => {
+            Some(ModalKind::Status {
+                spinner_frame,
+                phase,
+                ..
+            }) => {
                 assert_eq!(*spinner_frame, 2, "two ticks land on frame 2");
                 assert_eq!(phase, "still waiting", "phase reflects last tick");
             }

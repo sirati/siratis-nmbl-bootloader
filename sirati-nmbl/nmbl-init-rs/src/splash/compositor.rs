@@ -211,7 +211,11 @@ pub fn blit_cell(
             // the +127 trick from src_over so the two stages share
             // identical rounding behaviour.
             let effective = ((u16::from(coverage).saturating_mul(fa16)) + 127) / 255;
-            let effective = if effective > 255 { 255u8 } else { effective as u8 };
+            let effective = if effective > 255 {
+                255u8
+            } else {
+                effective as u8
+            };
             if effective == 0 {
                 continue;
             }
@@ -532,8 +536,16 @@ fn src_over(sr: u8, sg: u8, sb: u8, a: u8, dr: u8, dg: u8, db: u8) -> (u8, u8, u
     }
     let alpha = f32::from(a) / 255.0;
     let inv = 1.0 - alpha;
-    let src_lab = oklab::srgb_to_oklab(oklab::Rgb { r: sr, g: sg, b: sb });
-    let dst_lab = oklab::srgb_to_oklab(oklab::Rgb { r: dr, g: dg, b: db });
+    let src_lab = oklab::srgb_to_oklab(oklab::Rgb {
+        r: sr,
+        g: sg,
+        b: sb,
+    });
+    let dst_lab = oklab::srgb_to_oklab(oklab::Rgb {
+        r: dr,
+        g: dg,
+        b: db,
+    });
     let out_lab = oklab::Oklab {
         l: dst_lab.l * inv + src_lab.l * alpha,
         a: dst_lab.a * inv + src_lab.a * alpha,
@@ -831,9 +843,18 @@ mod tests {
         let got_b = fb[p21];
         let got_g = fb[p21 + 1];
         let got_r = fb[p21 + 2];
-        assert!(got_r > 10 && got_r < 200, "R at (2,1) should be between dst=10 and src=200, got {got_r}");
-        assert!(got_g > 20 && got_g < 100, "G at (2,1) should be between dst=20 and src=100, got {got_g}");
-        assert!(got_b > 30 && got_b < 50, "B at (2,1) should be between dst=30 and src=50, got {got_b}");
+        assert!(
+            got_r > 10 && got_r < 200,
+            "R at (2,1) should be between dst=10 and src=200, got {got_r}"
+        );
+        assert!(
+            got_g > 20 && got_g < 100,
+            "G at (2,1) should be between dst=20 and src=100, got {got_g}"
+        );
+        assert!(
+            got_b > 30 && got_b < 50,
+            "B at (2,1) should be between dst=30 and src=50, got {got_b}"
+        );
 
         // Pixel (0, 0): outside the glyph rect — must remain bg.
         let p00 = 0;

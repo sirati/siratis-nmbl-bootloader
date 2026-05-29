@@ -24,8 +24,8 @@ use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork, setsid};
-use rustix::fs::fcntl_setfl;
 use rustix::fs::OFlags as RustixOFlags;
+use rustix::fs::fcntl_setfl;
 
 use crate::error::{NmblError, Result};
 use crate::nmbl_warn;
@@ -236,11 +236,10 @@ pub fn spawn_shell(shell_path: &Path, cols: u16, rows: u16) -> Result<PtyChild> 
     // happen here, before fork(2). The post-fork child path is restricted
     // to async-signal-safe operations. ===
 
-    let path_c = CString::new(shell_path.as_os_str().as_encoded_bytes()).map_err(|_| {
-        NmblError::Tui {
+    let path_c =
+        CString::new(shell_path.as_os_str().as_encoded_bytes()).map_err(|_| NmblError::Tui {
             source: std::io::Error::other("shell path contains interior NUL"),
-        }
-    })?;
+        })?;
 
     let argv0_bytes: Vec<u8> = shell_path
         .file_name()
@@ -256,11 +255,10 @@ pub fn spawn_shell(shell_path: &Path, cols: u16, rows: u16) -> Result<PtyChild> 
     let env_term = CString::new("TERM=xterm-256color").map_err(|_| NmblError::Tui {
         source: std::io::Error::other("static TERM env contains interior NUL"),
     })?;
-    let env_path = CString::new("PATH=/usr/sbin:/usr/bin:/sbin:/bin").map_err(|_| {
-        NmblError::Tui {
+    let env_path =
+        CString::new("PATH=/usr/sbin:/usr/bin:/sbin:/bin").map_err(|_| NmblError::Tui {
             source: std::io::Error::other("static PATH env contains interior NUL"),
-        }
-    })?;
+        })?;
 
     let winsize = Winsize {
         ws_row: rows,
@@ -409,11 +407,10 @@ pub fn spawn_shell_on_tty(shell_path: &Path, tty_path: &Path) -> Result<Detached
     // happen here, before fork(2). The post-fork child path is restricted
     // to async-signal-safe operations (same discipline as spawn_shell). ===
 
-    let path_c = CString::new(shell_path.as_os_str().as_encoded_bytes()).map_err(|_| {
-        NmblError::Tui {
+    let path_c =
+        CString::new(shell_path.as_os_str().as_encoded_bytes()).map_err(|_| NmblError::Tui {
             source: std::io::Error::other("shell path contains interior NUL"),
-        }
-    })?;
+        })?;
     let argv0_bytes: Vec<u8> = shell_path
         .file_name()
         .map(|n| n.as_encoded_bytes().to_vec())
@@ -424,11 +421,10 @@ pub fn spawn_shell_on_tty(shell_path: &Path, tty_path: &Path) -> Result<Detached
     let env_term = CString::new("TERM=xterm-256color").map_err(|_| NmblError::Tui {
         source: std::io::Error::other("static TERM env contains interior NUL"),
     })?;
-    let env_path = CString::new("PATH=/usr/sbin:/usr/bin:/sbin:/bin").map_err(|_| {
-        NmblError::Tui {
+    let env_path =
+        CString::new("PATH=/usr/sbin:/usr/bin:/sbin:/bin").map_err(|_| NmblError::Tui {
             source: std::io::Error::other("static PATH env contains interior NUL"),
-        }
-    })?;
+        })?;
 
     // Open the target tty in the PARENT so an open(2) failure surfaces
     // synchronously (not as an opaque _exit code from a forked child).
