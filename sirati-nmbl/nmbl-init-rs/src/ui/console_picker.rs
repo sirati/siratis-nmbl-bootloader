@@ -135,6 +135,10 @@ pub struct PickerState {
     /// keystroke; when valid AND non-empty, treated as an additional
     /// pre-checked spawn target.
     pub custom_input: String,
+    /// Byte-index cursor into `custom_input` for line editing. Always on
+    /// a char boundary in `0..=custom_input.len()`. A path is not secret,
+    /// so word motion is permitted here.
+    pub custom_cursor: usize,
     /// Operator's intent for the custom-path checkbox. When the path
     /// becomes invalid the entry is suppressed regardless of this flag.
     pub custom_checked: bool,
@@ -265,6 +269,7 @@ impl PickerState {
             cursor: 0,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         })
@@ -332,27 +337,16 @@ impl PickerState {
             return self.outcome.is_some();
         }
 
-        // Custom-input field captures most keystrokes when focused so
-        // the operator can type a path; navigation keys still escape
-        // to move focus.
+        // Custom-input field captures editing keystrokes when focused so
+        // the operator can type AND edit a path with a real cursor
+        // (Left/Right/Home/End, Backspace/Delete, word motion). A few
+        // keys still escape to move focus / commit: Up/Down navigate,
+        // Esc/Enter fall through to the shared handler, and Tab toggles
+        // the custom checkbox.
         if self.focus() == FocusZone::CustomInput {
             match key.code {
                 KeyCode::Up | KeyCode::Down | KeyCode::Esc | KeyCode::Enter => {
-                    // fall through to the shared handler below
-                }
-                KeyCode::Char(' ') => {
-                    // Space inside the field is a real space, NOT a
-                    // toggle. Only the [Space] on the list rows toggles.
-                    self.custom_input.push(' ');
-                    return false;
-                }
-                KeyCode::Char(c) => {
-                    self.custom_input.push(c);
-                    return false;
-                }
-                KeyCode::Backspace => {
-                    self.custom_input.pop();
-                    return false;
+                    // fall through to the shared navigation handler below
                 }
                 KeyCode::Tab => {
                     // Tab on the custom field toggles its "checked"
@@ -360,7 +354,25 @@ impl PickerState {
                     self.custom_checked = !self.custom_checked;
                     return false;
                 }
-                _ => return false,
+                _ => {
+                    // Everything else (printable chars incl. Space,
+                    // Left/Right/Home/End, Backspace/Delete, word
+                    // motion) edits the buffer through the shared
+                    // line-editing helper. Space here is a literal
+                    // space, NOT a checkbox toggle. A path is not a
+                    // secret, so word motion is allowed.
+                    let (new_cursor, _handled) = crate::ui::editline::handle_key_on(
+                        &mut self.custom_input,
+                        self.custom_cursor,
+                        key,
+                        true,
+                    );
+                    self.custom_cursor = new_cursor;
+                    if self.custom_input.is_empty() {
+                        self.custom_cursor = 0;
+                    }
+                    return false;
+                }
             }
         }
 
@@ -644,7 +656,8 @@ pub(crate) fn render_picker_frame(frame: &mut Frame<'_>, state: &PickerState) {
     let list_height = u16::try_from(state.candidates.len().saturating_add(2)).unwrap_or(u16::MAX);
     let [list_area, custom_area, button_area] = Layout::vertical([
         Constraint::Length(list_height),
-        Constraint::Length(3),
+        // 4 rows: 2 borders + the input line + the caret line.
+        Constraint::Length(4),
         Constraint::Length(3),
     ])
     .areas::<3>(modal);
@@ -768,19 +781,35 @@ fn render_custom_input(frame: &mut Frame<'_>, area: Rect, state: &PickerState) {
     } else {
         "custom (/dev/X)"
     };
-    let cursor_suffix = if focused { "|" } else { "" };
-    let body = Line::from(vec![
+    // Width of the "[x] " (marker + separating space) prefix in display
+    // columns, so the caret line below lines up under the input text.
+    let marker_cols = marker.chars().count().saturating_add(1);
+    let text_line = Line::from(vec![
         Span::styled(marker, marker_style),
         Span::raw(" "),
-        Span::styled(format!("{}{cursor_suffix}", state.custom_input), text_style),
+        Span::styled(state.custom_input.clone(), text_style),
     ]);
     let block_style = if focused {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
-    let para =
-        Paragraph::new(body).block(Block::bordered().title(Span::styled(title, block_style)));
+    let block = Block::bordered().title(Span::styled(title, block_style));
+    // When focused, draw a caret on a second line under the cursor
+    // column (byte→char column conversion mirrors the cmdline editor's
+    // `render_edit`), offset by the marker prefix. Unfocused fields
+    // omit the caret to avoid implying input focus.
+    let lines = if focused {
+        // Reuse the cmdline editor's caret helper; the marker prefix is
+        // passed as the lead-in column offset so the caret aligns under
+        // the input text rather than the "[x] " marker.
+        let caret =
+            crate::ui::view::caret_line(&state.custom_input, state.custom_cursor, marker_cols);
+        vec![text_line, caret]
+    } else {
+        vec![text_line]
+    };
+    let para = Paragraph::new(lines).block(block);
     frame.render_widget(para, area);
 }
 
@@ -1034,6 +1063,7 @@ mod tests {
             cursor: 1,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1063,6 +1093,7 @@ mod tests {
             cursor: 3,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1090,6 +1121,7 @@ mod tests {
             cursor: 2,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1109,6 +1141,7 @@ mod tests {
             cursor: 0,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1135,6 +1168,7 @@ mod tests {
             cursor: 0,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1211,6 +1245,7 @@ mod tests {
             cursor: 1,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1218,8 +1253,118 @@ mod tests {
             state.on_key(press(KeyCode::Char(c)));
         }
         assert_eq!(state.custom_input, "/dev/ttyS9");
+        assert_eq!(state.custom_cursor, "/dev/ttyS9".len());
         state.on_key(press(KeyCode::Backspace));
         assert_eq!(state.custom_input, "/dev/ttyS");
+        assert_eq!(state.custom_cursor, "/dev/ttyS".len());
+    }
+
+    /// Build a picker state focused on the custom-input row, pre-filled
+    /// with `input` and the cursor parked at the end.
+    fn custom_state(input: &str) -> PickerState {
+        let cursor = input.len();
+        PickerState {
+            candidates: vec![PickerCandidate {
+                label: "a".into(),
+                target: PathBuf::from("/dev/a"),
+                origin: CandidateOrigin::KernelConsole,
+            }],
+            selected: vec![true],
+            // candidates(1) → custom-input row is index 1.
+            cursor: 1,
+            button_cursor: ButtonCursor::Spawn,
+            custom_input: input.to_string(),
+            custom_cursor: cursor,
+            custom_checked: true,
+            outcome: None,
+        }
+    }
+
+    /// The custom field supports real line editing: Home/End/Left/Right
+    /// move the caret, and a printable inserted mid-string lands at the
+    /// caret rather than appending.
+    #[test]
+    fn custom_input_mid_string_insert_with_caret_motion() {
+        let mut state = custom_state("/dev/tt0");
+        assert_eq!(state.focus(), FocusZone::CustomInput);
+        // End → cursor at len; Left once → between 't' and '0'.
+        state.on_key(press(KeyCode::End));
+        assert_eq!(state.custom_cursor, "/dev/tt0".len());
+        state.on_key(press(KeyCode::Left));
+        assert_eq!(state.custom_cursor, "/dev/tt".len());
+        // Insert 'y' → "/dev/tty0".
+        state.on_key(press(KeyCode::Char('y')));
+        assert_eq!(state.custom_input, "/dev/tty0");
+        assert_eq!(state.custom_cursor, "/dev/tty".len());
+        // Home jumps to column 0.
+        state.on_key(press(KeyCode::Home));
+        assert_eq!(state.custom_cursor, 0);
+        // Right walks one char forward.
+        state.on_key(press(KeyCode::Right));
+        assert_eq!(state.custom_cursor, 1);
+    }
+
+    /// Backspace removes the char before the caret; Delete removes the
+    /// char at the caret. Both operate at the cursor, not the end.
+    #[test]
+    fn custom_input_backspace_and_delete_at_cursor() {
+        let mut state = custom_state("/dev/ttyX");
+        // Park the caret between 'tty' and 'X' (before 'X').
+        state.on_key(press(KeyCode::End));
+        state.on_key(press(KeyCode::Left)); // before 'X'
+        // Backspace removes the 'y' before the caret.
+        state.on_key(press(KeyCode::Backspace));
+        assert_eq!(state.custom_input, "/dev/ttX");
+        // Delete removes the 'X' at the caret.
+        state.on_key(press(KeyCode::Delete));
+        assert_eq!(state.custom_input, "/dev/tt");
+    }
+
+    /// Live validation reflects the edited buffer after mid-string
+    /// editing, not just appends. Editing "/dev/nul" → insert 'l' at the
+    /// end yields the valid chardev "/dev/null".
+    #[test]
+    fn custom_input_validation_tracks_edited_buffer() {
+        if !is_char_device(Path::new("/dev/null")) {
+            return;
+        }
+        let mut state = custom_state("/dev/nul");
+        assert_eq!(state.custom_validation(), CustomValidation::Invalid);
+        state.on_key(press(KeyCode::End));
+        state.on_key(press(KeyCode::Char('l')));
+        assert_eq!(state.custom_input, "/dev/null");
+        assert_eq!(state.custom_validation(), CustomValidation::Valid);
+        // Backspace mid-edit invalidates again.
+        state.on_key(press(KeyCode::Backspace));
+        assert_eq!(state.custom_input, "/dev/nul");
+        assert_eq!(state.custom_validation(), CustomValidation::Invalid);
+    }
+
+    /// Arrows in the custom field EDIT (move the caret) and never leak
+    /// into navigation: Left/Right stay on the custom row, while Up/Down
+    /// still move focus.
+    #[test]
+    fn custom_input_arrows_edit_not_navigate() {
+        let mut state = custom_state("/dev/x");
+        state.on_key(press(KeyCode::Left));
+        assert_eq!(
+            state.focus(),
+            FocusZone::CustomInput,
+            "Left must edit the field, not move focus"
+        );
+        // Up moves focus out (to the list row).
+        state.on_key(press(KeyCode::Up));
+        assert_eq!(state.focus(), FocusZone::List);
+    }
+
+    /// A literal Space typed in the focused custom field is inserted as
+    /// text (NOT treated as a checkbox toggle).
+    #[test]
+    fn custom_input_space_is_literal() {
+        let mut state = custom_state("/dev");
+        state.on_key(press(KeyCode::Char(' ')));
+        assert_eq!(state.custom_input, "/dev ");
+        assert_eq!(state.custom_cursor, "/dev ".len());
     }
 
     #[test]
@@ -1234,6 +1379,7 @@ mod tests {
             cursor: 0,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1274,6 +1420,7 @@ mod tests {
             cursor: 0,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1324,6 +1471,7 @@ mod tests {
             cursor: 0,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1361,6 +1509,7 @@ mod tests {
             cursor: 0,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1406,6 +1555,7 @@ mod tests {
             cursor: 0,
             button_cursor: ButtonCursor::Spawn,
             custom_input: "/dev/null".to_string(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1461,6 +1611,7 @@ mod tests {
             cursor: 0,
             button_cursor: ButtonCursor::Spawn,
             custom_input: "/dev/null".to_string(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
@@ -1481,6 +1632,7 @@ mod tests {
             cursor: 0,
             button_cursor: ButtonCursor::Spawn,
             custom_input: "/dev/does-not-exist".to_string(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         };
