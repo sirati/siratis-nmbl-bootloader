@@ -170,10 +170,10 @@ fn handle_key_on_mirrors_editable_line_for_insert_and_nav() {
     let mut buf = String::from("scret");
     let mut cur = buf.len();
     // Home, then Right once → between 's' and 'c' (byte 1).
-    (cur, _) = handle_key_on(&mut buf, cur, key(KeyCode::Home));
-    (cur, _) = handle_key_on(&mut buf, cur, key(KeyCode::Right));
+    (cur, _) = handle_key_on(&mut buf, cur, key(KeyCode::Home), true);
+    (cur, _) = handle_key_on(&mut buf, cur, key(KeyCode::Right), true);
     // Insert 'e' → "secret", cursor advances past it to byte 2.
-    (cur, _) = handle_key_on(&mut buf, cur, key(KeyCode::Char('e')));
+    (cur, _) = handle_key_on(&mut buf, cur, key(KeyCode::Char('e')), true);
     assert_eq!(buf, "secret");
     assert_eq!(cur, 2);
 }
@@ -183,12 +183,53 @@ fn handle_key_on_backspace_and_delete_at_cursor() {
     let mut buf = String::from("abc");
     let mut cur = 1; // between 'a' and 'b'
     let handled;
-    (cur, handled) = handle_key_on(&mut buf, cur, key(KeyCode::Backspace));
+    (cur, handled) = handle_key_on(&mut buf, cur, key(KeyCode::Backspace), true);
     assert!(handled);
     assert_eq!(buf, "bc");
     assert_eq!(cur, 0);
     // Delete at cursor removes 'b'.
-    (cur, _) = handle_key_on(&mut buf, cur, key(KeyCode::Delete));
+    (cur, _) = handle_key_on(&mut buf, cur, key(KeyCode::Delete), true);
     assert_eq!(buf, "c");
     assert_eq!(cur, 0);
+}
+
+#[test]
+fn secret_mode_disables_word_jump_but_keeps_char_and_absolute_nav() {
+    // Masked-passphrase semantics (`allow_word_motion = false`):
+    // Alt+F / Ctrl+Right MUST NOT land on a word boundary (which
+    // would leak a space position) and MUST NOT insert a literal
+    // char. They degrade to a single-char move. Plain
+    // Left/Right/Home/End and Ctrl+A/E still work.
+    let mut buf = String::from("foo bar baz");
+    let mut cur = 0;
+    let handled;
+
+    // Alt+F from byte 0: word motion would jump to byte 4 ("bar").
+    // With it disabled we expect a single-char move to byte 1.
+    (cur, handled) = handle_key_on(&mut buf, cur, alt(KeyCode::Char('f')), false);
+    assert!(handled, "Alt+F must still be handled (not fall through)");
+    assert_eq!(cur, 1, "Alt+F must move one char, not jump to a word");
+    assert_eq!(buf, "foo bar baz", "Alt+F must not insert a literal 'f'");
+
+    // Ctrl+Right from byte 1: word motion would jump to byte 4.
+    // Disabled → single-char move to byte 2.
+    (cur, _) = handle_key_on(&mut buf, cur, ctrl(KeyCode::Right), false);
+    assert_eq!(cur, 2, "Ctrl+Right must move one char, not jump to a word");
+
+    // Alt+B never reaches a word boundary either; from byte 2 it is
+    // a single char left to byte 1.
+    (cur, _) = handle_key_on(&mut buf, cur, alt(KeyCode::Char('b')), false);
+    assert_eq!(cur, 1, "Alt+B must move one char left, not jump");
+
+    // Absolute navigation is unaffected.
+    (cur, _) = handle_key_on(&mut buf, cur, key(KeyCode::Home), false);
+    assert_eq!(cur, 0);
+    (cur, _) = handle_key_on(&mut buf, cur, key(KeyCode::End), false);
+    assert_eq!(cur, buf.len());
+    (cur, _) = handle_key_on(&mut buf, cur, key(KeyCode::Left), false);
+    assert_eq!(cur, buf.len().saturating_sub(1));
+    (cur, _) = handle_key_on(&mut buf, cur, ctrl(KeyCode::Char('a')), false);
+    assert_eq!(cur, 0);
+    (cur, _) = handle_key_on(&mut buf, cur, ctrl(KeyCode::Char('e')), false);
+    assert_eq!(cur, buf.len());
 }

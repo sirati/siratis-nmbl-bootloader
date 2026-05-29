@@ -3,3 +3,4 @@
 mod blit;
 mod colors;
 mod halo;
+mod text_layer;

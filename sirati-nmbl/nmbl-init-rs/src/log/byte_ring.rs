@@ -39,6 +39,64 @@ impl ByteLog {
             self.dropped_bytes = self.dropped_bytes.saturating_add(drop as u64);
         }
     }
+
+    /// Append `line\n` to the ring as one unit. Building the on-disk
+    /// representation up-front means a single append either lands whole
+    /// or (under overflow) gets truncated as one unit — no risk of a
+    /// half-line surviving at the front of the ring. The pure half of
+    /// [`push_byte_ring`]; runs on a borrowed log so overflow/drop
+    /// accounting is testable on a local instance.
+    pub(super) fn append_line(&mut self, line: &str) {
+        let mut bytes = Vec::with_capacity(line.len() + 1);
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
+        self.append(&bytes);
+    }
+
+    /// Compute the optional truncation header for a flush. The pure half
+    /// of [`flush_to`]'s under-lock block: when bytes were dropped off
+    /// the front, the file's first line names the lost count so
+    /// downstream tooling does not treat the remainder as the whole
+    /// transcript.
+    pub(super) fn flush_header(&self) -> Option<String> {
+        if self.dropped_bytes > 0 {
+            Some(format!(
+                "=== nmbl-init: log truncated, earlier {} bytes dropped ===\n",
+                self.dropped_bytes
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// Test-only constructor for a fresh, empty `ByteLog` so the ring tests
+/// can exercise append/overflow/flush logic on a local instance instead
+/// of the process-global [`BYTE_LOG`] static.
+#[cfg(test)]
+pub(super) fn new_byte_log() -> ByteLog {
+    ByteLog::new()
+}
+
+/// Decode buffered transcript bytes into lines (oldest first),
+/// prepending a truncation note when `dropped > 0`. Free function so
+/// [`snapshot_full`] can clone the bytes out under the `BYTE_LOG` lock
+/// and run the (potentially large) UTF-8 decode + split after the guard
+/// drops — matching `flush_to`'s lock-release-before-work pattern.
+pub(super) fn decode_snapshot_lines(dropped: u64, body: Vec<u8>) -> Vec<String> {
+    let text = String::from_utf8_lossy(&body);
+    // `lines()` would swallow a meaningful trailing empty line and also
+    // strip the final `\n`; splitting on '\n' keeps the round-trip
+    // predictable. Each emitted body was stored with a trailing '\n', so
+    // the split yields a trailing empty element we drop.
+    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+    if lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    if dropped > 0 {
+        lines.insert(0, format!("… {dropped} earlier bytes truncated …"));
+    }
+    lines
 }
 
 pub(super) static BYTE_LOG: Mutex<Option<ByteLog>> = Mutex::new(None);
@@ -51,13 +109,7 @@ pub(super) fn push_byte_ring(line: &str) {
         return;
     };
     let log = guard.get_or_insert_with(ByteLog::new);
-    // Build the on-disk representation up-front so a single append
-    // either lands whole or (under overflow) gets truncated as one
-    // unit — no risk of a half-line surviving at the front of the ring.
-    let mut bytes = Vec::with_capacity(line.len() + 1);
-    bytes.extend_from_slice(line.as_bytes());
-    bytes.push(b'\n');
-    log.append(&bytes);
+    log.append_line(line);
 }
 
 /// Persist the byte ring to `path`, replacing any prior contents.
@@ -78,14 +130,7 @@ pub fn flush_to(path: &Path) -> std::io::Result<()> {
             .map_err(|_| std::io::Error::other("byte log mutex poisoned"))?;
         match guard.as_ref() {
             Some(log) => {
-                let header = if log.dropped_bytes > 0 {
-                    Some(format!(
-                        "=== nmbl-init: log truncated, earlier {} bytes dropped ===\n",
-                        log.dropped_bytes
-                    ))
-                } else {
-                    None
-                };
+                let header = log.flush_header();
                 // Clone bytes out under the lock so we release it before
                 // doing file I/O (which can block on disk, fsync, etc.).
                 let body: Vec<u8> = log.buf.iter().copied().collect();
@@ -128,27 +173,17 @@ pub fn snapshot_full() -> Vec<String> {
             None => return Vec::new(),
         }
     };
-
-    let text = String::from_utf8_lossy(&body);
-    // `lines()` would swallow a meaningful trailing empty line and also
-    // strip the final `\n`; splitting on '\n' keeps the round-trip
-    // predictable. Each emitted body was stored with a trailing '\n', so
-    // the split yields a trailing empty element we drop.
-    let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
-    if lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
-
-    if dropped > 0 {
-        lines.insert(0, format!("… {dropped} earlier bytes truncated …"));
-    }
-    lines
+    decode_snapshot_lines(dropped, body)
 }
 
 /// Open `path` truncated and write the optional header + body, then
 /// fsync. Split out so `flush_to` can short-circuit when the ring is
 /// uninitialised without duplicating the I/O path.
-fn write_truncated(path: &Path, header: Option<&str>, body: &[u8]) -> std::io::Result<()> {
+pub(super) fn write_truncated(
+    path: &Path,
+    header: Option<&str>,
+    body: &[u8],
+) -> std::io::Result<()> {
     let mut f = OpenOptions::new()
         .write(true)
         .create(true)

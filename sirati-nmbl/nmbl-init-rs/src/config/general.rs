@@ -13,6 +13,20 @@ pub struct General {
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u32,
 
+    /// Optional selector-TUI countdown override in milliseconds. When
+    /// `Some(ms)` it takes precedence over `timeout_secs`, letting the
+    /// operator pick a sub-second auto-boot delay. Absent (the default)
+    /// preserves the historic whole-second `timeout_secs` behaviour.
+    #[serde(default)]
+    pub timeout_ms: Option<u32>,
+
+    /// Optional override (seconds) for the emergency/error screen's
+    /// auto-reboot countdown. When `Some(s)` it replaces the built-in
+    /// 30 s default; absent keeps the historic 30 s budget so the boot
+    /// UX does not silently change on upgrade.
+    #[serde(default)]
+    pub emergency_timeout_secs: Option<u64>,
+
     /// Per-device readiness budget (seconds) used while waiting for a
     /// `fileSystems[].device` to appear during mount, and while waiting
     /// for cryptsetup / LVM / mdraid activations to materialise their
@@ -39,6 +53,8 @@ impl Default for General {
         Self {
             verbosity: Verbosity::default(),
             timeout_secs: default_timeout_secs(),
+            timeout_ms: None,
+            emergency_timeout_secs: None,
             device_timeout_secs: default_device_timeout_secs(),
             panic_report_dir: default_panic_report_dir(),
             _serial_console_compat: false,

@@ -74,7 +74,7 @@ pub async fn run_emergency_screen(console: &mut dyn Console, err: &NmblError) ->
     // Convenience wrapper: no prior session to inherit, so start fresh.
     let session = SessionInteraction::new();
     let mut app = build_emergency_app(&message, &items, &session);
-    run_emergency_screen_with_app(console, &mut app).await
+    run_emergency_screen_with_app(console, &mut app, EMERGENCY_TIMEOUT).await
 }
 
 /// Same as [`run_emergency_screen`] but reuses an externally-owned
@@ -89,17 +89,32 @@ pub async fn run_emergency_screen(console: &mut dyn Console, err: &NmblError) ->
 /// latches the deadline at `now + 30s`; on re-entry the existing
 /// deadline is preserved. If the deadline has already elapsed on
 /// re-entry the loop reboots immediately.
+///
+/// `timeout` is the resolved auto-reboot budget — callers pass
+/// [`EMERGENCY_TIMEOUT`] for the historic 30 s default or an
+/// operator-configured override (see `boot.nmbl.emergencyTimeoutSecs`).
 pub async fn run_emergency_screen_with_app(
     console: &mut dyn Console,
     app: &mut App<'_>,
+    timeout: Duration,
 ) -> EmergencyChoice {
     // The loop itself latches on first entry — subsequent calls find
     // Some(_) and keep the original deadline. Re-entry after an
     // elapsed deadline trips the "remaining = None" branch inside the
     // loop and returns Reboot at once.
-    loop_driver::drive_emergency_loop(app, EMERGENCY_TIMEOUT, Instant::now, console)
+    loop_driver::drive_emergency_loop(app, timeout, Instant::now, console)
         .await
         .unwrap_or(EmergencyChoice::Reboot)
+}
+
+/// Resolve the emergency auto-reboot timeout from runtime config,
+/// falling back to the built-in [`EMERGENCY_TIMEOUT`] default when the
+/// operator has not set `general.emergency_timeout_secs`.
+pub fn resolve_emergency_timeout(config: &crate::config::Config) -> Duration {
+    config
+        .general
+        .emergency_timeout_secs
+        .map_or(EMERGENCY_TIMEOUT, Duration::from_secs)
 }
 
 #[cfg(test)]

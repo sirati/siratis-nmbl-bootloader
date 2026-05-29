@@ -28,6 +28,7 @@ fn renderer_paints_candidate_labels_and_buttons() {
         cursor: 0,
         button_cursor: ButtonCursor::Spawn,
         custom_input: String::new(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };
@@ -78,6 +79,7 @@ fn renderer_dims_spawn_when_no_target_selected() {
         cursor: 0,
         button_cursor: ButtonCursor::Spawn,
         custom_input: String::new(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };
@@ -115,6 +117,7 @@ fn renderer_does_not_dim_spawn_when_target_selected() {
         cursor: 0,
         button_cursor: ButtonCursor::Spawn,
         custom_input: String::new(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };
@@ -160,6 +163,7 @@ fn renderer_colours_custom_input_by_validation() {
         cursor: 0,
         button_cursor: ButtonCursor::Spawn,
         custom_input: "/dev/null".to_string(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };

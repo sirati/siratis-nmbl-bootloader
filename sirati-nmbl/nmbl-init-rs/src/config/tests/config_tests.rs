@@ -101,6 +101,38 @@ fn device_timeout_secs_is_honoured_when_present() {
     assert_eq!(config.general.device_timeout_secs, 90);
 }
 
+#[test]
+fn timeout_ms_defaults_to_none_when_absent() {
+    // Configs predating the knob must keep parsing cleanly and leave
+    // the whole-second `timeout_secs` path in charge.
+    let toml_text = "[general]\ntimeout_secs = 3\n";
+    let config: Config = toml::from_str(toml_text).expect("config must parse");
+    assert_eq!(config.general.timeout_ms, None);
+}
+
+#[test]
+fn timeout_ms_is_honoured_when_present() {
+    let toml_text = "[general]\ntimeout_ms = 500\n";
+    let config: Config = toml::from_str(toml_text).expect("config must parse");
+    assert_eq!(config.general.timeout_ms, Some(500));
+}
+
+#[test]
+fn emergency_timeout_secs_defaults_to_none_when_absent() {
+    // Absent → the Rust-side 30 s default applies; existing TOMLs
+    // must not observe a behaviour change on upgrade.
+    let toml_text = "[general]\ntimeout_secs = 3\n";
+    let config: Config = toml::from_str(toml_text).expect("config must parse");
+    assert_eq!(config.general.emergency_timeout_secs, None);
+}
+
+#[test]
+fn emergency_timeout_secs_is_honoured_when_present() {
+    let toml_text = "[general]\nemergency_timeout_secs = 1\n";
+    let config: Config = toml::from_str(toml_text).expect("config must parse");
+    assert_eq!(config.general.emergency_timeout_secs, Some(1));
+}
+
 #[cfg(feature = "image-splash")]
 #[test]
 fn config_parses_without_splash_table() {

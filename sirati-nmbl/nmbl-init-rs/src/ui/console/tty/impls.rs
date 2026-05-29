@@ -34,9 +34,9 @@ impl Console for TtyConsole {
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Option<ConsoleEvent>>> + 'a>> {
         Box::pin(async move {
-            // A key already classified from a previous cycle is ready
-            // now — no need to touch the fd / reactor.
-            if self.pending_keys.front().is_some() {
+            // A key or scroll already classified from a previous cycle
+            // is ready now — no need to touch the fd / reactor.
+            if self.pending_keys.front().is_some() || self.pending_scrolls.front().is_some() {
                 return self.poll_event_blocking(Duration::from_millis(0));
             }
             // Await readability (or the slice deadline) on the console
@@ -52,10 +52,13 @@ impl Console for TtyConsole {
     }
 
     fn poll_event_blocking(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>> {
-        // First: drain any keys already classified from a previous
-        // poll cycle without going to the fd again.
+        // First: drain any keys / scrolls already classified from a
+        // previous poll cycle without going to the fd again.
         if let Some(k) = self.pending_keys.pop_front() {
             return Ok(Some(ConsoleEvent::Key(k)));
+        }
+        if let Some(s) = self.pending_scrolls.pop_front() {
+            return Ok(Some(s));
         }
 
         // Cap the wait so backends are uniformly responsive to
@@ -65,13 +68,17 @@ impl Console for TtyConsole {
         let resize = self.refill(timeout_ms)?;
         // After refill, prefer surfacing a Resize first (so layout
         // catches up before the next key dispatches against the new
-        // size); then surface a key from whatever the parser emitted.
+        // size); then surface a key, then a scroll notch, from whatever
+        // the parser emitted.
         if let Some(ev) = resize {
             self.apply_resize(&ev);
             return Ok(Some(ev));
         }
         if let Some(k) = self.pending_keys.pop_front() {
             return Ok(Some(ConsoleEvent::Key(k)));
+        }
+        if let Some(s) = self.pending_scrolls.pop_front() {
+            return Ok(Some(s));
         }
         Ok(None)
     }

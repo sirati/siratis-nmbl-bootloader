@@ -10,8 +10,8 @@ use crate::generations::Generation;
 use crate::ui::app::{BootStatusData, SPINNER_FRAMES, SPINNER_GLYPHS};
 
 use super::{
-    EditScreenData, EmergencyScreenData, KeyEchoScreenData, ListScreenData,
-    char_column_for_byte_cursor, render_footer, render_header, split_chrome,
+    EditScreenData, EmergencyScreenData, KeyEchoScreenData, ListScreenData, caret_line,
+    render_footer, render_header, split_chrome,
 };
 
 fn generation_item<'a>(
@@ -89,15 +89,12 @@ pub fn render_edit(frame: &mut Frame<'_>, data: &EditScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
     // `cursor_position` is a BYTE index (the `EditableLine` cursor).
-    // Convert to a CHAR-column count so multi-byte text (e.g. "héllo")
-    // doesn't shove the caret one cell too far to the right.
-    let offset = char_column_for_byte_cursor(data.edited_cmdline, data.cursor_position);
-    let caret = format!("{}{}", " ".repeat(offset), "^");
+    // `caret_line` converts it to a CHAR column so multi-byte text
+    // (e.g. "héllo") doesn't shove the caret one cell too far right.
+    // No prefix here: the text starts at column 0 inside the block.
+    let caret = caret_line(data.edited_cmdline, data.cursor_position, 0);
     let title = format!("Edit cmdline — generation #{}", data.generation.number);
-    let text = Text::from(vec![
-        Line::raw(data.edited_cmdline.to_owned()),
-        Line::styled(caret, Style::default().add_modifier(Modifier::BOLD)),
-    ]);
+    let text = Text::from(vec![Line::raw(data.edited_cmdline.to_owned()), caret]);
     let para = Paragraph::new(text)
         .block(Block::bordered().title(title))
         .wrap(Wrap { trim: false });

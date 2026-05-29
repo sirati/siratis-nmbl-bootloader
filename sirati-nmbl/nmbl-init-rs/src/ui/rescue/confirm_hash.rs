@@ -129,7 +129,7 @@ pub(super) async fn run_confirm_hash(
             // iteration already repaints from the latest state — just
             // re-iterate so the new size lands in `console.size()`
             // before the next paint reads it.
-            Some(ConsoleEvent::Resize { .. }) | None => continue,
+            Some(ConsoleEvent::Resize { .. } | ConsoleEvent::Scroll { .. }) | None => continue,
             Some(ConsoleEvent::Key(k)) => k,
         };
         if let Some(outcome) = handle_hash_key(key, &mut state, computed_hex) {

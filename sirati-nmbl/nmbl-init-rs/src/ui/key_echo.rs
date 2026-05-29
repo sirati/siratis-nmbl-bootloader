@@ -49,7 +49,11 @@ pub async fn run_key_echo_loop(console: &mut dyn Console) -> Result<()> {
         // displays keys), matching the prior `poll_key` semantics.
         let maybe = match console.poll_event(POLL_SLICE).await? {
             Some(crate::ui::console::ConsoleEvent::Key(k)) => Some(k),
-            Some(crate::ui::console::ConsoleEvent::Resize { .. }) | None => None,
+            Some(
+                crate::ui::console::ConsoleEvent::Resize { .. }
+                | crate::ui::console::ConsoleEvent::Scroll { .. },
+            )
+            | None => None,
         };
         let Some(key) = maybe else {
             continue;

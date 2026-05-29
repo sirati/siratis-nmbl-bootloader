@@ -185,7 +185,8 @@ pub(super) async fn drive_picker_loop(
                     return Ok(());
                 }
             }
-            None => {}
+            // No scrollback in the console picker; ignore wheel notches.
+            Some(crate::ui::console::ConsoleEvent::Scroll { .. }) | None => {}
         }
     }
 }

@@ -7,7 +7,7 @@ use crate::sys::pty::spawn_shell;
 use crate::ui::POLL_SLICE;
 use crate::ui::console::{Console, ConsoleEvent};
 
-use super::keys::{KeyOutcome, handle_key};
+use super::keys::{KeyOutcome, handle_key, handle_scroll};
 use super::pump::{PumpError, pump_pty};
 use super::render::{apply_resize, render};
 use super::state::PtyShellState;
@@ -71,6 +71,14 @@ async fn drive(state: &mut PtyShellState, console: &mut dyn Console) -> Result<(
             // grid geometry and push it to the emulator + child. The guard
             // applies the resize and only marks dirty when geometry changed.
             Some(ConsoleEvent::Resize { .. }) if apply_resize(state, console) => {
+                dirty = true;
+            }
+            // Mouse wheel drives NMBL's scrollback exactly like
+            // Ctrl+Shift+Up/Down — a few rows per notch. A wheel notch is
+            // a scroll, not a keystroke, so it must NOT snap the view to
+            // the bottom and is never forwarded to the child PTY.
+            Some(ConsoleEvent::Scroll { up }) => {
+                handle_scroll(state, up);
                 dirty = true;
             }
             _ => {}

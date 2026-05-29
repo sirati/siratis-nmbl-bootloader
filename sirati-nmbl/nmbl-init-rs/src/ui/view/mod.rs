@@ -315,3 +315,18 @@ pub fn char_column_for_byte_cursor(s: &str, byte_idx: usize) -> usize {
     };
     s.get(..safe).map_or(0, |prefix| prefix.chars().count())
 }
+
+/// Build the bold `^` caret line that sits under a single-line text
+/// input, positioned at the char column of `byte_cursor` within `text`
+/// plus a fixed `prefix_cols` lead-in (e.g. a checkbox marker rendered
+/// to the left of the text). Shared by the cmdline editor
+/// ([`list_edit::render_edit`]) and the console picker's custom-path
+/// field so the byte→char conversion and spacing logic live in exactly
+/// one place.
+///
+/// [`list_edit::render_edit`]: super::list_edit::render_edit
+pub fn caret_line<'a>(text: &str, byte_cursor: usize, prefix_cols: usize) -> Line<'a> {
+    let col = prefix_cols.saturating_add(char_column_for_byte_cursor(text, byte_cursor));
+    let caret = format!("{}{}", " ".repeat(col), "^");
+    Line::styled(caret, Style::default().add_modifier(Modifier::BOLD))
+}

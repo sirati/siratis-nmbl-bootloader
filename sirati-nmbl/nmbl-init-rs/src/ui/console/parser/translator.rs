@@ -1,12 +1,16 @@
 use crossterm::event::{KeyCode as CtKeyCode, KeyEvent as CtKeyEvent, KeyModifiers as CtMods};
 use termwiz::input::{
     InputEvent, InputParser as TwInputParser, KeyCode as TwKeyCode, Modifiers as TwMods,
+    MouseButtons as TwMouseButtons,
 };
+
+use crate::ui::console::ConsoleEvent;
 
 /// Stateful translator wrapping [`termwiz::input::InputParser`] so the
 /// caller hands in raw bytes and pulls out
-/// `Option<crossterm::event::KeyEvent>` per recognised key. Mouse and
-/// paste events are dropped; the App state machine doesn't bind them.
+/// `Option<crossterm::event::KeyEvent>` per recognised key plus any
+/// mouse-wheel scroll notches. Non-wheel mouse events (motion, clicks)
+/// and paste are dropped; the App state machine doesn't bind them.
 pub(crate) struct TermwizToCrossterm {
     inner: TwInputParser,
 }
@@ -20,20 +24,67 @@ impl TermwizToCrossterm {
 
     /// Feed bytes into termwiz; drain matching events into `out` as
     /// crossterm `KeyEvent`s. Non-key events (mouse, paste, resize
-    /// from SIGWINCH) are discarded — NMBL doesn't bind them and the
-    /// CSI 8t pre-filter handles the resize path that matters.
+    /// from SIGWINCH) are discarded — callers that only bind keys (the
+    /// splash and mock backends) use this. The CSI 8t pre-filter handles
+    /// the resize path that matters.
     ///
     /// `maybe_more` is forwarded to termwiz so it knows whether a
     /// dangling `ESC` should commit as Esc (false) or wait for more
     /// bytes (true).
+    ///
+    /// Gated to the backends that actually use the key-only shape: the
+    /// splash kernel-VT path (no xterm mouse sequences) and the mock
+    /// console. The always-compiled tty backend uses [`Self::feed_events`]
+    /// directly, so without this gate `feed` would be dead code in the
+    /// default-feature lib build that crane clippy enforces.
+    #[cfg(any(feature = "image-splash", feature = "mocking"))]
     pub(crate) fn feed(&mut self, bytes: &[u8], maybe_more: bool, out: &mut Vec<CtKeyEvent>) {
+        // Reuse the richer path with a throwaway scroll sink so the two
+        // entry points can never drift; key-only callers just discard
+        // wheel notches (the splash kernel-VT path never produces any).
+        let mut scrolls = Vec::new();
+        self.feed_events(bytes, maybe_more, out, &mut scrolls);
+    }
+
+    /// Like [`Self::feed`], but also surfaces vertical mouse-wheel
+    /// notches as [`ConsoleEvent::Scroll`] into `scrolls`. Used by the
+    /// tty backend, the only input path that carries xterm mouse
+    /// sequences. Non-wheel mouse events (motion, clicks) and paste are
+    /// still dropped.
+    pub(crate) fn feed_events(
+        &mut self,
+        bytes: &[u8],
+        maybe_more: bool,
+        keys: &mut Vec<CtKeyEvent>,
+        scrolls: &mut Vec<ConsoleEvent>,
+    ) {
         let events = self.inner.parse_as_vec(bytes, maybe_more);
         for ev in events {
             if let Some(k) = to_crossterm_key(&ev) {
-                out.push(k);
+                keys.push(k);
+            } else if let Some(s) = to_scroll_event(&ev) {
+                scrolls.push(s);
             }
         }
     }
+}
+
+/// Map a termwiz `InputEvent::Mouse` carrying a vertical-wheel notch
+/// into a [`ConsoleEvent::Scroll`]. Wheel-up (xterm button 64 / termwiz
+/// `VERT_WHEEL | WHEEL_POSITIVE`) scrolls toward older scrollback;
+/// wheel-down (button 65 / `VERT_WHEEL` without `WHEEL_POSITIVE`)
+/// scrolls toward the live tail. Returns `None` for non-wheel mouse
+/// events and for horizontal-wheel notches (NMBL has no horizontal
+/// scrollback).
+fn to_scroll_event(ev: &InputEvent) -> Option<ConsoleEvent> {
+    let InputEvent::Mouse(m) = ev else {
+        return None;
+    };
+    if !m.mouse_buttons.contains(TwMouseButtons::VERT_WHEEL) {
+        return None;
+    }
+    let up = m.mouse_buttons.contains(TwMouseButtons::WHEEL_POSITIVE);
+    Some(ConsoleEvent::Scroll { up })
 }
 
 /// Map a single termwiz `InputEvent::Key` into the
@@ -93,11 +144,20 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
 
+    /// Feed bytes and return the key events — most parser tests only
+    /// care about the key path. Uses `feed_events` (always compiled)
+    /// rather than the feature-gated key-only `feed`.
+    fn feed_keys(t: &mut TermwizToCrossterm, bytes: &[u8], maybe_more: bool) -> Vec<CtKeyEvent> {
+        let mut keys = Vec::new();
+        let mut scrolls = Vec::new();
+        t.feed_events(bytes, maybe_more, &mut keys, &mut scrolls);
+        keys
+    }
+
     #[test]
     fn termwiz_to_crossterm_arrow_up() {
         let mut t = TermwizToCrossterm::new();
-        let mut out = Vec::new();
-        t.feed(b"\x1b[A", false, &mut out);
+        let out = feed_keys(&mut t, b"\x1b[A", false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].code, KeyCode::Up);
     }
@@ -105,8 +165,7 @@ mod tests {
     #[test]
     fn termwiz_to_crossterm_enter_via_cr() {
         let mut t = TermwizToCrossterm::new();
-        let mut out = Vec::new();
-        t.feed(b"\r", false, &mut out);
+        let out = feed_keys(&mut t, b"\r", false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].code, KeyCode::Enter);
     }
@@ -114,8 +173,7 @@ mod tests {
     #[test]
     fn termwiz_to_crossterm_plain_a() {
         let mut t = TermwizToCrossterm::new();
-        let mut out = Vec::new();
-        t.feed(b"a", false, &mut out);
+        let out = feed_keys(&mut t, b"a", false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].code, KeyCode::Char('a'));
         assert_eq!(out[0].modifiers, KeyModifiers::NONE);
@@ -124,8 +182,7 @@ mod tests {
     #[test]
     fn termwiz_to_crossterm_ctrl_c() {
         let mut t = TermwizToCrossterm::new();
-        let mut out = Vec::new();
-        t.feed(&[0x03], false, &mut out);
+        let out = feed_keys(&mut t, &[0x03], false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].code, KeyCode::Char('c'));
         assert!(out[0].modifiers.contains(KeyModifiers::CONTROL));
@@ -141,8 +198,7 @@ mod tests {
     #[test]
     fn modifier_encoded_ctrl_shift_up_decodes() {
         let mut t = TermwizToCrossterm::new();
-        let mut out = Vec::new();
-        t.feed(b"\x1b[1;6A", false, &mut out);
+        let out = feed_keys(&mut t, b"\x1b[1;6A", false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].code, KeyCode::Up);
         assert_eq!(
@@ -155,8 +211,7 @@ mod tests {
     fn bare_csi_up_carries_no_modifiers() {
         // What the kernel VT actually delivers for Ctrl+Shift+Up.
         let mut t = TermwizToCrossterm::new();
-        let mut out = Vec::new();
-        t.feed(b"\x1b[A", false, &mut out);
+        let out = feed_keys(&mut t, b"\x1b[A", false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].code, KeyCode::Up);
         assert_eq!(out[0].modifiers, KeyModifiers::NONE);
@@ -165,10 +220,40 @@ mod tests {
     #[test]
     fn termwiz_to_crossterm_esc_alone() {
         let mut t = TermwizToCrossterm::new();
-        let mut out = Vec::new();
         // `maybe_more = false` tells termwiz to commit Esc.
-        t.feed(b"\x1b", false, &mut out);
+        let out = feed_keys(&mut t, b"\x1b", false);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].code, KeyCode::Esc);
+    }
+
+    /// An xterm SGR mouse wheel-up report (`ESC [ < 64 ; col ; row M`)
+    /// surfaces as `ConsoleEvent::Scroll { up: true }` and produces no
+    /// key event; wheel-down (button 65) surfaces `up: false`.
+    #[test]
+    fn sgr_mouse_wheel_up_and_down_surface_scroll() {
+        let mut t = TermwizToCrossterm::new();
+        let mut keys = Vec::new();
+        let mut scrolls = Vec::new();
+        t.feed_events(b"\x1b[<64;10;10M", false, &mut keys, &mut scrolls);
+        assert!(keys.is_empty(), "wheel must not produce a key event");
+        assert_eq!(scrolls, vec![ConsoleEvent::Scroll { up: true }]);
+
+        keys.clear();
+        scrolls.clear();
+        t.feed_events(b"\x1b[<65;10;10M", false, &mut keys, &mut scrolls);
+        assert!(keys.is_empty(), "wheel must not produce a key event");
+        assert_eq!(scrolls, vec![ConsoleEvent::Scroll { up: false }]);
+    }
+
+    /// A non-wheel mouse click (`ESC [ < 0 ; col ; row M`, left button)
+    /// is dropped: no key and no scroll.
+    #[test]
+    fn sgr_mouse_click_dropped() {
+        let mut t = TermwizToCrossterm::new();
+        let mut keys = Vec::new();
+        let mut scrolls = Vec::new();
+        t.feed_events(b"\x1b[<0;10;10M", false, &mut keys, &mut scrolls);
+        assert!(keys.is_empty());
+        assert!(scrolls.is_empty(), "clicks are not in scope");
     }
 }

@@ -19,7 +19,19 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// Char insertion ignores `Char`s carrying CONTROL (so Ctrl+C doesn't
 /// type a literal 'c'); the recognised control combos (Ctrl+A/E/D and
 /// Alt+B/F, plus Ctrl+Left/Right) are handled explicitly.
-pub fn handle_key_on(buffer: &mut String, cursor: usize, key: KeyEvent) -> (usize, bool) {
+///
+/// `allow_word_motion` gates the word-wise jumps (Alt+B/F and
+/// Ctrl+Left/Right). The masked passphrase prompt passes `false`: a
+/// word jump there would reveal where the spaces sit in the secret, so
+/// those keys degrade to a single-char move instead. Absolute Home/End
+/// and Ctrl+A/E stay available either way — they don't expose word
+/// boundaries.
+pub fn handle_key_on(
+    buffer: &mut String,
+    cursor: usize,
+    key: KeyEvent,
+    allow_word_motion: bool,
+) -> (usize, bool) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
@@ -30,15 +42,19 @@ pub fn handle_key_on(buffer: &mut String, cursor: usize, key: KeyEvent) -> (usiz
             _ => (cursor, false),
         },
         KeyCode::Char(c) if alt => match c.to_ascii_lowercase() {
-            'b' => (word_left(buffer, cursor), true),
-            'f' => (word_right(buffer, cursor), true),
+            'b' if allow_word_motion => (word_left(buffer, cursor), true),
+            'f' if allow_word_motion => (word_right(buffer, cursor), true),
+            // Masked secret: degrade word motion to a single-char move so
+            // no word boundary (and no space position) is revealed.
+            'b' => (move_left(buffer, cursor), true),
+            'f' => (move_right(buffer, cursor), true),
             _ => (cursor, false),
         },
         KeyCode::Char(c) => (insert_char(buffer, cursor, c), true),
         KeyCode::Backspace => (backspace(buffer, cursor), true),
         KeyCode::Delete => (delete(buffer, cursor), true),
-        KeyCode::Left if ctrl => (word_left(buffer, cursor), true),
-        KeyCode::Right if ctrl => (word_right(buffer, cursor), true),
+        KeyCode::Left if ctrl && allow_word_motion => (word_left(buffer, cursor), true),
+        KeyCode::Right if ctrl && allow_word_motion => (word_right(buffer, cursor), true),
         KeyCode::Left => (move_left(buffer, cursor), true),
         KeyCode::Right => (move_right(buffer, cursor), true),
         KeyCode::Home => (0, true),

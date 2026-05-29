@@ -34,7 +34,8 @@ pub(crate) fn render_picker_frame(frame: &mut Frame<'_>, state: &PickerState) {
     let list_height = u16::try_from(state.candidates.len().saturating_add(2)).unwrap_or(u16::MAX);
     let [list_area, custom_area, button_area] = Layout::vertical([
         Constraint::Length(list_height),
-        Constraint::Length(3),
+        // 4 rows: 2 borders + the input line + the caret line.
+        Constraint::Length(4),
         Constraint::Length(3),
     ])
     .areas::<3>(modal);
@@ -164,19 +165,35 @@ fn render_custom_input(frame: &mut Frame<'_>, area: Rect, state: &PickerState) {
     } else {
         "custom (/dev/X)"
     };
-    let cursor_suffix = if focused { "|" } else { "" };
-    let body = Line::from(vec![
+    // Width of the "[x] " (marker + separating space) prefix in display
+    // columns, so the caret line below lines up under the input text.
+    let marker_cols = marker.chars().count().saturating_add(1);
+    let text_line = Line::from(vec![
         Span::styled(marker, marker_style),
         Span::raw(" "),
-        Span::styled(format!("{}{cursor_suffix}", state.custom_input), text_style),
+        Span::styled(state.custom_input.clone(), text_style),
     ]);
     let block_style = if focused {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
-    let para =
-        Paragraph::new(body).block(Block::bordered().title(Span::styled(title, block_style)));
+    let block = Block::bordered().title(Span::styled(title, block_style));
+    // When focused, draw a caret on a second line under the cursor
+    // column (byte→char column conversion mirrors the cmdline editor's
+    // `render_edit`), offset by the marker prefix. Unfocused fields
+    // omit the caret to avoid implying input focus.
+    let lines = if focused {
+        // Reuse the cmdline editor's caret helper; the marker prefix is
+        // passed as the lead-in column offset so the caret aligns under
+        // the input text rather than the "[x] " marker.
+        let caret =
+            crate::ui::view::caret_line(&state.custom_input, state.custom_cursor, marker_cols);
+        vec![text_line, caret]
+    } else {
+        vec![text_line]
+    };
+    let para = Paragraph::new(lines).block(block);
     frame.render_widget(para, area);
 }
 

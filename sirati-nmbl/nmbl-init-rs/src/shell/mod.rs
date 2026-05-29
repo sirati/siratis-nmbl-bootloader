@@ -81,7 +81,7 @@ use crate::ui::console::{Console, open_console};
 use crate::ui::emergency_actions::{retry_boot, surface_action_failure, verify_kexec_readiness};
 use crate::ui::{
     EmergencyChoice, SessionInteraction, TuiPasswordSupplier, build_emergency_app, build_message,
-    default_items, run_emergency_screen_with_app,
+    default_items, resolve_emergency_timeout, run_emergency_screen_with_app,
 };
 
 /// Print the operator-facing emergency banner and drive the
@@ -139,6 +139,10 @@ pub async fn drop_to_emergency(
     // along with how many have been seen — see `update_latest_error`.
     let mut error_count: u32 = 0;
 
+    // Resolve the auto-reboot countdown once: an operator-configured
+    // `emergency_timeout_secs` overrides the built-in 30 s default.
+    let emergency_timeout = resolve_emergency_timeout(config);
+
     // Re-entrant picker. The Raw Shell, Pretty Shell, Retry boot, and
     // Verify kexec readiness branches all return control to this loop
     // on exit (sub-shell ended, retry failed, operator picked Back).
@@ -154,7 +158,8 @@ pub async fn drop_to_emergency(
         // cleared before re-entering the picker; otherwise a stale
         // overlay would obscure the menu.
         app.modal = None;
-        let choice = run_emergency_screen_with_app(&mut *console, &mut app).await;
+        let choice =
+            run_emergency_screen_with_app(&mut *console, &mut app, emergency_timeout).await;
 
         match choice {
             EmergencyChoice::Reboot => {

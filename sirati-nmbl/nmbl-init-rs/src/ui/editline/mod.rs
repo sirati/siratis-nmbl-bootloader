@@ -106,7 +106,8 @@ impl EditableLine {
     /// can skip its own fallthrough), `false` for keys the line doesn't
     /// own (Enter, Esc, Tab, …) which the caller routes elsewhere.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
-        let (new_cursor, handled) = handle_key_on(&mut self.buffer, self.cursor, key);
+        // The cmdline editor is not a secret, so word motion is useful.
+        let (new_cursor, handled) = handle_key_on(&mut self.buffer, self.cursor, key, true);
         self.cursor = new_cursor;
         handled
     }
