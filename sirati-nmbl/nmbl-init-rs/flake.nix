@@ -51,15 +51,19 @@
         # -Oz, fat LTO, single codegen unit, strip — all for minimum image size.
         commonArgs = {
           # `cleanCargoSource` keeps only Rust/Cargo files, which drops the
-          # compiled terminfo entry bundled via `include_bytes!`
-          # (`src/ui/console/data/xterm-256color`). Union it back in so the
-          # crate compiles; without `cup` from this entry termwiz transposes
-          # row/col on every incremental serial repaint.
+          # binary blobs bundled via `include_bytes!`:
+          #   * the compiled terminfo entry (`src/ui/console/data/xterm-256color`)
+          #     — without `cup` from it termwiz transposes row/col on every
+          #     incremental serial repaint, and
+          #   * the embedded splash fallback font (`src/splash/data/`) used when
+          #     the configured font fails to load.
+          # Union them back in so the crate compiles.
           src = pkgs.lib.fileset.toSource {
             root = ./.;
             fileset = pkgs.lib.fileset.unions [
               (craneLib.fileset.commonCargoSources ./.)
               ./src/ui/console/data/xterm-256color
+              ./src/splash/data
             ];
           };
           strictDeps = true;
