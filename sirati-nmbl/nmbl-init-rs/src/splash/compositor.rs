@@ -116,25 +116,21 @@ pub fn blit_background(fb: &mut [u8], fb_dims: FramebufferDims, bg_rgba: &[u8]) 
     }
 }
 
-/// Fill the cell rectangle at `(cell_x, cell_y)` pixels with `bg` (if
-/// `bg.3 > 0`), then alpha-blend the glyph in `fg` color over it. Any
-/// pixel that would fall outside the framebuffer is silently clipped.
+/// Fill the cell rectangle at `(cell_x, cell_y)` pixels with `bg`,
+/// alpha-blending it over whatever the framebuffer already holds (PNG
+/// background, or the halo). No-op when `bg.3 == 0`. Any pixel that
+/// would fall outside the framebuffer is silently clipped.
 ///
-/// The background fill always covers the whole cell box
-/// (`cell_w` × `cell_h`). The glyph overlay honours
-/// `glyph.offset_x` / `glyph.offset_y` so the bitmap sits at
-/// `(cell_x + offset_x, cell_y + offset_y)`; offsets are signed and can
-/// place the bitmap outside the cell box (e.g. descenders), in which
-/// case the surrounding cells overlap visually. Out-of-framebuffer
-/// pixels are clipped without overflow.
-pub fn blit_cell(
-    fb: &mut [u8],
-    fb_dims: FramebufferDims,
-    glyph: &GlyphBitmap,
-    cell: CellRect,
-    fg: RgbaColor,
-    bg: RgbaColor,
-) {
+/// This is the **background** half of the old single-pass `blit_cell`:
+/// it always covers the whole cell box (`cell_w` × `cell_h`). Glyph
+/// foreground is no longer painted here — text is collected into a
+/// [`TextLayer`] and composited once, on top of all the cell-bg fills,
+/// so overlapping semi-transparent glyphs do not double-composite (the
+/// "white dots along borders" bug).
+pub fn fill_cell_bg(fb: &mut [u8], fb_dims: FramebufferDims, cell: CellRect, bg: RgbaColor) {
+    if bg.3 == 0 {
+        return;
+    }
     let stride = fb_dims.stride as usize;
     let fb_w = fb_dims.w;
     let fb_h = fb_dims.h;
@@ -145,90 +141,224 @@ pub fn blit_cell(
         h: cell_h,
     } = cell;
 
-    // Stage 1: background fill over the full cell box.
-    if bg.3 > 0 {
-        let RgbaColor(br, bg_g, bb, ba) = bg;
-        for cy in 0..cell_h {
-            let py = cell_y.saturating_add(cy);
-            if py >= fb_h {
+    let RgbaColor(br, bg_g, bb, ba) = bg;
+    for cy in 0..cell_h {
+        let py = cell_y.saturating_add(cy);
+        if py >= fb_h {
+            break;
+        }
+        let row_off = (py as usize).saturating_mul(stride);
+        for cx in 0..cell_w {
+            let px = cell_x.saturating_add(cx);
+            if px >= fb_w {
                 break;
             }
-            let row_off = (py as usize).saturating_mul(stride);
-            for cx in 0..cell_w {
-                let px = cell_x.saturating_add(cx);
-                if px >= fb_w {
-                    break;
-                }
-                let pix_off = row_off.saturating_add((px as usize).saturating_mul(4));
-                let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
-                    continue;
-                };
-                let (dr, dg, db) = read_bgrx(dst);
-                let (nr, ng, nb) = src_over(br, bg_g, bb, ba, dr, dg, db);
-                write_bgrx(dst, nr, ng, nb);
-            }
-        }
-    }
-
-    // Stage 2: glyph overlay positioned by the per-glyph offset.
-    // The blend alpha combines glyph coverage with the foreground's
-    // own alpha (e.g. NamedColor::Foreground at 0x99 for the
-    // 60% white) so that an "unset fg" still respects the palette.
-    let RgbaColor(fr, fg_g, fb_c, fa) = fg;
-    if fa == 0 {
-        return;
-    }
-    let fa16 = u16::from(fa);
-    for gy in 0..glyph.height {
-        let dy = i64::from(cell_y) + i64::from(glyph.offset_y) + i64::from(gy);
-        if dy < 0 {
-            continue;
-        }
-        let dy = dy as u64;
-        if dy >= u64::from(fb_h) {
-            continue;
-        }
-        let row_off = (dy as usize).saturating_mul(stride);
-
-        for gx in 0..glyph.width {
-            let dx = i64::from(cell_x) + i64::from(glyph.offset_x) + i64::from(gx);
-            if dx < 0 {
-                continue;
-            }
-            let dx = dx as u64;
-            if dx >= u64::from(fb_w) {
-                continue;
-            }
-
-            let cov_idx = (gy as usize)
-                .saturating_mul(glyph.width as usize)
-                .saturating_add(gx as usize);
-            let coverage = glyph.coverage.get(cov_idx).copied().unwrap_or(0);
-            if coverage == 0 {
-                continue;
-            }
-            // (coverage * fa + 127) / 255 — round-to-nearest, keeps
-            // the +127 trick from src_over so the two stages share
-            // identical rounding behaviour.
-            let effective = ((u16::from(coverage).saturating_mul(fa16)) + 127) / 255;
-            let effective = if effective > 255 {
-                255u8
-            } else {
-                effective as u8
-            };
-            if effective == 0 {
-                continue;
-            }
-
-            let pix_off = row_off.saturating_add((dx as usize).saturating_mul(4));
+            let pix_off = row_off.saturating_add((px as usize).saturating_mul(4));
             let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
                 continue;
             };
             let (dr, dg, db) = read_bgrx(dst);
-            let (nr, ng, nb) = src_over(fr, fg_g, fb_c, effective, dr, dg, db);
+            let (nr, ng, nb) = src_over(br, bg_g, bb, ba, dr, dg, db);
             write_bgrx(dst, nr, ng, nb);
         }
     }
+}
+
+/// Intermediate foreground-text layer.
+///
+/// Mirrors [`HaloMask`]'s bbox-bounded, framebuffer-sized scratch
+/// approach but stores, per pixel, a resolved COLOR + a single resolved
+/// ALPHA instead of a coverage byte. Foreground glyphs are stamped here
+/// (no compositing onto the background during the pass), then the whole
+/// layer is composited onto the framebuffer ONCE.
+///
+/// The point is to lay each pixel's foreground down exactly once. Where
+/// two semi-transparent glyphs overlap (box-drawing runs, adjacent
+/// chars bleeding a pixel at cell joins) the old per-glyph path
+/// alpha-composited the same 60% white twice, brightening the overlap
+/// into a bright dot. Here overlaps combine by **MAX alpha** (never
+/// additively), so two identical 60%-white glyphs resolve to a single
+/// 60% pixel — no doubled dot — while a non-overlapping pixel is bit for
+/// bit what the old per-glyph composite produced.
+pub struct TextLayer {
+    /// Per-pixel RGB, row-major `w * h * 3`. Only meaningful where the
+    /// matching `alpha` slot is non-zero.
+    color: Vec<u8>,
+    /// Per-pixel resolved alpha, row-major `w * h`. 0 = untouched.
+    alpha: Vec<u8>,
+    w: usize,
+    h: usize,
+    /// Inclusive bbox of touched pixels, `None` until the first stamp.
+    /// Bounds the composite region (text doesn't blur → no spread).
+    bbox: Option<(usize, usize, usize, usize)>,
+}
+
+impl TextLayer {
+    /// Allocate a zeroed layer matching the framebuffer pixel
+    /// dimensions. Like [`HaloMask::new`] the buffer is full-frame for
+    /// O(1) addressing but composite cost is bounded to the stamped bbox.
+    #[must_use]
+    pub fn new(fb_dims: FramebufferDims) -> Self {
+        let w = fb_dims.w as usize;
+        let h = fb_dims.h as usize;
+        let pixels = w.saturating_mul(h);
+        Self {
+            color: vec![0u8; pixels.saturating_mul(3)],
+            alpha: vec![0u8; pixels],
+            w,
+            h,
+            bbox: None,
+        }
+    }
+
+    /// Stamp one glyph's coverage into the layer using the same
+    /// positioning and clipping as the old `blit_cell` glyph stage: the
+    /// bitmap sits at `(cell.x + offset_x, cell.y + offset_y)` and
+    /// out-of-framebuffer pixels are clipped. A space (empty glyph) or a
+    /// fully-transparent `fg` contributes nothing.
+    ///
+    /// Per pixel the effective alpha is `round(coverage * fg.alpha /
+    /// 255)`. Overlaps combine by MAX: if the new alpha exceeds the
+    /// pixel's current alpha, BOTH the alpha and the stored color are
+    /// overwritten so the higher-coverage contributor wins its color.
+    /// Alpha is never additively accumulated.
+    pub fn stamp(&mut self, glyph: &GlyphBitmap, cell: CellRect, fg: RgbaColor) {
+        let RgbaColor(fr, fg_g, fb_c, fa) = fg;
+        if fa == 0 || self.w == 0 || self.h == 0 {
+            return;
+        }
+        let gw = glyph.width as usize;
+        let gh = glyph.height as usize;
+        if gw == 0 || gh == 0 {
+            return;
+        }
+        let fa16 = u16::from(fa);
+        let base_x = i64::from(cell.x) + i64::from(glyph.offset_x);
+        let base_y = i64::from(cell.y) + i64::from(glyph.offset_y);
+        for gy in 0..gh {
+            let dy = base_y + gy as i64;
+            if dy < 0 || dy as u64 >= self.h as u64 {
+                continue;
+            }
+            let dy = dy as usize;
+            let row = dy.saturating_mul(self.w);
+            let cov_row = gy.saturating_mul(gw);
+            for gx in 0..gw {
+                let coverage = glyph
+                    .coverage
+                    .get(cov_row.saturating_add(gx))
+                    .copied()
+                    .unwrap_or(0);
+                if coverage == 0 {
+                    continue;
+                }
+                let dx = base_x + gx as i64;
+                if dx < 0 || dx as u64 >= self.w as u64 {
+                    continue;
+                }
+                let dx = dx as usize;
+                // (coverage * fa + 127) / 255 — round-to-nearest, the
+                // identical rounding the old per-glyph stage used so a
+                // non-overlapping pixel lands on the same effective
+                // alpha (and thus the same composite) as before.
+                let effective = ((u16::from(coverage).saturating_mul(fa16)) + 127) / 255;
+                let effective = if effective > 255 {
+                    255u8
+                } else {
+                    effective as u8
+                };
+                if effective == 0 {
+                    continue;
+                }
+                // MAX-combine: only the strongest contributor at this
+                // pixel survives, taking its color with it. Two equal
+                // 60%-white glyphs therefore resolve to one 60% pixel.
+                let idx = row.saturating_add(dx);
+                let cur = self.alpha.get(idx).copied().unwrap_or(0);
+                if effective > cur {
+                    if let Some(slot) = self.alpha.get_mut(idx) {
+                        *slot = effective;
+                    }
+                    let coff = idx.saturating_mul(3);
+                    if let Some(c) = self.color.get_mut(coff..coff.saturating_add(3)) {
+                        c[0] = fr;
+                        c[1] = fg_g;
+                        c[2] = fb_c;
+                    }
+                    self.bbox = Some(match self.bbox {
+                        None => (dx, dy, dx, dy),
+                        Some((x0, y0, x1, y1)) => (x0.min(dx), y0.min(dy), x1.max(dx), y1.max(dy)),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Composite the whole layer onto the framebuffer ONCE: for every
+    /// touched pixel with alpha > 0, run a single Oklab [`src_over`] of
+    /// the stored color at the resolved alpha. Only the stamped bbox is
+    /// walked, so an empty or small text region costs accordingly.
+    ///
+    /// Must be called *after* the cell-background fills so the text sits
+    /// on top of any selection highlight.
+    pub fn composite_onto(&self, fb: &mut [u8], fb_dims: FramebufferDims) {
+        let Some((bx0, by0, bx1, by1)) = self.bbox else {
+            return;
+        };
+        if self.w == 0 || self.h == 0 {
+            return;
+        }
+        let stride = fb_dims.stride as usize;
+        for py in by0..=by1 {
+            if py as u64 >= u64::from(fb_dims.h) {
+                break;
+            }
+            let row_off = py.saturating_mul(stride);
+            let layer_row = py.saturating_mul(self.w);
+            for px in bx0..=bx1 {
+                if px as u64 >= u64::from(fb_dims.w) {
+                    break;
+                }
+                let idx = layer_row.saturating_add(px);
+                let a = self.alpha.get(idx).copied().unwrap_or(0);
+                if a == 0 {
+                    continue;
+                }
+                let coff = idx.saturating_mul(3);
+                let Some(c) = self.color.get(coff..coff.saturating_add(3)) else {
+                    continue;
+                };
+                let (sr, sg, sb) = (c[0], c[1], c[2]);
+                let pix_off = row_off.saturating_add(px.saturating_mul(4));
+                let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
+                    continue;
+                };
+                let (dr, dg, db) = read_bgrx(dst);
+                let (nr, ng, nb) = src_over(sr, sg, sb, a, dr, dg, db);
+                write_bgrx(dst, nr, ng, nb);
+            }
+        }
+    }
+}
+
+/// Fill the cell rectangle with `bg` then alpha-blend the glyph in `fg`
+/// over it, in a single self-contained pass. Retained as a convenience
+/// for callers that paint one cell in isolation (and for the unit
+/// tests); the live splash pipeline now uses [`fill_cell_bg`] +
+/// [`TextLayer`] so overlapping glyphs composite once. The visible
+/// result for a single isolated cell is identical to the layered path.
+pub fn blit_cell(
+    fb: &mut [u8],
+    fb_dims: FramebufferDims,
+    glyph: &GlyphBitmap,
+    cell: CellRect,
+    fg: RgbaColor,
+    bg: RgbaColor,
+) {
+    fill_cell_bg(fb, fb_dims, cell, bg);
+    let mut layer = TextLayer::new(fb_dims);
+    layer.stamp(glyph, cell, fg);
+    layer.composite_onto(fb, fb_dims);
 }
 
 /// Whether a cell should get the dark contrast halo behind its glyph.
@@ -1314,6 +1444,246 @@ mod tests {
         assert!(
             dark_after <= bright_after,
             "result on dark bg ({dark_after}) must be <= result on bright bg ({bright_after})"
+        );
+    }
+
+    /// Regression for the "white dots along borders" bug: two identical
+    /// semi-transparent-white glyphs that overlap one pixel must, after
+    /// the MAX-alpha layer combine, composite that pixel exactly ONCE —
+    /// i.e. land on the same value as a single 60%-white src_over, not a
+    /// doubled (brighter) one.
+    #[test]
+    fn text_layer_overlap_composites_once_not_doubled() {
+        let dims = FramebufferDims {
+            w: 2,
+            h: 1,
+            stride: 8,
+        };
+        // dst = (10, 20, 30) → BGRX (30, 20, 10, 0) at both pixels.
+        let mk_fb = || {
+            let mut fb = vec![0u8; (dims.stride * dims.h) as usize];
+            for x in 0..2usize {
+                let o = x * 4;
+                fb[o] = 30;
+                fb[o + 1] = 20;
+                fb[o + 2] = 10;
+            }
+            fb
+        };
+
+        // 60% white, the NamedColor::Foreground tone.
+        let fg = RgbaColor(0xFF, 0xFF, 0xFF, 0x99);
+        // Single 1×1 full-coverage glyph at pixel (0,0).
+        let g = GlyphBitmap {
+            width: 1,
+            height: 1,
+            coverage: vec![255],
+            offset_x: 0,
+            offset_y: 0,
+        };
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        };
+
+        // Reference: a SINGLE stamp+composite at pixel (0,0).
+        let mut single = mk_fb();
+        {
+            let mut layer = TextLayer::new(dims);
+            layer.stamp(&g, rect, fg);
+            layer.composite_onto(&mut single, dims);
+        }
+
+        // Doubled scenario: TWO identical glyphs both hitting pixel (0,0)
+        // (the cell-join overlap). MAX-combine must collapse them to one.
+        let mut overlap = mk_fb();
+        {
+            let mut layer = TextLayer::new(dims);
+            layer.stamp(&g, rect, fg);
+            layer.stamp(&g, rect, fg);
+            layer.composite_onto(&mut overlap, dims);
+        }
+
+        assert_eq!(
+            &overlap[0..3],
+            &single[0..3],
+            "overlapping identical 60%-white glyphs must composite once, not doubled"
+        );
+    }
+
+    /// A non-overlapping glyph pixel routed through the TextLayer must
+    /// produce the same framebuffer value as the old per-glyph path (a
+    /// single `src_over` at `round(coverage * fg.alpha / 255)`).
+    #[test]
+    fn text_layer_non_overlap_matches_per_glyph() {
+        let dims = FramebufferDims {
+            w: 2,
+            h: 2,
+            stride: 8,
+        };
+        let mk_fb = || {
+            let mut fb = vec![0u8; (dims.stride * dims.h) as usize];
+            for i in 0..fb.len() / 4 {
+                let o = i * 4;
+                fb[o] = 70;
+                fb[o + 1] = 90;
+                fb[o + 2] = 110;
+            }
+            fb
+        };
+        let fg = RgbaColor(0xFF, 0xFF, 0xFF, 0x99);
+        let g = GlyphBitmap {
+            width: 1,
+            height: 1,
+            coverage: vec![200],
+            offset_x: 0,
+            offset_y: 0,
+        };
+        let rect = CellRect {
+            x: 1,
+            y: 1,
+            w: 1,
+            h: 1,
+        };
+
+        // Layered path.
+        let mut layered = mk_fb();
+        {
+            let mut layer = TextLayer::new(dims);
+            layer.stamp(&g, rect, fg);
+            layer.composite_onto(&mut layered, dims);
+        }
+
+        // Direct src_over with the same effective alpha the stamp uses:
+        // round(200 * 0x99 / 255).
+        let mut direct = mk_fb();
+        {
+            let eff = ((u16::from(200u8) * u16::from(0x99u8)) + 127) / 255;
+            let eff = eff as u8;
+            let off = 8 + 4; // pixel (1,1)
+            let (dr, dg, db) = read_bgrx(&direct[off..off + 4]);
+            let (nr, ng, nb) = src_over(0xFF, 0xFF, 0xFF, eff, dr, dg, db);
+            write_bgrx(&mut direct[off..off + 4], nr, ng, nb);
+        }
+
+        assert_eq!(
+            layered, direct,
+            "non-overlapping pixel must match the direct per-glyph composite"
+        );
+    }
+
+    /// Selection: a cell with an opaque-ish bg fill plus a glyph. The bg
+    /// fill must be present where the glyph has no ink, and the text
+    /// must sit on top of the fill where it does (bg drawn first, text
+    /// layer last).
+    #[test]
+    fn fill_bg_then_text_layer_ordering() {
+        let dims = FramebufferDims {
+            w: 2,
+            h: 1,
+            stride: 8,
+        };
+        let mut fb = vec![0u8; (dims.stride * dims.h) as usize];
+
+        let bg = RgbaColor(0xD3, 0xD7, 0xCF, 0xFF); // opaque selection-ish fill
+        // Glyph inks only pixel (0,0); pixel (1,0) is bare bg.
+        let glyph = GlyphBitmap {
+            width: 2,
+            height: 1,
+            coverage: vec![255, 0],
+            offset_x: 0,
+            offset_y: 0,
+        };
+        let fg = RgbaColor(0x10, 0x10, 0x10, 0xFF); // dark text
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            w: 2,
+            h: 1,
+        };
+
+        // bg fills first...
+        fill_cell_bg(&mut fb, dims, rect, bg);
+        // ...then text layer on top.
+        let mut layer = TextLayer::new(dims);
+        layer.stamp(&glyph, rect, fg);
+        layer.composite_onto(&mut fb, dims);
+
+        // Pixel (0,0): full-coverage dark text overwrites the fill.
+        assert_eq!(&fb[0..3], &[0x10, 0x10, 0x10], "text over fill at (0,0)");
+        // Pixel (1,0): no ink → the bg fill shows (BGRX = CF D7 D3).
+        assert_eq!(&fb[4..7], &[0xCF, 0xD7, 0xD3], "bg fill at (1,0)");
+    }
+
+    /// Multi-colour overlap: when two differently-coloured glyphs touch
+    /// the same pixel, the higher-coverage contributor's colour wins,
+    /// and MAX is order-independent.
+    #[test]
+    fn text_layer_higher_coverage_color_wins() {
+        let dims = FramebufferDims {
+            w: 1,
+            h: 1,
+            stride: 4,
+        };
+        let g_low = GlyphBitmap {
+            width: 1,
+            height: 1,
+            coverage: vec![80],
+            offset_x: 0,
+            offset_y: 0,
+        };
+        let g_high = GlyphBitmap {
+            width: 1,
+            height: 1,
+            coverage: vec![255],
+            offset_x: 0,
+            offset_y: 0,
+        };
+        let rect = CellRect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        };
+        let red = RgbaColor(0xCC, 0x00, 0x00, 0xFF);
+        let green = RgbaColor(0x00, 0xCC, 0x00, 0xFF);
+
+        // Low-coverage red then high-coverage green: green (higher
+        // coverage → higher alpha) must claim the pixel colour. Full
+        // coverage + opaque green → src replaces dst (BGRX = 00 CC 00).
+        let mut fb = vec![0u8; 4];
+        let mut layer = TextLayer::new(dims);
+        layer.stamp(&g_low, rect, red);
+        layer.stamp(&g_high, rect, green);
+        layer.composite_onto(&mut fb, dims);
+        assert_eq!(&fb[0..3], &[0x00, 0xCC, 0x00], "higher-coverage green wins");
+
+        // Reverse order → MAX keeps the same winner.
+        let mut fb2 = vec![0u8; 4];
+        let mut layer2 = TextLayer::new(dims);
+        layer2.stamp(&g_high, rect, green);
+        layer2.stamp(&g_low, rect, red);
+        layer2.composite_onto(&mut fb2, dims);
+        assert_eq!(&fb2[0..3], &[0x00, 0xCC, 0x00], "MAX is order-independent");
+    }
+
+    #[test]
+    fn text_layer_empty_is_noop() {
+        let dims = FramebufferDims {
+            w: 8,
+            h: 8,
+            stride: 32,
+        };
+        let (mut fb, _) = grey_fb(8, 123);
+        let before = fb.clone();
+        // No stamps → bbox None → composite is a no-op.
+        let layer = TextLayer::new(dims);
+        layer.composite_onto(&mut fb, dims);
+        assert_eq!(
+            fb, before,
+            "empty text layer must not touch the framebuffer"
         );
     }
 

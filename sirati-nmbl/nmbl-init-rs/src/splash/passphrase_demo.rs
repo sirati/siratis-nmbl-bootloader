@@ -295,7 +295,10 @@ fn render_frame(
             halo.stamp(glyph, rect);
         });
         halo.composite_onto(fb, fb_dims);
-        // Pass 2: cell backgrounds + glyphs.
+        // Pass 2: cell-background fills first, then all glyphs collected
+        // into one text layer composited once on top (mirrors
+        // ui::render_splash_frame_with — kills the doubled "white dots").
+        let mut text_layer = compositor::TextLayer::new(fb_dims);
         term_pipe.for_each_cell(|col, row, cell| {
             if cell.c == ' ' && cell.bg == AnsiColor::Named(NamedColor::Background) {
                 return;
@@ -314,8 +317,10 @@ fn render_frame(
                 w: cell_dims.cell_w,
                 h: cell_dims.cell_h,
             };
-            compositor::blit_cell(fb, fb_dims, glyph, rect, fg, bg);
+            compositor::fill_cell_bg(fb, fb_dims, rect, bg);
+            text_layer.stamp(glyph, rect, fg);
         });
+        text_layer.composite_onto(fb, fb_dims);
         Ok(())
     })
 }
