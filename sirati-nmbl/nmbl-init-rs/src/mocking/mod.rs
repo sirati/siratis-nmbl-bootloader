@@ -60,8 +60,8 @@ use crate::ui::console::parser::TermwizToCrossterm;
 use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
 use crate::ui::render_current_screen;
 use crate::ui::{
-    passphrase_prompt_on_console, show_modal_buttons, show_modal_confirm, show_modal_error,
-    show_wrong_password_modal,
+    SessionInteraction, passphrase_prompt_on_console, show_modal_buttons, show_modal_confirm,
+    show_modal_error, show_wrong_password_modal,
 };
 
 /// Parsed `--debug-tui -- <scenario> [args...]` invocation.
@@ -199,7 +199,7 @@ fn run_wrong_password(console: &mut MockConsole, args: &[String]) -> Result<()> 
 /// test harness can distinguish the two outcomes from the exit code.
 fn run_passphrase(console: &mut MockConsole, args: &[String]) -> Result<()> {
     let label = arg_or_default(args, 0, "Unlock root");
-    match passphrase_prompt_on_console(console, &label) {
+    match passphrase_prompt_on_console(console, &label, &SessionInteraction::new()) {
         Ok(secret) => {
             eprintln!("[mocking] passphrase entered='{}'", &**secret);
             Ok(())
