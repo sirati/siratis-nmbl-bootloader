@@ -72,61 +72,23 @@ where
             && let Some(v) = iter.next()
         {
             validate_config = Some(PathBuf::from(v));
-        } else if let Some(rest) = arg.strip_prefix("--init-state=") {
+        } else if let Some(value) = parse_stateful_flag(&arg, "--init-state", &mut iter)? {
             #[cfg(feature = "stateful")]
             {
-                init_state_dir = Some(PathBuf::from(rest));
+                init_state_dir = Some(value);
             }
             #[cfg(not(feature = "stateful"))]
             {
-                let _ = rest;
-                return Err(
-                    "--init-state requires nmbl-init to be built with the `stateful` feature"
-                        .to_string(),
-                );
+                let _ = value;
             }
-        } else if arg == "--init-state" {
+        } else if let Some(value) = parse_stateful_flag(&arg, "--boot-succeeded", &mut iter)? {
             #[cfg(feature = "stateful")]
             {
-                let Some(v) = iter.next() else {
-                    return Err("--init-state requires a directory argument".to_string());
-                };
-                init_state_dir = Some(PathBuf::from(v));
+                boot_succeeded_dir = Some(value);
             }
             #[cfg(not(feature = "stateful"))]
             {
-                return Err(
-                    "--init-state requires nmbl-init to be built with the `stateful` feature"
-                        .to_string(),
-                );
-            }
-        } else if let Some(rest) = arg.strip_prefix("--boot-succeeded=") {
-            #[cfg(feature = "stateful")]
-            {
-                boot_succeeded_dir = Some(PathBuf::from(rest));
-            }
-            #[cfg(not(feature = "stateful"))]
-            {
-                let _ = rest;
-                return Err(
-                    "--boot-succeeded requires nmbl-init to be built with the `stateful` feature"
-                        .to_string(),
-                );
-            }
-        } else if arg == "--boot-succeeded" {
-            #[cfg(feature = "stateful")]
-            {
-                let Some(v) = iter.next() else {
-                    return Err("--boot-succeeded requires a directory argument".to_string());
-                };
-                boot_succeeded_dir = Some(PathBuf::from(v));
-            }
-            #[cfg(not(feature = "stateful"))]
-            {
-                return Err(
-                    "--boot-succeeded requires nmbl-init to be built with the `stateful` feature"
-                        .to_string(),
-                );
+                let _ = value;
             }
         }
     }
@@ -157,6 +119,52 @@ where
         #[cfg(feature = "stateful")]
         boot_succeeded_dir,
     })
+}
+
+/// Recognise a stateful-only flag (`--init-state` / `--boot-succeeded`)
+/// in both `--flag=<v>` and `--flag <v>` forms. Returns `Ok(None)` when
+/// `arg` is not this flag, `Ok(Some(path))` when it matched and the path
+/// was consumed (stateful builds only), `Err` when the path argument is
+/// missing or — on a non-stateful build — the flag was used at all.
+fn parse_stateful_flag<I>(
+    arg: &str,
+    flag: &'static str,
+    iter: &mut I,
+) -> std::result::Result<Option<PathBuf>, String>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    let equals_prefix = format!("{flag}=");
+    if let Some(rest) = arg.strip_prefix(&equals_prefix) {
+        #[cfg(feature = "stateful")]
+        {
+            return Ok(Some(PathBuf::from(rest)));
+        }
+        #[cfg(not(feature = "stateful"))]
+        {
+            let _ = rest;
+            return Err(format!(
+                "{flag} requires nmbl-init to be built with the `stateful` feature"
+            ));
+        }
+    }
+    if arg == flag {
+        #[cfg(feature = "stateful")]
+        {
+            let Some(v) = iter.next() else {
+                return Err(format!("{flag} requires a directory argument"));
+            };
+            return Ok(Some(PathBuf::from(v)));
+        }
+        #[cfg(not(feature = "stateful"))]
+        {
+            let _ = iter;
+            return Err(format!(
+                "{flag} requires nmbl-init to be built with the `stateful` feature"
+            ));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
