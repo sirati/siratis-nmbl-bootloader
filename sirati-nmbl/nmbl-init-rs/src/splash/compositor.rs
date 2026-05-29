@@ -312,7 +312,11 @@ impl HaloMask {
             let row = dy.saturating_mul(self.w);
             let cov_row = gy.saturating_mul(gw);
             for gx in 0..gw {
-                let cov = glyph.coverage.get(cov_row.saturating_add(gx)).copied().unwrap_or(0);
+                let cov = glyph
+                    .coverage
+                    .get(cov_row.saturating_add(gx))
+                    .copied()
+                    .unwrap_or(0);
                 if cov == 0 {
                     continue;
                 }
@@ -328,9 +332,7 @@ impl HaloMask {
                 }
                 self.bbox = Some(match self.bbox {
                     None => (dx, dy, dx, dy),
-                    Some((x0, y0, x1, y1)) => {
-                        (x0.min(dx), y0.min(dy), x1.max(dx), y1.max(dy))
-                    }
+                    Some((x0, y0, x1, y1)) => (x0.min(dx), y0.min(dy), x1.max(dx), y1.max(dy)),
                 });
             }
         }
@@ -372,7 +374,9 @@ impl HaloMask {
         // Copy the mask sub-region into a tight buffer.
         let mut field = vec![0u8; area];
         for y in 0..rh {
-            let src_row = (ry0.saturating_add(y)).saturating_mul(self.w).saturating_add(rx0);
+            let src_row = (ry0.saturating_add(y))
+                .saturating_mul(self.w)
+                .saturating_add(rx0);
             let dst_row = y.saturating_mul(rw);
             for x in 0..rw {
                 if let (Some(&s), Some(d)) = (
@@ -452,7 +456,9 @@ fn box_blur_h(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
         // Prime the window over [0, r]; the count is clamped to the row.
         let mut sum: u32 = 0;
         for xx in 0..=r.min(w.saturating_sub(1)) {
-            sum = sum.saturating_add(u32::from(src.get(row.saturating_add(xx)).copied().unwrap_or(0)));
+            sum = sum.saturating_add(u32::from(
+                src.get(row.saturating_add(xx)).copied().unwrap_or(0),
+            ));
         }
         for x in 0..w {
             let lo = x.saturating_sub(r);
@@ -487,7 +493,9 @@ fn box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
         let mut sum: u32 = 0;
         for yy in 0..=r.min(h.saturating_sub(1)) {
             sum = sum.saturating_add(u32::from(
-                src.get(yy.saturating_mul(w).saturating_add(x)).copied().unwrap_or(0),
+                src.get(yy.saturating_mul(w).saturating_add(x))
+                    .copied()
+                    .unwrap_or(0),
             ));
         }
         for y in 0..h {
@@ -1158,7 +1166,15 @@ mod tests {
         let (mut fb, _) = grey_fb(16, 200);
         let glyph = solid_glyph(3);
         let mut m = HaloMask::new(dims);
-        m.stamp(&glyph, CellRect { x: 6, y: 6, w: 3, h: 3 });
+        m.stamp(
+            &glyph,
+            CellRect {
+                x: 6,
+                y: 6,
+                w: 3,
+                h: 3,
+            },
+        );
         m.composite_onto(&mut fb, dims);
         // (7,7) sits squarely under the ink.
         assert!(
@@ -1190,7 +1206,15 @@ mod tests {
             offset_x: 0,
             offset_y: 0,
         };
-        m2.stamp(&empty, CellRect { x: 8, y: 8, w: 8, h: 8 });
+        m2.stamp(
+            &empty,
+            CellRect {
+                x: 8,
+                y: 8,
+                w: 8,
+                h: 8,
+            },
+        );
         m2.composite_onto(&mut fb, dims);
         assert_eq!(fb, before, "empty glyph must not touch the framebuffer");
     }
@@ -1207,7 +1231,15 @@ mod tests {
         let (mut fb, _) = grey_fb(64, 200);
         let glyph = solid_glyph(3);
         let mut m = HaloMask::new(dims);
-        m.stamp(&glyph, CellRect { x: 4, y: 4, w: 3, h: 3 });
+        m.stamp(
+            &glyph,
+            CellRect {
+                x: 4,
+                y: 4,
+                w: 3,
+                h: 3,
+            },
+        );
         m.composite_onto(&mut fb, dims);
 
         // Glyph occupies cols/rows 4..=6. The blur reaches HALO_SPREAD
