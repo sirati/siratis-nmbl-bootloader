@@ -229,14 +229,13 @@ fn drive(state: &mut PtyShellState, console: &mut dyn Console) -> Result<()> {
                 KeyOutcome::Redraw => dirty = true,
                 KeyOutcome::Noop => {}
             },
-            Some(ConsoleEvent::Resize { .. }) => {
-                // The backend has already cached the new size; re-derive
-                // the grid geometry and push it to the emulator + child.
-                if apply_resize(state, console) {
-                    dirty = true;
-                }
+            // The backend has already cached the new size; re-derive the
+            // grid geometry and push it to the emulator + child. The guard
+            // applies the resize and only marks dirty when geometry changed.
+            Some(ConsoleEvent::Resize { .. }) if apply_resize(state, console) => {
+                dirty = true;
             }
-            None => {}
+            _ => {}
         }
 
         // 2. Drain whatever the child has produced this slice. Multiple
