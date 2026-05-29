@@ -129,6 +129,17 @@ impl SplashInput {
         Ok(())
     }
 
+    /// Best-effort Caps-Lock state of this VT keyboard, for the
+    /// passphrase prompt's warning. Delegates to
+    /// [`crate::sys::vt::caps_lock_active`] on the owned input fd;
+    /// returns `None` when the line is not a VT. Decoupled from the
+    /// input-parsing path on purpose — it only reads a keyboard LED
+    /// flag and never touches the byte stream.
+    #[must_use]
+    pub fn caps_lock_active(&self) -> Option<bool> {
+        crate::sys::vt::caps_lock_active(self.fd.as_fd())
+    }
+
     /// Poll for and parse a single key event. Returns `Ok(None)` if no
     /// input arrived within `timeout`.
     ///

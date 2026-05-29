@@ -310,6 +310,12 @@ impl Console for SplashConsole {
         log::set_tui_active();
         Ok(())
     }
+
+    fn caps_lock_active(&self) -> Option<bool> {
+        // `/dev/tty1` is always a kernel VT, so KDGKBLED works here and
+        // reports the live Caps-Lock state of the framebuffer keyboard.
+        self.input.caps_lock_active()
+    }
 }
 
 impl Drop for SplashConsole {
