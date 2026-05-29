@@ -212,6 +212,39 @@
           system
           ;
       };
+
+      # Automated log-import test. Reuses the existing direct-kernel runner
+      # for the qemu_kernel_invoke config (fastest path: real NMBL init +
+      # kexec into a booted NixOS, no install) and drives it with the
+      # assertion scripts under testing/assertions. Asserts the pre-kexec
+      # NMBL log lands in the booted journal under tag `nmbl-init`.
+      logImportRunner = testRunners.mkRunner {
+        name = "test-gpt-qemu-kernel-invoke";
+        config = testing.mkTestConfigurations."test-gpt-qemu-kernel-invoke";
+        inherit vmSerialMan;
+        bootMode = null;
+      };
+
+      checkLogImport = pkgs.writeShellApplication {
+        name = "check-log-import";
+        runtimeInputs = [
+          vmSerialMan
+          pkgs.screen
+          pkgs.coreutils
+          pkgs.gnugrep
+          pkgs.gnused
+          pkgs.qemu_kvm
+        ];
+        text = ''
+          export NMBL_RUNNER=${logImportRunner}
+          # Import the whole assertions dir so log-import.sh finds its
+          # sibling lib.sh at runtime (it sources ./lib.sh by BASH_SOURCE).
+          assertions=${./testing/assertions}
+          # Hard wall-clock cap so a wedged VM can never hang CI forever.
+          timeout "''${NMBL_WALL_TIMEOUT:-600}" \
+            bash "$assertions/log-import.sh"
+        '';
+      };
     in
     {
       # The main NixOS module
@@ -261,12 +294,17 @@
       # Run with: nix run .#test-gpt-qemu-kernel-invoke -- --debug-shell  (drops to emergency shell)
       # Run with: nix run .#test-rescue-ssh -- [--pubkey-file PATH] [--port N]
       # Run with: nix run .#tmux-serial-test-gpt-uefi-grub-luks-password
+      # Run with: nix run .#check-log-import  (asserts NMBL pre-kexec log in journal)
       # Apps: legacy names first, then the three-axis matrix grafted
       # on. Legacy names keep working unchanged (operators may have
       # them in muscle memory). New matrix apps use the dotted
       # `<start>-<target>-<interaction>` naming.
       apps.${system} = testApps // {
         test-rescue-ssh = rescueVmTestApp;
+        check-log-import = {
+          type = "app";
+          program = "${checkLogImport}/bin/check-log-import";
+        };
       } // nixosAnywhereTestApps // testMatrix.apps // nixosAnywhereInstallAliases;
 
       # Reusable library: external flakes (the LUKS install orchestrator,
