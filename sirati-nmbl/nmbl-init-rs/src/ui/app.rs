@@ -158,14 +158,19 @@ pub enum Screen<'a> {
     Editing {
         /// Index into the generations slice.
         generation_index: usize,
-        /// Working buffer for the cmdline.
-        buffer: String,
-        /// Byte index into `buffer`; always lies on a char boundary.
-        cursor: usize,
+        /// Working buffer + cursor for the cmdline. Shares its editing
+        /// semantics with the passphrase prompt via
+        /// [`crate::ui::editline`].
+        line: crate::ui::editline::EditableLine,
     },
     Passphrase {
         prompt_label: String,
         buffer: Zeroizing<String>,
+        /// Byte index into `buffer`; always lies on a char boundary.
+        /// The displayed characters are masked (dots) but the cursor
+        /// tracks the real position in the secret so mid-string edits
+        /// land where the operator expects.
+        cursor: usize,
         /// `true` once the operator has submitted the buffer and the
         /// activation runner is verifying it (cryptsetup is running).
         /// Renderer overlays a spinner so the operator sees the boot
@@ -294,6 +299,13 @@ pub struct App<'a> {
     /// Screen stashed while the log viewer ([`Screen::Log`]) is open, so
     /// Esc / Ctrl+L can pop back to exactly where the operator was.
     pub return_screen: Option<Box<Screen<'a>>>,
+    /// Live Caps-Lock state, polled each render tick by the passphrase
+    /// prompt loop. `true` paints the (reserved, non-resizing) warning
+    /// row on the passphrase modal; `false` leaves it blank. Only the
+    /// passphrase screen reads it. Defaults to `false` (off / unknown)
+    /// so backends that can't query the keyboard LED — serial lines,
+    /// the mock harness — simply never show the warning.
+    pub caps_lock_warning: bool,
 }
 
 /// Number of frames in the boot-status spinner cycle.
@@ -327,6 +339,7 @@ impl<'a> App<'a> {
             interaction: SessionInteraction::new(),
             exit_session: false,
             return_screen: None,
+            caps_lock_warning: false,
         }
     }
 
@@ -363,6 +376,7 @@ impl<'a> App<'a> {
             interaction: SessionInteraction::new(),
             exit_session: false,
             return_screen: None,
+            caps_lock_warning: false,
         }
     }
 
@@ -387,6 +401,7 @@ impl<'a> App<'a> {
             interaction: SessionInteraction::new(),
             exit_session: false,
             return_screen: None,
+            caps_lock_warning: false,
         }
     }
 
@@ -423,6 +438,21 @@ impl<'a> App<'a> {
         if self.error_countdown_deadline.is_none() {
             let now = Instant::now();
             self.error_countdown_deadline = Some(now.checked_add(auto_reboot_in).unwrap_or(now));
+        }
+    }
+
+    /// Replace the error text shown on the emergency screen so the
+    /// operator always sees the *latest* failure, not the first one
+    /// the session ever hit. Called whenever a new error is surfaced
+    /// (an emergency action failing, a re-entry after a sub-flow) so
+    /// the menu's "error" box tracks the most recent diagnostic
+    /// instead of latching the original boot error forever. No-op when
+    /// the App is on any other screen.
+    pub fn set_emergency_message(&mut self, new_message: impl Into<String>) {
+        if let Screen::Emergency { message, .. } = &mut self.screen {
+            *message = new_message.into();
+        } else {
+            debug_assert!(false, "set_emergency_message called on non-Emergency screen");
         }
     }
 
@@ -527,12 +557,14 @@ impl<'a> App<'a> {
     pub fn clear_passphrase_buffer(&mut self) {
         if let Screen::Passphrase {
             buffer,
+            cursor,
             verifying,
             spinner_frame,
             ..
         } = &mut self.screen
         {
             buffer.clear();
+            *cursor = 0;
             *verifying = false;
             *spinner_frame = 0;
         } else {
@@ -620,10 +652,10 @@ impl<'a> App<'a> {
                 &mut self.decision,
             ),
             Screen::Editing { .. } => {
-                Self::handle_editing_key(key.code, &mut self.screen, &mut self.decision)
+                Self::handle_editing_key(key, &mut self.screen, &mut self.decision)
             }
             Screen::Passphrase { .. } => {
-                Self::handle_passphrase_key(key.code, &mut self.screen, &mut self.decision)
+                Self::handle_passphrase_key(key, &mut self.screen, &mut self.decision)
             }
             Screen::Emergency { .. } => Self::handle_emergency_key(key.code, &mut self.screen),
             // BootStatus absorbs keypresses without producing a Decision.
@@ -745,11 +777,9 @@ impl<'a> App<'a> {
                     .get(*selected_index)
                     .map(|g| g.kernel_params.join(" "))
                     .unwrap_or_default();
-                let cursor = buffer.len();
                 *screen = Screen::Editing {
                     generation_index: *selected_index,
-                    buffer,
-                    cursor,
+                    line: crate::ui::editline::EditableLine::with_text(buffer),
                 };
                 false
             }
@@ -770,89 +800,51 @@ impl<'a> App<'a> {
     }
 
     fn handle_editing_key(
-        code: KeyCode,
+        key: KeyEvent,
         screen: &mut Screen,
         decision: &mut Option<Decision>,
     ) -> bool {
         let Screen::Editing {
             generation_index,
-            buffer,
-            cursor,
+            line,
         } = screen
         else {
             return false;
         };
 
-        match code {
-            KeyCode::Char(c) => {
-                let insert_at = clamp_to_char_boundary(buffer, *cursor);
-                buffer.insert(insert_at, c);
-                *cursor = insert_at.saturating_add(c.len_utf8());
-                false
-            }
-            KeyCode::Backspace => {
-                let current = clamp_to_char_boundary(buffer, *cursor);
-                if let Some(prev) = prev_char_boundary(buffer, current) {
-                    buffer.replace_range(prev..current, "");
-                    *cursor = prev;
-                }
-                false
-            }
-            KeyCode::Left => {
-                let current = clamp_to_char_boundary(buffer, *cursor);
-                if let Some(prev) = prev_char_boundary(buffer, current) {
-                    *cursor = prev;
-                } else {
-                    *cursor = 0;
-                }
-                false
-            }
-            KeyCode::Right => {
-                let current = clamp_to_char_boundary(buffer, *cursor);
-                *cursor = next_char_boundary(buffer, current).unwrap_or(buffer.len());
-                false
-            }
-            KeyCode::Home => {
-                *cursor = 0;
-                false
-            }
-            KeyCode::End => {
-                *cursor = buffer.len();
-                false
-            }
+        // Enter / Esc are owned by the editor screen, not the line.
+        match key.code {
             KeyCode::Enter => {
                 *decision = Some(Decision::Boot {
                     generation_index: *generation_index,
-                    cmdline_override: Some(buffer.clone()),
+                    cmdline_override: Some(line.text().to_owned()),
                 });
-                true
+                return true;
             }
             KeyCode::Esc => {
                 *screen = Screen::List;
-                false
+                return false;
             }
-            _ => false,
+            _ => {}
         }
+        // Everything else (insert, Backspace/Delete, cursor motion,
+        // Ctrl+A/E/D, word-wise motion) goes through the shared
+        // editable-line helper so the cmdline editor and the passphrase
+        // prompt behave identically.
+        line.handle_key(key);
+        false
     }
 
     fn handle_passphrase_key(
-        code: KeyCode,
+        key: KeyEvent,
         screen: &mut Screen,
         decision: &mut Option<Decision>,
     ) -> bool {
-        let Screen::Passphrase { buffer, .. } = screen else {
+        let Screen::Passphrase { buffer, cursor, .. } = screen else {
             return false;
         };
 
-        match code {
-            KeyCode::Char(c) => {
-                buffer.push(c);
-                false
-            }
-            KeyCode::Backspace => {
-                buffer.pop();
-                false
-            }
+        match key.code {
             KeyCode::Enter => {
                 // Caller (the passphrase prompt loop) detects the buffer
                 // is ready by polling — we do NOT exit the App here.
@@ -864,51 +856,18 @@ impl<'a> App<'a> {
                 *decision = Some(Decision::Shell);
                 true
             }
-            _ => false,
+            _ => {
+                // Drive the same shared editable-line logic as the
+                // cmdline editor. The secret stays in the Zeroizing
+                // buffer (which derefs to &mut String); only the
+                // renderer masks it. The cursor tracks the real index.
+                let (new_cursor, _handled) =
+                    crate::ui::editline::handle_key_on(buffer, *cursor, key);
+                *cursor = new_cursor;
+                false
+            }
         }
     }
-}
-
-/// Round `byte_idx` down to the nearest char boundary in `s`. The
-/// editor stores the cursor as a byte index and the screen renders
-/// it as a char count, so we have to be precise about boundaries.
-fn clamp_to_char_boundary(s: &str, byte_idx: usize) -> usize {
-    let len = s.len();
-    if byte_idx >= len {
-        return len;
-    }
-    let mut idx = byte_idx;
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx = idx.saturating_sub(1);
-    }
-    idx
-}
-
-/// Byte index of the char boundary strictly before `byte_idx`, or
-/// `None` if `byte_idx` is at the start (or before).
-fn prev_char_boundary(s: &str, byte_idx: usize) -> Option<usize> {
-    if byte_idx == 0 {
-        return None;
-    }
-    let mut idx = byte_idx.saturating_sub(1);
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx = idx.saturating_sub(1);
-    }
-    Some(idx)
-}
-
-/// Byte index of the next char boundary after `byte_idx`, or `None`
-/// if `byte_idx` is at or past the end.
-fn next_char_boundary(s: &str, byte_idx: usize) -> Option<usize> {
-    let len = s.len();
-    if byte_idx >= len {
-        return None;
-    }
-    let mut idx = byte_idx.saturating_add(1);
-    while idx < len && !s.is_char_boundary(idx) {
-        idx = idx.saturating_add(1);
-    }
-    Some(idx)
 }
 
 #[cfg(test)]
@@ -975,12 +934,11 @@ mod tests {
         match &app.screen {
             Screen::Editing {
                 generation_index,
-                buffer,
-                cursor,
+                line,
             } => {
                 assert_eq!(*generation_index, 0);
-                assert_eq!(buffer, "init=/sbin/init quiet loglevel=4");
-                assert_eq!(*cursor, buffer.len(), "cursor must land at end");
+                assert_eq!(line.text(), "init=/sbin/init quiet loglevel=4");
+                assert_eq!(line.cursor(), line.text().len(), "cursor must land at end");
             }
             _ => panic!("expected Editing screen"),
         }
@@ -1072,9 +1030,9 @@ mod tests {
             app.on_key(press(KeyCode::Char(c)));
         }
         match &app.screen {
-            Screen::Editing { buffer, cursor, .. } => {
-                assert_eq!(buffer, "foo bar");
-                assert_eq!(*cursor, buffer.len());
+            Screen::Editing { line, .. } => {
+                assert_eq!(line.text(), "foo bar");
+                assert_eq!(line.cursor(), line.text().len());
             }
             _ => panic!("expected Editing"),
         }
@@ -1082,7 +1040,7 @@ mod tests {
         // Backspace once removes 'r'.
         app.on_key(press(KeyCode::Backspace));
         match &app.screen {
-            Screen::Editing { buffer, .. } => assert_eq!(buffer, "foo ba"),
+            Screen::Editing { line, .. } => assert_eq!(line.text(), "foo ba"),
             _ => panic!("expected Editing"),
         }
     }
@@ -1128,26 +1086,26 @@ mod tests {
         // Cursor starts at end. Home jumps to 0.
         app.on_key(press(KeyCode::Home));
         match &app.screen {
-            Screen::Editing { cursor, .. } => assert_eq!(*cursor, 0),
+            Screen::Editing { line, .. } => assert_eq!(line.cursor(), 0),
             _ => panic!(),
         }
         // Right advances one byte.
         app.on_key(press(KeyCode::Right));
         match &app.screen {
-            Screen::Editing { cursor, .. } => assert_eq!(*cursor, 1),
+            Screen::Editing { line, .. } => assert_eq!(line.cursor(), 1),
             _ => panic!(),
         }
         // End jumps to the end.
         app.on_key(press(KeyCode::End));
         match &app.screen {
-            Screen::Editing { cursor, buffer, .. } => assert_eq!(*cursor, buffer.len()),
+            Screen::Editing { line, .. } => assert_eq!(line.cursor(), line.text().len()),
             _ => panic!(),
         }
         // Left walks back one byte.
         app.on_key(press(KeyCode::Left));
         match &app.screen {
-            Screen::Editing { cursor, buffer, .. } => {
-                assert_eq!(*cursor, buffer.len().saturating_sub(1));
+            Screen::Editing { line, .. } => {
+                assert_eq!(line.cursor(), line.text().len().saturating_sub(1));
             }
             _ => panic!(),
         }
@@ -1162,9 +1120,9 @@ mod tests {
         app.on_key(press(KeyCode::Char('e')));
         app.on_key(press(KeyCode::Backspace));
         match &app.screen {
-            Screen::Editing { buffer, cursor, .. } => {
-                assert_eq!(buffer, "héll");
-                assert_eq!(*cursor, buffer.len());
+            Screen::Editing { line, .. } => {
+                assert_eq!(line.text(), "héll");
+                assert_eq!(line.cursor(), line.text().len());
             }
             _ => panic!("expected Editing"),
         }
@@ -1177,6 +1135,7 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new(String::new()),
+            cursor: 0,
             verifying: false,
             spinner_frame: 0,
         };
@@ -1201,6 +1160,7 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new(String::new()),
+            cursor: 0,
             verifying: false,
             spinner_frame: 0,
         };
@@ -1215,6 +1175,7 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new("secret".to_string()),
+            cursor: 0,
             verifying: false,
             spinner_frame: 0,
         };
@@ -1231,6 +1192,7 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new(String::new()),
+            cursor: 0,
             verifying: false,
             spinner_frame: 0,
         };
@@ -1269,6 +1231,7 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new(String::new()),
+            cursor: 0,
             verifying: true,
             spinner_frame: 0,
         };
@@ -1290,6 +1253,7 @@ mod tests {
         app.screen = Screen::Passphrase {
             prompt_label: "Unlock".to_string(),
             buffer: Zeroizing::new("typed".to_string()),
+            cursor: 0,
             verifying: true,
             spinner_frame: 3,
         };
@@ -1378,6 +1342,47 @@ mod tests {
         assert!(!app.on_key(press(KeyCode::Down)));
         assert!(app.on_key(press(KeyCode::Enter)));
         assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::RawShell));
+    }
+
+    #[test]
+    fn set_emergency_message_replaces_displayed_error() {
+        // Regression: the emergency screen used to latch the first
+        // error it was built with. set_emergency_message must overwrite
+        // the displayed text so the operator always sees the LATEST
+        // failure (e.g. a failed Raw Shell), not the original boot one.
+        let mut app = emergency_app();
+        match &app.screen {
+            Screen::Emergency { message, .. } => {
+                assert_eq!(message, "boot failed: test");
+            }
+            _ => panic!("expected Emergency screen"),
+        }
+
+        app.set_emergency_message("Latest error (#1): Raw Shell failed\n\nEACCES");
+        match &app.screen {
+            Screen::Emergency { message, .. } => {
+                assert!(
+                    message.contains("Latest error (#1)"),
+                    "message not updated: {message}"
+                );
+                assert!(message.contains("Raw Shell failed"), "missing title: {message}");
+                assert!(!message.contains("boot failed: test"), "stale first error retained");
+            }
+            _ => panic!("expected Emergency screen"),
+        }
+
+        // A second update wins again (most-recent-wins, no latch).
+        app.set_emergency_message("Latest error (#2): Retry failed\n\nENOENT");
+        match &app.screen {
+            Screen::Emergency { message, .. } => {
+                assert!(message.contains("Latest error (#2)"), "second update lost: {message}");
+                assert!(!message.contains("(#1)"), "stale #1 retained: {message}");
+            }
+            _ => panic!("expected Emergency screen"),
+        }
+
+        // Selection / items are untouched by a message-only update.
+        assert_eq!(emergency_state(&app).0, 0);
     }
 
     #[test]

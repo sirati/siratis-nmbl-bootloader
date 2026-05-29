@@ -122,6 +122,12 @@ pub fn drop_to_emergency(
     // already `'static` — the explicit annotation merely pins it.
     let mut app: App<'static> = build_emergency_app(&message, &items, session);
 
+    // Count of distinct failures surfaced this session. Used so the
+    // persistent emergency-screen "error" box can show the LATEST
+    // failure (not just the original boot error it latched on entry)
+    // along with how many have been seen — see `update_latest_error`.
+    let mut error_count: u32 = 0;
+
     // Re-entrant picker. The Raw Shell, Pretty Shell, Retry boot, and
     // Verify kexec readiness branches all return control to this loop
     // on exit (sub-shell ended, retry failed, operator picked Back).
@@ -175,6 +181,12 @@ pub fn drop_to_emergency(
                             &chain,
                             std::time::Duration::from_secs(10),
                         );
+                        update_latest_error(
+                            &mut app,
+                            &mut error_count,
+                            "Emergency shell failed",
+                            &chain,
+                        );
                     }
                 }
                 // Picker session done (shell exited, detached, or
@@ -193,6 +205,12 @@ pub fn drop_to_emergency(
                         &chain,
                         std::time::Duration::from_secs(10),
                     );
+                    update_latest_error(
+                        &mut app,
+                        &mut error_count,
+                        "Pretty Shell failed to start",
+                        &chain,
+                    );
                 }
                 continue;
             }
@@ -205,11 +223,13 @@ pub fn drop_to_emergency(
                             "emergency retry-boot failed: {}",
                             format_chain(&e as &dyn std::error::Error)
                         );
-                        surface_action_failure(
-                            &mut *console,
+                        let title = abort_aware_title(&e, "Retry boot failed");
+                        surface_action_failure(&mut *console, &mut app, title, &e);
+                        update_latest_error(
                             &mut app,
-                            abort_aware_title(&e, "Retry boot failed"),
-                            &e,
+                            &mut error_count,
+                            title,
+                            &format_chain(&e as &dyn std::error::Error),
                         );
                         continue;
                     }
@@ -224,11 +244,13 @@ pub fn drop_to_emergency(
                             "emergency verify-kexec-readiness failed: {}",
                             format_chain(&e as &dyn std::error::Error)
                         );
-                        surface_action_failure(
-                            &mut *console,
+                        let title = abort_aware_title(&e, "Kexec readiness check failed");
+                        surface_action_failure(&mut *console, &mut app, title, &e);
+                        update_latest_error(
                             &mut app,
-                            abort_aware_title(&e, "Kexec readiness check failed"),
-                            &e,
+                            &mut error_count,
+                            title,
+                            &format_chain(&e as &dyn std::error::Error),
                         );
                         continue;
                     }
@@ -236,6 +258,28 @@ pub fn drop_to_emergency(
             }
         }
     }
+}
+
+/// Update the persistent emergency-screen "error" box so it always
+/// reflects the *most recent* failure rather than latching the
+/// original boot error for the rest of the session. The transient
+/// modal that just flashed the failure auto-dismisses; without this
+/// the operator would be left staring at the first error again, with
+/// no trace of what actually went wrong (e.g. a failed Raw Shell).
+///
+/// `count` is bumped per call and rendered so repeated failures are
+/// visible at a glance; the freshest chain is shown in full underneath.
+fn update_latest_error(
+    app: &mut App<'static>,
+    count: &mut u32,
+    title: &str,
+    chain: &str,
+) {
+    *count = count.saturating_add(1);
+    let message = format!(
+        "Latest error (#{count}): {title}\n\n{chain}\n\nChoose what to do next.",
+    );
+    app.set_emergency_message(message);
 }
 
 /// Open a fresh tty console (panic-recovery mode skips splash) and

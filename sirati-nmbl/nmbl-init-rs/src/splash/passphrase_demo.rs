@@ -269,6 +269,28 @@ fn render_frame(
 
     drm.render(|fb, fb_dims| {
         compositor::blit_background(fb, fb_dims, bg_scaled);
+        // Pass 1: dark contrast halo behind glyphs on the transparent
+        // default background, painted first so it only darkens the
+        // background photo and never bleeds onto adjacent drawn text.
+        term_pipe.for_each_cell(|col, row, cell| {
+            if !compositor::wants_halo(cell.bg) {
+                return;
+            }
+            let bold = cell.flags.contains(Flags::BOLD);
+            let Some(glyph) = cache.get(cell.c, bold) else {
+                return;
+            };
+            let x = u32::from(col).saturating_mul(cell_dims.cell_w);
+            let y = u32::from(row).saturating_mul(cell_dims.cell_h);
+            let rect = compositor::CellRect {
+                x,
+                y,
+                w: cell_dims.cell_w,
+                h: cell_dims.cell_h,
+            };
+            compositor::blit_halo(fb, fb_dims, glyph, rect);
+        });
+        // Pass 2: cell backgrounds + glyphs.
         term_pipe.for_each_cell(|col, row, cell| {
             if cell.c == ' ' && cell.bg == AnsiColor::Named(NamedColor::Background) {
                 return;
@@ -278,7 +300,7 @@ fn render_frame(
                 return;
             };
             let fg = compositor::resolve_color(cell.fg);
-            let bg = compositor::resolve_color(cell.bg);
+            let bg = compositor::resolve_bg_color(cell.bg);
             let x = u32::from(col).saturating_mul(cell_dims.cell_w);
             let y = u32::from(row).saturating_mul(cell_dims.cell_h);
             let rect = compositor::CellRect {

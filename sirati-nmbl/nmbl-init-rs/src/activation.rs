@@ -272,6 +272,7 @@ fn run_luks_with_spinner(
         // input character (the supplier doesn't add a newline), so
         // its length is a faithful approximation.
         buffer: zeroize::Zeroizing::new("*".repeat(stdin_slice.map_or(0, <[u8]>::len))),
+        cursor: 0,
         verifying: true,
         spinner_frame: 0,
     };
