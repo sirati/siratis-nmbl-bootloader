@@ -1,35 +1,17 @@
-//! NETLINK-free network-interface enumerator + bring-up helper used
-//! by the rescue HTTP fallback path (Phase D.1).
-//!
-//! NMBL's rescue path needs three things from each candidate
-//! Ethernet-like NIC:
-//!   1. its kernel name (for log lines + the SIOCSIFFLAGS ioctl),
-//!   2. its ifindex (for the DHCP socket bind in D.2),
-//!   3. its MAC address (DHCPv4 `chaddr` field).
-//!
-//! …plus a way to flip `IFF_UP` and a way to wait for the link to
-//! settle. We deliberately AVOID hand-rolling NETLINK RTM_GETLINK
-//! response parsing — `/sys/class/net/<name>/{address,ifindex,type,carrier}`
-//! exposes the same data with no `unsafe` and no UAPI ABI risk.
-//!
-//! The only `unsafe` lives in [`bring_up`], where SIOCGIFFLAGS /
-//! SIOCSIFFLAGS need a raw `libc::ifreq`. Both blocks are local,
-//! pre-zeroed, and bounded to the function — no globals, no FFI
-//! lifetimes leaking out.
+//! Sysfs-based interface enumeration and carrier polling.
 
 use std::fs;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
-
 use crate::error::{NmblError, Result};
+
+use super::Interface;
 
 /// Filesystem prefix that exposes the per-interface attributes we
 /// need. Constant so unit tests can reason about which paths the
 /// reader is going to touch.
-const SYSFS_NET: &str = "/sys/class/net";
+pub(super) const SYSFS_NET: &str = "/sys/class/net";
 
 /// `ARPHRD_ETHER` from `<linux/if_arp.h>`. Filtering on this value
 /// drops `lo` (`ARPHRD_LOOPBACK = 772`), wireguard tunnels
@@ -38,45 +20,9 @@ const SYSFS_NET: &str = "/sys/class/net";
 /// also report 1, which is what we want).
 const ARPHRD_ETHER: u16 = 1;
 
-/// `IFF_UP` from `<linux/if.h>` — must match `libc::IFF_UP` (which
-/// has type `c_int`). Stored as `i16` to match the `ifr_flags` field
-/// width in `struct ifreq`.
-const IFF_UP_BIT: i16 = libc::IFF_UP as i16;
-
-/// One discovered Ethernet-like interface. Fields are populated from
-/// `/sys/class/net/<name>/…` at [`enumerate`] time and never
-/// re-fetched; callers that need fresh carrier state should call
-/// [`wait_for_link`] explicitly.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Interface {
-    /// Kernel name, e.g. `"eth0"` or `"enp3s0"`.
-    pub name: String,
-    /// Kernel ifindex (1-based, unique per netns).
-    pub index: u32,
-    /// 6-byte EUI-48 hardware address (DHCPv4 `chaddr`).
-    pub mac: [u8; 6],
-    /// Snapshot of `/sys/class/net/<name>/carrier` at enumeration
-    /// time. May be stale by the time DHCP runs — re-check with
-    /// [`wait_for_link`] before sending the first DISCOVER.
-    pub has_carrier: bool,
-}
-
-/// Enumerate `ARPHRD_ETHER` interfaces under `/sys/class/net`.
-///
-/// Loopback (`type=772`), tunnels (non-1 types) and entries with
-/// unparseable attributes are filtered out. The returned vector is
-/// sorted by interface name so the result is deterministic across
-/// invocations — important for log triage.
-///
-/// In a CI sandbox where only `lo` exists, this returns
-/// `Ok(vec![])` because `lo`'s ARPHRD does not match `ETHER`.
-pub fn enumerate() -> Result<Vec<Interface>> {
-    enumerate_in(Path::new(SYSFS_NET))
-}
-
-/// Test-friendly version of [`enumerate`] that takes the sysfs root
-/// as a parameter. Production callers go through [`enumerate`].
-fn enumerate_in(root: &Path) -> Result<Vec<Interface>> {
+/// Test-friendly version of [`super::enumerate`] that takes the sysfs root
+/// as a parameter. Production callers go through [`super::enumerate`].
+pub(super) fn enumerate_in(root: &Path) -> Result<Vec<Interface>> {
     let mut out = Vec::new();
     let entries = fs::read_dir(root).map_err(|source| NmblError::Rescue {
         stage: "net-enumerate",
@@ -196,7 +142,7 @@ fn read_mac(path: &Path) -> Result<Option<[u8; 6]>> {
 
 /// Pure parser separated for unit-testability. Returns `None` on any
 /// malformed input (wrong field count, non-hex, wrong byte width).
-fn parse_mac(s: &str) -> Option<[u8; 6]> {
+pub(super) fn parse_mac(s: &str) -> Option<[u8; 6]> {
     let mut out = [0u8; 6];
     let mut count = 0usize;
     for part in s.split(':') {
@@ -225,103 +171,6 @@ fn read_carrier_or_false(path: &Path) -> bool {
         Ok(s) => s.trim() == "1",
         Err(_) => false,
     }
-}
-
-/// Bring `iface` up by setting `IFF_UP`. No-op if already up.
-///
-/// Uses the classic SIOCGIFFLAGS / SIOCSIFFLAGS pair on a fresh
-/// AF_INET/SOCK_DGRAM socket — per the netdevice(7) contract, the
-/// socket's address family is irrelevant. Both ioctls operate on a
-/// `struct ifreq` so we drive them with `nix::ioctl_readwrite_bad!`.
-pub fn bring_up(name: &str) -> Result<()> {
-    if name.len() >= libc::IFNAMSIZ {
-        return Err(NmblError::Rescue {
-            stage: "net-bring-up",
-            source: Box::new(NmblError::ConfigInvalid {
-                reason: format!(
-                    "interface name {name:?} exceeds IFNAMSIZ ({})",
-                    libc::IFNAMSIZ
-                ),
-                context: "preparing SIOCGIFFLAGS ifreq".to_string(),
-            }),
-        });
-    }
-
-    // Disposable AF_INET datagram socket — never `bind`d or used to
-    // send data; only carries the ioctl. CLOEXEC matches the
-    // initramfs convention.
-    let sock = socket(
-        AddressFamily::Inet,
-        SockType::Datagram,
-        SockFlag::SOCK_CLOEXEC,
-        None,
-    )
-    .map_err(|source| NmblError::Rescue {
-        stage: "net-bring-up",
-        source: Box::new(NmblError::Io {
-            source: std::io::Error::from_raw_os_error(source as i32),
-            context: format!("socket(AF_INET, SOCK_DGRAM) for {name}"),
-        }),
-    })?;
-
-    // GET current flags.
-    let mut req = blank_ifreq(name);
-    // `libc::ioctl`'s request-code parameter is `c_int` on musl and
-    // `c_ulong` on glibc — both reachable via `as _` from the
-    // `c_ulong` constant. The cast is lossless on every Linux ABI
-    // because Linux ioctl opcodes are 32-bit.
-    let siocgifflags = libc::SIOCGIFFLAGS as _;
-    // SAFETY: SIOCGIFFLAGS is a kernel-stable opcode. `req` is a
-    // pre-zeroed `libc::ifreq` whose `ifr_name` field has been
-    // populated and the rest of the union is zero. The ioctl reads
-    // `ifr_name` and writes `ifr_ifru.ifru_flags` (an i16).
-    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), siocgifflags, &mut req) };
-    if rc < 0 {
-        return Err(NmblError::Rescue {
-            stage: "net-bring-up",
-            source: Box::new(NmblError::Io {
-                source: std::io::Error::last_os_error(),
-                context: format!("SIOCGIFFLAGS on {name}"),
-            }),
-        });
-    }
-    // SAFETY: SIOCGIFFLAGS sets the `ifru_flags` variant of the
-    // anonymous union; we read it back through the same field.
-    let cur = unsafe { req.ifr_ifru.ifru_flags };
-    if cur & IFF_UP_BIT != 0 {
-        return Ok(());
-    }
-
-    // OR in IFF_UP and push back.
-    req.ifr_ifru.ifru_flags = cur | IFF_UP_BIT;
-    let siocsifflags = libc::SIOCSIFFLAGS as _;
-    // SAFETY: SIOCSIFFLAGS reads `ifr_name` + `ifru_flags`; both are
-    // initialized above.
-    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), siocsifflags, &req) };
-    if rc < 0 {
-        return Err(NmblError::Rescue {
-            stage: "net-bring-up",
-            source: Box::new(NmblError::Io {
-                source: std::io::Error::last_os_error(),
-                context: format!("SIOCSIFFLAGS on {name}"),
-            }),
-        });
-    }
-    Ok(())
-}
-
-/// Construct a zeroed `libc::ifreq` and copy `name` into the
-/// `ifr_name` slot, including a trailing NUL. Caller guarantees
-/// `name.len() < IFNAMSIZ`.
-fn blank_ifreq(name: &str) -> libc::ifreq {
-    // SAFETY: `libc::ifreq` is a POD made of integers, a fixed-size
-    // char array, and a union of POD variants. The all-zero bit
-    // pattern is a valid value (`ifru_flags = 0`, etc.).
-    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
-    for (slot, byte) in req.ifr_name.iter_mut().zip(name.as_bytes()) {
-        *slot = *byte as libc::c_char;
-    }
-    req
 }
 
 /// Poll `/sys/class/net/<name>/carrier` until it reads `1` or
@@ -388,12 +237,6 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn privileged() -> bool {
-        // CAP_NET_ADMIN proxy: euid 0. Skip bring_up tests otherwise
-        // — same skip-pattern as sys/loopdev.rs.
-        nix::unistd::Uid::effective().is_root()
-    }
-
     #[test]
     fn parse_mac_round_trip() {
         assert_eq!(
@@ -414,25 +257,6 @@ mod tests {
         assert_eq!(parse_mac("00-11-22-33-44-55"), None); // wrong sep
         assert_eq!(parse_mac("zz:11:22:33:44:55"), None); // non-hex
         assert_eq!(parse_mac("0:1:2:3:4:5"), None); // single-digit fields
-    }
-
-    #[test]
-    fn enumerate_returns_ok_in_sandbox() {
-        // /sys/class/net always exists on Linux; in a sandbox where
-        // only `lo` is present we expect an empty vector because lo's
-        // ARPHRD is 772, not 1.
-        let result = enumerate();
-        match result {
-            Ok(v) => {
-                for iface in &v {
-                    // Sanity: every returned iface must be ARPHRD_ETHER
-                    // (we already filtered, but assert anyway) and have
-                    // a non-empty name.
-                    assert!(!iface.name.is_empty());
-                }
-            }
-            Err(e) => panic!("enumerate failed: {e}"),
-        }
     }
 
     #[test]
@@ -514,17 +338,5 @@ mod tests {
             }
             other => panic!("expected Rescue/net-link-wait, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn bring_up_requires_cap_net_admin() {
-        if !privileged() {
-            eprintln!("skipping: bring_up needs CAP_NET_ADMIN");
-            return;
-        }
-        // Even with caps the test is mostly a smoke check: `lo` is
-        // almost always already up, so bring_up should return Ok
-        // without changing anything.
-        bring_up("lo").expect("bring_up lo");
     }
 }
