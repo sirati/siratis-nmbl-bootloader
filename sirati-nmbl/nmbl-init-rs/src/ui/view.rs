@@ -203,6 +203,18 @@ pub fn char_column_for_byte_cursor(s: &str, byte_idx: usize) -> usize {
     s.get(..safe).map_or(0, |prefix| prefix.chars().count())
 }
 
+/// Build the bold `^` caret line that sits under a single-line text
+/// input, positioned at the char column of `byte_cursor` within `text`
+/// plus a fixed `prefix_cols` lead-in (e.g. a checkbox marker rendered
+/// to the left of the text). Shared by the cmdline editor
+/// ([`render_edit`]) and the console picker's custom-path field so the
+/// byte→char conversion and spacing logic live in exactly one place.
+pub fn caret_line<'a>(text: &str, byte_cursor: usize, prefix_cols: usize) -> Line<'a> {
+    let col = prefix_cols.saturating_add(char_column_for_byte_cursor(text, byte_cursor));
+    let caret = format!("{}{}", " ".repeat(col), "^");
+    Line::styled(caret, Style::default().add_modifier(Modifier::BOLD))
+}
+
 fn generation_item<'a>(
     g: &'a Generation,
     show_kernel_params: bool,
@@ -278,15 +290,12 @@ pub fn render_edit(frame: &mut Frame<'_>, data: &EditScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
     // `cursor_position` is a BYTE index (the `EditableLine` cursor).
-    // Convert to a CHAR-column count so multi-byte text (e.g. "héllo")
-    // doesn't shove the caret one cell too far to the right.
-    let offset = char_column_for_byte_cursor(data.edited_cmdline, data.cursor_position);
-    let caret = format!("{}{}", " ".repeat(offset), "^");
+    // `caret_line` converts it to a CHAR column so multi-byte text
+    // (e.g. "héllo") doesn't shove the caret one cell too far right.
+    // No prefix here: the text starts at column 0 inside the block.
+    let caret = caret_line(data.edited_cmdline, data.cursor_position, 0);
     let title = format!("Edit cmdline — generation #{}", data.generation.number);
-    let text = Text::from(vec![
-        Line::raw(data.edited_cmdline.to_owned()),
-        Line::styled(caret, Style::default().add_modifier(Modifier::BOLD)),
-    ]);
+    let text = Text::from(vec![Line::raw(data.edited_cmdline.to_owned()), caret]);
     let para = Paragraph::new(text)
         .block(Block::bordered().title(title))
         .wrap(Wrap { trim: false });
