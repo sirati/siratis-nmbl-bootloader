@@ -58,5 +58,17 @@ pub(super) fn handle_early_exit_modes(args: &Args) -> Option<ExitCode> {
         }
     }
 
+    // Remote-TUI client mode: any non-PID-1 invocation of the binary
+    // (the operator's `nmbl-init` in a rescue login, or the chrooted
+    // rescue view) connects to PID 1's control socket, hands across its
+    // controlling terminal, and goes quiescent while PID 1 drives it.
+    // PID 1 itself (the boot path) never takes this branch.
+    #[cfg(feature = "remote-tui")]
+    {
+        if nix::unistd::getpid().as_raw() != 1 {
+            return Some(nmbl_init::ipc::tui_socket::connect_and_serve());
+        }
+    }
+
     None
 }

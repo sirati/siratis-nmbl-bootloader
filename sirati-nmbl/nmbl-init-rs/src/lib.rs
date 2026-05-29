@@ -4,6 +4,8 @@ pub mod config;
 pub mod devices;
 pub mod error;
 pub mod generations;
+#[cfg(feature = "remote-tui")]
+pub mod ipc;
 pub mod log;
 #[cfg(feature = "mocking")]
 pub mod mocking;
