@@ -173,13 +173,18 @@ fn ioctl_scan(control_fd: libc::c_int, dev: &Path) -> i32 {
     //   * `args` is stack-allocated, correctly sized, and zero-initialized;
     //     the kernel reads the `name` field and does not write to our buffer.
     //   * The ioctl number matches linux/btrfs.h BTRFS_IOC_SCAN_DEV.
-    // `libc::ioctl` on musl takes the request as `c_int`; casting a
-    // u32 ioctl code to i32 is safe — the kernel treats it as unsigned,
-    // and the bit pattern is preserved through the system-call argument.
+    // `libc::ioctl`'s request argument is `c_int` on musl (our production
+    // target) but `c_ulong` on glibc; cast to whichever this build needs.
+    // Casting the u32 ioctl code is safe either way — the kernel treats it
+    // as unsigned and the bit pattern is preserved through the syscall.
+    #[cfg(target_env = "musl")]
+    let request = BTRFS_IOC_SCAN_DEV as libc::c_int;
+    #[cfg(not(target_env = "musl"))]
+    let request = BTRFS_IOC_SCAN_DEV as libc::c_ulong;
     let rc = unsafe {
         libc::ioctl(
             control_fd,
-            BTRFS_IOC_SCAN_DEV as libc::c_int,
+            request,
             &mut args as *mut BtrfsIoctlVolArgs,
         )
     };

@@ -30,10 +30,15 @@ use rustix::io::Errno as RustixErrno;
 use rustix::ioctl::{BadOpcode, Ioctl, IoctlOutput, NoArg, Opcode, RawOpcode, Setter};
 
 use crate::error::{NmblError, Result};
+use crate::nmbl_warn;
 
 /// `/dev/loop-control` — single global control node used to allocate
 /// and release loop indices.
 pub const LOOP_CONTROL_PATH: &str = "/dev/loop-control";
+
+/// sysfs path exposing `major:minor` for the loop-control misc device.
+/// Read at runtime so we never hard-code the (10:237) pair.
+const LOOP_CONTROL_SYSFS: &str = "/sys/class/misc/loop-control/dev";
 
 /// Loop-control ioctl: return the index of an unused loop device,
 /// allocating one if none is free. Result is the index (≥0); negative
@@ -179,6 +184,67 @@ unsafe impl Ioctl for LoopCtlGetFree {
     }
 }
 
+/// Ensure `/dev/loop-control` exists. NMBL ships no udev, so the node
+/// may be absent even after `loop.ko` loads. We read the actual
+/// `major:minor` from sysfs and `mknod(2)` the char-device node when it
+/// isn't already there. A no-op when the node exists (the common case:
+/// devtmpfs created it on module load). When sysfs is missing the loop
+/// module isn't loaded at all; we warn and let the `open` below surface
+/// the failure.
+fn ensure_loop_control() {
+    if Path::new(LOOP_CONTROL_PATH).exists() {
+        return;
+    }
+
+    let raw = match std::fs::read_to_string(LOOP_CONTROL_SYSFS) {
+        Ok(s) => s,
+        Err(e) => {
+            nmbl_warn!(
+                "loop: cannot read {} ({}); {} will be absent",
+                LOOP_CONTROL_SYSFS,
+                e,
+                LOOP_CONTROL_PATH,
+            );
+            return;
+        }
+    };
+    let trimmed = raw.trim();
+    let Some((maj_str, min_str)) = trimmed.split_once(':') else {
+        nmbl_warn!(
+            "loop: unexpected format in {} ({:?}); skipping mknod",
+            LOOP_CONTROL_SYSFS,
+            trimmed,
+        );
+        return;
+    };
+    let (Ok(major), Ok(minor)) = (maj_str.parse::<u32>(), min_str.parse::<u32>()) else {
+        nmbl_warn!(
+            "loop: cannot parse major:minor from {:?}; skipping mknod",
+            trimmed,
+        );
+        return;
+    };
+
+    let mode: libc::mode_t = libc::S_IFCHR | 0o600;
+    let dev = libc::makedev(major, minor);
+    let Ok(path_cstr) = std::ffi::CString::new(LOOP_CONTROL_PATH) else {
+        nmbl_warn!("loop: LOOP_CONTROL_PATH contains NUL; skipping mknod");
+        return;
+    };
+    // SAFETY: mknod(2) with a char-device type. `path_cstr` is a valid
+    // NUL-terminated CString that outlives the call; `dev` is the numeric
+    // major:minor obtained from libc::makedev. The kernel creates or
+    // rejects the node; no user-space buffers are written. rustix 0.38
+    // exposes no safe mknod wrapper.
+    let rc = unsafe { libc::mknod(path_cstr.as_ptr(), mode, dev) };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EEXIST) {
+            nmbl_warn!("loop: mknod {} failed: {}", LOOP_CONTROL_PATH, e);
+        }
+    }
+}
+
 /// Open `/dev/loop-control` and run `LOOP_CTL_GET_FREE`.
 ///
 /// Returns the index of a free `/dev/loopN`. The caller is expected
@@ -187,6 +253,13 @@ unsafe impl Ioctl for LoopCtlGetFree {
 /// process if `/dev/loop-control` is shared, but in the NMBL initrd
 /// nothing else is running yet.
 pub fn allocate_loop_device() -> Result<u32> {
+    // NMBL has no udev. On most kernels devtmpfs materialises
+    // `/dev/loop-control` the moment the `loop` module loads, but
+    // belt-and-braces: if the node is still absent (and the module is
+    // loaded, so sysfs exposes its major:minor) create it with mknod,
+    // mirroring `sys::btrfs::ensure_btrfs_control`. Without this the
+    // open below would fail with ENOENT.
+    ensure_loop_control();
     let control = rustix::fs::open(
         LOOP_CONTROL_PATH,
         OFlags::RDWR | OFlags::CLOEXEC,

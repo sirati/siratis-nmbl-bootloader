@@ -65,21 +65,21 @@ pub enum EmergencyChoice {
     /// between the operator's keystrokes and a forked shell on a PTY.
     /// When the shell exits, control returns to the emergency screen.
     ///
-    /// Gated behind the `image-splash` feature because the terminal
-    /// emulator reuses `alacritty_terminal` (already an optional dep
-    /// for the splash backend). The build without the feature has no
-    /// way to render an ANSI grid and would either need a private
-    /// terminal emulator (forbidden by the no-reimplement rule) or a
-    /// degraded plain-text mode that defeats the purpose.
+    /// Gated behind the `pretty-shell` feature because the terminal
+    /// emulator reuses `alacritty_terminal`. The feature is default-on
+    /// (and also pulled in by `image-splash`); a `--no-default-features`
+    /// build has no way to render an ANSI grid and would either need a
+    /// private terminal emulator (forbidden by the no-reimplement rule)
+    /// or a degraded plain-text mode that defeats the purpose.
     ///
     /// Pretty Shell is the preferred default whenever the feature is
     /// compiled in; it sits at the top of the shell options on the
     /// emergency picker, with the raw busybox-on-tty fallback below it.
-    #[cfg(feature = "image-splash")]
+    #[cfg(feature = "pretty-shell")]
     PrettyShell,
     /// Drop to the configured emergency shell on a raw tty via the
     /// console picker + multiplexed busybox PTY relay. Kept available
-    /// even when `image-splash` is on so operators can fall back when
+    /// even when `pretty-shell` is on so operators can fall back when
     /// the terminal emulator misbehaves.
     RawShell,
     /// Re-run the full normal boot path (phases 3, 3b, 4, 5) from the
@@ -564,7 +564,7 @@ impl<'a> App<'a> {
                 *chosen = Some(EmergencyChoice::Reboot);
                 true
             }
-            #[cfg(feature = "image-splash")]
+            #[cfg(feature = "pretty-shell")]
             KeyCode::Char('p') => {
                 *chosen = Some(EmergencyChoice::PrettyShell);
                 true
@@ -1280,7 +1280,7 @@ mod tests {
         assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::RawShell));
     }
 
-    #[cfg(feature = "image-splash")]
+    #[cfg(feature = "pretty-shell")]
     #[test]
     fn emergency_hotkey_p_commits_pretty_shell() {
         let mut app = emergency_app();

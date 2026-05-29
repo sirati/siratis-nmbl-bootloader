@@ -402,7 +402,7 @@ fn handle_wrong_password(
     match show_wrong_password_modal(console, attempt)? {
         WrongPasswordOutcome::TryAgain => Ok(WrongPasswordHandled::TryAgain),
         WrongPasswordOutcome::Reboot => Ok(WrongPasswordHandled::Reboot),
-        #[cfg(feature = "image-splash")]
+        #[cfg(feature = "pretty-shell")]
         WrongPasswordOutcome::PrettyShell => {
             if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(console, config) {
                 let chain = crate::error::format_chain(&e as &dyn std::error::Error);

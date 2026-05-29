@@ -115,6 +115,19 @@ let
         network = true;
         default_url = cfg.rescue.defaultUrl;
         default_sha256 = cfg.rescue.defaultSha256;
+      }
+      # The full recovery system bakes a bash PID-1 script at /init; the
+      # Rust loader execve's `entrypoint` after switch_root instead of the
+      # default /bin/sh. Omitted otherwise so the flat busybox image keeps
+      # the Rust-side default.
+      // lib.optionalAttrs (cfg.rescue.mode == "external" && cfg.rescue.fullSystem.enable) {
+        entrypoint = "/init";
+      }
+      # Deterministic rescue trigger. Emitted only when set so the wire
+      # shape stays unchanged for the common case; the Rust serde default
+      # is `false`.
+      // lib.optionalAttrs cfg.rescue.forceOnBoot {
+        force_on_boot = true;
       };
 
     # Operator-curated list of extra `/dev/<tty>` paths the picker
@@ -128,16 +141,28 @@ let
   }
   # Splash rendering. Emitted only when the graphical splash is enabled
   # so the validator (`deny_unknown_fields`) accepts the TOML on builds
-  # that don't pull in the Rust-side `splash` config struct. Runtime
-  # paths are fixed because the initramfs landing locations (see
-  # lib/config.nix `splashContents`) are fixed.
+  # that don't pull in the Rust-side `splash` config struct. The
+  # initramfs landing path for the font is fixed; the background path is
+  # fixed too in `initrd` mode (`/etc/splash/image.png`). In
+  # `boot-partition` mode the background is NOT embedded — the Rust /init
+  # reads the FIXED sidecar basename (`nmblsplash.png`) from the boot
+  # partition mountpoint, so we only emit `background_location` and leave
+  # `background_image` at its embedded default (unused in that mode).
+  # `background_location` is omitted when it matches the Rust-side
+  # default (`initrd`) so the wire shape for embedded-background builds
+  # stays unchanged. Mirrors how `rescue.sfs_path` is omitted at its
+  # default basename.
   // lib.optionalAttrs cfg.splash.enable {
-    splash = {
-      enable           = true;
-      background_image = "/etc/splash/image.png";
-      font_path        = "/etc/splash/font.ttf";
-      dri_path         = "/dev/dri/card0";
-    };
+    splash =
+      {
+        enable           = true;
+        background_image = "/etc/splash/image.png";
+        font_path        = "/etc/splash/font.ttf";
+        dri_path         = "/dev/dri/card0";
+      }
+      // lib.optionalAttrs (cfg.splash.backgroundLocation != "initrd") {
+        background_location = cfg.splash.backgroundLocation;
+      };
   }
   # Stateful boot tracking. Emitted only when enabled so builds without
   # the Rust-side `stateful` feature still pass `deny_unknown_fields`.

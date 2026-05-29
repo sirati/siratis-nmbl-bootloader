@@ -180,7 +180,7 @@ pub fn drop_to_emergency(
                 // cancelled); re-show the emergency menu.
                 continue;
             }
-            #[cfg(feature = "image-splash")]
+            #[cfg(feature = "pretty-shell")]
             EmergencyChoice::PrettyShell => {
                 if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(&mut *console, config) {
                     let chain = format_chain(&e as &dyn std::error::Error);
