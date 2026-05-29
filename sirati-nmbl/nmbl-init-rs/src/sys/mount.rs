@@ -118,6 +118,29 @@ pub fn mount_fs(source: Option<&Path>, target: &Path, fstype: &str, options: &st
     })
 }
 
+/// Mark an existing mount as a shared-subtree peer
+/// (`mount(NULL, target, NULL, MS_SHARED, NULL)`). The shared-subtree
+/// propagation calls take neither a source, an fstype, nor a data
+/// string — only the flag and the target — which [`mount_fs`] cannot
+/// express (it always passes a fstype). The chrooted-rescue runner uses
+/// this so a mount the child makes under its `/mnt` propagates back to
+/// PID 1's view of the same subtree.
+pub fn make_shared(target: &Path) -> Result<()> {
+    nix::mount::mount(
+        Option::<&Path>::None,
+        target,
+        Option::<&str>::None,
+        MsFlags::MS_SHARED,
+        Option::<&str>::None,
+    )
+    .map_err(|e| NmblError::Mount {
+        src: None,
+        dst: PathBuf::from(target),
+        fstype: "(make-shared)".to_owned(),
+        source: e,
+    })
+}
+
 /// Unmount a target with the given flags. Use [`MntFlags::MNT_DETACH`] for the
 /// lazy unmount the pre-kexec tear-down wants.
 pub fn umount(target: &Path, flags: MntFlags) -> Result<()> {

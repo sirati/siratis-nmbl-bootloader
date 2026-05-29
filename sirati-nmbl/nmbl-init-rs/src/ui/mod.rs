@@ -71,7 +71,7 @@ pub use emergency::{
     resolve_emergency_timeout, run_emergency_screen, run_emergency_screen_with_app,
 };
 pub use reporter::{BootReporter, ProgressSink, TickOutcome};
-pub use runtime::{block_on_tui, build_local_runtime, spawn_poller};
+pub use runtime::{block_on_tui, block_on_tui_with_poller, build_local_runtime, spawn_poller};
 
 pub use modal_confirm::{show_modal_confirm, show_modal_confirm_over};
 pub use modal_error::{show_modal_error, show_modal_error_over};

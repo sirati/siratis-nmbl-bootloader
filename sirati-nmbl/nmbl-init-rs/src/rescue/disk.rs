@@ -40,7 +40,7 @@ use crate::sys::mount::mount_fs;
 /// Mountpoint where the writable rescue overlay is staged before the
 /// root switch. Lives at the initramfs root because `/rescue` is
 /// unlikely to collide with anything the initramfs created.
-const RESCUE_MOUNT: &str = "/rescue";
+pub(crate) const RESCUE_MOUNT: &str = "/rescue";
 
 /// Read-only squashfs lower layer of the rescue overlay.
 const RESCUE_LOWER: &str = "/run/nmbl-rescue/lower";
@@ -134,10 +134,14 @@ pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'stati
 /// squashfs can't support; the tmpfs upper absorbs every write while
 /// the image stays untouched.
 ///
+/// Shared by the disk-rescue path and the network-rescue path (which
+/// loop-mounts a memfd-backed squashfs) so both land on an identical
+/// writable `/rescue` the chrooted child runner can use.
+///
 /// All mount failures are wrapped in [`NmblError::Rescue`] with the
 /// `mount-rescue` stage so the emergency banner reads the same as the
 /// previous read-only path.
-fn mount_overlay_root(loop_dev: &Path) -> Result<()> {
+pub(crate) fn mount_overlay_root(loop_dev: &Path) -> Result<()> {
     let wrap = |source: NmblError| NmblError::Rescue {
         stage: "mount-rescue",
         source: Box::new(source),
