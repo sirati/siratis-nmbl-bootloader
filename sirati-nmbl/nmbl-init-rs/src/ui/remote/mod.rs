@@ -17,12 +17,13 @@
 //! NMBL is one OS thread and the recovery state (`config`, the boot
 //! error) is borrowed, not `'static`, so the per-connection futures
 //! cannot be `tokio::task::spawn_local`'d (that bound is `'static`).
-//! Instead [`driver`] hand-rolls a cooperative multiplexer: `accept`
-//! and every live session future are polled together each turn via
-//! [`std::future::poll_fn`]. A session that is stuck awaiting its pty
-//! simply stays `Pending` and never blocks `accept` — the same
-//! starvation guarantee `spawn_local` would give, without the `'static`
-//! requirement and without any worker thread (fork-safety preserved).
+//! Instead [`driver`] holds the live session futures in a
+//! `FuturesUnordered` (boxed so the borrowed, non-`'static` set fits) and
+//! polls `accept`, that set, and the shutdown signal together each turn.
+//! A session that is stuck awaiting its pty simply stays `Pending` and
+//! never blocks `accept` — the same starvation guarantee `spawn_local`
+//! would give, without the `'static` requirement and without any worker
+//! thread (fork-safety preserved).
 //!
 //! ## Shutdown
 //!

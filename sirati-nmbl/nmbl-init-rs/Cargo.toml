@@ -75,9 +75,11 @@ image-splash = ["dep:drm", "dep:png", "dep:fontdue", "pretty-shell", "rustix/eve
 # of release builds — production initramfs MUST NOT carry this code.
 mocking = []
 # Opt-in socket TUI / chrooted rescue / remote log viewer. Phase 2/3
-# socket/client/remote code is gated behind this; empty for now (the
-# tokio runtime + async migration is the new base and is NOT gated).
-remote-tui = []
+# socket/client/remote code is gated behind this. Pulls `futures-util`
+# only here for `FuturesUnordered` (the remote accept multiplexer); the
+# default build never compiles it. The tokio runtime + async migration
+# is the new base and is NOT gated.
+remote-tui = ["dep:futures-util"]
 
 [dependencies]
 nix = { version = "0.29", default-features = false, features = ["mount", "fs", "process", "term", "user", "signal", "reboot", "feature"] }
@@ -157,6 +159,12 @@ getrandom = { version = "0.3", optional = true, default-features = false }
 # generation-id slots; its `serde` feature plumbs the encoding through.
 ciborium = { version = "0.2", default-features = false, features = ["std"], optional = true }
 nonmax   = { version = "0.5", default-features = false, features = ["serde"], optional = true }
+# Optional (gated behind `remote-tui`). Provides `FuturesUnordered` +
+# `StreamExt::next` for the remote accept multiplexer in
+# `src/ui/remote/driver.rs`. `alloc` is the minimal feature set that
+# carries both (no `std`, no executors); the default build never compiles
+# it.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"
