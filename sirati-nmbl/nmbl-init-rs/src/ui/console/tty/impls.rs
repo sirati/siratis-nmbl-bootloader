@@ -110,7 +110,13 @@ impl Console for TtyConsole {
         if let Some(mut q) = self.printk_quiet.take() {
             q.restore();
         }
-        log::clear_tui_active();
+        // Only the primary boot console owns the process-global
+        // stderr-suppression refcount; a remote-pty console never set
+        // it, so it must not clear it (that would un-suppress the local
+        // console's stderr mid-boot).
+        if self.owns_global_tui_state {
+            log::clear_tui_active();
+        }
         if let Some(previous) = self.previous_kd_mode.take() {
             restore_kd_mode(self.fd.as_fd(), previous);
         }
@@ -129,9 +135,14 @@ impl Console for TtyConsole {
         let saved = save_termios(self.fd.as_fd())?;
         let _ = enter_raw(self.fd.as_fd())?;
         self.saved_termios = Some(saved);
-        self.previous_kd_mode = enter_kd_graphics(self.fd.as_fd());
-        self.printk_quiet = Some(PrintkQuiet::engage());
-        log::set_tui_active();
+        // Re-acquiring the kernel VT / printk / stderr suppression is
+        // only correct for the primary console that owned them. A remote
+        // pty console renders to its own pty and leaves the globals alone.
+        if self.owns_global_tui_state {
+            self.previous_kd_mode = enter_kd_graphics(self.fd.as_fd());
+            self.printk_quiet = Some(PrintkQuiet::engage());
+            log::set_tui_active();
+        }
         self.terminal.clear().map_err(tui_err)?;
         Ok(())
     }
@@ -150,7 +161,9 @@ impl Drop for TtyConsole {
         if let Some(mut q) = self.printk_quiet.take() {
             q.restore();
         }
-        log::clear_tui_active();
+        if self.owns_global_tui_state {
+            log::clear_tui_active();
+        }
         if let Some(previous) = self.previous_kd_mode.take() {
             restore_kd_mode(self.fd.as_fd(), previous);
         }

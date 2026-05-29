@@ -44,6 +44,8 @@ pub mod modal_password;
 pub mod password_supplier;
 #[cfg(feature = "pretty-shell")]
 pub mod pretty_shell;
+#[cfg(feature = "remote-tui")]
+pub mod remote;
 pub mod reporter;
 #[cfg(feature = "network-rescue")]
 pub mod rescue;

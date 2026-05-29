@@ -84,6 +84,17 @@ const CONSOLE_PATH: &str = "/dev/console";
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
+/// Resolve the seed grid for a pty whose handshake winsize may be 0x0
+/// (a freshly-allocated pty before the client's `TIOCSWINSZ`, or a
+/// client that reported nothing). Returns `(rows, cols)`, substituting
+/// the 80x24 default for any zero dimension so the first frame paints.
+fn pty_seed_size(winsize: (u16, u16)) -> (u16, u16) {
+    let (rows, cols) = winsize;
+    let rows = if rows == 0 { DEFAULT_ROWS } else { rows };
+    let cols = if cols == 0 { DEFAULT_COLS } else { cols };
+    (rows, cols)
+}
+
 /// Raw-mode tty backend. See module docs for the lifetime story.
 pub struct TtyConsole {
     /// Owns the `/dev/console` fd for the lifetime of the console.
@@ -116,6 +127,14 @@ pub struct TtyConsole {
     /// Latest grid size observed via a CSI 8;rows;cols t report from
     /// the host terminal. Wins over the backend's reported size.
     last_resize: Option<(u16, u16)>,
+    /// Whether this console owns the process-global TUI state — the
+    /// printk-quiet engagement and the stderr-suppression refcount
+    /// (`log::set_tui_active`). The primary boot console (`open`/
+    /// `open_path`) owns it; a remote-TUI console built on a received
+    /// pty (`from_pty`) does NOT — it renders to its own pty only and
+    /// must never silence the local console's printk or stderr, nor
+    /// touch the kernel VT mode (a pty is never a VT).
+    owns_global_tui_state: bool,
 }
 
 impl TtyConsole {
@@ -129,8 +148,75 @@ impl TtyConsole {
     pub fn open_path(path: &Path) -> Result<TtyConsole> {
         let fd = open_console_fd(path)?;
         let saved = enter_raw(fd.as_fd())?;
+        // The primary console may be a kernel VT (framebuffer case):
+        // grab graphics mode so printk stops smearing the framebuffer.
         let previous_kd_mode = enter_kd_graphics(fd.as_fd());
+        let terminal = Self::build_terminal(&fd, None)?;
 
+        // Silence kernel-printk to console while we own the screen.
+        let printk_quiet = Some(PrintkQuiet::engage());
+        // Tell the `nmbl_*!` macros to stop writing to stderr.
+        log::set_tui_active();
+
+        Ok(TtyConsole {
+            fd,
+            saved_termios: Some(saved),
+            previous_kd_mode,
+            printk_quiet,
+            terminal,
+            resize_filter: ResizeFilter::new(),
+            key_parser: TermwizToCrossterm::new(),
+            pending_keys: VecDeque::new(),
+            pending_scrolls: VecDeque::new(),
+            last_resize: None,
+            owns_global_tui_state: true,
+        })
+    }
+
+    /// Build a [`TtyConsole`] on an already-open pty `OwnedFd`, seeding
+    /// the render surface from `winsize` (`(rows, cols)`).
+    ///
+    /// This is the remote-TUI path: the operator's client passes its
+    /// controlling terminal across the root-only socket via `SCM_RIGHTS`
+    /// and PID 1 drives a TUI on that pty. Unlike [`open_path`] it:
+    ///   * does NOT touch the kernel VT mode — a pty is never a VT, so
+    ///     `KDSETMODE` is meaningless (and would `ENOTTY`);
+    ///   * does NOT engage `PrintkQuiet` or `log::set_tui_active` — those
+    ///     are process-global and belong to the local boot console; a
+    ///     remote session must not silence the local console's printk or
+    ///     stderr. The session renders ONLY to its own pty.
+    ///
+    /// The saved termios is restored on drop, so the client's terminal is
+    /// left clean when the session ends.
+    pub fn from_pty(fd: OwnedFd, winsize: (u16, u16)) -> Result<TtyConsole> {
+        let saved = enter_raw(fd.as_fd())?;
+        // `winsize` is `(rows, cols)` (handshake order). `build_terminal`
+        // takes the same order; `last_resize`/`size()` use `(cols, rows)`.
+        let (rows, cols) = pty_seed_size(winsize);
+        let terminal = Self::build_terminal(&fd, Some((rows, cols)))?;
+        Ok(TtyConsole {
+            fd,
+            saved_termios: Some(saved),
+            previous_kd_mode: None,
+            printk_quiet: None,
+            terminal,
+            resize_filter: ResizeFilter::new(),
+            key_parser: TermwizToCrossterm::new(),
+            pending_keys: VecDeque::new(),
+            pending_scrolls: VecDeque::new(),
+            // Seed the cached size so the first render and any modal
+            // layout use the client's reported geometry immediately,
+            // before the in-band `CSI 8;rows;cols t` report (if any).
+            last_resize: Some((cols, rows)),
+            owns_global_tui_state: false,
+        })
+    }
+
+    /// Shared termwiz/ratatui terminal construction for both
+    /// constructors. `seed` overrides the surface size when the fd
+    /// reports no winsize (serial line or pty); `None` falls back to the
+    /// historic 80x24 default.
+    fn build_terminal(fd: &OwnedFd, seed: Option<(u16, u16)>) -> Result<Terminal<TermwizBackend>> {
         // We read input from `self.fd` directly via rustix poll/read
         // in `poll_event`, so the fd must be non-blocking.
         if let Err(e) = fcntl_setfl(fd.as_fd(), OFlags::NONBLOCK) {
@@ -145,11 +231,10 @@ impl TtyConsole {
         // duplicates the fd internally for its own writer; the dup'd
         // reader is never used because we never call `poll_input` —
         // input flows through our own rustix loop and the parser.
-        // `Capabilities::new_from_env()` reads `$TERM` to pick a
-        // terminfo entry; we'd rather fall back to a minimal ANSI set
-        // when `$TERM` is unset (NMBL boots with no environment).
+        // We feed explicit caps (bundled terminfo + truecolor) rather
+        // than reading `$TERM`, since NMBL boots with no environment.
         let caps = caps_from_env_with_fallback()?;
-        let unix_term = UnixTerminal::new_with(caps, &fd, &fd).map_err(tw_err)?;
+        let unix_term = UnixTerminal::new_with(caps, fd, fd).map_err(tw_err)?;
         let mut buf = BufferedTerminal::new(unix_term).map_err(tw_err)?;
 
         // `UnixTerminal::new_with` `dup()`s our fd and, during
@@ -167,39 +252,21 @@ impl TtyConsole {
         }
 
         // `BufferedTerminal::new` seeds its `Surface` from
-        // `TIOCGWINSZ`. A serial line reports no winsize (0x0), so the
-        // surface would have zero area: ratatui's `draw()` autoresizes
-        // to the backend's 0x0, renders into an empty frame, the diff
-        // is empty, and *nothing* is ever written to the line — the
-        // empty-pane regression. Seed a sane default so the very first
+        // `TIOCGWINSZ`. A serial line / freshly-allocated pty may report
+        // no winsize (0x0), so the surface would have zero area:
+        // ratatui's `draw()` autoresizes to 0x0, renders into an empty
+        // frame, the diff is empty, and *nothing* is ever written — the
+        // empty-pane regression. Seed sane dimensions so the very first
         // frame paints; the host's `CSI 8;rows;cols t` report later
         // corrects the geometry via `apply_resize`.
         let (cols0, rows0) = buf.dimensions();
         if cols0 == 0 || rows0 == 0 {
-            buf.resize(usize::from(DEFAULT_COLS), usize::from(DEFAULT_ROWS));
+            let (rows, cols) = seed.unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
+            buf.resize(usize::from(cols), usize::from(rows));
         }
 
         let backend = TermwizBackend::with_buffered_terminal(buf);
-        let terminal = Terminal::new(backend).map_err(tui_err)?;
-
-        // Silence kernel-printk to console while we own the screen.
-        let printk_quiet = Some(PrintkQuiet::engage());
-
-        // Tell the `nmbl_*!` macros to stop writing to stderr.
-        log::set_tui_active();
-
-        Ok(TtyConsole {
-            fd,
-            saved_termios: Some(saved),
-            previous_kd_mode,
-            printk_quiet,
-            terminal,
-            resize_filter: ResizeFilter::new(),
-            key_parser: TermwizToCrossterm::new(),
-            pending_keys: VecDeque::new(),
-            pending_scrolls: VecDeque::new(),
-            last_resize: None,
-        })
+        Terminal::new(backend).map_err(tui_err)
     }
 
     /// Read whatever bytes are ready on `self.fd`, run them through
