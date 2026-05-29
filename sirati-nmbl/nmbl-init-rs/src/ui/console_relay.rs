@@ -39,7 +39,7 @@ use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{Mode, OFlags, fcntl_setfl, open};
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{NmblError, Result};
 use crate::nmbl_warn;
 use crate::sys::pty::{PtyChild, spawn_shell};
 use crate::ui::POLL_SLICE;
@@ -136,11 +136,23 @@ pub fn run_relay(
         .filter_map(|p| open_target_nonblocking(p).map(|fd| (p.clone(), fd)))
         .collect();
     if target_fds.is_empty() {
-        nmbl_warn!(
-            "console_relay: every selected target failed to open; \
-             aborting shell relay and returning to the menu"
-        );
-        return Ok(());
+        // Every selected tty failed to open (permissions, missing
+        // device node, …). This used to return Ok(()) and silently
+        // drop back to the menu — the operator saw NOTHING and had no
+        // idea the shell never spawned. Surface it as a real error so
+        // the emergency loop shows a modal naming the unopenable
+        // targets instead of leaving the menu unchanged.
+        let names = targets
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(NmblError::Tui {
+            source: std::io::Error::other(format!(
+                "could not open any selected shell target ({names}); \
+                 check the device node exists and is writable"
+            )),
+        });
     }
 
     // Now the shell. spawn_shell forks, sets up controlling terminal,

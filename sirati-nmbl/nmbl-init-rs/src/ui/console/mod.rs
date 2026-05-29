@@ -121,6 +121,21 @@ pub trait Console {
     /// [`Console::draw_with`] call must produce a visible frame, even
     /// if nothing about the underlying [`App`] state changed.
     fn resume(&mut self) -> Result<()>;
+
+    /// Best-effort query of the keyboard's Caps-Lock lock state on the
+    /// backend's input VT, used by the passphrase prompt to show a
+    /// (non-resizing) warning.
+    ///
+    /// Returns `Some(true)` / `Some(false)` only on a kernel VT where
+    /// the `KDGKBLED` ioctl succeeds (the splash and tty backends), and
+    /// `None` ("unknown") everywhere else — serial lines, the sentinel
+    /// [`NoopConsole`], the mock harness. The default impl returns
+    /// `None` so a backend that owns no queryable keyboard never shows
+    /// the warning. Polled every render tick; must never block, log, or
+    /// error.
+    fn caps_lock_active(&self) -> Option<bool> {
+        None
+    }
 }
 
 pub mod noop;

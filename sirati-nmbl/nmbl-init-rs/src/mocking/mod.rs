@@ -52,6 +52,7 @@ use termwiz::caps::Capabilities;
 use termwiz::terminal::buffered::BufferedTerminal;
 use termwiz::terminal::unix::UnixTerminal;
 
+use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::sys::tty::{enter_raw, restore_termios, save_termios};
 use crate::ui::POLL_SLICE;
@@ -122,6 +123,7 @@ pub fn run(args: DebugTuiArgs) -> Result<()> {
             "boot-status" => run_boot_status(&mut console, &args.args),
             "passphrase" => run_passphrase(&mut console, &args.args),
             "resize" => run_resize(&mut console, &args.args),
+            "emergency" => run_emergency(&mut console, &args.args),
             other => Err(NmblError::Io {
                 source: std::io::Error::other(format!("unknown --debug-tui scenario {other:?}")),
                 context: "mocking harness dispatch".to_string(),
@@ -326,6 +328,35 @@ fn run_boot_status(console: &mut MockConsole, args: &[String]) -> Result<()> {
         }
     }
     eprintln!("[mocking] boot-status dismissed");
+    Ok(())
+}
+
+/// Drive the real emergency menu (`shell::drop_to_emergency`) on the
+/// host terminal so the menu, the console picker, Raw Shell, and the
+/// error-display behaviour can be exercised without a VM. A synthetic
+/// boot error seeds the screen; the optional first arg overrides the
+/// shell path (default `/bin/sh`) so the picker can spawn a real shell
+/// on the host's controlling tty.
+///
+/// This is primarily a manual / tmux-driven smoke test for the
+/// latest-error display fix and the Raw Shell spawn: pick `Raw Shell`,
+/// keep the current tty checked, hit `Spawn`, and confirm a live shell
+/// appears. The picker resolves real `/dev/...` targets, so run it from
+/// a real terminal (a tmux pane is ideal).
+fn run_emergency(_console: &mut MockConsole, args: &[String]) -> Result<()> {
+    let mut config = Config::recovery_default();
+    if let Some(shell) = args.first() {
+        config.paths.shell = std::path::PathBuf::from(shell);
+    }
+    // drop_to_emergency owns its console; hand it a fresh boxed
+    // MockConsole (same stdin/stdout this process already uses).
+    let boxed: Box<dyn Console> = Box::new(MockConsole::new()?);
+    let err = NmblError::Io {
+        source: std::io::Error::other("synthetic boot failure (mocking harness)"),
+        context: "phase-3 generation discovery".to_string(),
+    };
+    let action = crate::shell::drop_to_emergency(boxed, &config, err);
+    eprintln!("[mocking] emergency action={action:?}");
     Ok(())
 }
 

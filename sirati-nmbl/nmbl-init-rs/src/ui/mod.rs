@@ -32,6 +32,7 @@ pub mod app;
 pub mod console;
 pub mod console_picker;
 pub mod console_relay;
+pub mod editline;
 pub mod emergency;
 pub mod emergency_actions;
 pub mod key_echo;
@@ -908,6 +909,28 @@ pub(crate) fn render_splash_frame_with(
 
     drm.render(|fb, fb_dims| {
         compositor::blit_background(fb, fb_dims, bg_scaled);
+        // Pass 1: dark contrast halo behind glyphs on the transparent
+        // default background, painted first so it only darkens the
+        // background photo and never bleeds onto adjacent drawn text.
+        term_pipe.for_each_cell(|col, row, cell| {
+            if !compositor::wants_halo(cell.bg) {
+                return;
+            }
+            let bold = cell.flags.contains(Flags::BOLD);
+            let Some(glyph) = cache.get(cell.c, bold) else {
+                return;
+            };
+            let x = u32::from(col).saturating_mul(cell_dims.cell_w);
+            let y = u32::from(row).saturating_mul(cell_dims.cell_h);
+            let rect = compositor::CellRect {
+                x,
+                y,
+                w: cell_dims.cell_w,
+                h: cell_dims.cell_h,
+            };
+            compositor::blit_halo(fb, fb_dims, glyph, rect);
+        });
+        // Pass 2: cell backgrounds + glyphs.
         term_pipe.for_each_cell(|col, row, cell| {
             if cell.c == ' ' && cell.bg == Color::Named(NamedColor::Background) {
                 return;
@@ -917,7 +940,7 @@ pub(crate) fn render_splash_frame_with(
                 return;
             };
             let fg = compositor::resolve_color(cell.fg);
-            let bg = compositor::resolve_color(cell.bg);
+            let bg = compositor::resolve_bg_color(cell.bg);
             let x = u32::from(col).saturating_mul(cell_dims.cell_w);
             let y = u32::from(row).saturating_mul(cell_dims.cell_h);
             let rect = compositor::CellRect {
@@ -1024,14 +1047,13 @@ fn render_screen_body(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
         Screen::Log { lines, offset } => render_log(frame, frame.area(), lines, *offset),
         Screen::Editing {
             generation_index,
-            buffer,
-            cursor,
+            line,
         } => {
             if let Some(g) = app.generations.get(*generation_index) {
                 let data = EditScreenData {
                     generation: g,
-                    edited_cmdline: buffer,
-                    cursor_position: *cursor,
+                    edited_cmdline: line.text(),
+                    cursor_position: line.cursor(),
                 };
                 render_edit(frame, &data);
             }
@@ -1039,14 +1061,20 @@ fn render_screen_body(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
         Screen::Passphrase {
             prompt_label,
             buffer,
+            cursor,
             verifying,
             spinner_frame,
         } => {
             let data = PassphraseScreenData {
                 prompt_label,
                 buffer_len: buffer.len(),
+                // Convert the real byte cursor into a char-column count
+                // so the masked caret lands at the right dot even when
+                // the secret holds multi-byte chars.
+                cursor_column: view::char_column_for_byte_cursor(buffer, *cursor),
                 verifying: *verifying,
                 spinner_frame: *spinner_frame,
+                caps_lock_on: app.caps_lock_warning,
             };
             render_passphrase(frame, &data);
         }
@@ -1144,12 +1172,24 @@ pub(crate) fn passphrase_prompt_on_console(
     app.screen = Screen::Passphrase {
         prompt_label: label.to_string(),
         buffer: Zeroizing::new(String::new()),
+        cursor: 0,
         verifying: false,
         spinner_frame: 0,
     };
 
     let mut dirty = true;
     loop {
+        // Poll the live Caps-Lock state every tick so the warning row
+        // appears / disappears as the operator toggles the key. `None`
+        // (serial line, no VT) degrades to "off" — the warning simply
+        // never shows. Redraw whenever the state flips so the change is
+        // visible without waiting for the next keystroke.
+        let caps = console.caps_lock_active().unwrap_or(false);
+        if caps != app.caps_lock_warning {
+            app.caps_lock_warning = caps;
+            dirty = true;
+        }
+
         if dirty {
             console.render(&app)?;
             dirty = false;
@@ -1367,8 +1407,10 @@ mod tests {
         let data = PassphraseScreenData {
             prompt_label: "Unlock root",
             buffer_len: 4,
+            cursor_column: 4,
             verifying: false,
             spinner_frame: 0,
+            caps_lock_on: false,
         };
         let mut term = Terminal::new(TestBackend::new(60, 14)).expect("test terminal");
         term.draw(|f| render_passphrase(f, &data)).expect("draw");

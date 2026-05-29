@@ -375,7 +375,7 @@ in
           ];
         splashContents = lib.optionals cfg.splash.enable [
           {
-            object = cfg.splash.fontPath;
+            object = cfg.splash.resolvedFontPath;
             symlink = "/etc/splash/font.ttf";
           }
         ] ++ splashBackgroundContents;
