@@ -323,7 +323,10 @@ pub fn snapshot_full() -> Vec<String> {
             // Clone bytes out under the lock so we release it before the
             // (potentially large) UTF-8 decode + split — same access
             // pattern as `flush_to`.
-            Some(log) => (log.dropped_bytes, log.buf.iter().copied().collect::<Vec<u8>>()),
+            Some(log) => (
+                log.dropped_bytes,
+                log.buf.iter().copied().collect::<Vec<u8>>(),
+            ),
             None => return Vec::new(),
         }
     };
@@ -434,10 +437,15 @@ mod tests {
         let _guard = ring_test_guard();
         // Hold the LOG_RING mutex across the body — see the comment in
         // `snapshot_caps_at_ring_capacity` for why.
-        let mut guard = LOG_RING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = LOG_RING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(VecDeque::with_capacity(LOG_RING_CAPACITY));
         for i in 0..10 {
-            push_inner(guard.as_mut().expect("ring just initialised"), &format!("line {i}"));
+            push_inner(
+                guard.as_mut().expect("ring just initialised"),
+                &format!("line {i}"),
+            );
         }
         let snap = snapshot_inner(guard.as_ref().expect("ring still initialised"), 5);
         assert_eq!(snap.len(), 5);
@@ -456,10 +464,15 @@ mod tests {
         // to the ring, shifts what the FIFO evicts, and our oldest /
         // newest entry assertions become flaky under cargo's parallel
         // test execution.
-        let mut guard = LOG_RING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = LOG_RING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(VecDeque::with_capacity(LOG_RING_CAPACITY));
         for i in 0..300 {
-            push_inner(guard.as_mut().expect("ring just initialised"), &format!("entry {i}"));
+            push_inner(
+                guard.as_mut().expect("ring just initialised"),
+                &format!("entry {i}"),
+            );
         }
         let snap = snapshot_inner(guard.as_ref().expect("ring still initialised"), usize::MAX);
         assert_eq!(snap.len(), LOG_RING_CAPACITY);
@@ -500,7 +513,9 @@ mod tests {
         let _guard = ring_test_guard();
         // Hold the LOG_RING mutex across the body — see the comment in
         // `snapshot_caps_at_ring_capacity` for why.
-        let mut guard = LOG_RING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = LOG_RING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = Some(VecDeque::new());
         let ring = guard.as_ref().expect("ring just initialised");
         assert!(snapshot_inner(ring, 10).is_empty());
@@ -637,7 +652,10 @@ mod tests {
         }
 
         let snap = snapshot_full();
-        assert_eq!(snap, lines.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        assert_eq!(
+            snap,
+            lines.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()
+        );
 
         reset_rings();
     }

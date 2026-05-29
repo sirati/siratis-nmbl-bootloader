@@ -181,16 +181,12 @@ fn ioctl_scan(control_fd: libc::c_int, dev: &Path) -> i32 {
     let request = BTRFS_IOC_SCAN_DEV as libc::c_int;
     #[cfg(not(target_env = "musl"))]
     let request = BTRFS_IOC_SCAN_DEV as libc::c_ulong;
-    let rc = unsafe {
-        libc::ioctl(
-            control_fd,
-            request,
-            &mut args as *mut BtrfsIoctlVolArgs,
-        )
-    };
+    let rc = unsafe { libc::ioctl(control_fd, request, &mut args as *mut BtrfsIoctlVolArgs) };
 
     if rc < 0 {
-        std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+        std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO)
     } else {
         0
     }

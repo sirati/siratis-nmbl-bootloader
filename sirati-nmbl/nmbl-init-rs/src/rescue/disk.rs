@@ -217,8 +217,8 @@ mod tests {
             context: "test".to_string(),
         };
         let cfg = cfg_with_sfs(None, None);
-        let err =
-            prepare_disk_rescue(&cfg, &cause).expect_err("missing runtime boot mountpoint must error");
+        let err = prepare_disk_rescue(&cfg, &cause)
+            .expect_err("missing runtime boot mountpoint must error");
         match err {
             NmblError::Rescue { stage, source } => {
                 assert_eq!(stage, "locate-sfs");

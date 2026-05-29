@@ -729,8 +729,7 @@ pub(crate) fn render_picker_frame(frame: &mut Frame<'_>, state: &PickerState) {
         .block(Block::bordered());
     frame.render_widget(cancel_para, cancel_area);
 
-    let footer_text =
-        "up/down move  Space toggle  Tab check custom  Enter confirm  Esc cancel";
+    let footer_text = "up/down move  Space toggle  Tab check custom  Enter confirm  Esc cancel";
     frame.render_widget(
         Paragraph::new(footer_text).alignment(Alignment::Left),
         footer,
@@ -751,7 +750,11 @@ fn render_custom_input(frame: &mut Frame<'_>, area: Rect, state: &PickerState) {
         ),
         CustomValidation::Valid => (
             Style::default().fg(Color::Green),
-            if state.custom_checked { "[x]".to_string() } else { "[ ]".to_string() },
+            if state.custom_checked {
+                "[x]".to_string()
+            } else {
+                "[ ]".to_string()
+            },
             Style::default().fg(Color::Green),
         ),
         CustomValidation::Invalid => (
@@ -776,7 +779,8 @@ fn render_custom_input(frame: &mut Frame<'_>, area: Rect, state: &PickerState) {
     } else {
         Style::default()
     };
-    let para = Paragraph::new(body).block(Block::bordered().title(Span::styled(title, block_style)));
+    let para =
+        Paragraph::new(body).block(Block::bordered().title(Span::styled(title, block_style)));
     frame.render_widget(para, area);
 }
 

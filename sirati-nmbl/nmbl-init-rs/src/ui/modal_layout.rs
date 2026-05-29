@@ -374,9 +374,8 @@ pub fn compute_modal_layout_with_button_width(
     let mut visible_text_lines: u16;
     let mut box_height: u16;
 
-    let available = |top: u16, bot: u16| -> u16 {
-        screen_h.saturating_sub(top.saturating_add(bot))
-    };
+    let available =
+        |top: u16, bot: u16| -> u16 { screen_h.saturating_sub(top.saturating_add(bot)) };
 
     // Initial fit?
     if target_box_h <= available(outer_top_pad, outer_bot_pad) {
@@ -508,7 +507,9 @@ pub fn compute_modal_layout_with_button_width(
     // If still doesn't fit even with all paddings at 0 and not
     // scrollable (pathologically tiny screen), accept whatever fits;
     // box_height = available height.
-    let max_box_h = screen_h.saturating_sub(outer_top_pad).saturating_sub(outer_bot_pad);
+    let max_box_h = screen_h
+        .saturating_sub(outer_top_pad)
+        .saturating_sub(outer_bot_pad);
     if box_height > max_box_h {
         box_height = max_box_h.max(3);
     }
@@ -690,7 +691,10 @@ mod tests {
     fn wrap_message_splits_on_word_boundary() {
         let lines = wrap_message("the quick brown fox", 10);
         // "the quick" is 9 → fits; "brown fox" is 9 → fits next.
-        assert_eq!(lines, vec!["the quick".to_string(), "brown fox".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["the quick".to_string(), "brown fox".to_string()]
+        );
     }
 
     #[test]
@@ -704,7 +708,10 @@ mod tests {
     #[test]
     fn wrap_message_preserves_hard_newlines() {
         let lines = wrap_message("a\nb\nc", 10);
-        assert_eq!(lines, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]
@@ -734,8 +741,7 @@ mod tests {
         let labels = ["[Try again]  [Reboot]  [Pretty Shell]  [Raw Shell]"];
         let btn_w = u16::try_from(labels[0].chars().count()).unwrap_or(0);
         let msg = "short message that wraps under buttons";
-        let layout =
-            compute_modal_layout_with_button_width(msg, true, 4, btn_w, screen(80, 24));
+        let layout = compute_modal_layout_with_button_width(msg, true, 4, btn_w, screen(80, 24));
         assert!(
             layout.inner_width >= btn_w,
             "inner_width ({}) must fit buttons ({btn_w})",

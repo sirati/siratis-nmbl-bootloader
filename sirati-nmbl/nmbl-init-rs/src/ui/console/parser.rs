@@ -23,7 +23,9 @@
 //! (no fd, no syscalls) and fully unit-tested on canned slices.
 
 use crossterm::event::{KeyCode as CtKeyCode, KeyEvent as CtKeyEvent, KeyModifiers as CtMods};
-use termwiz::input::{InputEvent, InputParser as TwInputParser, KeyCode as TwKeyCode, Modifiers as TwMods};
+use termwiz::input::{
+    InputEvent, InputParser as TwInputParser, KeyCode as TwKeyCode, Modifiers as TwMods,
+};
 
 use crate::ui::console::ConsoleEvent;
 
@@ -97,7 +99,11 @@ impl ResizeFilter {
             }
             // Try to recognise CSI 8;<rows>;<cols>t starting at idx.
             match recognise_csi_8t(self.buf.get(idx..buf_len).unwrap_or(&[])) {
-                CsiOutcome::Resize { rows, cols, consumed } => {
+                CsiOutcome::Resize {
+                    rows,
+                    cols,
+                    consumed,
+                } => {
                     // Drop the bytes BEFORE the CSI (already forwarded
                     // into scratch) AND the CSI itself (consumed). Shift
                     // the trailing tail down to buf[0] so the next call
@@ -165,7 +171,11 @@ impl ResizeFilter {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CsiOutcome {
     /// Recognised `CSI 8;rows;cols t`; consumed the listed byte count.
-    Resize { rows: u16, cols: u16, consumed: usize },
+    Resize {
+        rows: u16,
+        cols: u16,
+        consumed: usize,
+    },
     /// Either not a CSI at all, or a CSI we don't claim — caller
     /// forwards `consumed` bytes verbatim to termwiz.
     NotMine { consumed: usize },
@@ -233,7 +243,11 @@ fn recognise_csi_8t(bytes: &[u8]) -> CsiOutcome {
     }
     let rows = u16::try_from(rows).unwrap_or(u16::MAX);
     let cols = u16::try_from(cols).unwrap_or(u16::MAX);
-    CsiOutcome::Resize { rows, cols, consumed }
+    CsiOutcome::Resize {
+        rows,
+        cols,
+        consumed,
+    }
 }
 
 fn parse_u32(bytes: &[u8]) -> Option<u32> {
@@ -261,7 +275,9 @@ pub(crate) struct TermwizToCrossterm {
 
 impl TermwizToCrossterm {
     pub(crate) fn new() -> Self {
-        Self { inner: TwInputParser::new() }
+        Self {
+            inner: TwInputParser::new(),
+        }
     }
 
     /// Feed bytes into termwiz; drain matching events into `out` as

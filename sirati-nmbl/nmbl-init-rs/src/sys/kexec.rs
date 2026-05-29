@@ -154,12 +154,11 @@ pub fn load_with_extra_initrd_cpio(
     cmdline: &str,
     flags: u32,
 ) -> Result<()> {
-    let mut combined: Vec<u8> =
-        std::fs::read(initrd).map_err(|e| NmblError::KexecLoad {
-            kernel: kernel.to_path_buf(),
-            initrd: Some(initrd.to_path_buf()),
-            source: nix::Error::from_raw(e.raw_os_error().unwrap_or(libc::EIO)),
-        })?;
+    let mut combined: Vec<u8> = std::fs::read(initrd).map_err(|e| NmblError::KexecLoad {
+        kernel: kernel.to_path_buf(),
+        initrd: Some(initrd.to_path_buf()),
+        source: nix::Error::from_raw(e.raw_os_error().unwrap_or(libc::EIO)),
+    })?;
     // 4-byte align before the next concatenated archive — Linux's
     // initrd unpacker accepts NUL padding between archives.
     while !combined.len().is_multiple_of(4) {
@@ -194,12 +193,10 @@ pub fn load_with_extra_initrd_cpio(
         remaining = remaining.get(n..).unwrap_or(&[]);
     }
     // Rewind so `kexec_file_load` reads from offset 0.
-    rustix::fs::seek(&memfd, rustix::fs::SeekFrom::Start(0)).map_err(|e| {
-        NmblError::KexecLoad {
-            kernel: kernel.to_path_buf(),
-            initrd: Some(initrd.to_path_buf()),
-            source: nix::Error::from_raw(e.raw_os_error()),
-        }
+    rustix::fs::seek(&memfd, rustix::fs::SeekFrom::Start(0)).map_err(|e| NmblError::KexecLoad {
+        kernel: kernel.to_path_buf(),
+        initrd: Some(initrd.to_path_buf()),
+        source: nix::Error::from_raw(e.raw_os_error()),
     })?;
 
     load_with_initrd_fd(kernel, Some(initrd), Some(&memfd), cmdline, flags)

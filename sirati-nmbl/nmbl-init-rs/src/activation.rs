@@ -130,8 +130,7 @@ pub fn run_all_activations(
             // other non-zero exit code is fatal as before.
             if activation.kind == ActivationKind::LuksPassword && outcome.exit_code == 2 {
                 attempts = attempts.saturating_add(1);
-                match handle_wrong_password(config, &mut *reporter.console, activation, attempts)?
-                {
+                match handle_wrong_password(config, &mut *reporter.console, activation, attempts)? {
                     WrongPasswordHandled::TryAgain => continue,
                     WrongPasswordHandled::Reboot => {
                         return Err(NmblError::OperatorChoseReboot {
@@ -423,9 +422,7 @@ fn handle_wrong_password(
             // modal-error so the wrong-password flow doesn't crash the
             // boot — we still want the operator to be able to retry.
             match crate::ui::console_picker::run_picker_session(console, config) {
-                Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached {
-                    targets,
-                }) => {
+                Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached { targets }) => {
                     let joined = targets
                         .iter()
                         .map(|p| p.display().to_string())
@@ -541,11 +538,7 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
     }
 
     impl PasswordSupplier for MockSupplier {
-        fn prompt(
-            &mut self,
-            _console: &mut dyn Console,
-            label: &str,
-        ) -> Result<Zeroizing<String>> {
+        fn prompt(&mut self, _console: &mut dyn Console, label: &str) -> Result<Zeroizing<String>> {
             self.seen_label = Some(label.to_string());
             Ok(Zeroizing::new(self.canned.to_string()))
         }
@@ -571,10 +564,7 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
         fn kind(&self) -> crate::ui::console::ConsoleKind {
             crate::ui::console::ConsoleKind::Tty
         }
-        fn draw_with(
-            &mut self,
-            _body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
-        ) -> Result<()> {
+        fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
             Ok(())
         }
         fn suspend(&mut self) -> Result<()> {

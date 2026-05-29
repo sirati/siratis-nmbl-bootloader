@@ -45,7 +45,9 @@ use nmbl_init::sys::{blkid, mount as sys_mount};
 use nmbl_init::terminal::{TerminalAction, redirect_stdio_for_execve};
 use nmbl_init::ui::console::{Console, NoopConsole, open_console};
 use nmbl_init::ui::key_echo::run_key_echo_loop;
-use nmbl_init::ui::{BootReporter, Decision, SessionInteraction, TuiPasswordSupplier, run_selector};
+use nmbl_init::ui::{
+    BootReporter, Decision, SessionInteraction, TuiPasswordSupplier, run_selector,
+};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/nmbl/config.toml";
@@ -270,10 +272,7 @@ fn recover_from_panic(args: Args, report_path: PathBuf) -> (TerminalAction, Conf
     nmbl_warn!("panic recovery mode: report at {}", report_path.display());
     nmbl_warn!("panic report follows:\n{report}");
 
-    let action = open_console_and_drop_to_emergency(
-        &config,
-        NmblError::Panicked { report_path },
-    );
+    let action = open_console_and_drop_to_emergency(&config, NmblError::Panicked { report_path });
     (action, config)
 }
 
@@ -1133,9 +1132,7 @@ fn run_inner(
     // normal boot path a failure still routes through the emergency
     // screen exactly as before.
     #[cfg(feature = "stateful")]
-    if bootstrap_mode
-        && let Err(err) = mount_state_twin(&mut config, bootstrap_path)
-    {
+    if bootstrap_mode && let Err(err) = mount_state_twin(&mut config, bootstrap_path) {
         return Err(Box::new((err, config)));
     }
 
@@ -1400,8 +1397,11 @@ mod tests {
         let mut cfg = Config::recovery_default();
         cfg.rescue.force_on_boot = true;
         cfg.rescue.mode = RescueMode::External;
-        cfg.kernel_modules.explicit =
-            vec!["loop".to_owned(), "squashfs".to_owned(), "virtio_net".to_owned()];
+        cfg.kernel_modules.explicit = vec![
+            "loop".to_owned(),
+            "squashfs".to_owned(),
+            "virtio_net".to_owned(),
+        ];
         assert!(should_force_external_rescue(&cfg));
         // The force path loads `config.kernel_modules.explicit`; confirm
         // the rescue-critical names live there and not in `early`.
