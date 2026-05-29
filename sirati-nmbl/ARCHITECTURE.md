@@ -527,10 +527,10 @@ crash hard, not loop.
     storing the dumb-buffer mapping next to the card, so the
     self-reference problem that would have required a lifetime
     `transmute` doesn't arise.
-- **`std::process::Command::` and any `execve(` are forbidden outside
-  three files: `src/shell.rs`, `src/panic.rs`, `src/sys/activation.rs`.**
-  Enforced by the `nmbl-init-no-exec` flake check, which `grep`s the
-  source tree and fails the build on any out-of-place hit.
+- **`std::process::Command::` and any `execve(` require an inline
+  `// execve safety: <why>` comment** on, or directly above, the call.
+  Enforced by the `nmbl-init-no-exec` flake check, which scans the source
+  tree and fails the build on any unjustified hit.
 - **`overflow-checks = true` in release.** Aborting on overflow is
   strictly better than silently wrapping.
 - **Empty environment when exec'ing children.** Activation tools are
@@ -576,7 +576,7 @@ Rust path inside these end-to-end runs is still being expanded.
   with TPM / keyfile / passphrase unlock kinds.
 - Panic hook with `execve`-into-recovery.
 - Emergency shell with chained error display + variant-specific hints.
-- `nmbl-init-no-exec` flake check enforcing the exec allowlist.
+- `nmbl-init-no-exec` flake check enforcing inline `// execve safety:` justifications.
 
 ### Implemented post-v1
 
