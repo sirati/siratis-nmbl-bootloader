@@ -15,8 +15,9 @@ pub struct General {
 
     /// Optional selector-TUI countdown override in milliseconds. When
     /// `Some(ms)` it takes precedence over `timeout_secs`, letting the
-    /// operator pick a sub-second auto-boot delay. Absent (the default)
-    /// preserves the historic whole-second `timeout_secs` behaviour.
+    /// operator pick a sub-second auto-boot delay. Hand-written TOML may
+    /// omit it to fall back to whole-second `timeout_secs`; NixOS-generated
+    /// configs always emit it (defaulting to `timeout_secs * 1000`).
     #[serde(default)]
     pub timeout_ms: Option<u32>,
 
