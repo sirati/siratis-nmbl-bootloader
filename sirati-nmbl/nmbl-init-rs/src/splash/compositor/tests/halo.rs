@@ -8,8 +8,8 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 
 use crate::splash::types::{FramebufferDims, GlyphBitmap};
 
-use super::super::halo::HALO_PAD;
-use super::super::{CellRect, blit_halo, wants_halo};
+use super::super::halo::HALO_SPREAD;
+use super::super::{CellRect, HaloMask, wants_halo};
 
 /// Build a `dim × dim` framebuffer (stride = dim*4) filled with an
 /// opaque grey `v` in BGRX order, plus its dims.
@@ -64,77 +64,175 @@ fn wants_halo_only_transparent_default_background() {
 }
 
 #[test]
-fn blit_halo_darkens_glyph_and_leaves_distant_pixels() {
-    // 64×64 bright-grey fb, 5×5 solid glyph at cell (28, 28). The fb
-    // is sized so the whole padded halo canvas (glyph bbox ± HALO_PAD)
-    // fits with room to spare, leaving genuinely distant pixels.
-    let (mut fb, dims) = grey_fb(64, 200);
-    let glyph = solid_glyph(5);
-    let rect = CellRect {
-        x: 28,
-        y: 28,
-        w: 5,
-        h: 5,
+fn halo_mask_overlap_unions_via_max_not_sum() {
+    // Stamping the SAME glyph twice at the SAME spot must be identical
+    // to stamping it once: the mask combines with `max` (a union), so
+    // a pixel covered by two contributions holds 255 — not 510 — and
+    // the black is composited a single time. A summing implementation
+    // would over-darken (or, with clamping, still composite the field
+    // identically but a doubled mask value would shift the blurred
+    // tail); pinning the two framebuffers equal proves the union.
+    let dims = FramebufferDims {
+        w: 16,
+        h: 16,
+        stride: 64,
     };
-    blit_halo(&mut fb, dims, &glyph, rect);
+    let glyph = solid_glyph(3);
+    let rect = CellRect {
+        x: 6,
+        y: 6,
+        w: 3,
+        h: 3,
+    };
 
-    // Glyph core (30, 30) sits inside the solid ink → darkened.
+    let (mut fb_once, _) = grey_fb(16, 200);
+    {
+        let mut m = HaloMask::new(dims);
+        m.stamp(&glyph, rect);
+        m.composite_onto(&mut fb_once, dims);
+    }
+
+    let (mut fb_twice, _) = grey_fb(16, 200);
+    {
+        let mut m = HaloMask::new(dims);
+        m.stamp(&glyph, rect);
+        m.stamp(&glyph, rect); // exact overlap
+        m.composite_onto(&mut fb_twice, dims);
+    }
+
+    // Darkening actually happened (so the equality below is meaningful).
     assert!(
-        pixel_r(&fb, dims, 30, 30) < 200,
-        "halo must darken the glyph core"
+        pixel_r(&fb_once, dims, 7, 7) < 200,
+        "the overlap core must be darkened"
     );
-
-    // The wider, concave falloff still has a finite reach: the canvas
-    // spans the glyph bbox padded by HALO_PAD on each side. A pixel
-    // beyond that pad can never be touched.
-    let pad = HALO_PAD;
-    let glyph_max = 28 + 5; // exclusive right/bottom edge of the glyph
-    let tail_end = glyph_max + pad; // last column/row the canvas can reach
-    let far = tail_end + 2; // safely beyond the tail
+    // Max-combine: the doubled stamp produces a byte-identical result.
     assert_eq!(
-        pixel_r(&fb, dims, far, far),
-        200,
-        "pixel beyond the haze tail must be untouched"
-    );
-    // Corner (0, 0) is far outside the padded halo canvas → pristine.
-    assert_eq!(
-        pixel_r(&fb, dims, 0, 0),
-        200,
-        "distant corner pixel must be untouched"
+        fb_once, fb_twice,
+        "overlapping stamps must union via max (composited once), \
+         not sum/double-darken"
     );
 }
 
 #[test]
-fn blit_halo_empty_glyph_is_noop() {
-    let (mut fb, dims) = grey_fb(16, 123);
+fn halo_mask_ink_pixel_is_darkened_no_bright_dot_gap() {
+    // A pixel under glyph coverage must end up darker than the bare
+    // background: the mask is 255 there, so there is no untouched
+    // bright-dot gap between glyph and halo.
+    let dims = FramebufferDims {
+        w: 16,
+        h: 16,
+        stride: 64,
+    };
+    let (mut fb, _) = grey_fb(16, 200);
+    let glyph = solid_glyph(3);
+    let mut m = HaloMask::new(dims);
+    m.stamp(
+        &glyph,
+        CellRect {
+            x: 6,
+            y: 6,
+            w: 3,
+            h: 3,
+        },
+    );
+    m.composite_onto(&mut fb, dims);
+    // (7,7) sits squarely under the ink.
+    assert!(
+        pixel_r(&fb, dims, 7, 7) < 200,
+        "ink pixel must be darkened (no bright-dot gap under the glyph)"
+    );
+}
+
+#[test]
+fn halo_mask_empty_is_noop() {
+    let dims = FramebufferDims {
+        w: 16,
+        h: 16,
+        stride: 64,
+    };
+    let (mut fb, _) = grey_fb(16, 123);
     let before = fb.clone();
-    let glyph = GlyphBitmap {
+    // No stamps at all → bbox stays None → composite is a no-op.
+    let m = HaloMask::new(dims);
+    m.composite_onto(&mut fb, dims);
+    assert_eq!(fb, before, "empty mask must not touch the framebuffer");
+
+    // A space (empty glyph) stamps nothing either.
+    let mut m2 = HaloMask::new(dims);
+    let empty = GlyphBitmap {
         width: 0,
         height: 0,
         coverage: Vec::new(),
         offset_x: 0,
         offset_y: 0,
     };
-    let rect = CellRect {
-        x: 8,
-        y: 8,
-        w: 8,
-        h: 8,
-    };
-    blit_halo(&mut fb, dims, &glyph, rect);
+    m2.stamp(
+        &empty,
+        CellRect {
+            x: 8,
+            y: 8,
+            w: 8,
+            h: 8,
+        },
+    );
+    m2.composite_onto(&mut fb, dims);
     assert_eq!(fb, before, "empty glyph must not touch the framebuffer");
 }
 
 #[test]
-fn blit_halo_less_visible_on_dark_and_monotonic() {
-    // Same glyph + cell + halo strength over a bright vs a dark
-    // background. The Oklab multiply-toward-black means:
+fn halo_mask_far_pixel_beyond_spread_is_untouched() {
+    // A 3×3 glyph near one corner; a pixel well beyond the mask plus
+    // the blur spread must stay pristine.
+    let dims = FramebufferDims {
+        w: 64,
+        h: 64,
+        stride: 256,
+    };
+    let (mut fb, _) = grey_fb(64, 200);
+    let glyph = solid_glyph(3);
+    let mut m = HaloMask::new(dims);
+    m.stamp(
+        &glyph,
+        CellRect {
+            x: 4,
+            y: 4,
+            w: 3,
+            h: 3,
+        },
+    );
+    m.composite_onto(&mut fb, dims);
+
+    // Glyph occupies cols/rows 4..=6. The blur reaches HALO_SPREAD
+    // beyond that. A pixel comfortably past 6 + HALO_SPREAD is safe.
+    let far = 6 + HALO_SPREAD as u32 + 4;
+    assert_eq!(
+        pixel_r(&fb, dims, far, far),
+        200,
+        "pixel beyond mask + blur spread must be untouched"
+    );
+    // The far corner is also pristine.
+    assert_eq!(
+        pixel_r(&fb, dims, 63, 63),
+        200,
+        "distant corner must be untouched"
+    );
+}
+
+#[test]
+fn halo_mask_less_visible_on_dark_and_monotonic() {
+    // Same mask over a bright vs a dark background. The Oklab
+    // multiply-toward-black means:
     //   * the bright pixel is darkened by a larger absolute amount
     //     (the haze is "less visible" on dark backgrounds), and
     //   * the darker background can never end up brighter than the
     //     lighter one (monotonic in background brightness).
     const BRIGHT: u8 = 200;
     const DARK: u8 = 40;
+    let dims = FramebufferDims {
+        w: 24,
+        h: 24,
+        stride: 96,
+    };
     let glyph = solid_glyph(5);
     let rect = CellRect {
         x: 10,
@@ -143,12 +241,20 @@ fn blit_halo_less_visible_on_dark_and_monotonic() {
         h: 5,
     };
 
-    let (mut fb_bright, dims) = grey_fb(24, BRIGHT);
-    blit_halo(&mut fb_bright, dims, &glyph, rect);
+    let (mut fb_bright, _) = grey_fb(24, BRIGHT);
+    {
+        let mut m = HaloMask::new(dims);
+        m.stamp(&glyph, rect);
+        m.composite_onto(&mut fb_bright, dims);
+    }
     let bright_after = pixel_r(&fb_bright, dims, 12, 12);
 
     let (mut fb_dark, _) = grey_fb(24, DARK);
-    blit_halo(&mut fb_dark, dims, &glyph, rect);
+    {
+        let mut m = HaloMask::new(dims);
+        m.stamp(&glyph, rect);
+        m.composite_onto(&mut fb_dark, dims);
+    }
     let dark_after = pixel_r(&fb_dark, dims, 12, 12);
 
     // Both darkened.

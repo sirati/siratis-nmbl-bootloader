@@ -113,6 +113,25 @@ fn build_message_includes_error_chain_lines() {
 }
 
 #[test]
+fn resolve_emergency_timeout_uses_default_when_absent() {
+    let config = crate::config::Config::recovery_default();
+    assert_eq!(
+        super::resolve_emergency_timeout(&config),
+        super::EMERGENCY_TIMEOUT
+    );
+}
+
+#[test]
+fn resolve_emergency_timeout_honours_override() {
+    let mut config = crate::config::Config::recovery_default();
+    config.general.emergency_timeout_secs = Some(1);
+    assert_eq!(
+        super::resolve_emergency_timeout(&config),
+        Duration::from_secs(1)
+    );
+}
+
+#[test]
 fn default_items_first_is_reboot() {
     // The whole "timeout defaults to Reboot" contract hangs on
     // Reboot being the first item; if a future refactor flips the

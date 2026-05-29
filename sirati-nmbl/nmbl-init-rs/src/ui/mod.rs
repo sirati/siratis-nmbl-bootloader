@@ -65,7 +65,9 @@ pub use app::{
     SessionInteraction,
 };
 pub(crate) use emergency::{build_emergency_app, build_message, default_items};
-pub use emergency::{run_emergency_screen, run_emergency_screen_with_app};
+pub use emergency::{
+    resolve_emergency_timeout, run_emergency_screen, run_emergency_screen_with_app,
+};
 pub use reporter::{BootReporter, ProgressSink, TickOutcome};
 pub use runtime::{block_on_tui, build_local_runtime, spawn_poller};
 

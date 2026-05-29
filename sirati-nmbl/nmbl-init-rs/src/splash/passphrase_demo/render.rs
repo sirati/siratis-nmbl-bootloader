@@ -125,9 +125,13 @@ pub(super) fn render_frame(
 
     drm.render(|fb, fb_dims| {
         compositor::blit_background(fb, fb_dims, bg_scaled);
-        // Pass 1: dark contrast halo behind glyphs on the transparent
-        // default background, painted first so it only darkens the
-        // background photo and never bleeds onto adjacent drawn text.
+        // Pass 1: build ONE unified text-coverage mask from every cell
+        // that wants the halo (transparent default bg + inked glyph),
+        // then blur + composite the dark contrast halo a single time.
+        // Painted before any glyph so it only darkens the background
+        // photo, never adjacent drawn text; the mask uses max-combine so
+        // overlapping glyphs union (no rings / no double-darkening).
+        let mut halo = compositor::HaloMask::new(fb_dims);
         term_pipe.for_each_cell(|col, row, cell| {
             if !compositor::wants_halo(cell.bg) {
                 return;
@@ -144,9 +148,13 @@ pub(super) fn render_frame(
                 w: cell_dims.cell_w,
                 h: cell_dims.cell_h,
             };
-            compositor::blit_halo(fb, fb_dims, glyph, rect);
+            halo.stamp(glyph, rect);
         });
-        // Pass 2: cell backgrounds + glyphs.
+        halo.composite_onto(fb, fb_dims);
+        // Pass 2: cell-background fills first, then all glyphs collected
+        // into one text layer composited once on top (mirrors
+        // ui::render_splash_frame_with — kills the doubled "white dots").
+        let mut text_layer = compositor::TextLayer::new(fb_dims);
         term_pipe.for_each_cell(|col, row, cell| {
             if cell.c == ' ' && cell.bg == AnsiColor::Named(NamedColor::Background) {
                 return;
@@ -165,8 +173,10 @@ pub(super) fn render_frame(
                 w: cell_dims.cell_w,
                 h: cell_dims.cell_h,
             };
-            compositor::blit_cell(fb, fb_dims, glyph, rect, fg, bg);
+            compositor::fill_cell_bg(fb, fb_dims, rect, bg);
+            text_layer.stamp(glyph, rect, fg);
         });
+        text_layer.composite_onto(fb, fb_dims);
         Ok(())
     })
 }

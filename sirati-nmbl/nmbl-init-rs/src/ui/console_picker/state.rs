@@ -89,6 +89,7 @@ impl PickerState {
             cursor: 0,
             button_cursor: ButtonCursor::Spawn,
             custom_input: String::new(),
+            custom_cursor: 0,
             custom_checked: true,
             outcome: None,
         })
@@ -156,27 +157,16 @@ impl PickerState {
             return self.outcome.is_some();
         }
 
-        // Custom-input field captures most keystrokes when focused so
-        // the operator can type a path; navigation keys still escape
-        // to move focus.
+        // Custom-input field captures editing keystrokes when focused so
+        // the operator can type AND edit a path with a real cursor
+        // (Left/Right/Home/End, Backspace/Delete, word motion). A few
+        // keys still escape to move focus / commit: Up/Down navigate,
+        // Esc/Enter fall through to the shared handler, and Tab toggles
+        // the custom checkbox.
         if self.focus() == FocusZone::CustomInput {
             match key.code {
                 KeyCode::Up | KeyCode::Down | KeyCode::Esc | KeyCode::Enter => {
-                    // fall through to the shared handler below
-                }
-                KeyCode::Char(' ') => {
-                    // Space inside the field is a real space, NOT a
-                    // toggle. Only the [Space] on the list rows toggles.
-                    self.custom_input.push(' ');
-                    return false;
-                }
-                KeyCode::Char(c) => {
-                    self.custom_input.push(c);
-                    return false;
-                }
-                KeyCode::Backspace => {
-                    self.custom_input.pop();
-                    return false;
+                    // fall through to the shared navigation handler below
                 }
                 KeyCode::Tab => {
                     // Tab on the custom field toggles its "checked"
@@ -184,7 +174,25 @@ impl PickerState {
                     self.custom_checked = !self.custom_checked;
                     return false;
                 }
-                _ => return false,
+                _ => {
+                    // Everything else (printable chars incl. Space,
+                    // Left/Right/Home/End, Backspace/Delete, word
+                    // motion) edits the buffer through the shared
+                    // line-editing helper. Space here is a literal
+                    // space, NOT a checkbox toggle. A path is not a
+                    // secret, so word motion is allowed.
+                    let (new_cursor, _handled) = crate::ui::editline::handle_key_on(
+                        &mut self.custom_input,
+                        self.custom_cursor,
+                        key,
+                        true,
+                    );
+                    self.custom_cursor = new_cursor;
+                    if self.custom_input.is_empty() {
+                        self.custom_cursor = 0;
+                    }
+                    return false;
+                }
             }
         }
 

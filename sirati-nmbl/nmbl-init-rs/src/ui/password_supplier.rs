@@ -130,7 +130,8 @@ pub(crate) async fn passphrase_prompt_on_console(
                 }
                 dirty = true;
             }
-            None => {}
+            // No scrollback on the passphrase modal; ignore wheel notches.
+            Some(crate::ui::console::ConsoleEvent::Scroll { .. }) | None => {}
         }
     }
 }

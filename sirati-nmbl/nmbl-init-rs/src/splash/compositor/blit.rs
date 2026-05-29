@@ -1,6 +1,7 @@
 use crate::splash::types::{FramebufferDims, GlyphBitmap, RgbaColor};
 
 use super::CellRect;
+use super::text_layer::TextLayer;
 
 /// Copy the scaled background RGBA buffer into the framebuffer,
 /// respecting `fb_dims.stride`. The input is tight RGBA8 of exactly
@@ -53,37 +54,18 @@ pub fn blit_background(fb: &mut [u8], fb_dims: FramebufferDims, bg_rgba: &[u8]) 
     }
 }
 
-/// Fill the cell rectangle at `(cell_x, cell_y)` pixels with `bg` (if
-/// `bg.3 > 0`), then alpha-blend the glyph in `fg` color over it. Any
-/// pixel that would fall outside the framebuffer is silently clipped.
+/// Fill the cell rectangle at `(cell_x, cell_y)` pixels with `bg`,
+/// alpha-blending it over whatever the framebuffer already holds (PNG
+/// background, or the halo). No-op when `bg.3 == 0`. Any pixel that
+/// would fall outside the framebuffer is silently clipped.
 ///
-/// The background fill always covers the whole cell box
-/// (`cell_w` × `cell_h`). The glyph overlay honours
-/// `glyph.offset_x` / `glyph.offset_y` so the bitmap sits at
-/// `(cell_x + offset_x, cell_y + offset_y)`; offsets are signed and can
-/// place the bitmap outside the cell box (e.g. descenders), in which
-/// case the surrounding cells overlap visually. Out-of-framebuffer
-/// pixels are clipped without overflow.
-pub fn blit_cell(
-    fb: &mut [u8],
-    fb_dims: FramebufferDims,
-    glyph: &GlyphBitmap,
-    cell: CellRect,
-    fg: RgbaColor,
-    bg: RgbaColor,
-) {
-    // Stage 1: background fill over the full cell box.
-    blit_cell_bg(fb, fb_dims, cell, bg);
-
-    // Stage 2: glyph overlay positioned by the per-glyph offset.
-    // The blend alpha combines glyph coverage with the foreground's
-    // own alpha (e.g. NamedColor::Foreground at 0x99 for the
-    // 60% white) so that an "unset fg" still respects the palette.
-    blit_cell_glyph(fb, fb_dims, glyph, cell, fg);
-}
-
-/// Stage 1 of [`blit_cell`]: fill the cell box with the background colour.
-fn blit_cell_bg(fb: &mut [u8], fb_dims: FramebufferDims, cell: CellRect, bg: RgbaColor) {
+/// This is the **background** half of the old single-pass `blit_cell`:
+/// it always covers the whole cell box (`cell_w` × `cell_h`). Glyph
+/// foreground is no longer painted here — text is collected into a
+/// [`TextLayer`] and composited once, on top of all the cell-bg fills,
+/// so overlapping semi-transparent glyphs do not double-composite (the
+/// "white dots along borders" bug).
+pub fn fill_cell_bg(fb: &mut [u8], fb_dims: FramebufferDims, cell: CellRect, bg: RgbaColor) {
     if bg.3 == 0 {
         return;
     }
@@ -119,72 +101,24 @@ fn blit_cell_bg(fb: &mut [u8], fb_dims: FramebufferDims, cell: CellRect, bg: Rgb
     }
 }
 
-/// Stage 2 of [`blit_cell`]: alpha-blend the glyph onto the framebuffer.
-fn blit_cell_glyph(
+/// Fill the cell rectangle with `bg` then alpha-blend the glyph in `fg`
+/// over it, in a single self-contained pass. Retained as a convenience
+/// for callers that paint one cell in isolation (and for the unit
+/// tests); the live splash pipeline now uses [`fill_cell_bg`] +
+/// [`TextLayer`] so overlapping glyphs composite once. The visible
+/// result for a single isolated cell is identical to the layered path.
+pub fn blit_cell(
     fb: &mut [u8],
     fb_dims: FramebufferDims,
     glyph: &GlyphBitmap,
     cell: CellRect,
     fg: RgbaColor,
+    bg: RgbaColor,
 ) {
-    let RgbaColor(fr, fg_g, fb_c, fa) = fg;
-    if fa == 0 {
-        return;
-    }
-    let stride = fb_dims.stride as usize;
-    let fb_w = fb_dims.w;
-    let fb_h = fb_dims.h;
-    let fa16 = u16::from(fa);
-    for gy in 0..glyph.height {
-        let dy = i64::from(cell.y) + i64::from(glyph.offset_y) + i64::from(gy);
-        if dy < 0 {
-            continue;
-        }
-        let dy = dy as u64;
-        if dy >= u64::from(fb_h) {
-            continue;
-        }
-        let row_off = (dy as usize).saturating_mul(stride);
-
-        for gx in 0..glyph.width {
-            let dx = i64::from(cell.x) + i64::from(glyph.offset_x) + i64::from(gx);
-            if dx < 0 {
-                continue;
-            }
-            let dx = dx as u64;
-            if dx >= u64::from(fb_w) {
-                continue;
-            }
-
-            let cov_idx = (gy as usize)
-                .saturating_mul(glyph.width as usize)
-                .saturating_add(gx as usize);
-            let coverage = glyph.coverage.get(cov_idx).copied().unwrap_or(0);
-            if coverage == 0 {
-                continue;
-            }
-            // (coverage * fa + 127) / 255 — round-to-nearest, keeps
-            // the +127 trick from src_over so the two stages share
-            // identical rounding behaviour.
-            let effective = ((u16::from(coverage).saturating_mul(fa16)) + 127) / 255;
-            let effective = if effective > 255 {
-                255u8
-            } else {
-                effective as u8
-            };
-            if effective == 0 {
-                continue;
-            }
-
-            let pix_off = row_off.saturating_add((dx as usize).saturating_mul(4));
-            let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
-                continue;
-            };
-            let (dr, dg, db) = read_bgrx(dst);
-            let (nr, ng, nb) = src_over(fr, fg_g, fb_c, effective, dr, dg, db);
-            write_bgrx(dst, nr, ng, nb);
-        }
-    }
+    fill_cell_bg(fb, fb_dims, cell, bg);
+    let mut layer = TextLayer::new(fb_dims);
+    layer.stamp(glyph, cell, fg);
+    layer.composite_onto(fb, fb_dims);
 }
 
 /// Perceptually-correct src-over blend using Oklab interpolation.

@@ -123,6 +123,7 @@ fn space_toggles_checkbox_on_focused_row() {
         cursor: 1,
         button_cursor: ButtonCursor::Spawn,
         custom_input: String::new(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };
@@ -152,6 +153,7 @@ fn spawn_enter_returns_selected_targets() {
         cursor: 3,
         button_cursor: ButtonCursor::Spawn,
         custom_input: String::new(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };
@@ -179,6 +181,7 @@ fn spawn_with_nothing_selected_is_rejected() {
         cursor: 2,
         button_cursor: ButtonCursor::Spawn,
         custom_input: String::new(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };
@@ -198,6 +201,7 @@ fn esc_commits_cancel() {
         cursor: 0,
         button_cursor: ButtonCursor::Spawn,
         custom_input: String::new(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };
@@ -224,6 +228,7 @@ fn cursor_navigation_walks_list_custom_buttons() {
         cursor: 0,
         button_cursor: ButtonCursor::Spawn,
         custom_input: String::new(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };
@@ -300,6 +305,7 @@ fn typing_into_custom_input_updates_buffer() {
         cursor: 1,
         button_cursor: ButtonCursor::Spawn,
         custom_input: String::new(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };
@@ -307,8 +313,10 @@ fn typing_into_custom_input_updates_buffer() {
         state.on_key(press(KeyCode::Char(c)));
     }
     assert_eq!(state.custom_input, "/dev/ttyS9");
+    assert_eq!(state.custom_cursor, "/dev/ttyS9".len());
     state.on_key(press(KeyCode::Backspace));
     assert_eq!(state.custom_input, "/dev/ttyS");
+    assert_eq!(state.custom_cursor, "/dev/ttyS".len());
 }
 
 #[test]
@@ -326,6 +334,7 @@ fn valid_custom_input_appears_in_selected_targets() {
         cursor: 0,
         button_cursor: ButtonCursor::Spawn,
         custom_input: "/dev/null".to_string(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };
@@ -346,6 +355,7 @@ fn invalid_custom_input_is_excluded_from_selected_targets() {
         cursor: 0,
         button_cursor: ButtonCursor::Spawn,
         custom_input: "/dev/does-not-exist".to_string(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };

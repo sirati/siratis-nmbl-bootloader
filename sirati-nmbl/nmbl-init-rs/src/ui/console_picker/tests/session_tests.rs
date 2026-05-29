@@ -26,6 +26,7 @@ fn driver_loop_runs_picker_to_spawn_outcome_via_fake_console() {
         cursor: 0,
         button_cursor: ButtonCursor::Spawn,
         custom_input: String::new(),
+        custom_cursor: 0,
         custom_checked: true,
         outcome: None,
     };

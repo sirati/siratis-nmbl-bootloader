@@ -7,6 +7,7 @@
     reason = "tests assert on contract failures"
 )]
 
+mod custom_input_tests;
 mod render_tests;
 mod session_tests;
 mod state_tests;

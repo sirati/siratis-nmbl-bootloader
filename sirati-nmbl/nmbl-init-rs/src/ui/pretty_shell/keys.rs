@@ -9,6 +9,12 @@ use crate::error::{NmblError, Result};
 
 use super::state::{EscapeOutcome, PtyShellState};
 
+/// Scrollback rows moved per mouse-wheel notch, matching a typical
+/// terminal-emulator wheel step. Ctrl+Shift+Up/Down still step one row
+/// at a time; the wheel scrolls a few rows per detent so a flick covers
+/// ground.
+pub(super) const WHEEL_SCROLL_STEP: i32 = 3;
+
 /// Outcome of a single keystroke. The driver loop reads this to decide
 /// whether to repaint, exit, or proceed silently.
 pub(super) enum KeyOutcome {
@@ -85,6 +91,29 @@ pub(super) fn handle_key(state: &mut PtyShellState, key: KeyEvent) -> Result<Key
     // The terminal grid won't change until the shell echoes the byte
     // back; let the read pump trigger the next repaint.
     Ok(KeyOutcome::Noop)
+}
+
+/// The signed `Scroll::Delta` for one mouse-wheel notch. Wheel-up is a
+/// positive delta (toward older scrollback); wheel-down is negative
+/// (toward the live tail). Pure so the sign mapping is unit-testable
+/// without a live PTY.
+pub(super) fn wheel_scroll_delta(up: bool) -> i32 {
+    if up {
+        WHEEL_SCROLL_STEP
+    } else {
+        -WHEEL_SCROLL_STEP
+    }
+}
+
+/// Scroll the scrollback in response to one mouse-wheel notch. Uses the
+/// same `scroll_display` path as the Ctrl+Shift+Up/Down key bindings;
+/// `scroll_display` clamps the offset to the history size, so
+/// over-scrolling at either end is a no-op.
+pub(super) fn handle_scroll(state: &mut PtyShellState, up: bool) {
+    state
+        .term
+        .grid_mut()
+        .scroll_display(Scroll::Delta(wheel_scroll_delta(up)));
 }
 
 /// Write `bytes` to the master fd, retrying on partial writes. EAGAIN

@@ -39,7 +39,7 @@ pub(super) async fn run_pick_source(
                 continue;
             }
             Some(ConsoleEvent::Key(k)) => k,
-            None => continue,
+            Some(ConsoleEvent::Scroll { .. }) | None => continue,
         };
         if key.kind != KeyEventKind::Press {
             continue;

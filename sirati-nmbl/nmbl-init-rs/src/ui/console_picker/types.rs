@@ -76,6 +76,10 @@ pub struct PickerState {
     /// keystroke; when valid AND non-empty, treated as an additional
     /// pre-checked spawn target.
     pub custom_input: String,
+    /// Byte-index cursor into `custom_input` for line editing. Always on
+    /// a char boundary in `0..=custom_input.len()`. A path is not secret,
+    /// so word motion is permitted here.
+    pub custom_cursor: usize,
     /// Operator's intent for the custom-path checkbox. When the path
     /// becomes invalid the entry is suppressed regardless of this flag.
     pub custom_checked: bool,

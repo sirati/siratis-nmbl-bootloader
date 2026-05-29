@@ -31,9 +31,8 @@ use crate::ui::app::App;
 
 /// A single input event from a console backend.
 ///
-/// Today only key and resize events are produced; the enum is open-coded
-/// so future additions (mouse, paste) can land additively without
-/// breaking the `poll_event` signature.
+/// The enum is open-coded so future additions (paste, clicks) can land
+/// additively without breaking the `poll_event` signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsoleEvent {
     /// A key press / repeat / release synthesised by the backend.
@@ -42,6 +41,11 @@ pub enum ConsoleEvent {
     /// Backends with a fixed grid (the DRM splash framebuffer) never
     /// emit this variant.
     Resize { rows: u16, cols: u16 },
+    /// A mouse-wheel scroll notch. `up` is `true` for wheel-up (scroll
+    /// toward older scrollback) and `false` for wheel-down. Only the
+    /// tty/termwiz path with xterm mouse reporting produces this; the
+    /// kernel-VT splash path never emits it (no xterm mouse sequences).
+    Scroll { up: bool },
 }
 
 /// Which backend a [`Console`] is. Surfaced via [`Console::kind`] so
@@ -107,8 +111,10 @@ pub trait Console {
             Some(ConsoleEvent::Key(k)) => Ok(Some(k)),
             // Resize events were consumed by `poll_event_blocking`
             // (which is responsible for re-sizing the backend's render
-            // target); the caller asked for a key, so report no key.
-            Some(ConsoleEvent::Resize { .. }) | None => Ok(None),
+            // target). Scroll events only matter to scrollback-aware
+            // consumers (the pretty shell) that call `poll_event`
+            // directly. The caller asked for a key, so report no key.
+            Some(ConsoleEvent::Resize { .. } | ConsoleEvent::Scroll { .. }) | None => Ok(None),
         }
     }
     /// Backend grid size in (cols, rows). Useful for centring modals

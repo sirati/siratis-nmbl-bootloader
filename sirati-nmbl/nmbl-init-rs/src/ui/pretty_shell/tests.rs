@@ -7,12 +7,12 @@
 
 use alacritty_terminal::Term;
 use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::Config as TermConfig;
 use alacritty_terminal::vte::ansi::Processor;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::keys::key_to_bytes;
+use super::keys::{WHEEL_SCROLL_STEP, key_to_bytes, wheel_scroll_delta};
 use super::state::{EscapeOutcome, EscapeState, GridSize, run_escape};
 
 fn press_with(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -187,6 +187,48 @@ fn collect_visible_rows_reflects_display_offset() {
     assert_ne!(
         scrolled, tail,
         "scrolled view must differ from the live tail"
+    );
+}
+
+#[test]
+fn wheel_scroll_delta_sign_matches_direction() {
+    assert!(
+        wheel_scroll_delta(true) > 0,
+        "wheel-up must scroll toward older scrollback (positive delta)"
+    );
+    assert!(
+        wheel_scroll_delta(false) < 0,
+        "wheel-down must scroll toward the live tail (negative delta)"
+    );
+}
+
+/// One wheel-up notch moves the scrollback offset off the live tail
+/// (by `WHEEL_SCROLL_STEP` rows), and a wheel-down notch brings it
+/// back. Exercises the exact `scroll_display` path `handle_scroll`
+/// drives, without a live PTY.
+#[test]
+fn wheel_notches_move_scroll_offset() {
+    let lines: Vec<String> = (0..30).map(|i| format!("line{i}")).collect();
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut term = term_with_lines(20, 6, &refs);
+    assert_eq!(term.grid().display_offset(), 0, "starts at live tail");
+
+    // Wheel up one notch.
+    term.grid_mut()
+        .scroll_display(Scroll::Delta(wheel_scroll_delta(true)));
+    assert_eq!(
+        term.grid().display_offset(),
+        WHEEL_SCROLL_STEP as usize,
+        "wheel-up moves the offset up by one step"
+    );
+
+    // Wheel down one notch returns to the live tail.
+    term.grid_mut()
+        .scroll_display(Scroll::Delta(wheel_scroll_delta(false)));
+    assert_eq!(
+        term.grid().display_offset(),
+        0,
+        "wheel-down snaps back to the live tail"
     );
 }
 

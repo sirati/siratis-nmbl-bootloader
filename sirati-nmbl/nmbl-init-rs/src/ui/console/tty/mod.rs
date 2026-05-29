@@ -110,6 +110,9 @@ pub struct TtyConsole {
     /// Translated key events drained from `key_parser` but not yet
     /// surfaced to the caller. `poll_event` pops one per call.
     pending_keys: VecDeque<KeyEvent>,
+    /// Mouse-wheel scroll notches drained from `key_parser` but not yet
+    /// surfaced. `poll_event` pops one per call after pending keys.
+    pending_scrolls: VecDeque<ConsoleEvent>,
     /// Latest grid size observed via a CSI 8;rows;cols t report from
     /// the host terminal. Wins over the backend's reported size.
     last_resize: Option<(u16, u16)>,
@@ -194,6 +197,7 @@ impl TtyConsole {
             resize_filter: ResizeFilter::new(),
             key_parser: TermwizToCrossterm::new(),
             pending_keys: VecDeque::new(),
+            pending_scrolls: VecDeque::new(),
             last_resize: None,
         })
     }
@@ -260,9 +264,14 @@ impl TtyConsole {
         if n > 0 {
             let bytes = scratch.get(..n).unwrap_or(&[]);
             let mut keys = Vec::new();
-            self.key_parser.feed(bytes, maybe_more, &mut keys);
+            let mut scrolls = Vec::new();
+            self.key_parser
+                .feed_events(bytes, maybe_more, &mut keys, &mut scrolls);
             for k in keys {
                 self.pending_keys.push_back(k);
+            }
+            for s in scrolls {
+                self.pending_scrolls.push_back(s);
             }
         }
         Ok(ev)

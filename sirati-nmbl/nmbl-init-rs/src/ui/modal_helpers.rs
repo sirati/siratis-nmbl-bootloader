@@ -40,7 +40,8 @@ pub(super) async fn modal_poll(
     match console.poll_event(timeout).await? {
         Some(crate::ui::console::ConsoleEvent::Key(k)) => Ok(ModalPollOutcome::Key(k)),
         Some(crate::ui::console::ConsoleEvent::Resize { .. }) => Ok(ModalPollOutcome::Resized),
-        None => Ok(ModalPollOutcome::Idle),
+        // Modals have no scrollback; wheel notches are idle here.
+        Some(crate::ui::console::ConsoleEvent::Scroll { .. }) | None => Ok(ModalPollOutcome::Idle),
     }
 }
 

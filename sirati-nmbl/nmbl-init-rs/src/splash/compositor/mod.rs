@@ -15,13 +15,15 @@
 mod blit;
 mod colors;
 mod halo;
+mod text_layer;
 
 #[cfg(test)]
 mod tests;
 
-pub use blit::{blit_background, blit_cell};
+pub use blit::{blit_background, blit_cell, fill_cell_bg};
 pub use colors::{resolve_bg_color, resolve_color};
-pub use halo::{blit_halo, wants_halo};
+pub use halo::{HaloMask, wants_halo};
+pub use text_layer::TextLayer;
 
 /// Pixel rectangle describing one terminal cell on the framebuffer:
 /// origin in pixels (`x`, `y`) plus dimensions in pixels (`w`, `h`).
