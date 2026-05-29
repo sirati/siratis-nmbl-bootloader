@@ -32,6 +32,7 @@ pub mod app;
 pub mod console;
 pub mod console_picker;
 pub mod console_relay;
+pub mod editline;
 pub mod emergency;
 pub mod emergency_actions;
 pub mod key_echo;
@@ -1040,14 +1041,13 @@ fn render_screen_body(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
         Screen::List => render_list(frame, &list_data(app)),
         Screen::Editing {
             generation_index,
-            buffer,
-            cursor,
+            line,
         } => {
             if let Some(g) = app.generations.get(*generation_index) {
                 let data = EditScreenData {
                     generation: g,
-                    edited_cmdline: buffer,
-                    cursor_position: *cursor,
+                    edited_cmdline: line.text(),
+                    cursor_position: line.cursor(),
                 };
                 render_edit(frame, &data);
             }
@@ -1055,14 +1055,20 @@ fn render_screen_body(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
         Screen::Passphrase {
             prompt_label,
             buffer,
+            cursor,
             verifying,
             spinner_frame,
         } => {
             let data = PassphraseScreenData {
                 prompt_label,
                 buffer_len: buffer.len(),
+                // Convert the real byte cursor into a char-column count
+                // so the masked caret lands at the right dot even when
+                // the secret holds multi-byte chars.
+                cursor_column: view::char_column_for_byte_cursor(buffer, *cursor),
                 verifying: *verifying,
                 spinner_frame: *spinner_frame,
+                caps_lock_on: app.caps_lock_warning,
             };
             render_passphrase(frame, &data);
         }
@@ -1152,12 +1158,24 @@ pub(crate) fn passphrase_prompt_on_console(
     app.screen = Screen::Passphrase {
         prompt_label: label.to_string(),
         buffer: Zeroizing::new(String::new()),
+        cursor: 0,
         verifying: false,
         spinner_frame: 0,
     };
 
     let mut dirty = true;
     loop {
+        // Poll the live Caps-Lock state every tick so the warning row
+        // appears / disappears as the operator toggles the key. `None`
+        // (serial line, no VT) degrades to "off" — the warning simply
+        // never shows. Redraw whenever the state flips so the change is
+        // visible without waiting for the next keystroke.
+        let caps = console.caps_lock_active().unwrap_or(false);
+        if caps != app.caps_lock_warning {
+            app.caps_lock_warning = caps;
+            dirty = true;
+        }
+
         if dirty {
             console.render(&app)?;
             dirty = false;
@@ -1374,8 +1392,10 @@ mod tests {
         let data = PassphraseScreenData {
             prompt_label: "Unlock root",
             buffer_len: 4,
+            cursor_column: 4,
             verifying: false,
             spinner_frame: 0,
+            caps_lock_on: false,
         };
         let mut term = Terminal::new(TestBackend::new(60, 14)).expect("test terminal");
         term.draw(|f| render_passphrase(f, &data)).expect("draw");

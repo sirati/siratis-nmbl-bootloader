@@ -55,6 +55,11 @@ pub struct EditScreenData<'a> {
 pub struct PassphraseScreenData<'a> {
     pub prompt_label: &'a str,
     pub buffer_len: usize,
+    /// Cursor position as a CHAR column within the masked input (0-based,
+    /// `0..=buffer_len`). The caret `|` is painted after this many dots
+    /// so the operator sees where their next keystroke lands even though
+    /// the characters themselves are masked.
+    pub cursor_column: usize,
     /// `true` while the activation runner is verifying the passphrase
     /// (cryptsetup running). The renderer overlays a spinner so the
     /// operator sees the boot is alive rather than hung.
@@ -62,6 +67,10 @@ pub struct PassphraseScreenData<'a> {
     /// Spinner phase; indexes [`SPINNER_GLYPHS`] modulo [`SPINNER_FRAMES`].
     /// Only meaningful when `verifying = true`; ignored otherwise.
     pub spinner_frame: u8,
+    /// `true` when Caps Lock is engaged on the input keyboard. Drives a
+    /// warning rendered into a permanently-reserved row so the modal
+    /// geometry is identical whether the warning shows or not.
+    pub caps_lock_on: bool,
 }
 
 /// State needed to render the emergency-on-boot-failure screen.
@@ -180,7 +189,7 @@ pub fn render_footer(frame: &mut Frame<'_>, area: Rect, hint: &str) {
 /// caret positioning. Clamps to the end of `s`, then walks back to the
 /// nearest char boundary so a stale cursor mid-codepoint doesn't panic
 /// when sliced.
-fn char_column_for_byte_cursor(s: &str, byte_idx: usize) -> usize {
+pub fn char_column_for_byte_cursor(s: &str, byte_idx: usize) -> usize {
     let clamped = byte_idx.min(s.len());
     // Walk back to the nearest char boundary. Index 0 is always a
     // boundary, so `(0..=clamped).rev().find(..)` is never empty —
@@ -261,7 +270,7 @@ pub fn render_list(frame: &mut Frame<'_>, data: &ListScreenData<'_>) {
 pub fn render_edit(frame: &mut Frame<'_>, data: &EditScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
-    // `cursor_position` is a BYTE index (per `Screen::Editing.cursor`).
+    // `cursor_position` is a BYTE index (the `EditableLine` cursor).
     // Convert to a CHAR-column count so multi-byte text (e.g. "héllo")
     // doesn't shove the caret one cell too far to the right.
     let offset = char_column_for_byte_cursor(data.edited_cmdline, data.cursor_position);
@@ -769,17 +778,42 @@ pub fn render_pty_shell(frame: &mut Frame<'_>, data: &PtyShellScreenData<'_>) {
 pub fn render_passphrase(frame: &mut Frame<'_>, data: &PassphraseScreenData<'_>) {
     let [header, body, footer] = split_chrome(frame.area());
     render_header(frame, header, None);
-    // Modal is one row taller in verifying mode so the spinner row
-    // doesn't displace the dotted input line.
-    let modal_height: u16 = if data.verifying { 8 } else { 7 };
+    // Modal height is FIXED regardless of the Caps-Lock warning so the
+    // box geometry never reflows when the operator toggles Caps Lock —
+    // the warning row is always present in the layout (blank when off).
+    // Verifying mode adds one row for the spinner line, as before.
+    let modal_height: u16 = if data.verifying { 9 } else { 8 };
     let modal = centered_rect(body, 60, modal_height);
     frame.render_widget(Clear, modal);
-    // Cap mask so a huge typo doesn't overflow the box.
-    let dots: String = "*".repeat(data.buffer_len.min(40));
+    // Cap the visible mask so a huge typo doesn't overflow the box. The
+    // caret `|` is drawn at the real cursor column (also capped) so the
+    // operator sees where the next keystroke lands; the characters
+    // themselves stay masked.
+    let visible = data.buffer_len.min(40);
+    let caret_at = data.cursor_column.min(visible);
+    let before: String = "*".repeat(caret_at);
+    let after: String = "*".repeat(visible.saturating_sub(caret_at));
     let mut lines: Vec<Line<'_>> = vec![
         Line::raw(data.prompt_label.to_owned()),
         Line::raw(String::new()),
-        Line::from(vec![Span::raw(dots), Span::raw("|")]),
+        Line::from(vec![Span::raw(before), Span::raw("|"), Span::raw(after)]),
+        // Permanently-reserved Caps-Lock warning row. Always emitted so
+        // the box height is identical whether or not the warning shows;
+        // blank when Caps Lock is off.
+        if data.caps_lock_on {
+            // ASCII only: the splash glyph cache rasterises ASCII
+            // printable plus a box-drawing subset (see
+            // `src/splash/glyph_cache.rs`); a Unicode warning sign
+            // (U+26A0) would render as a blank cell on the framebuffer.
+            Line::from(Span::styled(
+                "! Caps Lock is ON",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Line::raw(String::new())
+        },
     ];
     let hint_line: Line<'_> = if data.verifying {
         // Reuse the boot-status spinner glyphs (see crate::ui::app::
@@ -950,6 +984,8 @@ mod tests {
         let data = PassphraseScreenData {
             prompt_label: "Unlock /dev/sda2",
             buffer_len: 5,
+            cursor_column: 5,
+            caps_lock_on: false,
             verifying: false,
             spinner_frame: 0,
         };
@@ -977,6 +1013,8 @@ mod tests {
             let data = PassphraseScreenData {
                 prompt_label: "Unlock /dev/sda2",
                 buffer_len: 8,
+                cursor_column: 8,
+                caps_lock_on: false,
                 verifying: true,
                 spinner_frame: frame_idx,
             };
@@ -1012,6 +1050,8 @@ mod tests {
         let data = PassphraseScreenData {
             prompt_label: "Unlock",
             buffer_len: 2,
+            cursor_column: 2,
+            caps_lock_on: false,
             verifying: true,
             spinner_frame: 99,
         };
@@ -1054,6 +1094,8 @@ mod tests {
         let empty = PassphraseScreenData {
             prompt_label: "Unlock root",
             buffer_len: 0,
+            cursor_column: 0,
+            caps_lock_on: false,
             verifying: false,
             spinner_frame: 0,
         };
@@ -1068,6 +1110,8 @@ mod tests {
         let filled = PassphraseScreenData {
             prompt_label: "Unlock root",
             buffer_len: 3,
+            cursor_column: 3,
+            caps_lock_on: false,
             verifying: false,
             spinner_frame: 0,
         };
@@ -1079,6 +1123,84 @@ mod tests {
         assert!(
             !style_filled.add_modifier.contains(Modifier::DIM),
             "Enter=submit must NOT be DIM with non-empty buffer; got {style_filled:?}",
+        );
+    }
+
+    /// The masked caret must sit at `cursor_column`, not always at the
+    /// end: a 5-char secret with the cursor at column 2 renders
+    /// `**|***` so the operator sees where a mid-string edit lands.
+    #[test]
+    fn test_render_passphrase_caret_tracks_cursor_column() {
+        let data = PassphraseScreenData {
+            prompt_label: "Unlock",
+            buffer_len: 5,
+            cursor_column: 2,
+            verifying: false,
+            spinner_frame: 0,
+            caps_lock_on: false,
+        };
+        let mut term = new_term(80, 24);
+        term.draw(|f| render_passphrase(f, &data)).expect("draw");
+        let text = buffer_text(&term);
+        assert!(
+            text.contains("**|***"),
+            "caret must render after 2 dots with 3 trailing dots:\n{text}"
+        );
+    }
+
+    /// Caps-Lock warning must appear when on and the box geometry must be
+    /// byte-for-byte identical whether the warning shows or not — the
+    /// reserved row guarantees zero reflow.
+    #[test]
+    fn test_render_passphrase_caps_lock_warning_does_not_resize_box() {
+        let base = |caps: bool| PassphraseScreenData {
+            prompt_label: "Unlock root",
+            buffer_len: 4,
+            cursor_column: 4,
+            verifying: false,
+            spinner_frame: 0,
+            caps_lock_on: caps,
+        };
+
+        let mut term_off = new_term(80, 24);
+        term_off
+            .draw(|f| render_passphrase(f, &base(false)))
+            .expect("draw");
+        let mut term_on = new_term(80, 24);
+        term_on
+            .draw(|f| render_passphrase(f, &base(true)))
+            .expect("draw");
+
+        let off = buffer_lines(&term_off);
+        let on = buffer_lines(&term_on);
+
+        // Warning present only when on.
+        assert!(
+            on.join("\n").contains("Caps Lock is ON"),
+            "warning must show when caps on:\n{}",
+            on.join("\n")
+        );
+        assert!(
+            !off.join("\n").contains("Caps Lock is ON"),
+            "warning must be absent when caps off:\n{}",
+            off.join("\n")
+        );
+
+        // The box border rows must be at the SAME positions in both
+        // renders — i.e. the modal occupies identical rows. Compare the
+        // set of rows that contain a vertical border glyph.
+        let border_rows = |lines: &[String]| -> Vec<usize> {
+            lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| l.contains('│') || l.contains('┌') || l.contains('└'))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        assert_eq!(
+            border_rows(&off),
+            border_rows(&on),
+            "modal box must occupy identical rows regardless of caps warning"
         );
     }
 
