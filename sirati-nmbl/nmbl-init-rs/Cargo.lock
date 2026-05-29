@@ -1225,6 +1225,7 @@ dependencies = [
  "drm",
  "flate2",
  "fontdue",
+ "futures-util",
  "getrandom 0.3.4",
  "libc",
  "lzma-rs",
