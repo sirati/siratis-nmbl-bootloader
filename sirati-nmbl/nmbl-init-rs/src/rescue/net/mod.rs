@@ -17,9 +17,11 @@
 //!    through `sha2::Sha256` and `rustix::io::write` in one pass.
 //! 6. Show the computed hash to the operator and let them confirm
 //!    against the pre-filled expected value.
-//! 7. Loop-mount the memfd at `/rescue`, `switch_root` into it via
-//!    the shared [`super::switch_root_and_exec`] helper, and
-//!    `execve("/bin/sh", …)`.
+//! 7. Loop-mount the memfd and layer a writable overlay at `/rescue`,
+//!    then return [`NetOutcome::RunChild`] so the dispatcher runs the
+//!    rescue system as a chrooted child via
+//!    [`crate::rescue::child::run_external_rescue_child`] while NMBL
+//!    stays PID 1.
 //!
 //! [`RescueUi`] is a trait so the TUI (E.2) can later plug in a
 //! ratatui-backed implementation while this module stays
