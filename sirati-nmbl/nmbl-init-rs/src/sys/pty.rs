@@ -157,15 +157,34 @@ impl PtyChild {
         })
     }
 
-    /// Send `SIGTERM` to the child and reap it. Best-effort; logs but
-    /// does not propagate errors so the caller's cleanup path can always
-    /// proceed.
+    /// Tear down the child shell and reap it. Best-effort; never
+    /// propagates errors so the caller's cleanup path can always proceed.
+    ///
+    /// An *interactive* bash IGNORES `SIGTERM`, so the previous
+    /// `SIGTERM` + blocking `waitpid(self.pid, None)` deadlocked the
+    /// single-threaded GUI on the `~.` quit path (shell still alive): the
+    /// signal did nothing and the reap never returned. We send `SIGHUP`
+    /// (the terminal-hangup signal an interactive shell honours), give it
+    /// a brief grace window, then escalate to `SIGKILL` — which cannot be
+    /// caught or ignored — so the final reap is guaranteed to return.
     pub fn terminate(&self) {
-        let _ = kill(self.pid, Signal::SIGTERM);
-        // Drain the zombie. A second-shot SIGKILL fallback is overkill
-        // for an interactive shell that just got SIGTERM; if it ignores
-        // the signal the reaper at PID 1 will collect it on the next
-        // boot cycle.
+        let _ = kill(self.pid, Signal::SIGHUP);
+
+        // Grace window (~200 ms) for the shell to exit on its own.
+        for _ in 0..20 {
+            match waitpid(self.pid, Some(WaitPidFlag::WNOHANG)) {
+                // Still running: wait a beat and poll again.
+                Ok(WaitStatus::StillAlive) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                // Reaped, or an error we can't recover from — done.
+                _ => return,
+            }
+        }
+
+        // Still alive after the grace window: SIGKILL is uncatchable, so
+        // this blocking reap is guaranteed to return promptly.
+        let _ = kill(self.pid, Signal::SIGKILL);
         let _ = waitpid(self.pid, None);
     }
 }
