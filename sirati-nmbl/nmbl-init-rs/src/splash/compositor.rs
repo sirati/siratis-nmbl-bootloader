@@ -47,20 +47,23 @@ const HALO_MAX_ALPHA: u8 = 160;
 
 /// Blur radius (per pass) of the halo spread, in pixels. Several
 /// separable box passes (see [`HALO_PASSES`]) give a soft, slowly-fading
-/// Gaussian-ish falloff; the canvas is padded by [`HALO_PAD`] so the full
-/// cumulative spread fits without clipping at the canvas edge.
-const HALO_RADIUS: u32 = 4;
+/// Gaussian-ish falloff. Kept small (relative to the old per-glyph value)
+/// so the halo *hugs the combined text outline* instead of blooming a
+/// thin `-` into a circular blob — the mask is the union of every glyph,
+/// so the blur only needs to soften its edge, not invent shape.
+const HALO_RADIUS: usize = 2;
 
 /// Number of separable box-blur passes (each run as an H then V pair).
-/// More passes widen the soft tail and smooth the falloff toward a
-/// Gaussian, pushing the faint near-invisible edge further out.
-const HALO_PASSES: u32 = 3;
+/// Two passes of radius 2 approximate a small Gaussian with a gentle
+/// tail while keeping the spread tight to the letters.
+const HALO_PASSES: usize = 2;
 
-/// Canvas padding on every side. Each box pass of radius `HALO_RADIUS`
-/// spreads coverage by `HALO_RADIUS`, so `HALO_PASSES` passes reach
-/// `HALO_PASSES * HALO_RADIUS` pixels — pad by exactly that so the whole
-/// tail fits.
-const HALO_PAD: u32 = HALO_RADIUS * HALO_PASSES;
+/// Total spread (in pixels) of the cumulative blur on each side. Each
+/// box pass of radius `HALO_RADIUS` spreads coverage by `HALO_RADIUS`, so
+/// `HALO_PASSES` passes reach `HALO_PASSES * HALO_RADIUS` pixels. Used to
+/// expand the stamped bounding box before blurring so the whole tail is
+/// computed without clipping.
+const HALO_SPREAD: usize = HALO_RADIUS * HALO_PASSES;
 
 /// Copy the scaled background RGBA buffer into the framebuffer,
 /// respecting `fb_dims.stride`. The input is tight RGBA8 of exactly
@@ -233,175 +236,279 @@ pub fn blit_cell(
 /// dark backing regardless of its foreground colour, so coloured text on
 /// the image is legible too. Cells with an explicit, opaque background
 /// (e.g. the selection highlight) paint their own backing and are left
-/// alone. A blank cell (a space) early-returns in [`blit_halo`] on empty
-/// coverage, so this never paints behind whitespace.
+/// alone. A blank cell (a space) contributes no ink to the [`HaloMask`],
+/// so this never paints behind whitespace either way.
 pub fn wants_halo(bg: Color) -> bool {
     matches!(bg, Color::Named(NamedColor::Background))
 }
 
-/// Paint a dark, quickly-fading contrast halo behind a glyph.
+/// A single framebuffer-sized coverage mask that unifies the ink of
+/// every glyph that [`wants_halo`]. The dark contrast halo is derived
+/// from this one mask — built, blurred, and composited *once* per frame
+/// — rather than per glyph. That kills the old per-glyph defects:
 ///
-/// The halo is a blurred, gained copy of the glyph coverage composited
-/// as pure black through the Oklab [`src_over`] blend, so it darkens
-/// the background image proportionally to that pixel's own lightness
-/// (see [`HALO_MAX_ALPHA`]). Drawn in a pass *before* any glyph so it
-/// only ever darkens the background photo, never adjacent text.
+///   * **no rings / no double-darkening** — overlapping glyph
+///     contributions combine with `max` (a union), and the black is
+///     composited a single time, so an overlap is darkened to the
+///     stronger of the two, never twice;
+///   * **shape-following** — blurring the union of the real glyph
+///     outlines means a lone `-` yields a soft horizontal bar, not a
+///     circular blob;
+///   * **no bright-dot gaps** — the mask is the *same* coverage that
+///     draws the text, so every ink pixel sits over a fully-stamped
+///     (255) mask cell; there is never an untouched pixel between glyph
+///     and halo.
 ///
-/// Out-of-framebuffer pixels are clipped without overflow; an empty
-/// glyph (a space) is a no-op.
-pub fn blit_halo(fb: &mut [u8], fb_dims: FramebufferDims, glyph: &GlyphBitmap, cell: CellRect) {
-    let gw = glyph.width as usize;
-    let gh = glyph.height as usize;
-    if gw == 0 || gh == 0 {
-        return;
-    }
-    let r = HALO_RADIUS as usize;
-    let pad = HALO_PAD as usize;
-    // Halo canvas: glyph bbox padded by `pad` on every side so the full
-    // multi-pass blur spread fits without clipping at the canvas edge.
-    let hw = gw.saturating_add(pad.saturating_mul(2));
-    let hh = gh.saturating_add(pad.saturating_mul(2));
-    let Some(area) = hw.checked_mul(hh) else {
-        return;
-    };
+/// The mask is stamped in framebuffer pixel space. To keep
+/// [`HaloMask::composite_onto`] cheap (it runs every redraw on a buffer
+/// up to 1920×1080), the bounding box of stamped pixels is tracked and
+/// only that region — expanded by [`HALO_SPREAD`] — is blurred and
+/// composited; the blur itself is an O(n) running-sum box blur.
+pub struct HaloMask {
+    mask: Vec<u8>,
+    w: usize,
+    h: usize,
+    /// Inclusive bbox of stamped (non-zero) pixels, `None` until the
+    /// first stamp. Bounds the blur/composite region.
+    bbox: Option<(usize, usize, usize, usize)>,
+}
 
-    // Seed the glyph coverage into the centre of a zero-padded canvas.
-    let mut field = vec![0u8; area];
-    for gy in 0..gh {
-        for gx in 0..gw {
-            let cov = glyph
-                .coverage
-                .get(gy.saturating_mul(gw).saturating_add(gx))
-                .copied()
-                .unwrap_or(0);
-            if cov == 0 {
+impl HaloMask {
+    /// Allocate a zeroed mask matching the framebuffer pixel dimensions.
+    #[must_use]
+    pub fn new(fb_dims: FramebufferDims) -> Self {
+        let w = fb_dims.w as usize;
+        let h = fb_dims.h as usize;
+        Self {
+            mask: vec![0u8; w.saturating_mul(h)],
+            w,
+            h,
+            bbox: None,
+        }
+    }
+
+    /// Stamp a glyph's coverage into the mask at the cell's pixel origin
+    /// plus the glyph offset, combining with `max` so overlapping glyphs
+    /// union instead of summing. Out-of-mask pixels are clipped. An empty
+    /// glyph (a space) contributes nothing.
+    pub fn stamp(&mut self, glyph: &GlyphBitmap, cell: CellRect) {
+        let gw = glyph.width as usize;
+        let gh = glyph.height as usize;
+        if gw == 0 || gh == 0 || self.w == 0 || self.h == 0 {
+            return;
+        }
+        let base_x = i64::from(cell.x) + i64::from(glyph.offset_x);
+        let base_y = i64::from(cell.y) + i64::from(glyph.offset_y);
+        for gy in 0..gh {
+            let dy = base_y + gy as i64;
+            if dy < 0 || dy as u64 >= self.h as u64 {
                 continue;
             }
-            let idx = (gy.saturating_add(pad))
-                .saturating_mul(hw)
-                .saturating_add(gx.saturating_add(pad));
-            if let Some(slot) = field.get_mut(idx) {
-                *slot = cov;
+            let dy = dy as usize;
+            let row = dy.saturating_mul(self.w);
+            let cov_row = gy.saturating_mul(gw);
+            for gx in 0..gw {
+                let cov = glyph.coverage.get(cov_row.saturating_add(gx)).copied().unwrap_or(0);
+                if cov == 0 {
+                    continue;
+                }
+                let dx = base_x + gx as i64;
+                if dx < 0 || dx as u64 >= self.w as u64 {
+                    continue;
+                }
+                let dx = dx as usize;
+                if let Some(slot) = self.mask.get_mut(row.saturating_add(dx)) {
+                    if cov > *slot {
+                        *slot = cov;
+                    }
+                }
+                self.bbox = Some(match self.bbox {
+                    None => (dx, dy, dx, dy),
+                    Some((x0, y0, x1, y1)) => {
+                        (x0.min(dx), y0.min(dy), x1.max(dx), y1.max(dy))
+                    }
+                });
             }
         }
     }
 
-    // `HALO_PASSES` separable box passes ≈ a wide Gaussian spread. Each
-    // pass is an H then V box blur sharing one scratch buffer.
-    let mut scratch = vec![0u8; area];
-    for _ in 0..HALO_PASSES {
-        box_blur_h(&field, &mut scratch, hw, hh, r);
-        box_blur_v(&scratch, &mut field, hw, hh, r);
-    }
+    /// Blur the mask once and composite the dark halo onto `fb`.
+    ///
+    /// For each masked pixel, pure black is composited through the Oklab
+    /// [`src_over`] blend at `alpha = curve(blurred) * HALO_MAX_ALPHA`.
+    /// Keeping that multiply-toward-black blend preserves the
+    /// brightness-aware darkening: the effect weakens as the background
+    /// approaches black (it darkens by `L_bg * alpha`) and is monotonic
+    /// in background lightness, so a darker pixel can never end up
+    /// brighter than a lighter one at equal halo strength.
+    ///
+    /// Only the stamped bounding box, expanded by [`HALO_SPREAD`] (so the
+    /// full blur tail is included), is touched — distant pixels are left
+    /// pristine. Must be called *after* [`blit_background`] and *before*
+    /// the per-cell [`blit_cell`] pass.
+    pub fn composite_onto(&self, fb: &mut [u8], fb_dims: FramebufferDims) {
+        let Some((bx0, by0, bx1, by1)) = self.bbox else {
+            return;
+        };
+        if self.w == 0 || self.h == 0 {
+            return;
+        }
+        // Expand the bbox by the cumulative blur spread, clamped to the
+        // mask, and work in a tight scratch buffer covering only it.
+        let rx0 = bx0.saturating_sub(HALO_SPREAD);
+        let ry0 = by0.saturating_sub(HALO_SPREAD);
+        let rx1 = (bx1.saturating_add(HALO_SPREAD)).min(self.w.saturating_sub(1));
+        let ry1 = (by1.saturating_add(HALO_SPREAD)).min(self.h.saturating_sub(1));
+        let rw = rx1.saturating_sub(rx0).saturating_add(1);
+        let rh = ry1.saturating_sub(ry0).saturating_add(1);
+        let Some(area) = rw.checked_mul(rh) else {
+            return;
+        };
 
-    // Composite black over the framebuffer, per-pixel alpha from the
-    // (gained) blurred coverage. The canvas top-left maps to the glyph
-    // origin shifted back by `pad`.
-    let base_x = i64::from(cell.x) + i64::from(glyph.offset_x) - pad as i64;
-    let base_y = i64::from(cell.y) + i64::from(glyph.offset_y) - pad as i64;
-    let stride = fb_dims.stride as usize;
-    for fy in 0..hh {
-        let dy = base_y + fy as i64;
-        if dy < 0 {
-            continue;
+        // Copy the mask sub-region into a tight buffer.
+        let mut field = vec![0u8; area];
+        for y in 0..rh {
+            let src_row = (ry0.saturating_add(y)).saturating_mul(self.w).saturating_add(rx0);
+            let dst_row = y.saturating_mul(rw);
+            for x in 0..rw {
+                if let (Some(&s), Some(d)) = (
+                    self.mask.get(src_row.saturating_add(x)),
+                    field.get_mut(dst_row.saturating_add(x)),
+                ) {
+                    *d = s;
+                }
+            }
         }
-        let dy = dy as u64;
-        if dy >= u64::from(fb_dims.h) {
-            continue;
+
+        // Separable running-sum box passes (O(n) per pass): H then V.
+        let mut scratch = vec![0u8; area];
+        for _ in 0..HALO_PASSES {
+            box_blur_h(&field, &mut scratch, rw, rh, HALO_RADIUS);
+            box_blur_v(&scratch, &mut field, rw, rh, HALO_RADIUS);
         }
-        let row_off = (dy as usize).saturating_mul(stride);
-        for fx in 0..hw {
-            let v = field
-                .get(fy.saturating_mul(hw).saturating_add(fx))
-                .copied()
-                .unwrap_or(0);
-            if v == 0 {
-                continue;
+
+        // Composite black, alpha from the curved blurred coverage.
+        let stride = fb_dims.stride as usize;
+        for y in 0..rh {
+            let py = ry0.saturating_add(y);
+            if py as u64 >= u64::from(fb_dims.h) {
+                break;
             }
-            // Shape the spatial falloff with a concave curve so the core
-            // stays a solid backing while low coverage is lifted into a
-            // gentle, wide tail (rather than a linear ramp that fades too
-            // fast). `sqrt` of the normalized blurred coverage is a
-            // gamma-0.5 lift; an extra small gain keeps thin strokes
-            // backed. This only shapes the SPATIAL alpha — the Oklab
-            // multiply-toward-black blend below is untouched, so the
-            // brightness-monotonicity property is preserved.
-            let norm = f32::from(v) / 255.0;
-            let shaped = norm.sqrt() * 1.25;
-            let shaped = if shaped > 1.0 { 1.0 } else { shaped };
-            let alpha = (shaped * f32::from(HALO_MAX_ALPHA)).round();
-            let alpha = if alpha >= 255.0 {
-                255u8
-            } else if alpha <= 0.0 {
-                0u8
-            } else {
-                alpha as u8
-            };
-            if alpha == 0 {
-                continue;
+            let row_off = py.saturating_mul(stride);
+            let field_row = y.saturating_mul(rw);
+            for x in 0..rw {
+                let v = field.get(field_row.saturating_add(x)).copied().unwrap_or(0);
+                if v == 0 {
+                    continue;
+                }
+                let px = rx0.saturating_add(x);
+                if px as u64 >= u64::from(fb_dims.w) {
+                    break;
+                }
+                // Gentle concave curve (gamma 0.5) for a soft tail. The
+                // mask is 255 under ink, and sqrt(1)=1, so the core stays
+                // at full HALO_MAX_ALPHA — no dead zone under the glyph.
+                // This shapes only the spatial alpha; the Oklab
+                // multiply-toward-black blend below is untouched, so the
+                // brightness-monotonicity / weaker-on-dark property holds.
+                let shaped = (f32::from(v) / 255.0).sqrt();
+                let alpha = (shaped * f32::from(HALO_MAX_ALPHA)).round();
+                let alpha = if alpha >= 255.0 {
+                    255u8
+                } else if alpha <= 0.0 {
+                    0u8
+                } else {
+                    alpha as u8
+                };
+                if alpha == 0 {
+                    continue;
+                }
+                let pix_off = row_off.saturating_add(px.saturating_mul(4));
+                let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
+                    continue;
+                };
+                let (dr, dg, db) = read_bgrx(dst);
+                let (nr, ng, nb) = src_over(0, 0, 0, alpha, dr, dg, db);
+                write_bgrx(dst, nr, ng, nb);
             }
-            let dx = base_x + fx as i64;
-            if dx < 0 {
-                continue;
-            }
-            let dx = dx as u64;
-            if dx >= u64::from(fb_dims.w) {
-                continue;
-            }
-            let pix_off = row_off.saturating_add((dx as usize).saturating_mul(4));
-            let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
-                continue;
-            };
-            let (dr, dg, db) = read_bgrx(dst);
-            let (nr, ng, nb) = src_over(0, 0, 0, alpha, dr, dg, db);
-            write_bgrx(dst, nr, ng, nb);
         }
     }
 }
 
-/// Horizontal box blur of radius `r`: each output pixel is the mean of
-/// `[x - r, x + r]` clamped to the row. Edge samples outside the canvas
-/// are simply not counted (the canvas is zero-padded, so this is a
-/// faithful clamp-to-edge of near-zero values).
+/// Horizontal box blur of radius `r` via a running sum: O(w) per row
+/// instead of O(w·r). Each output pixel is the mean of `[x - r, x + r]`
+/// clamped to the row; samples outside the buffer are not counted (the
+/// scratch region is zero-padded at its expanded edge).
 fn box_blur_h(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    if w == 0 {
+        return;
+    }
     for y in 0..h {
         let row = y.saturating_mul(w);
+        // Prime the window over [0, r]; the count is clamped to the row.
+        let mut sum: u32 = 0;
+        for xx in 0..=r.min(w.saturating_sub(1)) {
+            sum = sum.saturating_add(u32::from(src.get(row.saturating_add(xx)).copied().unwrap_or(0)));
+        }
         for x in 0..w {
             let lo = x.saturating_sub(r);
             let hi = (x.saturating_add(r)).min(w.saturating_sub(1));
-            let mut sum: u32 = 0;
-            let mut n: u32 = 0;
-            for xx in lo..=hi {
-                sum = sum.saturating_add(u32::from(
-                    src.get(row.saturating_add(xx)).copied().unwrap_or(0),
-                ));
-                n = n.saturating_add(1);
-            }
+            let n = (hi - lo + 1) as u32;
             if let Some(slot) = dst.get_mut(row.saturating_add(x)) {
                 *slot = sum.checked_div(n).unwrap_or(0) as u8;
+            }
+            // Slide: drop the sample leaving at `x - r`, add the one
+            // entering at `x + r + 1`.
+            if x + 1 < w {
+                if x >= r {
+                    let out = src.get(row.saturating_add(x - r)).copied().unwrap_or(0);
+                    sum = sum.saturating_sub(u32::from(out));
+                }
+                let add_idx = x.saturating_add(r).saturating_add(1);
+                if add_idx < w {
+                    let inb = src.get(row.saturating_add(add_idx)).copied().unwrap_or(0);
+                    sum = sum.saturating_add(u32::from(inb));
+                }
             }
         }
     }
 }
 
-/// Vertical counterpart to [`box_blur_h`].
+/// Vertical counterpart to [`box_blur_h`], running-sum down each column.
 fn box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    if h == 0 {
+        return;
+    }
     for x in 0..w {
+        let mut sum: u32 = 0;
+        for yy in 0..=r.min(h.saturating_sub(1)) {
+            sum = sum.saturating_add(u32::from(
+                src.get(yy.saturating_mul(w).saturating_add(x)).copied().unwrap_or(0),
+            ));
+        }
         for y in 0..h {
             let lo = y.saturating_sub(r);
             let hi = (y.saturating_add(r)).min(h.saturating_sub(1));
-            let mut sum: u32 = 0;
-            let mut n: u32 = 0;
-            for yy in lo..=hi {
-                sum = sum.saturating_add(u32::from(
-                    src.get(yy.saturating_mul(w).saturating_add(x))
-                        .copied()
-                        .unwrap_or(0),
-                ));
-                n = n.saturating_add(1);
-            }
+            let n = (hi - lo + 1) as u32;
             if let Some(slot) = dst.get_mut(y.saturating_mul(w).saturating_add(x)) {
                 *slot = sum.checked_div(n).unwrap_or(0) as u8;
+            }
+            if y + 1 < h {
+                if y >= r {
+                    let out = src
+                        .get((y - r).saturating_mul(w).saturating_add(x))
+                        .copied()
+                        .unwrap_or(0);
+                    sum = sum.saturating_sub(u32::from(out));
+                }
+                let add_idx = y.saturating_add(r).saturating_add(1);
+                if add_idx < h {
+                    let inb = src
+                        .get(add_idx.saturating_mul(w).saturating_add(x))
+                        .copied()
+                        .unwrap_or(0);
+                    sum = sum.saturating_add(u32::from(inb));
+                }
             }
         }
     }
@@ -968,77 +1075,151 @@ mod tests {
     }
 
     #[test]
-    fn blit_halo_darkens_glyph_and_leaves_distant_pixels() {
-        // 64×64 bright-grey fb, 5×5 solid glyph at cell (28, 28). The fb
-        // is sized so the whole padded halo canvas (glyph bbox ± HALO_PAD)
-        // fits with room to spare, leaving genuinely distant pixels.
-        let (mut fb, dims) = grey_fb(64, 200);
-        let glyph = solid_glyph(5);
-        let rect = CellRect {
-            x: 28,
-            y: 28,
-            w: 5,
-            h: 5,
+    fn halo_mask_overlap_unions_via_max_not_sum() {
+        // Stamping the SAME glyph twice at the SAME spot must be identical
+        // to stamping it once: the mask combines with `max` (a union), so
+        // a pixel covered by two contributions holds 255 — not 510 — and
+        // the black is composited a single time. A summing implementation
+        // would over-darken (or, with clamping, still composite the field
+        // identically but a doubled mask value would shift the blurred
+        // tail); pinning the two framebuffers equal proves the union.
+        let dims = FramebufferDims {
+            w: 16,
+            h: 16,
+            stride: 64,
         };
-        blit_halo(&mut fb, dims, &glyph, rect);
+        let glyph = solid_glyph(3);
+        let rect = CellRect {
+            x: 6,
+            y: 6,
+            w: 3,
+            h: 3,
+        };
 
-        // Glyph core (30, 30) sits inside the solid ink → darkened.
+        let (mut fb_once, _) = grey_fb(16, 200);
+        {
+            let mut m = HaloMask::new(dims);
+            m.stamp(&glyph, rect);
+            m.composite_onto(&mut fb_once, dims);
+        }
+
+        let (mut fb_twice, _) = grey_fb(16, 200);
+        {
+            let mut m = HaloMask::new(dims);
+            m.stamp(&glyph, rect);
+            m.stamp(&glyph, rect); // exact overlap
+            m.composite_onto(&mut fb_twice, dims);
+        }
+
+        // Darkening actually happened (so the equality below is meaningful).
         assert!(
-            pixel_r(&fb, dims, 30, 30) < 200,
-            "halo must darken the glyph core"
+            pixel_r(&fb_once, dims, 7, 7) < 200,
+            "the overlap core must be darkened"
         );
-
-        // The wider, concave falloff still has a finite reach: the canvas
-        // spans the glyph bbox padded by HALO_PAD on each side. A pixel
-        // beyond that pad can never be touched.
-        let pad = HALO_PAD;
-        let glyph_max = 28 + 5; // exclusive right/bottom edge of the glyph
-        let tail_end = glyph_max + pad; // last column/row the canvas can reach
-        let far = tail_end + 2; // safely beyond the tail
+        // Max-combine: the doubled stamp produces a byte-identical result.
         assert_eq!(
-            pixel_r(&fb, dims, far, far),
-            200,
-            "pixel beyond the haze tail must be untouched"
-        );
-        // Corner (0, 0) is far outside the padded halo canvas → pristine.
-        assert_eq!(
-            pixel_r(&fb, dims, 0, 0),
-            200,
-            "distant corner pixel must be untouched"
+            fb_once, fb_twice,
+            "overlapping stamps must union via max (composited once), \
+             not sum/double-darken"
         );
     }
 
     #[test]
-    fn blit_halo_empty_glyph_is_noop() {
-        let (mut fb, dims) = grey_fb(16, 123);
+    fn halo_mask_ink_pixel_is_darkened_no_bright_dot_gap() {
+        // A pixel under glyph coverage must end up darker than the bare
+        // background: the mask is 255 there, so there is no untouched
+        // bright-dot gap between glyph and halo.
+        let dims = FramebufferDims {
+            w: 16,
+            h: 16,
+            stride: 64,
+        };
+        let (mut fb, _) = grey_fb(16, 200);
+        let glyph = solid_glyph(3);
+        let mut m = HaloMask::new(dims);
+        m.stamp(&glyph, CellRect { x: 6, y: 6, w: 3, h: 3 });
+        m.composite_onto(&mut fb, dims);
+        // (7,7) sits squarely under the ink.
+        assert!(
+            pixel_r(&fb, dims, 7, 7) < 200,
+            "ink pixel must be darkened (no bright-dot gap under the glyph)"
+        );
+    }
+
+    #[test]
+    fn halo_mask_empty_is_noop() {
+        let dims = FramebufferDims {
+            w: 16,
+            h: 16,
+            stride: 64,
+        };
+        let (mut fb, _) = grey_fb(16, 123);
         let before = fb.clone();
-        let glyph = GlyphBitmap {
+        // No stamps at all → bbox stays None → composite is a no-op.
+        let m = HaloMask::new(dims);
+        m.composite_onto(&mut fb, dims);
+        assert_eq!(fb, before, "empty mask must not touch the framebuffer");
+
+        // A space (empty glyph) stamps nothing either.
+        let mut m2 = HaloMask::new(dims);
+        let empty = GlyphBitmap {
             width: 0,
             height: 0,
             coverage: Vec::new(),
             offset_x: 0,
             offset_y: 0,
         };
-        let rect = CellRect {
-            x: 8,
-            y: 8,
-            w: 8,
-            h: 8,
-        };
-        blit_halo(&mut fb, dims, &glyph, rect);
+        m2.stamp(&empty, CellRect { x: 8, y: 8, w: 8, h: 8 });
+        m2.composite_onto(&mut fb, dims);
         assert_eq!(fb, before, "empty glyph must not touch the framebuffer");
     }
 
     #[test]
-    fn blit_halo_less_visible_on_dark_and_monotonic() {
-        // Same glyph + cell + halo strength over a bright vs a dark
-        // background. The Oklab multiply-toward-black means:
+    fn halo_mask_far_pixel_beyond_spread_is_untouched() {
+        // A 3×3 glyph near one corner; a pixel well beyond the mask plus
+        // the blur spread must stay pristine.
+        let dims = FramebufferDims {
+            w: 64,
+            h: 64,
+            stride: 256,
+        };
+        let (mut fb, _) = grey_fb(64, 200);
+        let glyph = solid_glyph(3);
+        let mut m = HaloMask::new(dims);
+        m.stamp(&glyph, CellRect { x: 4, y: 4, w: 3, h: 3 });
+        m.composite_onto(&mut fb, dims);
+
+        // Glyph occupies cols/rows 4..=6. The blur reaches HALO_SPREAD
+        // beyond that. A pixel comfortably past 6 + HALO_SPREAD is safe.
+        let far = 6 + HALO_SPREAD as u32 + 4;
+        assert_eq!(
+            pixel_r(&fb, dims, far, far),
+            200,
+            "pixel beyond mask + blur spread must be untouched"
+        );
+        // The far corner is also pristine.
+        assert_eq!(
+            pixel_r(&fb, dims, 63, 63),
+            200,
+            "distant corner must be untouched"
+        );
+    }
+
+    #[test]
+    fn halo_mask_less_visible_on_dark_and_monotonic() {
+        // Same mask over a bright vs a dark background. The Oklab
+        // multiply-toward-black means:
         //   * the bright pixel is darkened by a larger absolute amount
         //     (the haze is "less visible" on dark backgrounds), and
         //   * the darker background can never end up brighter than the
         //     lighter one (monotonic in background brightness).
         const BRIGHT: u8 = 200;
         const DARK: u8 = 40;
+        let dims = FramebufferDims {
+            w: 24,
+            h: 24,
+            stride: 96,
+        };
         let glyph = solid_glyph(5);
         let rect = CellRect {
             x: 10,
@@ -1047,12 +1228,20 @@ mod tests {
             h: 5,
         };
 
-        let (mut fb_bright, dims) = grey_fb(24, BRIGHT);
-        blit_halo(&mut fb_bright, dims, &glyph, rect);
+        let (mut fb_bright, _) = grey_fb(24, BRIGHT);
+        {
+            let mut m = HaloMask::new(dims);
+            m.stamp(&glyph, rect);
+            m.composite_onto(&mut fb_bright, dims);
+        }
         let bright_after = pixel_r(&fb_bright, dims, 12, 12);
 
         let (mut fb_dark, _) = grey_fb(24, DARK);
-        blit_halo(&mut fb_dark, dims, &glyph, rect);
+        {
+            let mut m = HaloMask::new(dims);
+            m.stamp(&glyph, rect);
+            m.composite_onto(&mut fb_dark, dims);
+        }
         let dark_after = pixel_r(&fb_dark, dims, 12, 12);
 
         // Both darkened.

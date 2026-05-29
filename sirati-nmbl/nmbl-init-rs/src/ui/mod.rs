@@ -904,9 +904,13 @@ pub(crate) fn render_splash_frame_with(
 
     drm.render(|fb, fb_dims| {
         compositor::blit_background(fb, fb_dims, bg_scaled);
-        // Pass 1: dark contrast halo behind glyphs on the transparent
-        // default background, painted first so it only darkens the
-        // background photo and never bleeds onto adjacent drawn text.
+        // Pass 1: build ONE unified text-coverage mask from every cell
+        // that wants the halo (transparent default bg + inked glyph),
+        // then blur + composite the dark contrast halo a single time.
+        // Painted before any glyph so it only darkens the background
+        // photo, never adjacent drawn text; the mask uses max-combine so
+        // overlapping glyphs union (no rings / no double-darkening).
+        let mut halo = compositor::HaloMask::new(fb_dims);
         term_pipe.for_each_cell(|col, row, cell| {
             if !compositor::wants_halo(cell.bg) {
                 return;
@@ -923,8 +927,9 @@ pub(crate) fn render_splash_frame_with(
                 w: cell_dims.cell_w,
                 h: cell_dims.cell_h,
             };
-            compositor::blit_halo(fb, fb_dims, glyph, rect);
+            halo.stamp(glyph, rect);
         });
+        halo.composite_onto(fb, fb_dims);
         // Pass 2: cell backgrounds + glyphs.
         term_pipe.for_each_cell(|col, row, cell| {
             if cell.c == ' ' && cell.bg == Color::Named(NamedColor::Background) {
