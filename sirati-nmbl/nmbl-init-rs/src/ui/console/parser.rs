@@ -503,6 +503,37 @@ mod tests {
         assert!(out[0].modifiers.contains(KeyModifiers::CONTROL));
     }
 
+    /// A userspace terminal emulator (the proven tty/console path)
+    /// emits the modifier-encoded `ESC [ 1 ; 6 A` for Ctrl+Shift+Up,
+    /// and the shared parser decodes the modifiers correctly. The
+    /// kernel VT (splash path) instead collapses the chord onto the
+    /// bare `ESC [ A`; this pins both facts so the splash-side
+    /// shift-state recovery (`splash::input::read_shift_state`) stays
+    /// justified.
+    #[test]
+    fn modifier_encoded_ctrl_shift_up_decodes() {
+        let mut t = TermwizToCrossterm::new();
+        let mut out = Vec::new();
+        t.feed(b"\x1b[1;6A", false, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].code, KeyCode::Up);
+        assert_eq!(
+            out[0].modifiers,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        );
+    }
+
+    #[test]
+    fn bare_csi_up_carries_no_modifiers() {
+        // What the kernel VT actually delivers for Ctrl+Shift+Up.
+        let mut t = TermwizToCrossterm::new();
+        let mut out = Vec::new();
+        t.feed(b"\x1b[A", false, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].code, KeyCode::Up);
+        assert_eq!(out[0].modifiers, KeyModifiers::NONE);
+    }
+
     #[test]
     fn termwiz_to_crossterm_esc_alone() {
         let mut t = TermwizToCrossterm::new();
