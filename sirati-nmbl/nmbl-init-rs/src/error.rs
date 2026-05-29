@@ -137,6 +137,22 @@ pub enum NmblError {
     /// and re-prompts for the passphrase).
     #[error("operator dropped to shell from wrong-password modal ({context})")]
     WrongPasswordShellExited { context: String },
+
+    /// The ciborium-encoded `State` overflowed the fixed 16 KiB
+    /// `state.bin` slot. Indicates an installer bug: state.bin grew a
+    /// field the on-disk layout can't accommodate. Always treat as
+    /// fatal — silently truncating would corrupt subsequent reads.
+    /// Kept feature-free to avoid `#[cfg]` noise inside this enum.
+    #[error("state.bin payload {encoded_len} bytes exceeds {max} byte slot")]
+    StateTooLarge { encoded_len: usize, max: usize },
+
+    /// `init_or_validate` decoded an existing `state.bin`, re-encoded
+    /// it, and the byte representation diverged from the on-disk one
+    /// (modulo trailing-zero padding). Signals schema drift between
+    /// the installer and the on-disk file — the installer refuses to
+    /// silently rewrite the file because doing so could mask a bug.
+    #[error("state.bin at {path} did not round-trip through encode/decode")]
+    StateRoundtripMismatch { path: PathBuf },
 }
 
 pub type Result<T> = std::result::Result<T, NmblError>;

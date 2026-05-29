@@ -30,7 +30,8 @@ let
   # both are requested we build a combined binary via `mkNmblInit`.
   nmblFeatures =
     lib.optional cfg.splash.enable "image-splash"
-    ++ lib.optional cfg.rescue.network "network-rescue";
+    ++ lib.optional cfg.rescue.network "network-rescue"
+    ++ lib.optional cfg.stateful.enable "stateful";
 
   # Resolved /init binary used by the initramfs builder. Identity-equal
   # to the prebuilt `nmblInit` / `nmblInitSplash` in the single-feature
@@ -40,6 +41,8 @@ let
       nmblInit
     else if nmblFeatures == [ "image-splash" ] then
       nmblInitSplash
+    else if nmblFeatures == [ "stateful" ] then
+      mkNmblInit { features = [ "stateful" ]; }
     else
       mkNmblInit { features = nmblFeatures; };
 

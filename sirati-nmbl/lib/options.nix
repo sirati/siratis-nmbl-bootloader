@@ -38,6 +38,8 @@ in
 {
   imports = [
     ./modules/activation.nix
+    ./modules/log-import.nix
+    ./modules/stateful.nix
   ];
 
   options.boot.nmbl = {
@@ -186,6 +188,30 @@ in
               Set to null for qemu_kernel_invoke mode (no bootloader).
             '';
           };
+
+          bootDisks = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [ ];
+            example = [
+              "/dev/nvme0n1"
+              "/dev/nvme1n1"
+            ];
+            description = lib.mdDoc ''
+              Block devices to install the bootloader to.
+
+              When empty (the default), NMBL auto-discovers boot disks at
+              install time:
+              - BIOS: every whole disk with an EF02 partition gets
+                `grub-install`, so each member of e.g. a RAID1 mirror is
+                independently bootable.
+              - UEFI: the single mounted /boot ESP is used; multi-ESP
+                mirroring is currently a manual post-install step.
+
+              Set this to pin the candidate set explicitly — e.g. when
+              EF02 discovery would match disks you don't want touched, or
+              when your layout doesn't expose EF02 partitions (rare).
+            '';
+          };
         };
       };
       default = { };
@@ -324,6 +350,21 @@ in
       '';
     };
 
+    deviceTimeoutSeconds = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 30;
+      description = lib.mdDoc ''
+        Per-device readiness budget (seconds) used while waiting for a
+        `fileSystems.<name>.device` to appear during the system-root
+        mount cascade, and while waiting for cryptsetup / LVM / mdraid
+        activations to materialise the block devices they produce.
+
+        Raise this on slow USB enclosures or hot-plug HBAs where a
+        single device can take longer than the default 30 s to show up
+        after its driver loads.
+      '';
+    };
+
     serialConsole = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
@@ -392,6 +433,17 @@ in
         Alias for `boot.nmbl.timeoutSeconds` matching the snake_case
         `timeout_secs` key in the runtime TOML config consumed by
         nmbl-init-rs.
+      '';
+    };
+
+    deviceTimeoutSecs = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = cfg.deviceTimeoutSeconds;
+      defaultText = lib.literalMD "inherits from `boot.nmbl.deviceTimeoutSeconds`.";
+      description = lib.mdDoc ''
+        Alias for `boot.nmbl.deviceTimeoutSeconds` matching the
+        snake_case `device_timeout_secs` key in the runtime TOML config
+        consumed by nmbl-init-rs.
       '';
     };
 

@@ -29,6 +29,10 @@ use nmbl_init::boot::kexec_into;
 use nmbl_init::config::{BootstrapConfig, Config, resolve_full_config_path};
 use nmbl_init::devices::mount_system_filesystems;
 use nmbl_init::error::{NmblError, Result, format_chain};
+#[cfg(feature = "stateful")]
+use nmbl_init::generations::Generation;
+#[cfg(feature = "stateful")]
+use nmbl_init::generations::active_generation_index;
 use nmbl_init::generations::scan_generations;
 use nmbl_init::modules::{load_early_modules, load_explicit_modules, load_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
@@ -45,6 +49,13 @@ use nmbl_init::{log, nmbl_info, nmbl_warn};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/nmbl/config.toml";
 const BOOTSTRAP_CONFIG_PATH: &str = "/etc/nmbl/bootstrap.toml";
+
+// Tmpfs path the byte-ring is flushed to right before every terminal
+// action — defined once in `log::NMBL_LOG_PATH`. The parent dir is
+// `mkdir -p`'d on every call; EEXIST is benign, anything else means
+// tmpfs is broken and we surface a warning but still proceed with the
+// terminal action.
+use log::NMBL_LOG_PATH;
 
 /// Kernel cmdline token that opts into the key-echo diagnostic screen.
 /// Must appear as a whitespace-delimited token (e.g.
@@ -65,22 +76,56 @@ fn cmdline_has_key_echo_flag() -> bool {
         .any(|tok| tok == KEY_ECHO_CMDLINE_TOKEN)
 }
 
+#[derive(Debug)]
 struct Args {
     config_path: PathBuf,
     errored_report: Option<PathBuf>,
     validate_config: Option<PathBuf>,
+    /// Installer-side: initialise (or validate) state.bin under the
+    /// given directory and exit. Mutually exclusive with
+    /// `validate_config` and `boot_succeeded_dir`.
+    #[cfg(feature = "stateful")]
+    init_state_dir: Option<PathBuf>,
+    /// systemd-unit side: flip `last_boot_succeeded = true` in
+    /// state.bin under the given directory and exit. Mutually
+    /// exclusive with `validate_config` and `init_state_dir`.
+    #[cfg(feature = "stateful")]
+    boot_succeeded_dir: Option<PathBuf>,
 }
 
 /// Hand-rolled arg parsing: clap is too big for the size budget. We
 /// recognise `--config=<v>` / `--config <v>` and the same two forms
-/// for `--errored` and `--validate-config`. Anything else is silently
-/// ignored — PID 1 has no useful "usage" target to print to.
-fn parse_args() -> Args {
+/// for `--errored`, `--validate-config`, `--init-state`, and
+/// `--boot-succeeded`. Anything else is silently ignored — PID 1 has
+/// no useful "usage" target to print to.
+///
+/// Returns `Err(String)` when the caller asked for a stateful flag in
+/// a binary built without the `stateful` feature, when two mutually
+/// exclusive early-exit modes were combined, or when an early-exit
+/// flag was passed with no path argument. Those three cases are
+/// programmer / operator errors, not normal boot failures, and we
+/// surface them to stderr before the panic hook or logger come up.
+fn parse_args() -> std::result::Result<Args, String> {
+    parse_args_from(std::env::args_os().skip(1))
+}
+
+/// Pure parsing core: takes an iterator of arg-like values so unit
+/// tests can drive the parser without touching `std::env::args_os()`.
+/// `parse_args` is the production entry point and stays a one-liner.
+fn parse_args_from<I, S>(args: I) -> std::result::Result<Args, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
+{
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut errored_report: Option<PathBuf> = None;
     let mut validate_config: Option<PathBuf> = None;
+    #[cfg(feature = "stateful")]
+    let mut init_state_dir: Option<PathBuf> = None;
+    #[cfg(feature = "stateful")]
+    let mut boot_succeeded_dir: Option<PathBuf> = None;
 
-    let mut iter = std::env::args_os().skip(1);
+    let mut iter = args.into_iter().map(Into::into);
     while let Some(arg_os) = iter.next() {
         let arg = arg_os.to_string_lossy();
         if let Some(rest) = arg.strip_prefix("--config=") {
@@ -101,14 +146,91 @@ fn parse_args() -> Args {
             && let Some(v) = iter.next()
         {
             validate_config = Some(PathBuf::from(v));
+        } else if let Some(rest) = arg.strip_prefix("--init-state=") {
+            #[cfg(feature = "stateful")]
+            {
+                init_state_dir = Some(PathBuf::from(rest));
+            }
+            #[cfg(not(feature = "stateful"))]
+            {
+                let _ = rest;
+                return Err(
+                    "--init-state requires nmbl-init to be built with the `stateful` feature"
+                        .to_string(),
+                );
+            }
+        } else if arg == "--init-state" {
+            #[cfg(feature = "stateful")]
+            {
+                let Some(v) = iter.next() else {
+                    return Err("--init-state requires a directory argument".to_string());
+                };
+                init_state_dir = Some(PathBuf::from(v));
+            }
+            #[cfg(not(feature = "stateful"))]
+            {
+                return Err(
+                    "--init-state requires nmbl-init to be built with the `stateful` feature"
+                        .to_string(),
+                );
+            }
+        } else if let Some(rest) = arg.strip_prefix("--boot-succeeded=") {
+            #[cfg(feature = "stateful")]
+            {
+                boot_succeeded_dir = Some(PathBuf::from(rest));
+            }
+            #[cfg(not(feature = "stateful"))]
+            {
+                let _ = rest;
+                return Err(
+                    "--boot-succeeded requires nmbl-init to be built with the `stateful` feature"
+                        .to_string(),
+                );
+            }
+        } else if arg == "--boot-succeeded" {
+            #[cfg(feature = "stateful")]
+            {
+                let Some(v) = iter.next() else {
+                    return Err("--boot-succeeded requires a directory argument".to_string());
+                };
+                boot_succeeded_dir = Some(PathBuf::from(v));
+            }
+            #[cfg(not(feature = "stateful"))]
+            {
+                return Err(
+                    "--boot-succeeded requires nmbl-init to be built with the `stateful` feature"
+                        .to_string(),
+                );
+            }
         }
     }
 
-    Args {
+    // Mutual exclusion across the three early-exit modes. Each mode
+    // funnels into a different exit path (validate, init-state,
+    // boot-succeeded); combining them would silently pick one and
+    // drop the others, masking an operator typo.
+    #[cfg(feature = "stateful")]
+    {
+        let count = u8::from(validate_config.is_some())
+            + u8::from(init_state_dir.is_some())
+            + u8::from(boot_succeeded_dir.is_some());
+        if count > 1 {
+            return Err(
+                "--validate-config, --init-state, and --boot-succeeded are mutually exclusive"
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(Args {
         config_path,
         errored_report,
         validate_config,
-    }
+        #[cfg(feature = "stateful")]
+        init_state_dir,
+        #[cfg(feature = "stateful")]
+        boot_succeeded_dir,
+    })
 }
 
 /// Read the panic report file, degrading gracefully if it's gone — we
@@ -294,6 +416,47 @@ fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
     // the build-time `/boot` convention.
     config.runtime_boot_mountpoint = Some(boot_fs.mountpoint.clone());
 
+    // When the operator opted into stateful storage AND this binary was
+    // built with the `stateful` feature, mount the same boot device a
+    // second time RW at `state.mountpoint`. The RO mount above keeps the
+    // operator's "read-only by default" expectation for the boot
+    // partition; the RW twin is the narrow window we use to rewrite
+    // `state.bin` between boots. We append `rw,nosuid,noexec,nodev` to
+    // the operator's original options so the RW twin is no more
+    // privileged than the RO mount needs to be.
+    #[cfg(feature = "stateful")]
+    if let Some(state_mount) = &section.state {
+        let mp = &state_mount.mountpoint;
+        nmbl_info!(
+            "phase 0.5: mounting boot fs {} at {} (rw twin for state.bin)",
+            boot_fs.device,
+            mp.display(),
+        );
+        std::fs::create_dir_all(mp).map_err(|source| NmblError::Bootstrap {
+            stage: "mount-state",
+            source: Box::new(NmblError::Io {
+                source,
+                context: format!("creating state mountpoint {}", mp.display()),
+            }),
+        })?;
+        let rw_options = if boot_fs.options.is_empty() {
+            "rw,nosuid,noexec,nodev".to_string()
+        } else {
+            format!("{},rw,nosuid,noexec,nodev", boot_fs.options)
+        };
+        sys_mount::mount_fs(
+            Some(Path::new(&boot_fs.device)),
+            mp,
+            &boot_fs.fstype,
+            &rw_options,
+        )
+        .map_err(|source| NmblError::Bootstrap {
+            stage: "mount-state",
+            source: Box::new(source),
+        })?;
+        config.runtime_state_mountpoint = Some(mp.clone());
+    }
+
     Ok(config)
 }
 
@@ -317,8 +480,19 @@ fn select_and_act(
         // reporter drops here, releasing the &mut console borrow.
     };
 
-    nmbl_info!("phase 5: TUI generation selector");
-    let decision = run_selector(config, &generations, console)?;
+    // Stateful rollback gate. When the operator opted into stateful
+    // storage AND state.bin is readable, `select_with_stateful` decides
+    // whether to honour the TUI countdown, force-pick a known-good
+    // generation, or surface an Exhausted rescue condition. In every
+    // other case (no feature, no opt-in, missing/unsupported state.bin,
+    // IO failure) the call collapses to the legacy `run_selector` path.
+    #[cfg(feature = "stateful")]
+    let decision = select_with_stateful(config, &generations, console)?;
+    #[cfg(not(feature = "stateful"))]
+    let decision = {
+        nmbl_info!("phase 5: TUI generation selector");
+        run_selector(config, &generations, console)?
+    };
 
     match decision {
         Decision::Boot {
@@ -347,6 +521,170 @@ fn select_and_act(
     }
 }
 
+/// Stateful entry point for the boot selector. Returns the same
+/// [`Decision`] shape `run_selector` would have returned; the caller's
+/// match on `Decision::Boot` / `Shell` / `Reboot` does not change.
+///
+/// Decision tree:
+///   - No `[stateful]` table, or no `[bootstrap.state]` mount, or
+///     no readable `state.bin`: fall back to `run_selector` unchanged.
+///   - `state::decide` → `HonourTui`: call `run_selector`, then record
+///     the operator's pick in `state.bin` before returning.
+///   - `state::decide` → `ForcePick(idx)`: skip the TUI, synthesize a
+///     `Decision::Boot` for `generations[idx]`, record the pick in
+///     `state.bin`.
+///   - `state::decide` → `Exhausted`: surface as
+///     `NmblError::Rescue { stage: "stateful-exhausted", ... }` so
+///     `run_inner`'s existing error arm routes through the emergency
+///     screen.
+#[cfg(feature = "stateful")]
+fn select_with_stateful(
+    config: &Config,
+    generations: &[Generation],
+    console: &mut dyn Console,
+) -> Result<Decision> {
+    // No opt-in: legacy path verbatim.
+    let (Some(_stateful), Some(state_mp)) = (
+        config.stateful.as_ref(),
+        config.runtime_state_mountpoint.as_deref(),
+    ) else {
+        nmbl_info!("phase 5: TUI generation selector");
+        return run_selector(config, generations, console);
+    };
+
+    let state_path = state_mp.join("nmbl").join("state.bin");
+    let mut state = match nmbl_init::state::read(&state_path) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            // File missing or wire-format version newer than us. Either
+            // is an explicit "fall back to non-stateful" signal per the
+            // forward-compat contract on `State`; do not surface as
+            // failure, just skip the rollback flow this boot.
+            nmbl_warn!(
+                "state.bin at {} absent or unsupported; skipping stateful boot this cycle",
+                state_path.display(),
+            );
+            nmbl_info!("phase 5: TUI generation selector");
+            return run_selector(config, generations, console);
+        }
+        Err(err) => {
+            // IO error other than NotFound (which `read` already maps to
+            // Ok(None)). The operator's choice was to enable stateful;
+            // surfacing this as a hard rescue would be heavy-handed for
+            // what may be a transient FS hiccup, so the contract is to
+            // warn and skip — same fall-back as a missing file.
+            nmbl_warn!(
+                "state.bin at {} could not be read ({err}); skipping stateful boot this cycle",
+                state_path.display(),
+            );
+            nmbl_info!("phase 5: TUI generation selector");
+            return run_selector(config, generations, console);
+        }
+    };
+
+    // Already validated at TOML parse time that `stateful = Some(...)`
+    // means max_recovery_attempts is present.
+    let max_attempts = _stateful.max_recovery_attempts;
+    let active_index = active_generation_index(generations, &config.paths.nix_profiles_dir);
+
+    match nmbl_init::state::decide(&mut state, generations, active_index, max_attempts) {
+        nmbl_init::state::StatefulDecision::HonourTui => {
+            nmbl_info!(
+                "phase 5: TUI generation selector (stateful: honour operator choice, recovery_attempt={})",
+                state.recovery_attempt,
+            );
+            let decision = run_selector(config, generations, console)?;
+            if let Decision::Boot {
+                generation_index,
+                cmdline_override: _,
+            } = &decision
+            {
+                record_attempt(&mut state, generations, *generation_index, &state_path);
+            }
+            Ok(decision)
+        }
+        nmbl_init::state::StatefulDecision::ForcePick(idx) => {
+            let Some(target) = generations.get(idx) else {
+                return Err(NmblError::ConfigInvalid {
+                    reason: format!(
+                        "state::decide returned ForcePick({idx}) but only {} generations",
+                        generations.len()
+                    ),
+                    context: "stateful dispatch".to_string(),
+                });
+            };
+            nmbl_info!(
+                "phase 5: stateful rollback forced generation {} (recovery_attempt={})",
+                target.number,
+                state.recovery_attempt,
+            );
+            record_attempt(&mut state, generations, idx, &state_path);
+            Ok(Decision::Boot {
+                generation_index: idx,
+                cmdline_override: None,
+            })
+        }
+        nmbl_init::state::StatefulDecision::Exhausted => {
+            // The emergency menu reads the source chain via
+            // `format_chain`, so wrap a leaf error that explains *why*
+            // the rescue arm fired. There's no `NmblError::Other`
+            // variant; the existing pattern (e.g. `select_and_act`'s
+            // `Decision::Shell` arm) wraps a free-form message in
+            // `NmblError::Io` via `io::Error::other`. Reusing that here
+            // keeps the chain walker happy and the operator-facing
+            // string clear.
+            Err(NmblError::Rescue {
+                stage: "stateful-exhausted",
+                source: Box::new(NmblError::Io {
+                    source: std::io::Error::other(
+                        "max recovery attempts exceeded; no known-good generation left to try",
+                    ),
+                    context: "stateful dispatch".to_string(),
+                }),
+            })
+        }
+    }
+}
+
+/// Persist the operator's (or stateful dispatcher's) generation pick to
+/// `state.bin` before kexec. Write failures degrade to a warning — the
+/// next boot will retry the decision against a stale state.bin, which
+/// is strictly less bad than blocking the boot handoff. The `u32::MAX`
+/// edge case on `NonMaxU32::new` is theoretical (Nix never emits that
+/// many generations), but we still log and skip the state update rather
+/// than panicking.
+#[cfg(feature = "stateful")]
+fn record_attempt(
+    state: &mut nmbl_init::state::State,
+    generations: &[Generation],
+    generation_index: usize,
+    state_path: &Path,
+) {
+    let Some(target) = generations.get(generation_index) else {
+        nmbl_warn!(
+            "stateful: generation index {generation_index} out of range, skipping state.bin update",
+        );
+        return;
+    };
+    match nonmax::NonMaxU32::new(target.number) {
+        Some(n) => state.last_attempted_generation = Some(n),
+        None => {
+            nmbl_warn!(
+                "stateful: generation number {} is u32::MAX, cannot record in state.bin",
+                target.number,
+            );
+            return;
+        }
+    }
+    state.last_boot_succeeded = false;
+    if let Err(err) = nmbl_init::state::write_padded(state_path, state) {
+        nmbl_warn!(
+            "stateful: failed to write state.bin at {}: {err}; proceeding with kexec anyway",
+            state_path.display(),
+        );
+    }
+}
+
 /// Dispatch the final [`TerminalAction`] produced by the inner
 /// layers. Single point of `execve(2)` / `reboot(2)` / `reboot
 /// (RB_KEXEC)` in the entire crate — by the time control reaches
@@ -362,6 +700,23 @@ fn select_and_act(
               taking by value makes the move explicit"
 )]
 fn execute_terminal_action(action: TerminalAction) -> ! {
+    // Persist the byte-ring transcript before the no-return syscall.
+    // The byte ring lives in RAM only; once we kexec / reboot / execve
+    // it is gone. Disk-flushing here means the operator's emergency
+    // shell (Execve path), and the kexec-staging step in `kexec_into`
+    // (Kexec path), both have a fresh on-disk snapshot to work with.
+    // Failures must not block the terminal action — a missing log is
+    // strictly less bad than failing to reboot a wedged system.
+    let log_path = Path::new(NMBL_LOG_PATH);
+    if let Some(parent) = log_path.parent() {
+        // EEXIST is the expected case after the first call; any other
+        // error gets surfaced by the flush_to attempt below.
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = log::flush_to(log_path) {
+        nmbl_warn!("failed to flush log to {}: {err}", log_path.display());
+    }
+
     match action {
         TerminalAction::Reboot => {
             eprintln!("[nmbl] operator (or timeout) chose reboot");
@@ -456,7 +811,13 @@ fn main() -> ExitCode {
         }
     }
 
-    let args = parse_args();
+    let args = match parse_args() {
+        Ok(a) => a,
+        Err(msg) => {
+            eprintln!("nmbl-init: {msg}");
+            return ExitCode::from(2);
+        }
+    };
 
     // Build-time validation hook: load and validate the given config
     // file, print the outcome, and exit. Used by the Nix expression
@@ -474,6 +835,46 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         };
+    }
+
+    // Installer and systemd-unit early-exit dispatches. Both flags
+    // touch `state.bin` and then exit — never the PID-1 init flow.
+    // Mirrors `--validate-config` above: no panic hook, no logger
+    // init, no `run_inner`. The parser already rejects these flags
+    // when the `stateful` feature is off, so the dispatch site only
+    // exists under the same gate.
+    #[cfg(feature = "stateful")]
+    {
+        if let Some(dir) = args.init_state_dir.as_deref() {
+            return match nmbl_init::state::init_or_validate(dir) {
+                Ok(_) => {
+                    println!("nmbl-init: state.bin OK under {}", dir.display());
+                    ExitCode::from(0)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "nmbl-init: --init-state failed for {}: {}",
+                        dir.display(),
+                        format_chain(&err as &dyn std::error::Error),
+                    );
+                    ExitCode::from(1)
+                }
+            };
+        }
+
+        if let Some(dir) = args.boot_succeeded_dir.as_deref() {
+            return match nmbl_init::state::mark_boot_succeeded(dir) {
+                Ok(()) => ExitCode::from(0),
+                Err(err) => {
+                    eprintln!(
+                        "nmbl-init: --boot-succeeded failed for {}: {}",
+                        dir.display(),
+                        format_chain(&err as &dyn std::error::Error),
+                    );
+                    ExitCode::from(1)
+                }
+            };
+        }
     }
 
     if let Some(report_path) = args.errored_report.clone() {
@@ -698,5 +1099,132 @@ fn run_inner(
             // operator wants after a shell detour.
             Ok(drop_to_emergency(console, &config, err))
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests assert on contract failures"
+)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "stateful")]
+    #[test]
+    fn init_state_with_path_parses() {
+        let args =
+            parse_args_from(["--init-state", "/some/path"]).expect("--init-state should parse");
+        assert_eq!(
+            args.init_state_dir.as_deref(),
+            Some(Path::new("/some/path"))
+        );
+        assert!(args.boot_succeeded_dir.is_none());
+        assert!(args.validate_config.is_none());
+    }
+
+    #[cfg(feature = "stateful")]
+    #[test]
+    fn init_state_equals_form_parses() {
+        let args =
+            parse_args_from(["--init-state=/some/path"]).expect("--init-state=… should parse");
+        assert_eq!(
+            args.init_state_dir.as_deref(),
+            Some(Path::new("/some/path"))
+        );
+    }
+
+    #[cfg(feature = "stateful")]
+    #[test]
+    fn boot_succeeded_with_path_parses() {
+        let args = parse_args_from(["--boot-succeeded", "/some/path"])
+            .expect("--boot-succeeded should parse");
+        assert_eq!(
+            args.boot_succeeded_dir.as_deref(),
+            Some(Path::new("/some/path"))
+        );
+        assert!(args.init_state_dir.is_none());
+        assert!(args.validate_config.is_none());
+    }
+
+    #[cfg(feature = "stateful")]
+    #[test]
+    fn init_state_and_boot_succeeded_are_mutually_exclusive() {
+        let err = parse_args_from(["--init-state", "/a", "--boot-succeeded", "/b"])
+            .expect_err("both flags at once must be rejected");
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[cfg(feature = "stateful")]
+    #[test]
+    fn validate_config_and_init_state_are_mutually_exclusive() {
+        let err = parse_args_from(["--validate-config", "/c", "--init-state", "/a"])
+            .expect_err("validate-config + init-state must be rejected");
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[cfg(feature = "stateful")]
+    #[test]
+    fn init_state_without_argument_errors() {
+        let err =
+            parse_args_from(["--init-state"]).expect_err("--init-state without dir must error");
+        assert!(err.contains("requires a directory argument"), "{err}");
+    }
+
+    #[cfg(feature = "stateful")]
+    #[test]
+    fn boot_succeeded_without_argument_errors() {
+        let err = parse_args_from(["--boot-succeeded"])
+            .expect_err("--boot-succeeded without dir must error");
+        assert!(err.contains("requires a directory argument"), "{err}");
+    }
+
+    #[cfg(not(feature = "stateful"))]
+    #[test]
+    fn init_state_without_feature_errors() {
+        // The operator built nmbl-init without `stateful` but still
+        // passed `--init-state`; we must not silently ignore — that
+        // would leave state.bin uninitialised and bricked installers
+        // would be invisible at build time.
+        let err = parse_args_from(["--init-state", "/a"])
+            .expect_err("--init-state without feature must error");
+        assert!(err.contains("stateful"), "{err}");
+    }
+
+    #[cfg(not(feature = "stateful"))]
+    #[test]
+    fn boot_succeeded_without_feature_errors() {
+        let err = parse_args_from(["--boot-succeeded", "/a"])
+            .expect_err("--boot-succeeded without feature must error");
+        assert!(err.contains("stateful"), "{err}");
+    }
+
+    #[cfg(not(feature = "stateful"))]
+    #[test]
+    fn init_state_equals_without_feature_errors() {
+        let err = parse_args_from(["--init-state=/a"])
+            .expect_err("--init-state=… without feature must error");
+        assert!(err.contains("stateful"), "{err}");
+    }
+
+    #[test]
+    fn unknown_args_are_ignored() {
+        // PID 1 has no "usage" target; unknown flags must not abort.
+        let args = parse_args_from(["--no-such-flag", "garbage"])
+            .expect("unknown flags should be silently dropped");
+        assert_eq!(args.config_path, PathBuf::from(DEFAULT_CONFIG_PATH));
+        assert!(args.errored_report.is_none());
+        assert!(args.validate_config.is_none());
+    }
+
+    #[test]
+    fn validate_config_parses_in_default_build() {
+        let args = parse_args_from(["--validate-config", "/etc/nmbl/config.toml"])
+            .expect("--validate-config should parse without stateful feature");
+        assert_eq!(
+            args.validate_config.as_deref(),
+            Some(Path::new("/etc/nmbl/config.toml"))
+        );
     }
 }

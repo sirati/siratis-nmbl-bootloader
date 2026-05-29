@@ -56,6 +56,13 @@ pretty-shell = ["dep:alacritty_terminal"]
 # `nix/net` activator pulls in `nix::sys::socket` only when the
 # rescue path is compiled in, so DHCP's `sockaddr_ll` is in scope.
 network-rescue = ["dep:dhcproto", "dep:sha2", "dep:getrandom", "nix/net"]
+# Opt-in persistent boot state (state.bin under /nmbl-state). When OFF
+# the `src/state.rs` module is `#[cfg]`d out and the optional deps
+# (`ciborium`, `nonmax`) are not compiled, so the default build is
+# byte-for-byte identical to a feature-free build. Forward-compat is
+# carried by ciborium's self-describing wire format and the State
+# struct's permissive serde defaults (see `src/state.rs`).
+stateful = ["dep:ciborium", "dep:nonmax"]
 # Opt-in graphical boot splash. Adds DRM mode-set on simpledrm, a PNG
 # background, and a fontdue-rasterized overlay of the ratatui menu.
 # Any failure of the splash path falls back to today's tty UI.
@@ -133,6 +140,13 @@ sha2     = { version = "0.10", optional = true, default-features = false }
 # Single 4-byte read for the DHCPv4 XID. We avoid pulling in a full RNG
 # crate (`rand`); `getrandom::fill` reads straight from `getrandom(2)`.
 getrandom = { version = "0.3", optional = true, default-features = false }
+# Phase 3 persistent state (optional; gated behind `stateful`). ciborium
+# is the self-describing CBOR codec used for state.bin so older binaries
+# can read newer files by skipping unknown fields. nonmax compresses
+# `Option<NonMaxU32>` to four bytes (niche optimisation) for the
+# generation-id slots; its `serde` feature plumbs the encoding through.
+ciborium = { version = "0.2", default-features = false, features = ["std"], optional = true }
+nonmax   = { version = "0.5", default-features = false, features = ["serde"], optional = true }
 
 [dev-dependencies]
 tempfile = "3"

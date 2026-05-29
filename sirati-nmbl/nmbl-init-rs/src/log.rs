@@ -2,10 +2,19 @@ use std::collections::VecDeque;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use serde::Deserialize;
+
+/// Tmpfs path the byte-ring is flushed to before every terminal action
+/// and before kexec. The same path is recreated in the next kernel's
+/// initramfs by the cpio fragment spliced into `kexec_file_load(2)`, so
+/// the booted system's `nmbl-log-import` stage-1 helper can drain it.
+/// Single source of truth for both the dispatcher (`main.rs`) and the
+/// kexec staging path (`boot.rs`).
+pub const NMBL_LOG_PATH: &str = "/nmbl-log/nmbl.log";
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -105,6 +114,7 @@ static KMSG: Mutex<Option<std::fs::File>> = Mutex::new(None);
 /// so on-screen logs stay in sync with the serial/kernel log.
 pub fn emit_kmsg(line: &str) {
     push_ring(line);
+    push_byte_ring(line);
     let Ok(mut guard) = KMSG.lock() else {
         return;
     };
@@ -180,6 +190,119 @@ pub fn snapshot(n: usize) -> Vec<String> {
     let take = n.min(ring.len());
     let start = ring.len().saturating_sub(take);
     ring.iter().skip(start).cloned().collect()
+}
+
+/// Byte-ring capacity (1 MiB). Chosen to be big enough to hold a full
+/// rescue-path transcript including hot-loop retries, while still
+/// fitting easily in tmpfs at boot. On overflow the front (oldest) bytes
+/// are dropped and the dropped count is remembered so the eventual
+/// `flush_to` consumer can flag truncation in a header line.
+const BYTE_RING_CAPACITY: usize = 1024 * 1024;
+
+/// Mirror of every `emit_kmsg` body (with its trailing `\n` appended)
+/// stored as raw bytes. Persisted to disk by `flush_to` right before
+/// kexec drops the pagecache, giving the next stage a complete NMBL
+/// transcript even when the kernel ring buffer has rotated past it.
+struct ByteLog {
+    buf: VecDeque<u8>,
+    dropped_bytes: u64,
+}
+
+impl ByteLog {
+    const fn new() -> Self {
+        Self {
+            buf: VecDeque::new(),
+            dropped_bytes: 0,
+        }
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        self.buf.extend(bytes);
+        if self.buf.len() > BYTE_RING_CAPACITY {
+            let drop = self.buf.len() - BYTE_RING_CAPACITY;
+            // VecDeque::drain on the prefix range pops `drop` bytes off
+            // the front in O(drop); we count them as truncated so the
+            // flushed header can name the exact number.
+            self.buf.drain(..drop);
+            self.dropped_bytes = self.dropped_bytes.saturating_add(drop as u64);
+        }
+    }
+}
+
+static BYTE_LOG: Mutex<Option<ByteLog>> = Mutex::new(None);
+
+/// Append `line\n` to the byte ring, dropping on lock contention so the
+/// hot logging path never blocks the boot. Mirrors `push_ring`'s
+/// try_lock policy for the same reason.
+fn push_byte_ring(line: &str) {
+    let Ok(mut guard) = BYTE_LOG.try_lock() else {
+        return;
+    };
+    let log = guard.get_or_insert_with(ByteLog::new);
+    // Build the on-disk representation up-front so a single append
+    // either lands whole or (under overflow) gets truncated as one
+    // unit — no risk of a half-line surviving at the front of the ring.
+    let mut bytes = Vec::with_capacity(line.len() + 1);
+    bytes.extend_from_slice(line.as_bytes());
+    bytes.push(b'\n');
+    log.append(&bytes);
+}
+
+/// Persist the byte ring to `path`, replacing any prior contents.
+///
+/// Used right before kexec hands off to the next kernel: kexec drops the
+/// pagecache, so the existing `write_all + flush` in `panic::write_report`
+/// would lose the tail of NMBL's transcript. The extra `fsync(2)` here
+/// forces the writeback so the on-disk log survives the handoff.
+///
+/// When the in-memory ring overflowed (`dropped_bytes > 0`), the file's
+/// first line is a fixed marker naming the byte count that was lost off
+/// the front, so downstream tooling does not silently treat the
+/// remainder as the entire transcript.
+pub fn flush_to(path: &Path) -> std::io::Result<()> {
+    let (header, body) = {
+        let guard = BYTE_LOG
+            .lock()
+            .map_err(|_| std::io::Error::other("byte log mutex poisoned"))?;
+        match guard.as_ref() {
+            Some(log) => {
+                let header = if log.dropped_bytes > 0 {
+                    Some(format!(
+                        "=== nmbl-init: log truncated, earlier {} bytes dropped ===\n",
+                        log.dropped_bytes
+                    ))
+                } else {
+                    None
+                };
+                // Clone bytes out under the lock so we release it before
+                // doing file I/O (which can block on disk, fsync, etc.).
+                let body: Vec<u8> = log.buf.iter().copied().collect();
+                (header, body)
+            }
+            None => (None, Vec::new()),
+        }
+    };
+    write_truncated(path, header.as_deref(), &body)
+}
+
+/// Open `path` truncated and write the optional header + body, then
+/// fsync. Split out so `flush_to` can short-circuit when the ring is
+/// uninitialised without duplicating the I/O path.
+fn write_truncated(path: &Path, header: Option<&str>, body: &[u8]) -> std::io::Result<()> {
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)?;
+    if let Some(h) = header {
+        f.write_all(h.as_bytes())?;
+    }
+    f.write_all(body)?;
+    f.flush()?;
+    // rustix's safe fsync wrapper takes any AsFd; the std File implements
+    // it via the OS-specific extension trait, so no unsafe is required.
+    rustix::fs::fsync(&f).map_err(std::io::Error::from)?;
+    Ok(())
 }
 
 #[macro_export]
@@ -323,5 +446,145 @@ mod tests {
         let ring = guard.as_ref().expect("ring just initialised");
         assert!(snapshot_inner(ring, 10).is_empty());
         assert!(snapshot_inner(ring, 0).is_empty());
+    }
+
+    /// Serialises the byte-ring tests against each other and against
+    /// the string-ring tests. The byte ring tests must NOT hold the
+    /// `BYTE_LOG` / `LOG_RING` mutexes across `emit_kmsg` calls (those
+    /// `try_lock` and drop on contention), so this outer lock is the
+    /// only thing keeping concurrent test threads from contaminating
+    /// the shared byte ring static.
+    static BYTE_LOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn byte_log_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        BYTE_LOG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Wipe both rings so the next test starts from a clean slate. Used
+    /// both at the start of a byte-ring test (in case a prior test left
+    /// the static populated) and at the end (so the next test gets the
+    /// same fresh state regardless of execution order).
+    fn reset_rings() {
+        let mut s = LOG_RING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *s = None;
+        drop(s);
+        let mut b = BYTE_LOG
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *b = None;
+    }
+
+    #[test]
+    fn byte_ring_overflow_drops_oldest_and_counts() {
+        let _outer = byte_log_test_guard();
+        // Combine the string-ring lock too; emit_kmsg touches both rings
+        // and we hold neither static lock across the calls.
+        let _inner = ring_test_guard();
+        reset_rings();
+
+        // Each line is 1024 bytes + '\n'. Push enough to overshoot the
+        // 1 MiB cap by ~2 MiB worth, so the drop count is well above
+        // zero and the buffer is forced back below cap.
+        let line = "x".repeat(1024);
+        let pushes = 3 * 1024;
+        for _ in 0..pushes {
+            emit_kmsg(&line);
+        }
+
+        let guard = BYTE_LOG
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = guard.as_ref().expect("byte log initialised by emit_kmsg");
+        assert!(
+            log.buf.len() <= BYTE_RING_CAPACITY,
+            "buf {} > cap",
+            log.buf.len()
+        );
+        assert!(log.dropped_bytes > 0, "expected dropped_bytes > 0");
+        drop(guard);
+
+        reset_rings();
+    }
+
+    #[test]
+    fn flush_to_emits_truncation_header_when_dropped() {
+        let _outer = byte_log_test_guard();
+        let _inner = ring_test_guard();
+        reset_rings();
+
+        // Force overflow.
+        let line = "y".repeat(1024);
+        for _ in 0..(3 * 1024) {
+            emit_kmsg(&line);
+        }
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("nmbl.log");
+        flush_to(&path).expect("flush_to ok");
+
+        let bytes = std::fs::read(&path).expect("read flushed file");
+        let text = std::str::from_utf8(&bytes).expect("utf8");
+        let first_line = text.split_once('\n').map(|(l, _)| l).unwrap_or(text);
+
+        // Header format is fixed; only the byte count varies.
+        let dropped = {
+            let g = BYTE_LOG
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.as_ref().expect("byte log").dropped_bytes
+        };
+        let expected = format!("=== nmbl-init: log truncated, earlier {dropped} bytes dropped ===");
+        assert_eq!(first_line, expected);
+
+        reset_rings();
+    }
+
+    #[test]
+    fn flush_to_omits_header_without_truncation() {
+        let _outer = byte_log_test_guard();
+        let _inner = ring_test_guard();
+        reset_rings();
+
+        emit_kmsg("hello");
+        emit_kmsg("world");
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("nmbl.log");
+        flush_to(&path).expect("flush_to ok");
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !text.starts_with("=== nmbl-init: log truncated"),
+            "unexpected truncation header in {text:?}"
+        );
+        assert_eq!(text, "hello\nworld\n");
+
+        reset_rings();
+    }
+
+    #[test]
+    fn flush_to_round_trips_emitted_lines() {
+        let _outer = byte_log_test_guard();
+        let _inner = ring_test_guard();
+        reset_rings();
+
+        let lines = ["alpha", "beta", "gamma"];
+        for l in &lines {
+            emit_kmsg(l);
+        }
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("nmbl.log");
+        flush_to(&path).expect("flush_to ok");
+
+        let text = std::fs::read_to_string(&path).expect("read");
+        let read_back: Vec<&str> = text.lines().collect();
+        assert_eq!(read_back, lines);
+
+        reset_rings();
     }
 }

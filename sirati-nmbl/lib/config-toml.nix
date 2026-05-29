@@ -28,6 +28,7 @@ let
     general = {
       verbosity = cfg.verbosity;
       timeout_secs = cfg.timeoutSecs;
+      device_timeout_secs = cfg.deviceTimeoutSecs;
       panic_report_dir = toString cfg.panicReportDir;
       # cfg.serialConsole drives kernel cmdline tagging at the Nix
       # layer (see ../nixos-modules/* for the `console=` plumbing);
@@ -136,6 +137,14 @@ let
       background_image = "/etc/splash/image.png";
       font_path        = "/etc/splash/font.ttf";
       dri_path         = "/dev/dri/card0";
+    };
+  }
+  # Stateful boot tracking. Emitted only when enabled so builds without
+  # the Rust-side `stateful` feature still pass `deny_unknown_fields`.
+  // lib.optionalAttrs cfg.stateful.enable {
+    stateful = {
+      max_recovery_attempts = cfg.stateful.maxRecoveryAttempts;
+      success_target = cfg.stateful.successTarget;
     };
   };
 

@@ -48,7 +48,10 @@ const BLKID_EXIT_NO_SUPERBLOCK: i32 = 2;
 /// just overwrite the same target. Errors from individual devices
 /// are logged via `nmbl_warn!` and do not fail the whole call; only
 /// catastrophic errors (e.g. /sys/class/block not readable) bubble.
-pub fn populate_disk_by_symlinks() -> Result<()> {
+///
+/// Also returns the list of block devices whose blkid TYPE is "btrfs"
+/// so the caller can issue `BTRFS_IOC_SCAN_DEV` before mounting.
+pub fn populate_disk_by_symlinks() -> Result<Vec<PathBuf>> {
     let sysfs = Path::new(SYSFS_BLOCK_DIR);
     let entries = std::fs::read_dir(sysfs).map_err(|source| NmblError::Io {
         source,
@@ -70,6 +73,7 @@ pub fn populate_disk_by_symlinks() -> Result<()> {
 
     let mut device_count: usize = 0;
     let mut link_count: usize = 0;
+    let mut btrfs_devs: Vec<PathBuf> = Vec::new();
 
     for entry in entries {
         let entry = match entry {
@@ -101,6 +105,10 @@ pub fn populate_disk_by_symlinks() -> Result<()> {
             }
         };
 
+        if attrs.get("TYPE").map(String::as_str) == Some("btrfs") {
+            btrfs_devs.push(dev_path.clone());
+        }
+
         link_count = link_count.saturating_add(create_links_for(&dev_path, &attrs));
     }
 
@@ -109,7 +117,7 @@ pub fn populate_disk_by_symlinks() -> Result<()> {
         device_count,
         link_count,
     );
-    Ok(())
+    Ok(btrfs_devs)
 }
 
 /// Run `blkid -o export <dev>` and parse the result. Exit code 2 is

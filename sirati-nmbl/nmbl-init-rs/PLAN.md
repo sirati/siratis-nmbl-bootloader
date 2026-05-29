@@ -720,6 +720,12 @@ the implementation stays HTTP-only — no TLS, no `rustls`, no
 `openssl`. HTTPS, IPv6, Wi-Fi, and PXE are intentionally out of
 scope.
 
+### Further shipped items
+
+- Configurable per-device wait timeout via `boot.nmbl.deviceTimeoutSeconds`.
+- Pre-kexec NMBL log captured, fsync'd, cpio-passed to the booted system's stage-1 unit, replayed into the journal.
+- Stateful boot tracking with rollback (opt-in `boot.nmbl.stateful`).
+
 ### Deferred (still)
 
 - A GUI menu for generation selection in graphical-console
