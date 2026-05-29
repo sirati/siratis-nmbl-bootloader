@@ -28,9 +28,16 @@ _socket_args() {
 }
 
 # wait_for <pattern> [match_timeout_seconds]
-# Waits for <pattern> to show up in NEW console output. Returns 0 only if
-# the pattern is seen and the timeout banner never appeared; 1 otherwise.
+# Waits for <pattern> to show up in console output. Returns 0 only if the
+# pattern is seen and the timeout banner never appeared; 1 otherwise.
 # Echoes the captured trigger output to stderr so failures are debuggable.
+#
+# `trigger` only watches NEW output, which races a response that already
+# landed in the preceding `send_cmd`'s own capture window. So on a trigger
+# timeout we make one more pass over the captured HISTORY before declaring
+# failure — this strictly *adds* a way to succeed (the pattern still has to
+# be present somewhere), so the empty-journal negative case, which never
+# emits the pattern at all, still fails as before.
 wait_for() {
   local pattern="$1"
   local match_timeout="${2:-30}"
@@ -43,6 +50,9 @@ wait_for() {
     "${sock_args[@]}" 2>&1)"
   printf '%s\n' "$out" >&2
   if printf '%s' "$out" | grep -Eq "$NMBL_TRIGGER_TIMEOUT_RE"; then
+    if seen_in_history "$pattern"; then
+      return 0
+    fi
     echo "wait_for: FAIL (timeout) waiting for: $pattern" >&2
     return 1
   fi
@@ -59,6 +69,20 @@ send_cmd() {
   local -a sock_args
   _socket_args sock_args
   vm-serial-man send "$1" "${sock_args[@]}" >/dev/null 2>&1
+}
+
+# seen_in_history <pattern>
+# Returns 0 if <pattern> already appears anywhere in the captured console
+# HISTORY. Unlike wait_for (which arms a trigger and only sees NEW output),
+# this catches a line that already scrolled past — e.g. an idle autologin
+# prompt that rendered once and is now silent. Use it to detect a state
+# that has been reached rather than to wait for one to occur.
+seen_in_history() {
+  local pattern="$1"
+  local -a sock_args
+  _socket_args sock_args
+  vm-serial-man find "$pattern" "${sock_args[@]}" 2>/dev/null \
+    | grep -Eq "$pattern"
 }
 
 # assert_journal_tag <tag> [phase_match]
