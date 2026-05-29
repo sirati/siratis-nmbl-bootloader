@@ -23,12 +23,28 @@
 //! modal sets a [`Decision::Shell`] exit.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use zeroize::Zeroizing;
 
 use crate::generations::Generation;
+
+/// Set the first time the operator presses any key during this NMBL
+/// session, across every screen (selector, passphrase, editor,
+/// emergency). Monotonic — never reset. The emergency screen consults
+/// it to decide whether to arm the auto-reboot countdown: a session in
+/// which the operator has already typed (e.g. a LUKS passphrase) is
+/// attended, so the error screen waits indefinitely rather than
+/// counting down.
+static USER_INTERACTED: AtomicBool = AtomicBool::new(false);
+
+/// True once the operator has pressed any key this session. See
+/// [`USER_INTERACTED`].
+pub fn user_has_interacted() -> bool {
+    USER_INTERACTED.load(Ordering::Relaxed)
+}
 
 /// Maximum number of entries retained in each [`Screen::KeyEcho`] ring
 /// buffer. Old entries are evicted from the front when full. ~20 keeps
@@ -491,6 +507,11 @@ impl<'a> App<'a> {
             return self.decision.is_some();
         }
 
+        // Record that the operator is present. Monotonic session latch
+        // consulted by the emergency screen to suppress the auto-reboot
+        // countdown once any key has been pressed.
+        USER_INTERACTED.store(true, Ordering::Relaxed);
+
         // Any keypress cancels the countdown — even one we ignore later.
         self.countdown_remaining_secs = None;
 
@@ -934,6 +955,14 @@ mod tests {
         // 'p' is a no-op-ish toggle, but should still clear the countdown.
         app.on_key(press(KeyCode::Char('p')));
         assert!(app.countdown_remaining_secs.is_none());
+    }
+
+    #[test]
+    fn any_keypress_sets_user_interacted_latch() {
+        let gens = vec![fake_gen(1, &[])];
+        let mut app = App::new(&gens);
+        app.on_key(press(KeyCode::Char('p')));
+        assert!(super::user_has_interacted());
     }
 
     #[test]
