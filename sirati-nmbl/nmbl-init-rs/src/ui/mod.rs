@@ -958,7 +958,13 @@ pub(crate) fn render_splash_frame_with(
             halo.stamp(glyph, rect);
         });
         halo.composite_onto(fb, fb_dims);
-        // Pass 2: cell backgrounds + glyphs.
+        // Pass 2: cell-background fills (selection highlight etc.) drawn
+        // directly, while every foreground glyph is collected into ONE
+        // text layer. The layer is composited last (after all bg fills)
+        // so text sits on top of selection backgrounds, and so two
+        // overlapping semi-transparent glyphs composite exactly once
+        // (no doubled "white dots" at cell joins).
+        let mut text_layer = compositor::TextLayer::new(fb_dims);
         term_pipe.for_each_cell(|col, row, cell| {
             if cell.c == ' ' && cell.bg == Color::Named(NamedColor::Background) {
                 return;
@@ -977,8 +983,10 @@ pub(crate) fn render_splash_frame_with(
                 w: cell_dims.cell_w,
                 h: cell_dims.cell_h,
             };
-            compositor::blit_cell(fb, fb_dims, glyph, rect, fg, bg);
+            compositor::fill_cell_bg(fb, fb_dims, rect, bg);
+            text_layer.stamp(glyph, rect, fg);
         });
+        text_layer.composite_onto(fb, fb_dims);
         Ok(())
     })
 }
