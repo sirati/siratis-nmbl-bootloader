@@ -34,6 +34,29 @@ use crate::nmbl_warn;
 /// fails. Matches the value used in `src/sys/activation.rs`.
 const EXEC_FAILED_EXIT_CODE: i32 = 127;
 
+/// Verify the shell binary actually exists and is executable *before*
+/// we fork. A post-fork `execve(2)` failure can only `_exit(127)` from
+/// the async-signal-safe child path — it cannot report which errno it
+/// hit. That silent death is exactly the "Raw Shell does nothing" bug:
+/// in external-rescue mode the initramfs ships no `/bin/sh`, so the
+/// child execve'd nothing and exited instantly while the parent saw a
+/// healthy fork and reported success. Checking up here turns that into
+/// a descriptive `Err` the emergency UI can surface.
+fn preflight_shell(shell_path: &Path) -> Result<()> {
+    use rustix::fs::{Access, access};
+    match access(shell_path, Access::EXEC_OK) {
+        Ok(()) => Ok(()),
+        Err(e) => Err(NmblError::Tui {
+            source: std::io::Error::other(format!(
+                "emergency shell {} is not executable: {e}; \
+                 in external-rescue mode the initramfs ships no /bin/sh — \
+                 set boot.nmbl.paths.shell to a binary present in the initrd",
+                shell_path.display()
+            )),
+        }),
+    }
+}
+
 /// Mount `devpts` on `/dev/pts` so `openpty(3)` can hand out slave
 /// terminals via `/dev/ptmx`. Idempotent: `EBUSY` (already mounted) and
 /// `ENOENT` on `/dev/pts` (directory missing → create it once) are
@@ -199,6 +222,11 @@ impl PtyChild {
 /// minus a minimal `TERM=xterm-256color` injection so curses-style
 /// applications work.
 pub fn spawn_shell(shell_path: &Path, cols: u16, rows: u16) -> Result<PtyChild> {
+    // Fail loudly up-front if the shell binary is missing/non-exec so
+    // the operator gets a real error instead of a shell that silently
+    // dies in the post-fork child (the "Raw Shell does nothing" bug).
+    preflight_shell(shell_path)?;
+
     // `nmbl-init`'s phase 1 doesn't mount `/dev/pts`; openpty(3) reads
     // `/dev/ptmx` and writes the PTY name back to `/dev/pts/N`, so we
     // mount devpts on demand before the first PTY allocation.
@@ -372,6 +400,11 @@ pub struct DetachedShell {
 pub fn spawn_shell_on_tty(shell_path: &Path, tty_path: &Path) -> Result<DetachedShell> {
     use rustix::fs::{Mode as RustixMode, OFlags as RustixOFlagsAlias};
 
+    // Same preflight as spawn_shell: a missing /bin/sh would otherwise
+    // produce a "Shell spawned" toast for a child that instantly
+    // _exit(127)s, masking the real problem.
+    preflight_shell(shell_path)?;
+
     // === Parent-side allocation: ALL CString / Vec construction MUST
     // happen here, before fork(2). The post-fork child path is restricted
     // to async-signal-safe operations (same discipline as spawn_shell). ===
@@ -487,6 +520,31 @@ mod tests {
     use super::*;
     use std::os::fd::AsFd;
     use std::path::PathBuf;
+
+    #[test]
+    fn preflight_shell_rejects_missing_binary() {
+        // Regression for the "Raw Shell does nothing" bug: in
+        // external-rescue mode the initramfs ships no /bin/sh, so the
+        // forked child execve'd nothing and silently _exit(127)'d. The
+        // preflight must turn a missing/non-exec shell into an Err the
+        // emergency UI can surface, not a healthy-looking fork.
+        let missing = PathBuf::from("/definitely/not/here/bin/sh");
+        let err = preflight_shell(&missing).expect_err("missing shell must error");
+        assert!(matches!(err, NmblError::Tui { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn preflight_shell_accepts_executable() {
+        // A real executable on the host passes. Skip if /bin/sh is
+        // absent (extremely sandboxed CI), trying /bin/echo as a fallback.
+        for cand in ["/bin/sh", "/bin/echo", "/usr/bin/env"] {
+            let p = PathBuf::from(cand);
+            if std::fs::metadata(&p).is_ok() {
+                preflight_shell(&p).expect("executable must pass preflight");
+                return;
+            }
+        }
+    }
 
     /// Spawning `/bin/echo` (which is not a shell) is enough to verify
     /// fork/execve + master-fd readback work end-to-end without
