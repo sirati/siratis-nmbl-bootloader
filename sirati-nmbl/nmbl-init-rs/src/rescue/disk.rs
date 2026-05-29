@@ -13,7 +13,10 @@
 //!    via `LO_FLAGS_READ_ONLY`).
 //! 4. Open the squashfs `O_RDONLY | CLOEXEC` and feed both fds to
 //!    [`crate::sys::loopdev::configure_loop_device`].
-//! 5. Mount `/dev/loopN` at `/rescue` as `squashfs,ro`.
+//! 5. Mount `/dev/loopN` read-only at `/run/nmbl-rescue/lower`, layer a
+//!    tmpfs upper over it, and mount an `overlay` at `/rescue` so the
+//!    rescue root is writable (live-CD style — the squashfs itself
+//!    stays read-only, all writes land in the tmpfs upper).
 //! 6. `switch_root`: `chdir /rescue`, `mount --move . /`, `chroot .`,
 //!    `chdir /`. The initramfs rootfs pseudo-filesystem is not used as
 //!    the outgoing root, so this avoids `pivot_root(2)`'s EINVAL when
@@ -34,13 +37,27 @@ use crate::error::{NmblError, Result};
 use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
 use crate::sys::mount::mount_fs;
 
-/// Mountpoint where the rescue squashfs is staged before the root switch.
-/// Lives at the initramfs root because `/rescue` is unlikely to collide
-/// with anything the initramfs created.
+/// Mountpoint where the writable rescue overlay is staged before the
+/// root switch. Lives at the initramfs root because `/rescue` is
+/// unlikely to collide with anything the initramfs created.
 const RESCUE_MOUNT: &str = "/rescue";
 
-/// Loop-mount the rescue squashfs at `/rescue`, returning the mount
-/// path. Caller is responsible for dropping the live boot console
+/// Read-only squashfs lower layer of the rescue overlay.
+const RESCUE_LOWER: &str = "/run/nmbl-rescue/lower";
+
+/// tmpfs holding the overlay's writable upper + work dirs.
+const RESCUE_RW: &str = "/run/nmbl-rescue/rw";
+
+/// Overlay upper dir (where all writes to `/rescue` land).
+const RESCUE_UPPER: &str = "/run/nmbl-rescue/rw/upper";
+
+/// Overlay work dir (overlayfs scratch space; must share a filesystem
+/// with the upper dir, hence both live in the same tmpfs).
+const RESCUE_WORK: &str = "/run/nmbl-rescue/rw/work";
+
+/// Loop-mount the rescue squashfs and layer a writable overlay at
+/// `/rescue`, returning the mount path. Caller is responsible for
+/// dropping the live boot console
 /// (so the backend's Drop impl restores VT text mode + termios) and
 /// then calling [`super::switch_root_and_exec`] with the returned
 /// path — splitting the steps this way keeps the no-return `execve`
@@ -103,21 +120,53 @@ pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'stati
         source: Box::new(source),
     })?;
 
-    let rescue_dir = Path::new(RESCUE_MOUNT);
-    ensure_dir(rescue_dir).map_err(|source| NmblError::Rescue {
+    let loop_dev = PathBuf::from(format!("/dev/loop{index}"));
+    mount_overlay_root(&loop_dev)?;
+
+    Ok(Path::new(RESCUE_MOUNT))
+}
+
+/// Build the writable rescue root as a live-CD-style overlay: a
+/// read-only squashfs lower (the `loop_dev` allocated by the caller), a
+/// tmpfs upper, and an `overlay` mounted at `/rescue`. The chrooted
+/// rescue path (its `/init`) needs to write into the root — populate
+/// `/dev`, create `/nmbl-root`, `/mnt`, … — which a bare read-only
+/// squashfs can't support; the tmpfs upper absorbs every write while
+/// the image stays untouched.
+///
+/// All mount failures are wrapped in [`NmblError::Rescue`] with the
+/// `mount-rescue` stage so the emergency banner reads the same as the
+/// previous read-only path.
+fn mount_overlay_root(loop_dev: &Path) -> Result<()> {
+    let wrap = |source: NmblError| NmblError::Rescue {
         stage: "mount-rescue",
         source: Box::new(source),
-    })?;
+    };
 
-    let loop_dev = PathBuf::from(format!("/dev/loop{index}"));
-    mount_fs(Some(&loop_dev), rescue_dir, "squashfs", "ro").map_err(|source| {
-        NmblError::Rescue {
-            stage: "mount-rescue",
-            source: Box::new(source),
-        }
-    })?;
+    // mkdir -p every intermediate dir before mounting onto it.
+    for dir in [RESCUE_LOWER, RESCUE_RW, RESCUE_MOUNT] {
+        ensure_dir(Path::new(dir)).map_err(wrap)?;
+    }
 
-    Ok(rescue_dir)
+    // 1. squashfs (read-only) at the overlay lower layer.
+    mount_fs(Some(loop_dev), Path::new(RESCUE_LOWER), "squashfs", "ro").map_err(wrap)?;
+
+    // 2. tmpfs for the writable upper + work dirs, then carve both out.
+    mount_fs(None, Path::new(RESCUE_RW), "tmpfs", "nosuid,nodev,mode=755").map_err(wrap)?;
+    ensure_dir(Path::new(RESCUE_UPPER)).map_err(wrap)?;
+    ensure_dir(Path::new(RESCUE_WORK)).map_err(wrap)?;
+
+    // 3. overlay at /rescue — writes land in the tmpfs upper.
+    let data = format!("lowerdir={RESCUE_LOWER},upperdir={RESCUE_UPPER},workdir={RESCUE_WORK}");
+    mount_fs(
+        Some(Path::new("overlay")),
+        Path::new(RESCUE_MOUNT),
+        "overlay",
+        &data,
+    )
+    .map_err(wrap)?;
+
+    Ok(())
 }
 
 /// Create `path` (and parents) on the rescue mountpoint side. Mirrors
