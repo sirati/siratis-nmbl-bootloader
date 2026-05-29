@@ -482,7 +482,7 @@ pub enum PickerSessionOutcome {
 /// The function NEVER produces a [`crate::terminal::TerminalAction`]:
 /// NMBL stays at PID 1 throughout. This is the deliberate departure
 /// from the legacy `EmergencyChoice::RawShell` -> execve path.
-pub fn run_picker_session(
+pub async fn run_picker_session(
     console: &mut dyn Console,
     config: &Config,
 ) -> Result<PickerSessionOutcome> {
@@ -490,7 +490,7 @@ pub fn run_picker_session(
     if state.candidates.is_empty() {
         return Ok(PickerSessionOutcome::Cancelled);
     }
-    drive_picker_loop(&mut state, console)?;
+    drive_picker_loop(&mut state, console).await?;
 
     let targets = match state.outcome {
         Some(PickerOutcome::Spawn { targets }) => targets,
@@ -502,9 +502,17 @@ pub fn run_picker_session(
         config,
         targets,
         &display_target,
-        crate::ui::console_relay::run_relay,
+        |console, config, targets, display_target| {
+            Box::pin(crate::ui::console_relay::run_relay(
+                console,
+                config,
+                targets,
+                display_target,
+            ))
+        },
         fire_and_forget_spawn,
     )
+    .await
 }
 
 /// Post-commit dispatch: given the operator's spawn set and the
@@ -518,7 +526,7 @@ pub fn run_picker_session(
 /// the historical bug that motivated this contract.
 ///
 /// [`run_relay`]: crate::ui::console_relay::run_relay
-fn dispatch_spawn<R, D>(
+async fn dispatch_spawn<R, D>(
     console: &mut dyn Console,
     config: &Config,
     targets: Vec<PathBuf>,
@@ -527,11 +535,20 @@ fn dispatch_spawn<R, D>(
     mut detach_fn: D,
 ) -> Result<PickerSessionOutcome>
 where
-    R: FnMut(&mut dyn Console, &Config, &[PathBuf], &Path) -> Result<()>,
+    R: for<'a> FnMut(
+        &'a mut dyn Console,
+        &'a Config,
+        &'a [PathBuf],
+        &'a Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>,
     D: FnMut(&Config, &[PathBuf]) -> Result<()>,
 {
     if display_overlaps_targets(display_target, &targets) {
-        relay_fn(console, config, &targets, display_target)?;
+        // The relay (overlap path) is async — it suspends the console,
+        // pumps the PTY relay loop, then resumes. The callback is a
+        // boxed-future seam so tests can drive the dispatch without
+        // forking a real shell.
+        relay_fn(console, config, &targets, display_target).await?;
         Ok(PickerSessionOutcome::ShellRan)
     } else {
         // Fire-and-forget: spawn one shell per target so each line
@@ -585,14 +602,14 @@ fn fire_and_forget_spawn(config: &Config, targets: &[PathBuf]) -> Result<()> {
 /// Drive the render-poll-react loop until the picker commits an
 /// outcome. Uses `poll_event` so a host-reported terminal resize
 /// triggers an immediate redraw at the new grid.
-fn drive_picker_loop(state: &mut PickerState, console: &mut dyn Console) -> Result<()> {
+async fn drive_picker_loop(state: &mut PickerState, console: &mut dyn Console) -> Result<()> {
     let mut dirty = true;
     loop {
         if dirty {
             render_picker(console, state)?;
             dirty = false;
         }
-        match console.poll_event(POLL_SLICE)? {
+        match console.poll_event(POLL_SLICE).await? {
             Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
                 dirty = true;
             }
@@ -892,7 +909,14 @@ mod tests {
             self.renders = self.renders.saturating_add(1);
             Ok(())
         }
-        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+        fn poll_event<'a>(
+            &'a mut self,
+            timeout: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>>
+        {
+            Box::pin(async move { self.poll_event_blocking(timeout) })
+        }
+        fn poll_event_blocking(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
             Ok(self.events.pop_front().flatten().map(ConsoleEvent::Key))
         }
         fn size(&self) -> (u16, u16) {
@@ -913,6 +937,17 @@ mod tests {
             self.resume_calls = self.resume_calls.saturating_add(1);
             Ok(())
         }
+    }
+
+    /// Drive an async future to completion on a throwaway current-thread
+    /// runtime so the synchronous picker unit tests can exercise the
+    /// now-async driver loop and dispatch.
+    fn block<F: std::future::Future>(fut: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build_local(tokio::runtime::LocalOptions::default())
+            .expect("test runtime");
+        rt.block_on(fut)
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -1245,7 +1280,7 @@ mod tests {
             // Enter on [Spawn].
             Some(press(KeyCode::Enter)),
         ]);
-        drive_picker_loop(&mut state, &mut console).expect("loop must not error");
+        block(drive_picker_loop(&mut state, &mut console)).expect("loop must not error");
         match state.outcome {
             Some(PickerOutcome::Spawn { targets }) => {
                 assert_eq!(targets, vec![PathBuf::from("/dev/tty0")]);
@@ -1535,30 +1570,38 @@ mod tests {
         let targets = vec![PathBuf::from("/dev/ttyS0")];
         let display_target = PathBuf::from(SPLASH_DISPLAY_TTY);
 
-        let mut relay_calls: u32 = 0;
-        let mut detach_calls: u32 = 0;
-        let mut detach_targets: Vec<PathBuf> = Vec::new();
+        // Counters live in `Cell`s so the boxed-future relay seam (which
+        // borrows only its `'a` args, not the closure environment) and
+        // the sync detach closure can both record calls without an
+        // illegal `&mut` capture across the `.await`.
+        let relay_calls = std::cell::Cell::new(0u32);
+        let detach_calls = std::cell::Cell::new(0u32);
+        let detach_targets = std::cell::RefCell::new(Vec::<PathBuf>::new());
 
-        let outcome = dispatch_spawn(
+        let outcome = block(dispatch_spawn(
             &mut console,
             &cfg,
             targets.clone(),
             &display_target,
             |_console, _config, _t, _d| {
-                relay_calls = relay_calls.saturating_add(1);
-                Ok(())
+                relay_calls.set(relay_calls.get().saturating_add(1));
+                Box::pin(async { Ok(()) })
             },
             |_config, t| {
-                detach_calls = detach_calls.saturating_add(1);
-                detach_targets = t.to_vec();
+                detach_calls.set(detach_calls.get().saturating_add(1));
+                *detach_targets.borrow_mut() = t.to_vec();
                 Ok(())
             },
-        )
+        ))
         .expect("dispatch must succeed");
 
-        assert_eq!(relay_calls, 0, "relay must NOT be called when no overlap");
-        assert_eq!(detach_calls, 1, "detach must be called exactly once");
-        assert_eq!(detach_targets, targets);
+        assert_eq!(
+            relay_calls.get(),
+            0,
+            "relay must NOT be called when no overlap"
+        );
+        assert_eq!(detach_calls.get(), 1, "detach must be called exactly once");
+        assert_eq!(*detach_targets.borrow(), targets);
         assert_eq!(
             console.suspend_calls, 0,
             "Console::suspend must NOT fire on the no-overlap branch"
@@ -1591,42 +1634,50 @@ mod tests {
         ];
         let display_target = PathBuf::from(SPLASH_DISPLAY_TTY);
 
-        let mut relay_calls: u32 = 0;
-        let mut relay_seen_display: Option<PathBuf> = None;
-        let mut relay_seen_targets: Vec<PathBuf> = Vec::new();
-        let mut detach_calls: u32 = 0;
+        // Shared-ref counters so the boxed relay future can record calls
+        // and drive suspend/resume on its borrowed `console` arg.
+        let relay_calls = std::cell::Cell::new(0u32);
+        let relay_seen_display = std::cell::RefCell::new(None::<PathBuf>);
+        let relay_seen_targets = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let detach_calls = std::cell::Cell::new(0u32);
 
-        let outcome = dispatch_spawn(
+        let outcome = block(dispatch_spawn(
             &mut console,
             &cfg,
             targets.clone(),
             &display_target,
             |console, _config, t, d| {
-                relay_calls = relay_calls.saturating_add(1);
-                relay_seen_display = Some(d.to_path_buf());
-                relay_seen_targets = t.to_vec();
-                // Mirror the production overlap path: suspend, then
-                // resume after the (fake) shell exits. This is what
-                // `run_relay` does on the overlap branch.
-                console.suspend()?;
-                console.resume()?;
-                Ok(())
+                relay_calls.set(relay_calls.get().saturating_add(1));
+                *relay_seen_display.borrow_mut() = Some(d.to_path_buf());
+                *relay_seen_targets.borrow_mut() = t.to_vec();
+                Box::pin(async move {
+                    // Mirror the production overlap path: suspend, then
+                    // resume after the (fake) shell exits. This is what
+                    // `run_relay` does on the overlap branch.
+                    console.suspend()?;
+                    console.resume()?;
+                    Ok(())
+                })
             },
             |_config, _t| {
-                detach_calls = detach_calls.saturating_add(1);
+                detach_calls.set(detach_calls.get().saturating_add(1));
                 Ok(())
             },
-        )
+        ))
         .expect("dispatch must succeed");
 
-        assert_eq!(relay_calls, 1, "relay must be called exactly once");
-        assert_eq!(detach_calls, 0, "detach must NOT be called on overlap");
+        assert_eq!(relay_calls.get(), 1, "relay must be called exactly once");
         assert_eq!(
-            relay_seen_display,
+            detach_calls.get(),
+            0,
+            "detach must NOT be called on overlap"
+        );
+        assert_eq!(
+            *relay_seen_display.borrow(),
             Some(display_target.clone()),
             "relay must receive the picker's display_target verbatim"
         );
-        assert_eq!(relay_seen_targets, targets);
+        assert_eq!(*relay_seen_targets.borrow(), targets);
         assert_eq!(
             console.suspend_calls, 1,
             "Console::suspend must fire exactly once on the overlap branch"

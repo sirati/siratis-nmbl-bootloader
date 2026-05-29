@@ -11,7 +11,9 @@
 //! No new `unsafe` is introduced; all syscalls flow through the splash
 //! primitives' existing rustix-based wrappers.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
 use crate::config::{Config, SplashBackgroundLocation};
@@ -256,7 +258,33 @@ impl Console for SplashConsole {
         )
     }
 
-    fn poll_event(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>> {
+    fn poll_event<'a>(
+        &'a mut self,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ConsoleEvent>>> + 'a>> {
+        Box::pin(async move {
+            // A key buffered by a prior poll is ready now; skip the
+            // reactor and drain it.
+            if self.input.has_pending() {
+                return Ok(self
+                    .input
+                    .poll(Duration::from_millis(0))?
+                    .map(ConsoleEvent::Key));
+            }
+            // Await readability on /dev/tty1 through tokio's reactor,
+            // then run the identical synchronous drain (which keeps the
+            // bare-Esc 10ms follow-up disambiguation). No borrow held
+            // across the await.
+            let slice = timeout.min(POLL_SLICE);
+            super::await_fd_readable(self.input.input_fd(), slice).await?;
+            Ok(self
+                .input
+                .poll(Duration::from_millis(0))?
+                .map(ConsoleEvent::Key))
+        })
+    }
+
+    fn poll_event_blocking(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>> {
         // Cap the effective wait the same way [`TtyConsole`] does so
         // backends are uniformly responsive to ticking countdowns and
         // spinner animations. The caller-supplied timeout is honoured

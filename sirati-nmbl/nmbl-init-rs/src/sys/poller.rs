@@ -129,11 +129,24 @@ pub trait Pacer {
     fn pace(&self) -> Pin<Box<dyn Future<Output = ()> + '_>>;
 }
 
+/// Production [`Pacer`]: sleeps ~1ms between driver passes via the
+/// tokio timer. This is the real pacing the module docs reserved the
+/// seam for — a 1ms `tokio::time::sleep` keeps the driver responsive
+/// without busy-spinning. Wired in by [`crate::ui::spawn_poller`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TokioPacer;
+
+impl Pacer for TokioPacer {
+    fn pace(&self) -> Pin<Box<dyn Future<Output = ()> + '_>> {
+        Box::pin(tokio::time::sleep(std::time::Duration::from_millis(1)))
+    }
+}
+
 /// Default [`Pacer`]: yields to the executor exactly once.
 ///
-/// Phase 1b replaces this with a tokio-timer-backed pacer that sleeps
-/// ~1ms. A single-`yield` future is the closest tokio-free analogue
-/// that neither blocks nor busy-spins.
+/// Kept as the tokio-free analogue used by the module's own unit tests
+/// (which drive the driver under a hand-rolled `std`-only executor with
+/// no tokio timer). Production uses [`TokioPacer`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct YieldPacer;
 

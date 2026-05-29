@@ -18,13 +18,15 @@
 //! in [`crate::ui::app::App`] and the renderers in [`crate::ui::view`];
 //! switching backends does not change what is shown, only where.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{NmblError, Result};
 use crate::ui::app::App;
 
 /// A single input event from a console backend.
@@ -59,35 +61,53 @@ pub enum ConsoleKind {
 pub trait Console {
     /// Render one frame from the current [`App`] state.
     fn render(&mut self, app: &App<'_>) -> Result<()>;
-    /// Poll for one input event. Returns `Ok(None)` at or before `timeout`.
+
+    /// Poll for one input event, `.await`ing readiness instead of
+    /// blocking the OS thread. Returns `Ok(None)` at or before `timeout`.
     ///
-    /// Backends may return early — in particular, both current backends
-    /// cap the effective wait at [`crate::ui::POLL_SLICE`] (~100ms) so
-    /// callers can drive ticking countdowns and spinner animations with
+    /// The future is boxed (rather than expressed as a native
+    /// `async fn` in the trait) so the trait stays **object-safe**: the
+    /// whole codebase drives the UI through `&mut dyn Console`, which a
+    /// native async-fn-in-trait would forbid. Each backend returns an
+    /// `async move` block from this method; callers `.await` it.
+    ///
+    /// Backends may return early — in particular, both real backends cap
+    /// the effective wait at [`crate::ui::POLL_SLICE`] (~100ms) so callers
+    /// can drive ticking countdowns and spinner animations with a
     /// consistent cadence regardless of backend. Callers that want a
     /// longer effective block must loop.
     ///
     /// Long-running render loops that need to redraw on host-terminal
     /// resize (passphrase modal, generations picker, rescue menu,
-    /// console picker) should call `poll_event` directly so they can
-    /// react to [`ConsoleEvent::Resize`]. Everything else can keep using
-    /// the [`Console::poll_key`] default below, which silently drains
-    /// resize events and applies them to the backend.
-    fn poll_event(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>>;
+    /// console picker) should `.await` `poll_event` directly so they can
+    /// react to [`ConsoleEvent::Resize`].
+    fn poll_event<'a>(
+        &'a mut self,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ConsoleEvent>>> + 'a>>;
 
-    /// Convenience wrapper around [`Console::poll_event`] that drops
-    /// resize events on the floor and only surfaces keys to the caller.
+    /// Synchronous, blocking poll for one input event. The async
+    /// [`Console::poll_event`] is the path every interactive loop uses;
+    /// this blocking variant exists for the early-boot
+    /// [`crate::ui::reporter::BootReporter`] which runs on the
+    /// synchronous mount/module/device path (those phases are
+    /// deliberately NOT async). Backends implement the real poll logic
+    /// here and the async `poll_event` simply awaits readiness then
+    /// delegates to this. Behaviour is identical.
+    fn poll_event_blocking(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>>;
+
+    /// Convenience wrapper around [`Console::poll_event_blocking`] that
+    /// drops resize events on the floor and only surfaces keys. Used by
+    /// the synchronous early-boot reporter's Esc-abort poll.
     ///
-    /// Backends override `poll_event`; this default takes care of the
-    /// common "I only care about keypresses" path while still letting
-    /// the backend update its own grid state internally as resize
-    /// events go by.
+    /// Async interactive loops never call this — they `.await`
+    /// [`Console::poll_event`] and match on the event directly.
     fn poll_key(&mut self, timeout: Duration) -> Result<Option<KeyEvent>> {
-        match self.poll_event(timeout)? {
+        match self.poll_event_blocking(timeout)? {
             Some(ConsoleEvent::Key(k)) => Ok(Some(k)),
-            // Resize events were consumed by `poll_event` (which is
-            // responsible for re-sizing the backend's render target);
-            // the caller asked for a key, so report no key this slice.
+            // Resize events were consumed by `poll_event_blocking`
+            // (which is responsible for re-sizing the backend's render
+            // target); the caller asked for a key, so report no key.
             Some(ConsoleEvent::Resize { .. }) | None => Ok(None),
         }
     }
@@ -135,6 +155,48 @@ pub trait Console {
     /// error.
     fn caps_lock_active(&self) -> Option<bool> {
         None
+    }
+}
+
+/// Await readability on a raw input fd through tokio's reactor, capped
+/// at `timeout`. Returns `Ok(true)` when the fd became readable,
+/// `Ok(false)` on the timeout, and an error only on a reactor
+/// registration failure.
+///
+/// Used by the real backends' async [`Console::poll_event`]: instead of
+/// a blocking `poll(2)` that parks the single OS thread, register the fd
+/// with [`tokio::io::unix::AsyncFd`] and `.await` readiness, racing a
+/// [`tokio::time::sleep`] for the slice deadline. After this resolves
+/// the backend runs its identical synchronous drain. The fd must be in
+/// non-blocking mode (both backends set `O_NONBLOCK` at open time).
+///
+/// `AsyncFd` is constructed per call from a [`BorrowedFd`]; it registers
+/// on construction and deregisters on drop, so no long-lived reactor
+/// state leaks between polls and the fd ownership stays with the
+/// backend.
+pub(crate) async fn await_fd_readable(
+    fd: std::os::fd::BorrowedFd<'_>,
+    timeout: Duration,
+) -> Result<bool> {
+    use tokio::io::Interest;
+    use tokio::io::unix::AsyncFd;
+
+    let async_fd = AsyncFd::with_interest(fd, Interest::READABLE).map_err(|e| NmblError::Tui {
+        source: std::io::Error::other(format!("AsyncFd registration failed: {e}")),
+    })?;
+    let ready = async_fd.readable();
+    match tokio::time::timeout(timeout, ready).await {
+        // Readable: clear the readiness so the next poll re-arms, then
+        // tell the caller to drain. A reactor error surfaces as Tui.
+        Ok(Ok(mut guard)) => {
+            guard.clear_ready();
+            Ok(true)
+        }
+        Ok(Err(e)) => Err(NmblError::Tui {
+            source: std::io::Error::other(format!("AsyncFd readiness failed: {e}")),
+        }),
+        // Slice deadline elapsed with no input — caller drains nothing.
+        Err(_elapsed) => Ok(false),
     }
 }
 

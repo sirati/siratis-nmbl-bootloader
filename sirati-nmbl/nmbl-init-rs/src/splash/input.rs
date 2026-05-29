@@ -129,6 +129,28 @@ impl SplashInput {
         Ok(())
     }
 
+    /// Borrow the owned input fd so the async [`Console::poll_event`]
+    /// path can register it with tokio's reactor and `.await`
+    /// readability before delegating to the synchronous [`poll`]. The fd
+    /// is only borrowed for readiness registration; all reads still go
+    /// through `poll`, preserving the bare-Esc follow-up logic.
+    ///
+    /// [`Console::poll_event`]: crate::ui::console::Console::poll_event
+    /// [`poll`]: SplashInput::poll
+    #[must_use]
+    pub fn input_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    /// Whether a key parsed on a previous [`poll`] is still buffered and
+    /// ready to return without touching the fd.
+    ///
+    /// [`poll`]: SplashInput::poll
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Best-effort Caps-Lock state of this VT keyboard, for the
     /// passphrase prompt's warning. Delegates to
     /// [`crate::sys::vt::caps_lock_active`] on the owned input fd;

@@ -115,7 +115,7 @@ fn open_target_nonblocking(path: &Path) -> Option<OwnedFd> {
 /// the cmdline ordering. Re-reading sysfs here used to flip the overlap
 /// verdict and leave the operator staring at a frozen "Shell running"
 /// modal with the shell painting invisibly behind it.
-pub fn run_relay(
+pub async fn run_relay(
     console: &mut dyn Console,
     config: &Config,
     targets: &[PathBuf],
@@ -170,7 +170,7 @@ pub fn run_relay(
                  the shell may render on top of stale TUI chrome"
             );
         }
-        let outcome = run_loop(child, &target_fds, None);
+        let outcome = run_loop(child, &target_fds, None).await;
         // Re-acquire. resume() failures aren't fatal — the operator
         // can press a key to force a redraw on the next render cycle.
         if let Err(e) = console.resume() {
@@ -180,14 +180,14 @@ pub fn run_relay(
     } else {
         // No overlap: keep the TUI live, show a modal, and pump the
         // relay loop on every render slice.
-        run_loop_with_modal(child, &target_fds, console)
+        run_loop_with_modal(child, &target_fds, console).await
     }
 }
 
 /// Modal-overlay relay loop. The TUI keeps the console; we paint a
 /// "Shell running on /dev/X" banner once per render slice and call
 /// [`run_loop_slice`] in between to keep bytes flowing.
-fn run_loop_with_modal(
+async fn run_loop_with_modal(
     child: PtyChild,
     targets: &[(PathBuf, OwnedFd)],
     console: &mut dyn Console,
@@ -213,9 +213,12 @@ fn run_loop_with_modal(
         // 1. Pump the relay for ~100ms.
         let _ = run_loop_slice(&child, targets);
 
-        // 2. Poll the live console for an operator-side abort. POLL_SLICE
-        //    is conservative; using zero here would spin.
-        if let Some(key) = console.poll_key(POLL_SLICE)?
+        // 2. Poll the live console for an operator-side abort via the
+        //    async `poll_event`; only a key matters, a resize is
+        //    ignored (the modal repaints next iteration anyway). This
+        //    matches the prior `poll_key` Esc-abort semantics.
+        if let Some(crate::ui::console::ConsoleEvent::Key(key)) =
+            console.poll_event(POLL_SLICE).await?
             && matches!(key.code, crossterm::event::KeyCode::Esc)
         {
             child.terminate();
@@ -244,9 +247,20 @@ fn run_loop_with_modal(
 /// The optional second argument is reserved for future cancellation
 /// channels (e.g. an operator-side abort token). Today the loop only
 /// ends on shell exit.
-fn run_loop(child: PtyChild, targets: &[(PathBuf, OwnedFd)], _abort: Option<()>) -> Result<()> {
+async fn run_loop(
+    child: PtyChild,
+    targets: &[(PathBuf, OwnedFd)],
+    _abort: Option<()>,
+) -> Result<()> {
     loop {
         let _ = run_loop_slice(&child, targets);
+        // Yield to the executor between byte-pump slices so the poller
+        // driver and any future spawn_local task get a turn. The slice
+        // itself already paces via its internal 100ms poll(2) timeout.
+        // (Phase: a later phase may replace the slice's rustix poll with
+        // a tokio::select! over AsyncFds; the byte-fan behaviour is kept
+        // identical here since no concurrent consumer exists yet.)
+        tokio::task::yield_now().await;
         if let Ok(Some(_)) = child.try_wait() {
             // Drain remaining bytes; the shell's exit message should
             // land on every target.

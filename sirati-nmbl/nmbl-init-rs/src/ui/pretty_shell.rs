@@ -183,7 +183,7 @@ impl PtyShellState {
 /// `Err` only when the supporting plumbing fails (fork, openpty,
 /// terminal backend write). The caller in `src/shell.rs` treats both
 /// outcomes the same way: re-display the emergency menu.
-pub fn run_pretty_shell(console: &mut dyn Console, config: &Config) -> Result<()> {
+pub async fn run_pretty_shell(console: &mut dyn Console, config: &Config) -> Result<()> {
     // Derive the PTY grid size from the live console dimensions so the
     // alacritty terminal fills the bordered block. The renderer paints
     // a 3-row header + 1-row footer + bordered block (2 rows of border
@@ -199,7 +199,7 @@ pub fn run_pretty_shell(console: &mut dyn Console, config: &Config) -> Result<()
     let child = spawn_shell(&config.paths.shell, cols, rows)?;
     let mut state = PtyShellState::new(child, cols, rows);
 
-    let outcome = drive(&mut state, console);
+    let outcome = drive(&mut state, console).await;
 
     // Best-effort kill + reap; safe on a child that has already exited.
     state.child.terminate();
@@ -210,7 +210,7 @@ pub fn run_pretty_shell(console: &mut dyn Console, config: &Config) -> Result<()
 /// Main loop. Render-then-poll-then-pump. Exits when the child is
 /// reaped and the master fd has been drained, or when the operator
 /// types the SSH-style `<newline>~.` quit escape.
-fn drive(state: &mut PtyShellState, console: &mut dyn Console) -> Result<()> {
+async fn drive(state: &mut PtyShellState, console: &mut dyn Console) -> Result<()> {
     let mut dirty = true;
     loop {
         if dirty {
@@ -223,7 +223,7 @@ fn drive(state: &mut PtyShellState, console: &mut dyn Console) -> Result<()> {
         //    `poll_key`) so host-terminal resizes reach us: the default
         //    `poll_key` adapter silently drops `ConsoleEvent::Resize`,
         //    which would leave the shell box stuck at its old geometry.
-        match console.poll_event(POLL_SLICE)? {
+        match console.poll_event(POLL_SLICE).await? {
             Some(ConsoleEvent::Key(k)) => match handle_key(state, k)? {
                 KeyOutcome::Quit => return Ok(()),
                 KeyOutcome::Redraw => dirty = true,

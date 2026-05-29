@@ -42,6 +42,7 @@ pub mod pretty_shell;
 pub mod reporter;
 #[cfg(feature = "network-rescue")]
 pub mod rescue;
+pub mod runtime;
 pub mod timeout;
 pub mod tty_enum;
 pub mod view;
@@ -90,6 +91,7 @@ pub use app::{
 pub(crate) use emergency::{build_emergency_app, build_message, default_items};
 pub use emergency::{run_emergency_screen, run_emergency_screen_with_app};
 pub use reporter::{BootReporter, ProgressSink, TickOutcome};
+pub use runtime::{block_on_tui, build_local_runtime, spawn_poller};
 
 /// Slice we wait on input per iteration. Shared by the event loop and
 /// the countdown ticker so they have the same responsiveness profile
@@ -220,8 +222,8 @@ enum ModalPollOutcome {
 /// (passphrase, generations picker, rescue menu, console picker,
 /// confirm / error / buttons) so they all react to host-reported
 /// resize events uniformly.
-fn modal_poll(console: &mut dyn Console, timeout: Duration) -> Result<ModalPollOutcome> {
-    match console.poll_event(timeout)? {
+async fn modal_poll(console: &mut dyn Console, timeout: Duration) -> Result<ModalPollOutcome> {
+    match console.poll_event(timeout).await? {
         Some(crate::ui::console::ConsoleEvent::Key(k)) => Ok(ModalPollOutcome::Key(k)),
         Some(crate::ui::console::ConsoleEvent::Resize { .. }) => Ok(ModalPollOutcome::Resized),
         None => Ok(ModalPollOutcome::Idle),
@@ -249,7 +251,7 @@ fn modal_poll(console: &mut dyn Console, timeout: Duration) -> Result<ModalPollO
 /// Falls back to `ConfirmOutcome::No` if rendering fails — same
 /// principle as [`show_modal_error`]: when the operator can't see the
 /// modal, default to the safer non-action.
-pub fn show_modal_confirm(
+pub async fn show_modal_confirm(
     console: &mut dyn Console,
     title: &str,
     message: &str,
@@ -284,7 +286,7 @@ pub fn show_modal_confirm(
             dirty = false;
         }
 
-        let key = match modal_poll(console, POLL_SLICE)? {
+        let key = match modal_poll(console, POLL_SLICE).await? {
             ModalPollOutcome::Key(k) => k,
             ModalPollOutcome::Resized => {
                 dirty = true;
@@ -324,7 +326,7 @@ pub fn show_modal_confirm(
 /// emergency picker) stays visible behind. Closing the modal restores
 /// `app.modal` to `None` and the next render returns to the same
 /// selection / scroll state.
-pub fn show_modal_confirm_over(
+pub async fn show_modal_confirm_over(
     console: &mut dyn Console,
     app: &mut App<'_>,
     title: &str,
@@ -337,7 +339,7 @@ pub fn show_modal_confirm_over(
 
     let hint = "Left/Right select  Enter confirm  Esc cancel";
     app.modal_scroll_reset();
-    let outcome = (|| -> Result<ConfirmOutcome> {
+    let outcome = async {
         app.modal = Some(ModalKind::Confirm {
             title: title.to_owned(),
             message: message.to_owned(),
@@ -358,7 +360,7 @@ pub fn show_modal_confirm_over(
                 dirty = false;
             }
 
-            let key = match modal_poll(console, POLL_SLICE)? {
+            let key = match modal_poll(console, POLL_SLICE).await? {
                 ModalPollOutcome::Key(k) => k,
                 ModalPollOutcome::Resized => {
                     dirty = true;
@@ -407,7 +409,8 @@ pub fn show_modal_confirm_over(
                 _ => {}
             }
         }
-    })();
+    }
+    .await;
     app.modal = None;
     app.modal_scroll_reset();
     outcome
@@ -422,7 +425,7 @@ pub fn show_modal_confirm_over(
 ///
 /// Falls back to a serial-style stderr dump when the render fails so
 /// the operator on a degraded console still gets the diagnostic.
-pub fn show_modal_error(
+pub async fn show_modal_error(
     console: &mut dyn Console,
     title: &str,
     message: &str,
@@ -454,7 +457,7 @@ pub fn show_modal_error(
             },
             None => POLL_SLICE,
         };
-        let key = match modal_poll(console, slice)? {
+        let key = match modal_poll(console, slice).await? {
             ModalPollOutcome::Key(k) => k,
             ModalPollOutcome::Resized => {
                 dirty = true;
@@ -478,7 +481,7 @@ pub fn show_modal_error(
 /// Overlay variant of [`show_modal_error`] that paints the modal ON
 /// TOP of `app.screen` so the menu underneath stays visible. Closing
 /// the modal restores `app.modal` to `None`.
-pub fn show_modal_error_over(
+pub async fn show_modal_error_over(
     console: &mut dyn Console,
     app: &mut App<'_>,
     title: &str,
@@ -510,7 +513,7 @@ pub fn show_modal_error_over(
             },
             None => POLL_SLICE,
         };
-        let key = match modal_poll(console, slice)? {
+        let key = match modal_poll(console, slice).await? {
             ModalPollOutcome::Key(k) => k,
             ModalPollOutcome::Resized => {
                 dirty = true;
@@ -546,7 +549,7 @@ pub fn show_modal_error_over(
 /// [`show_modal_error`]/[`show_modal_confirm`]: when the operator can't
 /// see the modal, default to the safest action (which here is to
 /// re-prompt rather than reboot or open a shell).
-pub fn show_wrong_password_modal(
+pub async fn show_wrong_password_modal(
     console: &mut dyn Console,
     attempt: u32,
 ) -> Result<WrongPasswordOutcome> {
@@ -589,7 +592,7 @@ pub fn show_wrong_password_modal(
             dirty = false;
         }
 
-        let key = match modal_poll(console, POLL_SLICE)? {
+        let key = match modal_poll(console, POLL_SLICE).await? {
             ModalPollOutcome::Key(k) => k,
             ModalPollOutcome::Resized => {
                 dirty = true;
@@ -646,7 +649,7 @@ pub fn show_wrong_password_modal(
 /// Esc returns the LAST button index (caller convention: rightmost is
 /// "Cancel" / "Back"). Empty `labels` returns 0 immediately so the
 /// caller's caller never indexes off the end.
-pub fn show_modal_buttons(
+pub async fn show_modal_buttons(
     console: &mut dyn Console,
     title: &str,
     message: &str,
@@ -679,7 +682,7 @@ pub fn show_modal_buttons(
             }
             dirty = false;
         }
-        let key = match modal_poll(console, POLL_SLICE)? {
+        let key = match modal_poll(console, POLL_SLICE).await? {
             ModalPollOutcome::Key(k) => k,
             ModalPollOutcome::Resized => {
                 dirty = true;
@@ -748,7 +751,7 @@ fn decode_wrong_password_selection(idx: usize) -> WrongPasswordOutcome {
 /// card / raw-mode tty serves the whole boot. Serial UARTs go through
 /// the same path — the TUI's crossterm backend emits portable
 /// vt100/xterm escapes that every modern serial terminal renders.
-pub fn run_selector(
+pub async fn run_selector(
     config: &Config,
     generations: &[Generation],
     console: &mut dyn Console,
@@ -759,13 +762,13 @@ pub fn run_selector(
     // timeout boots) the generation they rolled back to — not the
     // higher-numbered one they rolled away from.
     let default_index = active_generation_index(generations, &config.paths.nix_profiles_dir);
-    run_selector_on_console(config, generations, console, default_index, session)
+    run_selector_on_console(config, generations, console, default_index, session).await
 }
 
 /// TUI event loop. Backend-agnostic: every render and key-poll goes
 /// through the [`Console`] trait. Hosts the countdown, the List/Editing
 /// state machine, and the timeout-defaults-to-active-profile rule.
-fn run_selector_on_console(
+async fn run_selector_on_console(
     config: &Config,
     generations: &[Generation],
     console: &mut dyn Console,
@@ -778,7 +781,7 @@ fn run_selector_on_console(
 
     // 1. Countdown phase.
     let countdown = Duration::from_secs(u64::from(config.general.timeout_secs));
-    let outcome = run_console_countdown(console, &mut app, countdown)?;
+    let outcome = run_console_countdown(console, &mut app, countdown).await?;
     app.countdown_remaining_secs = None;
 
     if matches!(outcome, TimeoutOutcome::Expired) && app.decision.is_none() {
@@ -801,7 +804,7 @@ fn run_selector_on_console(
             console.render(&app)?;
             dirty = false;
         }
-        match console.poll_event(POLL_SLICE)? {
+        match console.poll_event(POLL_SLICE).await? {
             Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
                 dirty = true;
             }
@@ -826,7 +829,7 @@ fn run_selector_on_console(
 /// Countdown driver that polls the [`Console`] for keys instead of
 /// stdin, so cancel-on-keypress works on both the splash framebuffer
 /// (input via `/dev/tty1`) and the raw-mode tty.
-fn run_console_countdown(
+async fn run_console_countdown(
     console: &mut dyn Console,
     app: &mut App<'_>,
     duration: Duration,
@@ -846,7 +849,11 @@ fn run_console_countdown(
         };
 
         let slice = remaining.min(POLL_SLICE);
-        if console.poll_key(slice)?.is_some() {
+        // Any key cancels the countdown. A `Resize` only repaints (the
+        // selector loop below redraws at the new geometry); it does not
+        // count as the operator cancelling, matching the prior
+        // `poll_key` semantics which silently dropped resizes.
+        if let Some(crate::ui::console::ConsoleEvent::Key(_)) = console.poll_event(slice).await? {
             return Ok(TimeoutOutcome::Cancelled);
         }
 
@@ -1153,8 +1160,15 @@ impl TuiPasswordSupplier {
 }
 
 impl PasswordSupplier for TuiPasswordSupplier {
-    fn prompt(&mut self, console: &mut dyn Console, label: &str) -> Result<Zeroizing<String>> {
-        passphrase_prompt_on_console(console, label, &self.session)
+    fn prompt<'a>(
+        &'a mut self,
+        console: &'a mut dyn Console,
+        label: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Zeroizing<String>>> + 'a>> {
+        // Fully async: the activation runner now drives this future
+        // inside the single interactive runtime, so we just await the
+        // passphrase modal directly — no nested runtime.
+        Box::pin(passphrase_prompt_on_console(console, label, &self.session))
     }
 }
 
@@ -1165,7 +1179,7 @@ impl PasswordSupplier for TuiPasswordSupplier {
 /// the emergency shell. The Console is reused, NOT re-opened — the
 /// orchestrator already brought up the splash framebuffer or raw-mode
 /// tty before phase 1 and held it through every phase.
-pub(crate) fn passphrase_prompt_on_console(
+pub(crate) async fn passphrase_prompt_on_console(
     console: &mut dyn Console,
     label: &str,
     session: &SessionInteraction,
@@ -1203,7 +1217,7 @@ pub(crate) fn passphrase_prompt_on_console(
         // Drive `poll_event` so host-reported `CSI 8;rows;cols t`
         // resizes redraw the modal at the new dimensions instead of
         // smearing the old layout until the next keypress.
-        match console.poll_event(POLL_SLICE)? {
+        match console.poll_event(POLL_SLICE).await? {
             Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
                 dirty = true;
             }
@@ -1306,7 +1320,14 @@ mod tests {
             }
             Ok(())
         }
-        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+        fn poll_event<'a>(
+            &'a mut self,
+            timeout: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>>
+        {
+            Box::pin(async move { self.poll_event_blocking(timeout) })
+        }
+        fn poll_event_blocking(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
             Ok(self.keys.pop_front().map(ConsoleEvent::Key))
         }
         fn size(&self) -> (u16, u16) {
@@ -1331,6 +1352,17 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// Drive an async modal future to completion on a throwaway
+    /// current-thread runtime so the existing synchronous tests can call
+    /// the now-async modal helpers unchanged in spirit.
+    fn block<F: std::future::Future>(fut: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build_local(tokio::runtime::LocalOptions::default())
+            .expect("test runtime");
+        rt.block_on(fut)
+    }
+
     #[test]
     fn passphrase_prompt_collects_typed_chars_and_returns_on_enter() {
         // Type "ok" + Enter — supplier must return "ok" and the
@@ -1341,9 +1373,12 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let secret =
-            passphrase_prompt_on_console(&mut console, "Unlock root", &SessionInteraction::new())
-                .expect("Enter submits the buffer");
+        let secret = block(passphrase_prompt_on_console(
+            &mut console,
+            "Unlock root",
+            &SessionInteraction::new(),
+        ))
+        .expect("Enter submits the buffer");
         assert_eq!(&**secret, "ok");
         // Initial render + 2 char-keys + 1 Enter = 4 dirty repaints.
         assert!(
@@ -1370,9 +1405,12 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let secret =
-            passphrase_prompt_on_console(&mut console, "Unlock", &SessionInteraction::new())
-                .expect("Enter after a char submits the buffer");
+        let secret = block(passphrase_prompt_on_console(
+            &mut console,
+            "Unlock",
+            &SessionInteraction::new(),
+        ))
+        .expect("Enter after a char submits the buffer");
         assert_eq!(&**secret, "p");
     }
 
@@ -1385,9 +1423,12 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let secret =
-            passphrase_prompt_on_console(&mut console, "Unlock", &SessionInteraction::new())
-                .expect("Enter submits the buffer");
+        let secret = block(passphrase_prompt_on_console(
+            &mut console,
+            "Unlock",
+            &SessionInteraction::new(),
+        ))
+        .expect("Enter submits the buffer");
         assert_eq!(&**secret, "a", "backspace must drop the last char");
     }
 
@@ -1395,8 +1436,12 @@ mod tests {
     fn passphrase_prompt_esc_returns_tui_error() {
         let keys = vec![press(KeyCode::Char('x')), press(KeyCode::Esc)];
         let mut console = ScriptedConsole::new(keys);
-        let err = passphrase_prompt_on_console(&mut console, "Unlock", &SessionInteraction::new())
-            .expect_err("Esc must propagate as a Tui error");
+        let err = block(passphrase_prompt_on_console(
+            &mut console,
+            "Unlock",
+            &SessionInteraction::new(),
+        ))
+        .expect_err("Esc must propagate as a Tui error");
         assert!(matches!(err, NmblError::Tui { .. }));
     }
 
@@ -1448,14 +1493,14 @@ mod tests {
         // to Yes without needing arrow keys.
         let keys = vec![press(KeyCode::Enter)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_modal_confirm(
+        let out = block(show_modal_confirm(
             &mut console,
             "Boot one?",
             "Found 3 generations.",
             "Yes",
             "Back",
             true,
-        )
+        ))
         .expect("modal must succeed on Enter");
         assert_eq!(out, ConfirmOutcome::Yes);
     }
@@ -1465,14 +1510,14 @@ mod tests {
         // yes_default = false highlights Back; Enter commits to No.
         let keys = vec![press(KeyCode::Enter)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_modal_confirm(
+        let out = block(show_modal_confirm(
             &mut console,
             "Are you sure?",
             "This may destroy data.",
             "Yes",
             "No",
             false,
-        )
+        ))
         .expect("modal must succeed");
         assert_eq!(out, ConfirmOutcome::No);
     }
@@ -1482,15 +1527,29 @@ mod tests {
         // Default Yes, then Right toggles to No, Enter commits to No.
         let keys = vec![press(KeyCode::Right), press(KeyCode::Enter)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_modal_confirm(&mut console, "t", "b", "Yes", "No", true)
-            .expect("modal must succeed");
+        let out = block(show_modal_confirm(
+            &mut console,
+            "t",
+            "b",
+            "Yes",
+            "No",
+            true,
+        ))
+        .expect("modal must succeed");
         assert_eq!(out, ConfirmOutcome::No);
 
         // Default No, then Left toggles to Yes, Enter commits to Yes.
         let keys = vec![press(KeyCode::Left), press(KeyCode::Enter)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_modal_confirm(&mut console, "t", "b", "Yes", "No", false)
-            .expect("modal must succeed");
+        let out = block(show_modal_confirm(
+            &mut console,
+            "t",
+            "b",
+            "Yes",
+            "No",
+            false,
+        ))
+        .expect("modal must succeed");
         assert_eq!(out, ConfirmOutcome::Yes);
     }
 
@@ -1501,8 +1560,15 @@ mod tests {
         // other confirmation prompt in the binary.
         let keys = vec![press(KeyCode::Char('y'))];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_modal_confirm(&mut console, "t", "b", "Yes", "No", false)
-            .expect("modal must succeed on 'y'");
+        let out = block(show_modal_confirm(
+            &mut console,
+            "t",
+            "b",
+            "Yes",
+            "No",
+            false,
+        ))
+        .expect("modal must succeed on 'y'");
         assert_eq!(out, ConfirmOutcome::Yes);
     }
 
@@ -1510,8 +1576,15 @@ mod tests {
     fn show_modal_confirm_hotkey_n_returns_no() {
         let keys = vec![press(KeyCode::Char('n'))];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_modal_confirm(&mut console, "t", "b", "Yes", "No", true)
-            .expect("modal must succeed on 'n'");
+        let out = block(show_modal_confirm(
+            &mut console,
+            "t",
+            "b",
+            "Yes",
+            "No",
+            true,
+        ))
+        .expect("modal must succeed on 'n'");
         assert_eq!(out, ConfirmOutcome::No);
     }
 
@@ -1519,8 +1592,15 @@ mod tests {
     fn show_modal_confirm_esc_returns_cancelled() {
         let keys = vec![press(KeyCode::Esc)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_modal_confirm(&mut console, "t", "b", "Yes", "Back", true)
-            .expect("modal must succeed on Esc");
+        let out = block(show_modal_confirm(
+            &mut console,
+            "t",
+            "b",
+            "Yes",
+            "Back",
+            true,
+        ))
+        .expect("modal must succeed on Esc");
         assert_eq!(out, ConfirmOutcome::Cancelled);
     }
 
@@ -1531,8 +1611,15 @@ mod tests {
         // draw and poll, the picker would block on a stale screen.
         let keys = vec![press(KeyCode::Char('y'))];
         let mut console = ScriptedConsole::new(keys);
-        let _ = show_modal_confirm(&mut console, "t", "b", "Yes", "No", true)
-            .expect("modal must succeed");
+        let _ = block(show_modal_confirm(
+            &mut console,
+            "t",
+            "b",
+            "Yes",
+            "No",
+            true,
+        ))
+        .expect("modal must succeed");
         assert!(
             console.renders >= 1,
             "expected at least one render, got {}",
@@ -1549,7 +1636,8 @@ mod tests {
         // (operator mistyped, just wants to retry).
         let keys = vec![press(KeyCode::Enter)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_wrong_password_modal(&mut console, 1).expect("modal must succeed on Enter");
+        let out =
+            block(show_wrong_password_modal(&mut console, 1)).expect("modal must succeed on Enter");
         assert_eq!(out, WrongPasswordOutcome::TryAgain);
     }
 
@@ -1558,7 +1646,7 @@ mod tests {
         // Right toggles to [Reboot]; Enter commits.
         let keys = vec![press(KeyCode::Right), press(KeyCode::Enter)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_wrong_password_modal(&mut console, 1).expect("modal must succeed");
+        let out = block(show_wrong_password_modal(&mut console, 1)).expect("modal must succeed");
         assert_eq!(out, WrongPasswordOutcome::Reboot);
     }
 
@@ -1573,7 +1661,7 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_wrong_password_modal(&mut console, 2).expect("modal must succeed");
+        let out = block(show_wrong_password_modal(&mut console, 2)).expect("modal must succeed");
         assert_eq!(out, WrongPasswordOutcome::PrettyShell);
     }
 
@@ -1589,7 +1677,7 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_wrong_password_modal(&mut console, 2).expect("modal must succeed");
+        let out = block(show_wrong_password_modal(&mut console, 2)).expect("modal must succeed");
         assert_eq!(out, WrongPasswordOutcome::RawShell);
     }
 
@@ -1604,7 +1692,7 @@ mod tests {
             press(KeyCode::Enter),
         ];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_wrong_password_modal(&mut console, 2).expect("modal must succeed");
+        let out = block(show_wrong_password_modal(&mut console, 2)).expect("modal must succeed");
         assert_eq!(out, WrongPasswordOutcome::RawShell);
     }
 
@@ -1618,14 +1706,14 @@ mod tests {
             (KeyCode::Char('s'), WrongPasswordOutcome::RawShell),
         ] {
             let mut console = ScriptedConsole::new(vec![press(code)]);
-            let out =
-                show_wrong_password_modal(&mut console, 1).expect("modal must succeed on hotkey");
+            let out = block(show_wrong_password_modal(&mut console, 1))
+                .expect("modal must succeed on hotkey");
             assert_eq!(out, expected, "hotkey {code:?} should yield {expected:?}");
         }
         #[cfg(feature = "pretty-shell")]
         {
             let mut console = ScriptedConsole::new(vec![press(KeyCode::Char('p'))]);
-            let out = show_wrong_password_modal(&mut console, 1)
+            let out = block(show_wrong_password_modal(&mut console, 1))
                 .expect("modal must succeed on 'p' hotkey");
             assert_eq!(out, WrongPasswordOutcome::PrettyShell);
         }
@@ -1637,7 +1725,8 @@ mod tests {
         // wiping out the boot. Spec: Esc = Try again.
         let keys = vec![press(KeyCode::Esc)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_wrong_password_modal(&mut console, 3).expect("modal must succeed on Esc");
+        let out =
+            block(show_wrong_password_modal(&mut console, 3)).expect("modal must succeed on Esc");
         assert_eq!(out, WrongPasswordOutcome::TryAgain);
     }
 
@@ -1647,7 +1736,7 @@ mod tests {
         // in both feature configurations — it is the rightmost row).
         let keys = vec![press(KeyCode::Left), press(KeyCode::Enter)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_wrong_password_modal(&mut console, 1).expect("modal must succeed");
+        let out = block(show_wrong_password_modal(&mut console, 1)).expect("modal must succeed");
         assert_eq!(out, WrongPasswordOutcome::RawShell);
     }
 
@@ -1719,9 +1808,16 @@ mod tests {
         app.selected_index = 4;
         let keys = vec![press(KeyCode::Char('y'))];
         let mut console = ScriptedConsole::new(keys);
-        let out =
-            show_modal_confirm_over(&mut console, &mut app, "title", "body", "Yes", "No", true)
-                .expect("overlay modal must succeed on 'y'");
+        let out = block(show_modal_confirm_over(
+            &mut console,
+            &mut app,
+            "title",
+            "body",
+            "Yes",
+            "No",
+            true,
+        ))
+        .expect("overlay modal must succeed on 'y'");
         assert_eq!(out, ConfirmOutcome::Yes);
         assert!(app.modal.is_none(), "modal must be cleared on exit");
         assert_eq!(
@@ -1765,8 +1861,16 @@ mod tests {
         };
         let keys = vec![press(KeyCode::Esc)];
         let mut console = ScriptedConsole::new(keys);
-        let out = show_modal_confirm_over(&mut console, &mut app, "t", "b", "Yes", "Back", true)
-            .expect("modal must succeed on Esc");
+        let out = block(show_modal_confirm_over(
+            &mut console,
+            &mut app,
+            "t",
+            "b",
+            "Yes",
+            "Back",
+            true,
+        ))
+        .expect("modal must succeed on Esc");
         assert_eq!(out, ConfirmOutcome::Cancelled);
         assert!(app.modal.is_none());
         match &app.screen {

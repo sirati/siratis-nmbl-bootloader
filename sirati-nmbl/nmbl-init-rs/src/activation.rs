@@ -46,7 +46,15 @@ const PROC_MODULES: &str = "/proc/modules";
 /// callers (`run_all_activations`) hand it the `BootReporter`'s console;
 /// tests can pass a mock that ignores it.
 pub trait PasswordSupplier {
-    fn prompt(&mut self, console: &mut dyn Console, label: &str) -> Result<Zeroizing<String>>;
+    /// Prompt for a passphrase, `.await`ing the modal's input instead of
+    /// blocking. Returns a boxed future (not a native async-fn-in-trait)
+    /// so the trait stays object-safe — the activation runner drives it
+    /// through `&mut dyn PasswordSupplier`.
+    fn prompt<'a>(
+        &'a mut self,
+        console: &'a mut dyn Console,
+        label: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Zeroizing<String>>> + 'a>>;
 }
 
 /// Run every entry in declaration order. First failure is fatal —
@@ -60,7 +68,7 @@ pub trait PasswordSupplier {
 /// Returns the set of [`KeyInjection`]s the kexec path must append to
 /// the system initrd (one per `luks-password` activation whose TOML
 /// sets `pass_to_stage1`). The vec is empty when no activation opts in.
-pub fn run_all_activations(
+pub async fn run_all_activations(
     config: &Config,
     reporter: &mut BootReporter<'_, '_>,
     mut password_supplier: Option<&mut dyn PasswordSupplier>,
@@ -100,7 +108,8 @@ pub fn run_all_activations(
             // passphrase modal renders through the same backend as the
             // surrounding boot-status screen. The reporter borrow is
             // paused for the duration of the prompt and resumed after.
-            let stdin_owned = collect_stdin(activation, &mut *reporter.console, supplier_ref)?;
+            let stdin_owned =
+                collect_stdin(activation, &mut *reporter.console, supplier_ref).await?;
             let stdin_slice = stdin_owned.as_ref().map(|z| z.as_slice());
 
             // For luks-password activations, drive a spinner on the
@@ -130,7 +139,9 @@ pub fn run_all_activations(
             // other non-zero exit code is fatal as before.
             if activation.kind == ActivationKind::LuksPassword && outcome.exit_code == 2 {
                 attempts = attempts.saturating_add(1);
-                match handle_wrong_password(config, &mut *reporter.console, activation, attempts)? {
+                match handle_wrong_password(config, &mut *reporter.console, activation, attempts)
+                    .await?
+                {
                     WrongPasswordHandled::TryAgain => continue,
                     WrongPasswordHandled::Reboot => {
                         return Err(NmblError::OperatorChoseReboot {
@@ -201,7 +212,7 @@ pub fn run_all_activations(
 /// binary key data (no stripping). Appending `\n` would turn a 4-byte
 /// passphrase "test" into the 5-byte key "test\n", which doesn't match
 /// the stored LUKS header digest.
-fn collect_stdin(
+async fn collect_stdin(
     activation: &Activation,
     console: &mut dyn Console,
     supplier: Option<&mut dyn PasswordSupplier>,
@@ -230,7 +241,7 @@ fn collect_stdin(
         .prompt_label
         .as_deref()
         .unwrap_or("Enter passphrase");
-    let secret = supplier.prompt(console, label)?;
+    let secret = supplier.prompt(console, label).await?;
     let mut buf = Zeroizing::new(Vec::with_capacity(secret.len()));
     buf.extend_from_slice(secret.as_bytes());
     Ok(Some(buf))
@@ -391,7 +402,7 @@ enum WrongPasswordHandled {
 /// and — for the shell branches — drive the chosen in-process shell
 /// session. Returns when the operator's choice has been fully
 /// resolved (modal closed; shell, if any, has exited).
-fn handle_wrong_password(
+async fn handle_wrong_password(
     config: &Config,
     console: &mut dyn Console,
     _activation: &Activation,
@@ -399,12 +410,12 @@ fn handle_wrong_password(
 ) -> Result<WrongPasswordHandled> {
     use crate::ui::{WrongPasswordOutcome, show_wrong_password_modal};
 
-    match show_wrong_password_modal(console, attempt)? {
+    match show_wrong_password_modal(console, attempt).await? {
         WrongPasswordOutcome::TryAgain => Ok(WrongPasswordHandled::TryAgain),
         WrongPasswordOutcome::Reboot => Ok(WrongPasswordHandled::Reboot),
         #[cfg(feature = "pretty-shell")]
         WrongPasswordOutcome::PrettyShell => {
-            if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(console, config) {
+            if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(console, config).await {
                 let chain = crate::error::format_chain(&e as &dyn std::error::Error);
                 crate::nmbl_warn!("wrong-password pretty-shell failed: {chain}");
                 let _ = crate::ui::show_modal_error(
@@ -412,7 +423,8 @@ fn handle_wrong_password(
                     "Pretty Shell failed to start",
                     &chain,
                     std::time::Duration::from_secs(10),
-                );
+                )
+                .await;
             }
             Ok(WrongPasswordHandled::ShellExited)
         }
@@ -421,7 +433,7 @@ fn handle_wrong_password(
             // fire-and-forget (no overlap). Errors are surfaced via a
             // modal-error so the wrong-password flow doesn't crash the
             // boot — we still want the operator to be able to retry.
-            match crate::ui::console_picker::run_picker_session(console, config) {
+            match crate::ui::console_picker::run_picker_session(console, config).await {
                 Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached { targets }) => {
                     let joined = targets
                         .iter()
@@ -433,7 +445,8 @@ fn handle_wrong_password(
                         "Shell spawned",
                         &format!("Shell spawned on {joined}"),
                         std::time::Duration::from_secs(5),
-                    );
+                    )
+                    .await;
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -444,7 +457,8 @@ fn handle_wrong_password(
                         "Emergency shell failed",
                         &chain,
                         std::time::Duration::from_secs(10),
-                    );
+                    )
+                    .await;
                 }
             }
             Ok(WrongPasswordHandled::ShellExited)
@@ -538,9 +552,15 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
     }
 
     impl PasswordSupplier for MockSupplier {
-        fn prompt(&mut self, _console: &mut dyn Console, label: &str) -> Result<Zeroizing<String>> {
+        fn prompt<'a>(
+            &'a mut self,
+            _console: &'a mut dyn Console,
+            label: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Zeroizing<String>>> + 'a>>
+        {
             self.seen_label = Some(label.to_string());
-            Ok(Zeroizing::new(self.canned.to_string()))
+            let canned = self.canned.to_string();
+            Box::pin(async move { Ok(Zeroizing::new(canned)) })
         }
     }
 
@@ -552,7 +572,18 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
         fn render(&mut self, _app: &crate::ui::app::App<'_>) -> Result<()> {
             Ok(())
         }
-        fn poll_event(
+        fn poll_event<'a>(
+            &'a mut self,
+            timeout: Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Option<crate::ui::console::ConsoleEvent>>>
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { self.poll_event_blocking(timeout) })
+        }
+        fn poll_event_blocking(
             &mut self,
             _timeout: Duration,
         ) -> Result<Option<crate::ui::console::ConsoleEvent>> {
@@ -582,8 +613,12 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
             seen_label: None,
         };
         let mut console = NoopConsole;
-        let got = sup
-            .prompt(&mut console, "Unlock root")
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build_local(tokio::runtime::LocalOptions::default())
+            .expect("test runtime");
+        let got = rt
+            .block_on(sup.prompt(&mut console, "Unlock root"))
             .expect("mock never errors");
         assert_eq!(&**got, "hunter2");
         assert_eq!(sup.seen_label.as_deref(), Some("Unlock root"));
