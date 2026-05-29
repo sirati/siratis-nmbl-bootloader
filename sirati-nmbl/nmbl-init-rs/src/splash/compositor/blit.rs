@@ -1,0 +1,249 @@
+use crate::splash::types::{FramebufferDims, GlyphBitmap, RgbaColor};
+
+use super::CellRect;
+
+/// Copy the scaled background RGBA buffer into the framebuffer,
+/// respecting `fb_dims.stride`. The input is tight RGBA8 of exactly
+/// `fb_dims.w * fb_dims.h * 4` bytes; rows shorter than that are
+/// skipped silently rather than panicking, so a malformed scaler
+/// output downgrades to a partial paint instead of a crash.
+pub fn blit_background(fb: &mut [u8], fb_dims: FramebufferDims, bg_rgba: &[u8]) {
+    let row_pixels = fb_dims.w as usize;
+    let row_bytes = row_pixels.saturating_mul(4);
+    let stride = fb_dims.stride as usize;
+    let rows = fb_dims.h as usize;
+
+    for y in 0..rows {
+        let src_start = y.saturating_mul(row_bytes);
+        let src_end = src_start.saturating_add(row_bytes);
+        let dst_start = y.saturating_mul(stride);
+        let dst_end = dst_start.saturating_add(row_bytes);
+
+        let Some(src_row) = bg_rgba.get(src_start..src_end) else {
+            break;
+        };
+        let Some(dst_row) = fb.get_mut(dst_start..dst_end) else {
+            break;
+        };
+
+        // Walk one pixel at a time: RGBA → BGRX. Using chunks_exact pairs
+        // keeps the bounds check to once per pair (the compiler is happy
+        // to vectorize four-byte copies of a four-byte chunk).
+        let src_pixels = src_row.chunks_exact(4);
+        let dst_pixels = dst_row.chunks_exact_mut(4);
+        for (s, d) in src_pixels.zip(dst_pixels) {
+            // `chunks_exact(4)` guarantees length 4, so the `.get()`
+            // lookups all yield Some. Pattern-match to keep this total.
+            let (Some(&r), Some(&g), Some(&b)) = (s.first(), s.get(1), s.get(2)) else {
+                continue;
+            };
+            if let Some(slot) = d.first_mut() {
+                *slot = b;
+            }
+            if let Some(slot) = d.get_mut(1) {
+                *slot = g;
+            }
+            if let Some(slot) = d.get_mut(2) {
+                *slot = r;
+            }
+            if let Some(slot) = d.get_mut(3) {
+                *slot = 0;
+            }
+        }
+    }
+}
+
+/// Fill the cell rectangle at `(cell_x, cell_y)` pixels with `bg` (if
+/// `bg.3 > 0`), then alpha-blend the glyph in `fg` color over it. Any
+/// pixel that would fall outside the framebuffer is silently clipped.
+///
+/// The background fill always covers the whole cell box
+/// (`cell_w` × `cell_h`). The glyph overlay honours
+/// `glyph.offset_x` / `glyph.offset_y` so the bitmap sits at
+/// `(cell_x + offset_x, cell_y + offset_y)`; offsets are signed and can
+/// place the bitmap outside the cell box (e.g. descenders), in which
+/// case the surrounding cells overlap visually. Out-of-framebuffer
+/// pixels are clipped without overflow.
+pub fn blit_cell(
+    fb: &mut [u8],
+    fb_dims: FramebufferDims,
+    glyph: &GlyphBitmap,
+    cell: CellRect,
+    fg: RgbaColor,
+    bg: RgbaColor,
+) {
+    // Stage 1: background fill over the full cell box.
+    blit_cell_bg(fb, fb_dims, cell, bg);
+
+    // Stage 2: glyph overlay positioned by the per-glyph offset.
+    // The blend alpha combines glyph coverage with the foreground's
+    // own alpha (e.g. NamedColor::Foreground at 0x99 for the
+    // 60% white) so that an "unset fg" still respects the palette.
+    blit_cell_glyph(fb, fb_dims, glyph, cell, fg);
+}
+
+/// Stage 1 of [`blit_cell`]: fill the cell box with the background colour.
+fn blit_cell_bg(fb: &mut [u8], fb_dims: FramebufferDims, cell: CellRect, bg: RgbaColor) {
+    if bg.3 == 0 {
+        return;
+    }
+    let stride = fb_dims.stride as usize;
+    let fb_w = fb_dims.w;
+    let fb_h = fb_dims.h;
+    let CellRect {
+        x: cell_x,
+        y: cell_y,
+        w: cell_w,
+        h: cell_h,
+    } = cell;
+    let RgbaColor(br, bg_g, bb, ba) = bg;
+    for cy in 0..cell_h {
+        let py = cell_y.saturating_add(cy);
+        if py >= fb_h {
+            break;
+        }
+        let row_off = (py as usize).saturating_mul(stride);
+        for cx in 0..cell_w {
+            let px = cell_x.saturating_add(cx);
+            if px >= fb_w {
+                break;
+            }
+            let pix_off = row_off.saturating_add((px as usize).saturating_mul(4));
+            let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
+                continue;
+            };
+            let (dr, dg, db) = read_bgrx(dst);
+            let (nr, ng, nb) = src_over(br, bg_g, bb, ba, dr, dg, db);
+            write_bgrx(dst, nr, ng, nb);
+        }
+    }
+}
+
+/// Stage 2 of [`blit_cell`]: alpha-blend the glyph onto the framebuffer.
+fn blit_cell_glyph(
+    fb: &mut [u8],
+    fb_dims: FramebufferDims,
+    glyph: &GlyphBitmap,
+    cell: CellRect,
+    fg: RgbaColor,
+) {
+    let RgbaColor(fr, fg_g, fb_c, fa) = fg;
+    if fa == 0 {
+        return;
+    }
+    let stride = fb_dims.stride as usize;
+    let fb_w = fb_dims.w;
+    let fb_h = fb_dims.h;
+    let fa16 = u16::from(fa);
+    for gy in 0..glyph.height {
+        let dy = i64::from(cell.y) + i64::from(glyph.offset_y) + i64::from(gy);
+        if dy < 0 {
+            continue;
+        }
+        let dy = dy as u64;
+        if dy >= u64::from(fb_h) {
+            continue;
+        }
+        let row_off = (dy as usize).saturating_mul(stride);
+
+        for gx in 0..glyph.width {
+            let dx = i64::from(cell.x) + i64::from(glyph.offset_x) + i64::from(gx);
+            if dx < 0 {
+                continue;
+            }
+            let dx = dx as u64;
+            if dx >= u64::from(fb_w) {
+                continue;
+            }
+
+            let cov_idx = (gy as usize)
+                .saturating_mul(glyph.width as usize)
+                .saturating_add(gx as usize);
+            let coverage = glyph.coverage.get(cov_idx).copied().unwrap_or(0);
+            if coverage == 0 {
+                continue;
+            }
+            // (coverage * fa + 127) / 255 — round-to-nearest, keeps
+            // the +127 trick from src_over so the two stages share
+            // identical rounding behaviour.
+            let effective = ((u16::from(coverage).saturating_mul(fa16)) + 127) / 255;
+            let effective = if effective > 255 {
+                255u8
+            } else {
+                effective as u8
+            };
+            if effective == 0 {
+                continue;
+            }
+
+            let pix_off = row_off.saturating_add((dx as usize).saturating_mul(4));
+            let Some(dst) = fb.get_mut(pix_off..pix_off.saturating_add(4)) else {
+                continue;
+            };
+            let (dr, dg, db) = read_bgrx(dst);
+            let (nr, ng, nb) = src_over(fr, fg_g, fb_c, effective, dr, dg, db);
+            write_bgrx(dst, nr, ng, nb);
+        }
+    }
+}
+
+/// Perceptually-correct src-over blend using Oklab interpolation.
+///
+/// Alpha-weighted mix in Oklab space avoids the gamma-incorrect
+/// darkening that sRGB-linear math produces (e.g. white-at-30%-alpha
+/// over a mid-tone photo reading muddy instead of soft white).
+///
+/// Short-circuits for `a == 0` (fully transparent → dst unchanged) and
+/// `a == 255` (fully opaque → src replaces dst) to skip the round-trip.
+#[inline]
+pub(crate) fn src_over(sr: u8, sg: u8, sb: u8, a: u8, dr: u8, dg: u8, db: u8) -> (u8, u8, u8) {
+    if a == 0 {
+        return (dr, dg, db);
+    }
+    if a == 255 {
+        return (sr, sg, sb);
+    }
+    let alpha = f32::from(a) / 255.0;
+    let inv = 1.0 - alpha;
+    let src_lab = oklab::srgb_to_oklab(oklab::Rgb {
+        r: sr,
+        g: sg,
+        b: sb,
+    });
+    let dst_lab = oklab::srgb_to_oklab(oklab::Rgb {
+        r: dr,
+        g: dg,
+        b: db,
+    });
+    let out_lab = oklab::Oklab {
+        l: dst_lab.l * inv + src_lab.l * alpha,
+        a: dst_lab.a * inv + src_lab.a * alpha,
+        b: dst_lab.b * inv + src_lab.b * alpha,
+    };
+    let out_rgb = oklab::oklab_to_srgb(out_lab);
+    (out_rgb.r, out_rgb.g, out_rgb.b)
+}
+
+#[inline]
+pub(crate) fn read_bgrx(slot: &[u8]) -> (u8, u8, u8) {
+    let b = slot.first().copied().unwrap_or(0);
+    let g = slot.get(1).copied().unwrap_or(0);
+    let r = slot.get(2).copied().unwrap_or(0);
+    (r, g, b)
+}
+
+#[inline]
+pub(crate) fn write_bgrx(slot: &mut [u8], r: u8, g: u8, b: u8) {
+    if let Some(p) = slot.first_mut() {
+        *p = b;
+    }
+    if let Some(p) = slot.get_mut(1) {
+        *p = g;
+    }
+    if let Some(p) = slot.get_mut(2) {
+        *p = r;
+    }
+    if let Some(p) = slot.get_mut(3) {
+        *p = 0;
+    }
+}
