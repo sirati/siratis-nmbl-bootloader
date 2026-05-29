@@ -120,6 +120,17 @@ fn fresh_app() -> App<'static> {
     build_emergency_app(&message, &default_items(), &session)
 }
 
+/// Build an emergency App whose interaction latch is the given `session`
+/// (sharing the same `Rc<Cell<bool>>`), mirroring how `serve_session`
+/// wires the per-session latch into its App.
+fn app_in_session(session: &SessionInteraction) -> App<'static> {
+    let message = build_message(&NmblError::Io {
+        source: std::io::Error::other("boot failed"),
+        context: "test".to_string(),
+    });
+    build_emergency_app(&message, &default_items(), session)
+}
+
 fn run_menu(console: &mut dyn Console) -> Option<TerminalAction> {
     let config = Config::recovery_default();
     let session = SessionInteraction::new();
@@ -168,6 +179,55 @@ fn poll_error_ends_session_without_rebooting() {
     );
 }
 
+/// Drive `run_remote_menu` with an explicit session + timeout, mirroring
+/// `serve_session` (which shares the per-session latch into the App).
+fn run_menu_with_session(
+    console: &mut dyn Console,
+    session: &SessionInteraction,
+    timeout: Duration,
+) -> Option<TerminalAction> {
+    let config = Config::recovery_default();
+    let mut app = app_in_session(session);
+    let mut errs = 0u32;
+    block(run_remote_menu(
+        console, &mut app, &config, session, timeout, &mut errs,
+    ))
+}
+
+#[test]
+fn unattended_session_commits_reboot_on_zero_timeout() {
+    // Control for the test below: an UN-attended session with a
+    // zero-length countdown arms the auto-reboot deadline, which is
+    // already elapsed on entry → the loop commits Reboot WITHOUT ever
+    // polling the (immediately-erroring) console.
+    let session = SessionInteraction::new();
+    let mut console = FakeConsole::erroring(0);
+    let action = run_menu_with_session(&mut console, &session, Duration::ZERO);
+    assert!(
+        matches!(action, Some(TerminalAction::Reboot)),
+        "unattended session must arm the countdown and reboot, got {action:?}"
+    );
+}
+
+#[test]
+fn attended_remote_session_does_not_auto_reboot_on_timeout() {
+    // serve_session marks every fresh remote session attended (the
+    // operator connected, so they are present). That disarms the
+    // unattended auto-reboot countdown: even with a zero-length timeout
+    // the session must NOT commit a machine-wide Reboot. Here the console
+    // errors immediately (client gone), so a disarmed loop ends with
+    // None; were the countdown armed it would have rebooted before the
+    // console was ever polled (see the control test above).
+    let session = SessionInteraction::new();
+    session.set();
+    let mut console = FakeConsole::erroring(0);
+    let action = run_menu_with_session(&mut console, &session, Duration::ZERO);
+    assert!(
+        action.is_none(),
+        "an attended remote session must not auto-reboot on timeout, got {action:?}"
+    );
+}
+
 #[test]
 fn shutdown_signal_is_observable_across_clones() {
     let s = Shutdown::new();
@@ -175,6 +235,37 @@ fn shutdown_signal_is_observable_across_clones() {
     assert!(!s.is_signalled());
     c.signal();
     assert!(s.is_signalled(), "signal must be visible across clones");
+}
+
+#[test]
+fn shutdown_signal_wakes_a_parked_poller() {
+    // A future that registers its waker and parks on shutdown must be
+    // woken (not silently left Pending) when a clone signals — the
+    // property the accept multiplexer relies on to react with no other
+    // event in flight.
+    use std::future::poll_fn;
+    use std::task::Poll;
+
+    let s = Shutdown::new();
+    let waker_clone = s.clone();
+
+    block(async move {
+        let mut signalled_once = false;
+        poll_fn(|cx| {
+            s.register(cx);
+            if s.is_signalled() {
+                return Poll::Ready(());
+            }
+            if !signalled_once {
+                // Signal from "another" handle; this must wake us so the
+                // runtime re-polls and observes the flag on the next turn.
+                signalled_once = true;
+                waker_clone.signal();
+            }
+            Poll::Pending
+        })
+        .await;
+    });
 }
 
 #[test]
