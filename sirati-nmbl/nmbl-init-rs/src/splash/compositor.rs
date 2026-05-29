@@ -45,10 +45,22 @@ pub struct CellRect {
 /// ~0.63 keeps the strongest core a deep grey rather than full black.
 const HALO_MAX_ALPHA: u8 = 160;
 
-/// Blur radius (per pass) of the halo spread, in pixels. Two separable
-/// box passes give a soft, quickly-fading Gaussian-ish falloff; the
-/// canvas is padded by `2 * HALO_RADIUS` so the full spread fits.
-const HALO_RADIUS: u32 = 2;
+/// Blur radius (per pass) of the halo spread, in pixels. Several
+/// separable box passes (see [`HALO_PASSES`]) give a soft, slowly-fading
+/// Gaussian-ish falloff; the canvas is padded by [`HALO_PAD`] so the full
+/// cumulative spread fits without clipping at the canvas edge.
+const HALO_RADIUS: u32 = 4;
+
+/// Number of separable box-blur passes (each run as an H then V pair).
+/// More passes widen the soft tail and smooth the falloff toward a
+/// Gaussian, pushing the faint near-invisible edge further out.
+const HALO_PASSES: u32 = 3;
+
+/// Canvas padding on every side. Each box pass of radius `HALO_RADIUS`
+/// spreads coverage by `HALO_RADIUS`, so `HALO_PASSES` passes reach
+/// `HALO_PASSES * HALO_RADIUS` pixels — pad by exactly that so the whole
+/// tail fits.
+const HALO_PAD: u32 = HALO_RADIUS * HALO_PASSES;
 
 /// Copy the scaled background RGBA buffer into the framebuffer,
 /// respecting `fb_dims.stride`. The input is tight RGBA8 of exactly
@@ -212,16 +224,19 @@ pub fn blit_cell(
     }
 }
 
-/// Whether a cell's foreground should get the dark contrast halo.
+/// Whether a cell should get the dark contrast halo behind its glyph.
 ///
-/// Only the terminal *default* foreground qualifies — that's the soft
-/// 60%-white [`named_color`] resolves [`NamedColor::Foreground`] to,
-/// used for all unset-fg text. Explicitly-coloured text (named colours,
-/// indexed, or `Spec`) is left alone, and the halo is keyed off the
-/// glyph's foreground only, so a cell whose *background* happens to be
-/// that same colour never triggers it.
-pub fn wants_halo(fg: Color) -> bool {
-    matches!(fg, Color::Named(NamedColor::Foreground))
+/// Keyed on the cell *background*: only cells whose background is the
+/// terminal default (transparent — [`named_color`] resolves
+/// [`NamedColor::Background`] to alpha 0, letting the PNG show through)
+/// qualify. Every glyph drawn straight onto the photo therefore gets the
+/// dark backing regardless of its foreground colour, so coloured text on
+/// the image is legible too. Cells with an explicit, opaque background
+/// (e.g. the selection highlight) paint their own backing and are left
+/// alone. A blank cell (a space) early-returns in [`blit_halo`] on empty
+/// coverage, so this never paints behind whitespace.
+pub fn wants_halo(bg: Color) -> bool {
+    matches!(bg, Color::Named(NamedColor::Background))
 }
 
 /// Paint a dark, quickly-fading contrast halo behind a glyph.
@@ -241,9 +256,9 @@ pub fn blit_halo(fb: &mut [u8], fb_dims: FramebufferDims, glyph: &GlyphBitmap, c
         return;
     }
     let r = HALO_RADIUS as usize;
-    let pad = r.saturating_mul(2);
+    let pad = HALO_PAD as usize;
     // Halo canvas: glyph bbox padded by `pad` on every side so the full
-    // two-pass blur spread fits without clipping at the canvas edge.
+    // multi-pass blur spread fits without clipping at the canvas edge.
     let hw = gw.saturating_add(pad.saturating_mul(2));
     let hh = gh.saturating_add(pad.saturating_mul(2));
     let Some(area) = hw.checked_mul(hh) else {
@@ -271,12 +286,13 @@ pub fn blit_halo(fb: &mut [u8], fb_dims: FramebufferDims, glyph: &GlyphBitmap, c
         }
     }
 
-    // Two separable box passes ≈ Gaussian spread.
+    // `HALO_PASSES` separable box passes ≈ a wide Gaussian spread. Each
+    // pass is an H then V box blur sharing one scratch buffer.
     let mut scratch = vec![0u8; area];
-    box_blur_h(&field, &mut scratch, hw, hh, r);
-    box_blur_v(&scratch, &mut field, hw, hh, r);
-    box_blur_h(&field, &mut scratch, hw, hh, r);
-    box_blur_v(&scratch, &mut field, hw, hh, r);
+    for _ in 0..HALO_PASSES {
+        box_blur_h(&field, &mut scratch, hw, hh, r);
+        box_blur_v(&scratch, &mut field, hw, hh, r);
+    }
 
     // Composite black over the framebuffer, per-pixel alpha from the
     // (gained) blurred coverage. The canvas top-left maps to the glyph
@@ -302,11 +318,25 @@ pub fn blit_halo(fb: &mut [u8], fb_dims: FramebufferDims, glyph: &GlyphBitmap, c
             if v == 0 {
                 continue;
             }
-            // Gain ×2 (clamped) sharpens the core so thin strokes still
-            // get a solid backing, then scale by the max halo alpha.
-            let gained = u16::from(v).saturating_mul(2).min(255);
-            let alpha = (gained.saturating_mul(u16::from(HALO_MAX_ALPHA)) + 127) / 255;
-            let alpha = if alpha > 255 { 255u8 } else { alpha as u8 };
+            // Shape the spatial falloff with a concave curve so the core
+            // stays a solid backing while low coverage is lifted into a
+            // gentle, wide tail (rather than a linear ramp that fades too
+            // fast). `sqrt` of the normalized blurred coverage is a
+            // gamma-0.5 lift; an extra small gain keeps thin strokes
+            // backed. This only shapes the SPATIAL alpha — the Oklab
+            // multiply-toward-black blend below is untouched, so the
+            // brightness-monotonicity property is preserved.
+            let norm = f32::from(v) / 255.0;
+            let shaped = norm.sqrt() * 1.25;
+            let shaped = if shaped > 1.0 { 1.0 } else { shaped };
+            let alpha = (shaped * f32::from(HALO_MAX_ALPHA)).round();
+            let alpha = if alpha >= 255.0 {
+                255u8
+            } else if alpha <= 0.0 {
+                0u8
+            } else {
+                alpha as u8
+            };
             if alpha == 0 {
                 continue;
             }
@@ -442,6 +472,30 @@ pub fn resolve_color(c: Color) -> RgbaColor {
     }
 }
 
+/// Alpha (0..255) of the selection-highlight background. ratatui's
+/// `Color::Gray` highlight maps through SGR 37 to [`NamedColor::White`];
+/// rendered in the *background* role it should read as a faint tint so
+/// the photo stays visible. Kept separate from the foreground mapping so
+/// white *text* (which also resolves through the White slot) is never
+/// made fainter — see [`resolve_bg_color`].
+const SELECTION_BG_ALPHA: u8 = 0x40;
+
+/// Resolve a `Color` for the *background* cell role. Identical to
+/// [`resolve_color`] except the selection-highlight tone
+/// ([`NamedColor::White`] / `DimWhite`, i.e. ratatui `Color::Gray`) is
+/// rendered more transparent so the highlight is a soft tint rather than
+/// a solid bar. Foreground resolution still goes through
+/// [`resolve_color`], so white text keeps its full opacity.
+pub fn resolve_bg_color(c: Color) -> RgbaColor {
+    match c {
+        Color::Named(NamedColor::White | NamedColor::DimWhite) => {
+            let RgbaColor(r, g, b, _) = named_color(NamedColor::White);
+            RgbaColor(r, g, b, SELECTION_BG_ALPHA)
+        }
+        other => resolve_color(other),
+    }
+}
+
 /// Tango-palette mapping for the 16 ANSI names, with the
 /// foreground/background/cursor special slots picked to produce a
 /// readable splash overlay: white text on a transparent cell (so the
@@ -455,9 +509,10 @@ fn named_color(n: NamedColor) -> RgbaColor {
         NamedColor::Blue | NamedColor::DimBlue => RgbaColor(0x34, 0x65, 0xA4, 0xFF),
         NamedColor::Magenta | NamedColor::DimMagenta => RgbaColor(0x75, 0x50, 0x7B, 0xFF),
         NamedColor::Cyan | NamedColor::DimCyan => RgbaColor(0x06, 0x98, 0x9A, 0xFF),
-        // Selection background (ratatui Color::Gray) lands here; keep
-        // the Tango tone but let the cosmic-greeter image bleed through
-        // at ~50% so the highlight reads as a soft tint, not a solid bar.
+        // Tango "white" tone. ratatui `Color::Gray` lands here; in the
+        // background role [`resolve_bg_color`] drops the alpha further to
+        // `SELECTION_BG_ALPHA` so the selection reads as a soft tint. The
+        // 0x80 kept here applies to the foreground role only.
         NamedColor::White | NamedColor::DimWhite => RgbaColor(0xD3, 0xD7, 0xCF, 0x80),
         NamedColor::BrightBlack => RgbaColor(0x55, 0x57, 0x53, 0xFF),
         NamedColor::BrightRed => RgbaColor(0xEF, 0x29, 0x29, 0xFF),
@@ -896,9 +951,13 @@ mod tests {
     }
 
     #[test]
-    fn wants_halo_only_default_foreground() {
-        assert!(wants_halo(Color::Named(NamedColor::Foreground)));
+    fn wants_halo_only_transparent_default_background() {
+        // Keyed on the background now: only the transparent terminal
+        // default qualifies, regardless of foreground colour.
+        assert!(wants_halo(Color::Named(NamedColor::Background)));
+        // Any explicit/opaque background paints its own backing → no halo.
         assert!(!wants_halo(Color::Named(NamedColor::White)));
+        assert!(!wants_halo(Color::Named(NamedColor::Foreground)));
         assert!(!wants_halo(Color::Named(NamedColor::BrightWhite)));
         assert!(!wants_halo(Color::Indexed(15)));
         assert!(!wants_halo(Color::Spec(Rgb {
@@ -910,27 +969,42 @@ mod tests {
 
     #[test]
     fn blit_halo_darkens_glyph_and_leaves_distant_pixels() {
-        // 24×24 bright-grey fb, 5×5 solid glyph at cell (10, 10).
-        let (mut fb, dims) = grey_fb(24, 200);
+        // 64×64 bright-grey fb, 5×5 solid glyph at cell (28, 28). The fb
+        // is sized so the whole padded halo canvas (glyph bbox ± HALO_PAD)
+        // fits with room to spare, leaving genuinely distant pixels.
+        let (mut fb, dims) = grey_fb(64, 200);
         let glyph = solid_glyph(5);
         let rect = CellRect {
-            x: 10,
-            y: 10,
+            x: 28,
+            y: 28,
             w: 5,
             h: 5,
         };
         blit_halo(&mut fb, dims, &glyph, rect);
 
-        // Glyph core (12, 12) sits inside the solid ink → darkened.
+        // Glyph core (30, 30) sits inside the solid ink → darkened.
         assert!(
-            pixel_r(&fb, dims, 12, 12) < 200,
+            pixel_r(&fb, dims, 30, 30) < 200,
             "halo must darken the glyph core"
+        );
+
+        // The wider, concave falloff still has a finite reach: the canvas
+        // spans the glyph bbox padded by HALO_PAD on each side. A pixel
+        // beyond that pad can never be touched.
+        let pad = HALO_PAD;
+        let glyph_max = 28 + 5; // exclusive right/bottom edge of the glyph
+        let tail_end = glyph_max + pad; // last column/row the canvas can reach
+        let far = tail_end + 2; // safely beyond the tail
+        assert_eq!(
+            pixel_r(&fb, dims, far, far),
+            200,
+            "pixel beyond the haze tail must be untouched"
         );
         // Corner (0, 0) is far outside the padded halo canvas → pristine.
         assert_eq!(
             pixel_r(&fb, dims, 0, 0),
             200,
-            "distant pixel must be untouched"
+            "distant corner pixel must be untouched"
         );
     }
 
@@ -1067,6 +1141,42 @@ mod tests {
         assert_eq!(
             resolve_color(Color::Indexed(9)),
             resolve_color(Color::Named(NamedColor::BrightRed))
+        );
+    }
+
+    #[test]
+    fn resolve_bg_color_selection_is_more_transparent() {
+        // ratatui Color::Gray selection bg → NamedColor::White. In the
+        // background role it must be the faint selection alpha.
+        let bg = resolve_bg_color(Color::Named(NamedColor::White));
+        assert_eq!(bg, RgbaColor(0xD3, 0xD7, 0xCF, SELECTION_BG_ALPHA));
+        assert_eq!(SELECTION_BG_ALPHA, 0x40, "selection bg alpha pinned");
+        // More transparent than the shared/foreground White mapping.
+        let fg = resolve_color(Color::Named(NamedColor::White));
+        assert!(
+            bg.3 < fg.3,
+            "selection bg ({}) must be more transparent than white fg ({})",
+            bg.3,
+            fg.3
+        );
+    }
+
+    #[test]
+    fn resolve_color_white_fg_unchanged() {
+        // The foreground/shared path must NOT lose opacity — white text
+        // (and indexed 7) stay at the original 0x80 alpha.
+        assert_eq!(
+            resolve_color(Color::Named(NamedColor::White)),
+            RgbaColor(0xD3, 0xD7, 0xCF, 0x80)
+        );
+        // Non-white backgrounds resolve identically through both paths.
+        assert_eq!(
+            resolve_bg_color(Color::Named(NamedColor::Red)),
+            resolve_color(Color::Named(NamedColor::Red))
+        );
+        assert_eq!(
+            resolve_bg_color(Color::Named(NamedColor::Background)),
+            resolve_color(Color::Named(NamedColor::Background))
         );
     }
 
