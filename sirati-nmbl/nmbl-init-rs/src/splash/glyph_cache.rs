@@ -48,6 +48,16 @@ const BOX_DRAWING: &[char] = &[
     '\u{2593}', // ▓
 ];
 
+/// DejaVu Sans Mono, embedded into the binary as the always-available
+/// runtime fallback. Used by [`load_embedded_fallback`] when the
+/// configured font file is missing or fails to parse, so splash
+/// bring-up never fails purely because the operator's font is bad.
+///
+/// Licensing: DejaVu fonts are distributed under the permissive
+/// Bitstream Vera / DejaVu license, which allows redistribution and
+/// embedding. See `NOTICES` for the full text.
+const EMBEDDED_FALLBACK_FONT: &[u8] = include_bytes!("data/DejaVuSansMono.ttf");
+
 /// Owns the rasterized glyphs and the cell dimensions derived from
 /// the loaded font.
 pub struct GlyphCache {
@@ -151,16 +161,31 @@ fn synthesize_bold(regular: &GlyphBitmap) -> GlyphBitmap {
 /// Load `font_path` at `px` size, derive cell dimensions, and
 /// pre-rasterize the ASCII printable plus box-drawing subset.
 pub fn load(font_path: &Path, px: f32) -> Result<GlyphCache> {
+    let bytes = std::fs::read(font_path).map_err(|source| NmblError::Io {
+        source,
+        context: format!("reading font {}", font_path.display()),
+    })?;
+    load_from_bytes(&bytes, px)
+}
+
+/// Build a [`GlyphCache`] from the embedded DejaVu Sans Mono fallback
+/// at `px` size. Always available regardless of the on-disk font,
+/// letting splash bring-up recover from a missing or corrupt
+/// configured font instead of aborting to the serial/tty console.
+pub fn load_embedded_fallback(px: f32) -> Result<GlyphCache> {
+    load_from_bytes(EMBEDDED_FALLBACK_FONT, px)
+}
+
+/// Parse `bytes` as a font, derive cell dimensions, and pre-rasterize
+/// the ASCII printable plus box-drawing subset. Shared by [`load`]
+/// (on-disk path) and [`load_embedded_fallback`] (baked-in font) so
+/// both go through identical rasterisation.
+pub fn load_from_bytes(bytes: &[u8], px: f32) -> Result<GlyphCache> {
     if !(px.is_finite() && px > 0.0) {
         return Err(NmblError::Tui {
             source: std::io::Error::other(format!("invalid font size {px}")),
         });
     }
-
-    let bytes = std::fs::read(font_path).map_err(|source| NmblError::Io {
-        source,
-        context: format!("reading font {}", font_path.display()),
-    })?;
 
     let font = Font::from_bytes(bytes, FontSettings::default())
         .map_err(|e| fontdue_err("from_bytes", e))?;
@@ -308,6 +333,35 @@ mod tests {
         assert!(load(&path, 0.0).is_err());
         assert!(load(&path, -1.0).is_err());
         assert!(load(&path, f32::NAN).is_err());
+    }
+
+    #[test]
+    fn embedded_fallback_loads() {
+        // The baked-in DejaVu fallback must always parse and produce a
+        // usable cache, independent of any on-disk font or env var.
+        let cache = match load_embedded_fallback(16.0) {
+            Ok(c) => c,
+            Err(e) => panic!("load_embedded_fallback() failed: {e}"),
+        };
+
+        let size = cache.cell_size();
+        assert!(size.w > 0, "cell width must be positive");
+        assert!(size.h > 0, "cell height must be positive");
+
+        assert!(
+            matches!(cache.get('A', false), Some(g) if g.width > 0 && g.height > 0),
+            "regular 'A' glyph must be cached from the embedded font"
+        );
+        assert!(
+            cache.get('\u{2500}', false).is_some(),
+            "box-drawing glyph must be present in the embedded font"
+        );
+    }
+
+    #[test]
+    fn load_from_bytes_rejects_garbage() {
+        // A non-font byte string must fail to parse rather than panic.
+        assert!(load_from_bytes(b"not a font", 16.0).is_err());
     }
 
     #[test]

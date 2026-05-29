@@ -183,7 +183,23 @@ impl SplashConsole {
         };
 
         // 3. Load the font and derive grid dimensions from the cell size.
-        let cache = glyph_cache::load(&config.splash.font_path, SPLASH_FONT_PX)?;
+        //
+        //    Try the configured on-disk font first. On ANY load error
+        //    (missing file, unreadable, corrupt/unsupported face) WARN
+        //    and fall back to the DejaVu Sans Mono baked into the binary
+        //    so a bad operator font degrades gracefully instead of
+        //    dropping splash entirely. Mirrors how the sidecar
+        //    background falls back to a solid fill.
+        let cache = match glyph_cache::load(&config.splash.font_path, SPLASH_FONT_PX) {
+            Ok(cache) => cache,
+            Err(e) => {
+                nmbl_warn!(
+                    "splash: failed to load font {} ({e}); using embedded fallback",
+                    config.splash.font_path.display()
+                );
+                glyph_cache::load_embedded_fallback(SPLASH_FONT_PX)?
+            }
+        };
         let cell_size = cache.cell_size();
         let cell_w = cell_size.w.max(1);
         let cell_h = cell_size.h.max(1);

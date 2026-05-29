@@ -28,6 +28,60 @@ let
       }} -strip -define png:color-type=6 "$out"
     '';
 
+  # Default splash font: Adobe Source Code Pro (SIL OFL 1.1, freely
+  # redistributable). The upstream release tarball lays the faces out as
+  # `OTF/SourceCodePro-Regular.otf` at its root, which is exactly the
+  # `font.dir = "OTF"` / `font.variant = "SourceCodePro-Regular"`
+  # defaults below. The nixpkgs `source-code-pro` attr instead uses the
+  # XDG `share/fonts/opentype/...` layout, so we fetch the Adobe release
+  # directly to keep the out-of-the-box defaults resolvable.
+  sourceCodeProDefault = pkgs.fetchzip {
+    url = "https://github.com/adobe-fonts/source-code-pro/archive/refs/tags/2.042R-u/1.062R-i/1.026R-vf.tar.gz";
+    sha256 = "sha256-Pl7cuBFtbk9tPv421ejKnKFKdsW6oezMnAGCWKI3OVY=";
+  };
+
+  # Normalise a font.dir value: strip a leading `./` and any
+  # leading/trailing slashes so callers may write `OTF`, `./OTF`,
+  # `OTF/`, or `./OTF/` interchangeably.
+  normalizeFontDir = dir:
+    let
+      noDotSlash = lib.removePrefix "./" dir;
+      noLead = lib.removePrefix "/" noDotSlash;
+    in
+    lib.removeSuffix "/" noLead;
+
+  # Resolve `font.package`/`font.dir`/`font.variant` into the concrete
+  # `.otf` store path and VALIDATE at build time that it exists. The
+  # validator `test -f`s the resolved file; on failure it `ls`es the
+  # directory (or, if the dir itself is missing, the package root) so
+  # the build log lists the available options, then exits non-zero.
+  # Avoids import-from-derivation: the resolved font is emitted as the
+  # derivation's output so it can be embedded into the initramfs
+  # directly. Only OTF is supported, so `.otf` is implied.
+  resolveSplashFont = font:
+    let
+      dir = normalizeFontDir font.dir;
+      rel = "${dir}/${font.variant}.otf";
+    in
+    pkgs.runCommand "nmbl-splash-font.otf" { } ''
+      pkg=${font.package}
+      rel=${lib.escapeShellArg rel}
+      src="$pkg/$rel"
+      if [ ! -f "$src" ]; then
+        echo "nmbl splash font not found: $rel" >&2
+        echo "  resolved from package $pkg" >&2
+        if [ -d "$pkg/${lib.escapeShellArg dir}" ]; then
+          echo "  available faces in '${dir}':" >&2
+          ls -1 "$pkg/${lib.escapeShellArg dir}" >&2 || true
+        else
+          echo "  directory '${dir}' does not exist in the package; package root:" >&2
+          ls -1 "$pkg" >&2 || true
+        fi
+        exit 1
+      fi
+      cp "$src" "$out"
+    '';
+
   # Auto-detected NIC driver modules from hardware-configuration.nix.
   # Pure function over `lib` + `config`; consumed only when
   # `boot.nmbl.rescue.network = true`.
@@ -642,14 +696,72 @@ in
         '';
       };
 
-      fontPath = lib.mkOption {
+      # --- Splash font (structured: package + dir + variant) ----------
+      # The resolved face is `${font.package}/${font.dir}/${font.variant}.otf`
+      # (dir normalised, `.otf` implied — only OTF is supported). The
+      # resolved path is validated to EXIST at build time; a missing dir
+      # or variant fails the build with the available options listed in
+      # the build log. The validated face is embedded into the initramfs
+      # at `/etc/splash/font.ttf` (path name kept for back-compat; the
+      # Rust loader is format-agnostic and reads OTF fine).
+      font = {
+        package = lib.mkOption {
+          type = lib.types.package;
+          default = sourceCodeProDefault;
+          defaultText = lib.literalExpression "Adobe Source Code Pro release (OFL)";
+          description = lib.mdDoc ''
+            Nix package (derivation) containing the splash font files.
+            The face is resolved as
+            `''${font.package}/''${font.dir}/''${font.variant}.otf`.
+
+            The default is the Adobe Source Code Pro release, whose
+            tarball lays faces out as `OTF/SourceCodePro-Regular.otf` at
+            its root — matching the default `dir`/`variant`. Note the
+            nixpkgs `source-code-pro` attr uses a different
+            (`share/fonts/opentype/...`) layout, so if you point this at
+            a nixpkgs font package you must adjust `dir`/`variant`
+            accordingly.
+          '';
+        };
+
+        dir = lib.mkOption {
+          type = lib.types.str;
+          default = "OTF";
+          description = lib.mdDoc ''
+            Subdirectory within `font.package` that holds the OTF faces.
+            A leading `./` and/or surrounding slashes are normalised away,
+            so `OTF`, `./OTF`, `OTF/`, and `./OTF/` are all equivalent.
+          '';
+        };
+
+        variant = lib.mkOption {
+          type = lib.types.str;
+          default = "SourceCodePro-Regular";
+          description = lib.mdDoc ''
+            Face filename WITHOUT extension. Only OTF is supported, so the
+            trailing `.otf` is implied. Resolved as
+            `''${font.package}/''${font.dir}/''${font.variant}.otf`; if the
+            file does not exist the build fails and lists the available
+            faces in the build log.
+          '';
+        };
+      };
+
+      # Resolved + build-time-validated splash font face. Internal: it is
+      # derived from `font.*` by `resolveSplashFont` and consumed by
+      # `lib/config.nix` to embed the face into the initramfs at
+      # `/etc/splash/font.ttf`. Forcing this build also runs the
+      # existence validator (missing dir/variant fails with a listing).
+      resolvedFontPath = lib.mkOption {
         type = lib.types.path;
-        default = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf";
-        defaultText = lib.literalExpression
-          ''"''${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSansMono.ttf"'';
+        internal = true;
+        readOnly = true;
+        default = resolveSplashFont cfg.splash.font;
+        defaultText = lib.literalMD
+          "`font.package`/`font.dir`/`font.variant` resolved + validated to exist";
         description = lib.mdDoc ''
-          TrueType font (monospaced) used to rasterize the splash menu.
-          Embedded into the initramfs at `/etc/splash/font.ttf`.
+          The validated splash font face, embedded into the initramfs.
+          Computed from `boot.nmbl.splash.font.*`; not set directly.
         '';
       };
     };
