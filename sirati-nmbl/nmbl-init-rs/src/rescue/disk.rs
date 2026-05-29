@@ -17,11 +17,10 @@
 //!    tmpfs upper over it, and mount an `overlay` at `/rescue` so the
 //!    rescue root is writable (live-CD style — the squashfs itself
 //!    stays read-only, all writes land in the tmpfs upper).
-//! 6. `switch_root`: `chdir /rescue`, `mount --move . /`, `chroot .`,
-//!    `chdir /`. The initramfs rootfs pseudo-filesystem is not used as
-//!    the outgoing root, so this avoids `pivot_root(2)`'s EINVAL when
-//!    called from an initramfs where the current root is a rootfs.
-//! 7. `execve("/bin/sh", …)` with a minimal TERM+PATH environment.
+//! 6. Hand the writable `/rescue` overlay to
+//!    [`crate::rescue::child::run_external_rescue_child`], which forks a
+//!    chrooted child rooted at `/rescue` while NMBL stays PID 1 on the
+//!    initramfs rootfs.
 //!
 //! Every failure point is wrapped in [`NmblError::Rescue`] with a
 //! `stage` string the emergency-shell banner surfaces verbatim.
@@ -59,9 +58,9 @@ const RESCUE_WORK: &str = "/run/nmbl-rescue/rw/work";
 /// `/rescue`, returning the mount path. Caller is responsible for
 /// dropping the live boot console
 /// (so the backend's Drop impl restores VT text mode + termios) and
-/// then calling [`super::switch_root_and_exec`] with the returned
-/// path — splitting the steps this way keeps the no-return `execve`
-/// out of band from the (potentially-failing) mount work, so the
+/// then calling [`crate::rescue::child::run_external_rescue_child`] with
+/// the returned path — splitting the steps this way keeps the fork +
+/// chroot out of band from the (potentially-failing) mount work, so the
 /// dispatcher can fall through to network-rescue without losing the
 /// console.
 ///

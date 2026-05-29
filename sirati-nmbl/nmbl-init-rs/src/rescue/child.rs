@@ -1,10 +1,8 @@
 //! Chrooted external-rescue child runner (Phase 4b).
 //!
-//! Replaces the old `switch_root_and_exec` handoff for the EXTERNAL
-//! full-system squashfs path. Instead of `MS_MOVE`+`chroot`+`execve`
-//! detaching the initramfs root and replacing PID 1, NMBL stays PID 1
-//! on the initramfs rootfs and runs the rescue system as a **chrooted
-//! child**:
+//! Runs the EXTERNAL full-system squashfs path. Rather than detaching
+//! the initramfs root and replacing PID 1, NMBL stays PID 1 on the
+//! initramfs rootfs and runs the rescue system as a **chrooted child**:
 //!
 //! 1. Pre-fork (PID 1, safe nix wrappers): create the chroot's
 //!    `/nmbl-root` + `/mnt` and PID 1's own `/mnt`, set up a shared
@@ -316,7 +314,14 @@ pub async fn run_external_rescue_child(
     // Build the exec strings + set up the binds in the PARENT, before
     // fork (fork-safety: all allocation happens here).
     let exec = ChildExec::build(entrypoint)?;
-    apply_mount_plan()?;
+    // If the mount plan fails partway, tear down whatever it already set
+    // up before propagating: the network path can loop back and retry,
+    // and re-running bind/make-shared/rbind over surviving mounts would
+    // stack duplicates. teardown_mounts is idempotent (lazy MNT_DETACH).
+    if let Err(e) = apply_mount_plan() {
+        teardown_mounts();
+        return Err(e);
+    }
 
     let pid = match fork_rescue_child(&exec) {
         Ok(pid) => pid,
