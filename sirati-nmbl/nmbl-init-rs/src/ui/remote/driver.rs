@@ -23,6 +23,19 @@ use super::{ActionSink, Shutdown, handle_connection};
 /// heterogeneous set can live in one `Vec` and be polled by reference.
 type Session<'a> = Pin<Box<dyn Future<Output = ()> + 'a>>;
 
+/// Outcome of one combined poll of `accept` + all live sessions.
+enum Turn {
+    /// `accept` produced a new connection to serve.
+    Accepted(tokio::net::UnixStream),
+    /// `accept` errored persistently (e.g. `EMFILE` fd exhaustion, which
+    /// does NOT clear by re-polling). Stop accepting entirely so we never
+    /// busy-spin the single recovery thread re-polling a dead listener.
+    AcceptDead,
+    /// Nothing accepted this turn, but the outer loop should re-evaluate
+    /// (shutdown flipped or a session finished).
+    Progressed,
+}
+
 /// Accept connections and drive their sessions concurrently until
 /// `shutdown` is signalled and all in-flight sessions have finished (or
 /// the caller drops us, which drops every session → EOFs the clients).
@@ -51,34 +64,47 @@ pub(super) async fn accept_loop(
             return;
         }
 
-        // One combined poll of accept + all sessions. Returns the
-        // accepted stream (if any) and whether to re-check shutdown.
-        let accepted = drive_once(listener, shutdown, &mut sessions).await;
-
-        if let Some(stream) = accepted {
-            // New authenticated-or-not connection: push its session.
-            // `handle_connection` does the peercred/handshake itself and
-            // is a no-op for rejected peers, so pushing unconditionally
-            // is correct and keeps `accept` non-blocking.
-            sessions.push(Box::pin(handle_connection(stream, config, shutdown, sink)));
+        // One combined poll of accept + all sessions.
+        match drive_once(listener, shutdown, &mut sessions).await {
+            Turn::Accepted(stream) => {
+                // New authenticated-or-not connection: push its session.
+                // `handle_connection` does the peercred/handshake itself
+                // and is a no-op for rejected peers, so pushing
+                // unconditionally is correct and keeps `accept`
+                // non-blocking.
+                sessions.push(Box::pin(handle_connection(stream, config, shutdown, sink)));
+            }
+            // The listener is wedged (e.g. fd exhaustion). Re-polling it
+            // would spin at 100% CPU and flood the log, so stop accepting
+            // for the rest of this recovery — mirroring the
+            // `bind_listener`-failure fallback. Returning drops any
+            // in-flight sessions (clients EOF), exactly like shutdown.
+            Turn::AcceptDead => return,
+            // Shutdown flipped or a session finished: loop re-evaluates.
+            Turn::Progressed => {}
         }
     }
 }
 
 /// Poll `accept` and every live session exactly once (cooperatively),
-/// then yield. Removes any session that completed this turn. Returns the
-/// newly-accepted `UnixStream` if `accept` was ready, else `None`.
+/// then yield. Removes any session that completed this turn. Returns a
+/// [`Turn`] describing what (if anything) is ready.
 ///
-/// We resolve as soon as EITHER `accept` is ready OR at least one session
-/// made terminal progress OR shutdown flips — so the outer loop can react
-/// promptly. If nothing is ready we stay `Pending` (parked by tokio's
-/// reactor/timer via the polled sub-futures).
+/// We resolve as soon as EITHER `accept` is ready (or errors) OR at least
+/// one session made terminal progress OR shutdown flips — so the outer
+/// loop can react promptly. If nothing is ready we stay `Pending` (parked
+/// by tokio's reactor/timer via the polled sub-futures).
 async fn drive_once(
     listener: &UnixListener,
     shutdown: &Shutdown,
     sessions: &mut Vec<Session<'_>>,
-) -> Option<tokio::net::UnixStream> {
+) -> Turn {
     poll_fn(|cx| {
+        // Park on shutdown so a later `signal()` wakes us even when no
+        // session or `accept` is ready — without this the `Pending`
+        // branch below could sleep through a shutdown request.
+        shutdown.register(cx);
+
         // Reap finished sessions; track whether any completed this poll.
         let mut progressed = false;
         let mut i = 0;
@@ -97,12 +123,14 @@ async fn drive_once(
 
         // Poll accept. A ready connection resolves the combined future.
         match listener.poll_accept(cx) {
-            Poll::Ready(Ok((stream, _addr))) => return Poll::Ready(Some(stream)),
+            Poll::Ready(Ok((stream, _addr))) => return Poll::Ready(Turn::Accepted(stream)),
             Poll::Ready(Err(e)) => {
-                nmbl_warn!("remote-tui: accept failed: {e}");
-                // Treat as progress so the outer loop re-evaluates rather
-                // than wedging on a persistently-erroring listener.
-                return Poll::Ready(None);
+                // A `poll_accept` error here is typically persistent (fd
+                // exhaustion / `EMFILE` does not clear on re-poll). Log
+                // ONCE and tell the outer loop to stop accepting, instead
+                // of re-polling immediately and spinning the thread.
+                nmbl_warn!("remote-tui: accept failed: {e}; remote attach disabled");
+                return Poll::Ready(Turn::AcceptDead);
             }
             Poll::Pending => {}
         }
@@ -110,7 +138,7 @@ async fn drive_once(
         // Shutdown requested, or a session finished: let the outer loop
         // re-evaluate its exit condition / sink.
         if shutdown.is_signalled() || progressed {
-            return Poll::Ready(None);
+            return Poll::Ready(Turn::Progressed);
         }
         Poll::Pending
     })
