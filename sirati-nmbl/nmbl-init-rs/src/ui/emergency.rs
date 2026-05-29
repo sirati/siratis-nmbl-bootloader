@@ -292,7 +292,10 @@ where
                 dirty = true;
                 continue;
             }
-            None => {}
+            // The emergency menu has no scrollback, and a wheel notch is
+            // not a keypress, so it must NOT cancel the auto-reboot
+            // countdown — treat it as idle.
+            Some(ConsoleEvent::Scroll { .. }) | None => {}
         }
 
         // No input this slice. Tick the displayed countdown if the
