@@ -42,9 +42,7 @@ pub fn wait_for(
     progress: Option<&mut dyn ProgressSink>,
 ) -> Result<()> {
     let start = Instant::now();
-    let deadline = start
-        .checked_add(timeout)
-        .unwrap_or_else(Instant::now);
+    let deadline = start.checked_add(timeout).unwrap_or_else(Instant::now);
 
     let mut progress = progress;
 

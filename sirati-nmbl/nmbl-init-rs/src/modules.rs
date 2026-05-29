@@ -142,8 +142,7 @@ fn load_modules_inner(
     // request for `dm_crypt` (or vice versa) match consistently.
     let blacklist_canonical: HashSet<String> =
         blacklist.iter().map(|b| canonical_module_name(b)).collect();
-    let blacklist: HashSet<&str> =
-        blacklist_canonical.iter().map(String::as_str).collect();
+    let blacklist: HashSet<&str> = blacklist_canonical.iter().map(String::as_str).collect();
 
     let mut loaded: usize = 0;
     for name in explicit {
@@ -167,10 +166,7 @@ fn load_modules_inner(
         // a downstream phase genuinely needs the module the kernel will
         // surface that with a clearer failure.
         if !by_name.contains_key(canonical.as_str()) {
-            nmbl_verbose!(
-                "module {} not in modules tree; assuming built-in",
-                name
-            );
+            nmbl_verbose!("module {} not in modules tree; assuming built-in", name);
             continue;
         }
         let order = module::resolve_load_order(name, &by_name)?;
@@ -311,8 +307,7 @@ mod tests {
         // the dispatcher. Mirrors the production split: phase 2a loads
         // virtio_gpu/virtio_pci; phase 2b loads ext4/nvme.
         let mut config = Config::recovery_default();
-        config.kernel_modules.early =
-            vec!["virtio_pci".to_owned(), "virtio_gpu".to_owned()];
+        config.kernel_modules.early = vec!["virtio_pci".to_owned(), "virtio_gpu".to_owned()];
         config.kernel_modules.explicit = vec!["ext4".to_owned(), "nvme".to_owned()];
 
         let early = ModuleSet::Early.module_list(&config);

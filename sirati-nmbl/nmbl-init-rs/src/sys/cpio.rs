@@ -179,12 +179,15 @@ mod tests {
             content: b"hunter2",
         }];
         let fragment = build_fragment(&entries);
-        assert!(fragment.starts_with(b"070701"), "must start with newc magic");
+        assert!(
+            fragment.starts_with(b"070701"),
+            "must start with newc magic"
+        );
         // The TRAILER entry sits near the end; its name is "TRAILER!!!".
         let needle = b"TRAILER!!!";
-        let found = (0..fragment.len()).rev().any(|i| {
-            fragment.get(i..i.saturating_add(needle.len())) == Some(needle)
-        });
+        let found = (0..fragment.len())
+            .rev()
+            .any(|i| fragment.get(i..i.saturating_add(needle.len())) == Some(needle));
         assert!(found, "fragment must contain TRAILER!!! marker");
     }
 

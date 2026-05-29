@@ -192,7 +192,10 @@ fn run_loop_with_modal(
     targets: &[(PathBuf, OwnedFd)],
     console: &mut dyn Console,
 ) -> Result<()> {
-    let modal_targets: Vec<String> = targets.iter().map(|(p, _)| p.display().to_string()).collect();
+    let modal_targets: Vec<String> = targets
+        .iter()
+        .map(|(p, _)| p.display().to_string())
+        .collect();
     let banner = format!(
         "Shell running on:\n  {}\nType into those consoles. Press Esc to stop the shell.",
         modal_targets.join("\n  ")
@@ -220,9 +223,7 @@ fn run_loop_with_modal(
         }
 
         // 3. Has the shell exited?
-        if !child_exited
-            && let Ok(Some(_)) = child.try_wait()
-        {
+        if !child_exited && let Ok(Some(_)) = child.try_wait() {
             child_exited = true;
         }
         if child_exited {
@@ -243,11 +244,7 @@ fn run_loop_with_modal(
 /// The optional second argument is reserved for future cancellation
 /// channels (e.g. an operator-side abort token). Today the loop only
 /// ends on shell exit.
-fn run_loop(
-    child: PtyChild,
-    targets: &[(PathBuf, OwnedFd)],
-    _abort: Option<()>,
-) -> Result<()> {
+fn run_loop(child: PtyChild, targets: &[(PathBuf, OwnedFd)], _abort: Option<()>) -> Result<()> {
     loop {
         let _ = run_loop_slice(&child, targets);
         if let Ok(Some(_)) = child.try_wait() {
@@ -364,10 +361,7 @@ fn fan_in_target_to_master(child: &PtyChild, path: &Path, fd: BorrowedFd<'_>) {
             }
             Err(rustix::io::Errno::AGAIN) => return,
             Err(e) => {
-                nmbl_warn!(
-                    "console_relay: target {} read failed: {e}",
-                    path.display()
-                );
+                nmbl_warn!("console_relay: target {} read failed: {e}", path.display());
                 return;
             }
         }
