@@ -390,7 +390,14 @@ mod tests {
             }
             Ok(())
         }
-        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+        fn poll_event<'a>(
+            &'a mut self,
+            timeout: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>>
+        {
+            Box::pin(async move { self.poll_event_blocking(timeout) })
+        }
+        fn poll_event_blocking(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
             let v = self.scripted_keys.get(self.key_cursor).copied().flatten();
             self.key_cursor = self.key_cursor.saturating_add(1);
             Ok(v.map(ConsoleEvent::Key))

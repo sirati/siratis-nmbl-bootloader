@@ -35,7 +35,7 @@ use crate::ui::console::Console;
 /// `Ctrl+\\` (the SIGQUIT key) as a backup escape in case a particular
 /// VNC client mangles `^C` — same reasoning as why the loop avoids
 /// using Esc.
-pub fn run_key_echo_loop(console: &mut dyn Console) -> Result<()> {
+pub async fn run_key_echo_loop(console: &mut dyn Console) -> Result<()> {
     let mut app = App::key_echo();
 
     // Paint the empty screen once so the operator immediately sees the
@@ -44,7 +44,13 @@ pub fn run_key_echo_loop(console: &mut dyn Console) -> Result<()> {
     console.render(&app)?;
 
     loop {
-        let maybe = console.poll_key(POLL_SLICE)?;
+        // Await a key via the async `poll_event`; drop resize events
+        // (the key-echo screen has a fixed two-panel layout and only
+        // displays keys), matching the prior `poll_key` semantics.
+        let maybe = match console.poll_event(POLL_SLICE).await? {
+            Some(crate::ui::console::ConsoleEvent::Key(k)) => Some(k),
+            Some(crate::ui::console::ConsoleEvent::Resize { .. }) | None => None,
+        };
         let Some(key) = maybe else {
             continue;
         };

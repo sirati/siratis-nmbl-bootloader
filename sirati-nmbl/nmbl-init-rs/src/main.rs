@@ -306,7 +306,7 @@ fn run_phase_2a(config: &Config, reporter: &mut BootReporter<'_, '_>) -> Result<
 /// Returns the LUKS-passphrase injections that the kexec phase must
 /// thread into the chained initrd (one per `luks-password` activation
 /// whose TOML sets `pass_to_stage1`; empty when none opted in).
-fn run_phases_post_console(
+async fn run_phases_post_console(
     config: &Config,
     console: &mut dyn Console,
     session: &SessionInteraction,
@@ -329,7 +329,7 @@ fn run_phases_post_console(
 
     nmbl_info!("phase 3: storage activations");
     let mut supplier = TuiPasswordSupplier::new(config, session);
-    let injections = run_all_activations(config, &mut reporter, Some(&mut supplier))?;
+    let injections = run_all_activations(config, &mut reporter, Some(&mut supplier)).await?;
 
     nmbl_info!("phase 3b: mount system filesystems");
     mount_system_filesystems(config, &mut reporter)?;
@@ -490,7 +490,7 @@ fn mount_state_twin(config: &mut Config, bootstrap_path: &Path) -> Result<()> {
 /// directory. The reporter is dropped before phase 5 so the bare
 /// console can be handed to `run_selector`, which swaps the App over
 /// to the boot-menu screen on top of the same backend.
-fn select_and_act(
+async fn select_and_act(
     config: &Config,
     console: &mut dyn Console,
     key_injections: &[KeyInjection],
@@ -510,11 +510,11 @@ fn select_and_act(
     // other case (no feature, no opt-in, missing/unsupported state.bin,
     // IO failure) the call collapses to the legacy `run_selector` path.
     #[cfg(feature = "stateful")]
-    let decision = select_with_stateful(config, &generations, console, session)?;
+    let decision = select_with_stateful(config, &generations, console, session).await?;
     #[cfg(not(feature = "stateful"))]
     let decision = {
         nmbl_info!("phase 5: TUI generation selector");
-        run_selector(config, &generations, console, session)?
+        run_selector(config, &generations, console, session).await?
     };
 
     match decision {
@@ -561,7 +561,7 @@ fn select_and_act(
 ///     `run_inner`'s existing error arm routes through the emergency
 ///     screen.
 #[cfg(feature = "stateful")]
-fn select_with_stateful(
+async fn select_with_stateful(
     config: &Config,
     generations: &[Generation],
     console: &mut dyn Console,
@@ -573,7 +573,7 @@ fn select_with_stateful(
         config.runtime_state_mountpoint.as_deref(),
     ) else {
         nmbl_info!("phase 5: TUI generation selector");
-        return run_selector(config, generations, console, session);
+        return run_selector(config, generations, console, session).await;
     };
 
     let state_path = state_mp.join("nmbl").join("state.bin");
@@ -589,7 +589,7 @@ fn select_with_stateful(
                 state_path.display(),
             );
             nmbl_info!("phase 5: TUI generation selector");
-            return run_selector(config, generations, console, session);
+            return run_selector(config, generations, console, session).await;
         }
         Err(err) => {
             // IO error other than NotFound (which `read` already maps to
@@ -602,7 +602,7 @@ fn select_with_stateful(
                 state_path.display(),
             );
             nmbl_info!("phase 5: TUI generation selector");
-            return run_selector(config, generations, console, session);
+            return run_selector(config, generations, console, session).await;
         }
     };
 
@@ -617,7 +617,7 @@ fn select_with_stateful(
                 "phase 5: TUI generation selector (stateful: honour operator choice, recovery_attempt={})",
                 state.recovery_attempt,
             );
-            let decision = run_selector(config, generations, console, session)?;
+            let decision = run_selector(config, generations, console, session).await?;
             if let Decision::Boot {
                 generation_index,
                 cmdline_override: _,
@@ -1169,25 +1169,35 @@ fn run_inner(
     // boots (cmdline tokens are operator-set, not config-set).
     if cmdline_has_key_echo_flag() {
         nmbl_info!("nmbl.key_echo=1 in cmdline: entering key-echo diagnostic screen");
-        if let Err(e) = run_key_echo_loop(&mut *console) {
-            nmbl_warn!(
-                "key-echo loop error: {}",
-                format_chain(&e as &dyn std::error::Error)
-            );
-        }
         let err = NmblError::Io {
             source: std::io::Error::other("key-echo diagnostic mode terminated"),
             context: "key-echo".to_string(),
         };
-        // Hand the live console down to drop_to_emergency so the
-        // emergency UI paints through the same backend. The key-echo
-        // diagnostic owns its own App, so a fresh session is correct.
-        return Ok(drop_to_emergency(
-            console,
-            &config,
-            err,
-            &SessionInteraction::new(),
-        ));
+        // Cross into the async interactive phase: one LocalRuntime drives
+        // both the key-echo loop and the follow-on emergency session.
+        // The key-echo diagnostic owns its own App, so a fresh session is
+        // correct. A runtime-build failure routes to a plain Reboot.
+        let action = nmbl_init::ui::block_on_tui(async {
+            if let Err(e) = run_key_echo_loop(&mut *console).await {
+                nmbl_warn!(
+                    "key-echo loop error: {}",
+                    format_chain(&e as &dyn std::error::Error)
+                );
+            }
+            // Hand the live console down to drop_to_emergency so the
+            // emergency UI paints through the same backend.
+            drop_to_emergency(console, &config, err, &SessionInteraction::new()).await
+        });
+        return match action {
+            Ok(a) => Ok(a),
+            Err(rt_err) => {
+                nmbl_warn!(
+                    "key-echo runtime build failed: {}",
+                    format_chain(&rt_err as &dyn std::error::Error)
+                );
+                Ok(TerminalAction::Reboot)
+            }
+        };
     }
 
     // One interaction latch for the whole boot session: a keypress on
@@ -1196,38 +1206,73 @@ fn run_inner(
     // countdown. The same handle reaches all three Apps.
     let session = SessionInteraction::new();
 
-    match run_phases_post_console(&config, &mut *console, &session)
-        .and_then(|injections| select_and_act(&config, &mut *console, &injections, &session))
-    {
+    // Interactive phase: ONE LocalRuntime (with the reserve poller
+    // spawned) drives ALL the async TUI work — the post-console phases'
+    // passphrase prompt / wrong-password modal (phase 2b/3/3b), the
+    // selector (phase 4/5), and, on failure, the re-entrant emergency
+    // session. That is the keystone `run_tui_session` future. A
+    // runtime-build failure routes to a plain Reboot (the console Drop
+    // still restores the VT on the way out).
+    match nmbl_init::ui::block_on_tui(run_tui_session(&config, console, &session)) {
+        Ok(action) => Ok(action),
+        Err(rt_err) => {
+            nmbl_warn!(
+                "interactive runtime build failed: {}",
+                format_chain(&rt_err as &dyn std::error::Error)
+            );
+            Ok(TerminalAction::Reboot)
+        }
+    }
+}
+
+/// Keystone: a single self-contained async fn that IS one local
+/// interactive TUI session. It owns the console for its lifetime, runs
+/// the post-console phases (2b modules, 3 activations + passphrase
+/// prompt, 3b mount), the generation selector (phase 4/5), and on any
+/// failure drives the re-entrant emergency session through the same
+/// backend. It holds no globals and takes all state by parameter, so a
+/// later phase can `spawn_local` the same shape per connection. It is
+/// `block_on`'d once for the local console here.
+async fn run_tui_session(
+    config: &Config,
+    console: Box<dyn Console>,
+    session: &SessionInteraction,
+) -> TerminalAction {
+    let mut console = console;
+    // Phases 2b/3/3b run here too: their syscalls (modules, cryptsetup,
+    // mount) are plain synchronous calls inside this async fn, and the
+    // passphrase prompt / wrong-password modal `.await` the same
+    // console — no nested runtime anywhere.
+    let outcome = match run_phases_post_console(config, &mut *console, session).await {
+        Ok(injections) => select_and_act(config, &mut *console, &injections, session).await,
+        Err(err) => Err(err),
+    };
+    match outcome {
         Ok(action) => {
-            // `console` falls out of scope on this return, running
+            // `console` falls out of scope on return, running
             // SplashConsole/TtyConsole Drop (KD_TEXT restore, termios
             // reset) before the no-return syscall fires in main.
-            let _ = console;
-            Ok(action)
+            action
         }
         // Wrong-password modal Reboot path: the operator already picked
         // [Reboot]; routing through the emergency menu would just ask
-        // them again. Short-circuit straight to the dispatcher's reboot
-        // syscall, dropping `console` along the way so its Drop restores
-        // the VT before reboot(2) fires.
+        // them again. Short-circuit straight to Reboot, dropping
+        // `console` so its Drop restores the VT before reboot(2) fires.
         Err(NmblError::OperatorChoseReboot { .. }) => {
-            let _ = console;
-            Ok(TerminalAction::Reboot)
+            drop(console);
+            TerminalAction::Reboot
         }
         Err(err) => {
-            // Hand the live boot console down to the emergency screen
-            // so the operator keeps the same backend (splash or tty)
-            // they saw during phase progress — no DRM/tty re-grab, no
-            // flicker. drop_to_emergency itself drops the console
-            // before returning, by way of normal scope exit.
+            // Hand the live boot console down to the emergency screen so
+            // the operator keeps the same backend (splash or tty) they
+            // saw during phase progress — no DRM/tty re-grab, no flicker.
             //
             // `NmblError::WrongPasswordShellExited` deliberately falls
-            // through this arm so the standard emergency menu surfaces
-            // — its [Retry boot from config] re-runs phase 3 and re-
-            // prompts for the passphrase, which is exactly what the
-            // operator wants after a shell detour.
-            Ok(drop_to_emergency(console, &config, err, &session))
+            // through this arm so the standard emergency menu surfaces —
+            // its [Retry boot from config] re-runs phase 3 and re-prompts
+            // for the passphrase, which is what the operator wants after
+            // a shell detour.
+            drop_to_emergency(console, config, err, session).await
         }
     }
 }

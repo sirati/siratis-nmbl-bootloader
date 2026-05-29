@@ -305,7 +305,14 @@ mod tests {
         fn render(&mut self, _app: &App<'_>) -> Result<()> {
             Ok(())
         }
-        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+        fn poll_event<'a>(
+            &'a mut self,
+            timeout: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>>
+        {
+            Box::pin(async move { self.poll_event_blocking(timeout) })
+        }
+        fn poll_event_blocking(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
             Ok(None)
         }
         fn size(&self) -> (u16, u16) {

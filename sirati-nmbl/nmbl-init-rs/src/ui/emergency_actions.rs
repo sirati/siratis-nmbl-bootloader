@@ -64,7 +64,7 @@ use crate::ui::{
 /// modal and routed back to the emergency picker; they can fall back
 /// to `Verify kexec readiness` if every activation has already
 /// completed and they only need the selector.
-pub fn retry_boot(
+pub async fn retry_boot(
     config: &Config,
     console: &mut dyn Console,
     app: &mut App<'static>,
@@ -78,7 +78,7 @@ pub fn retry_boot(
     let injections = {
         let mut reporter =
             BootReporter::overlay(console, app, "phase 3: storage activations (retry)");
-        run_all_activations(config, &mut reporter, Some(supplier))?
+        run_all_activations(config, &mut reporter, Some(supplier)).await?
     };
 
     // Phase 3b: mount system filesystems.
@@ -88,7 +88,7 @@ pub fn retry_boot(
         mount_system_filesystems(config, &mut reporter)?;
     }
 
-    run_selector_and_dispatch(config, console, app, &injections)
+    run_selector_and_dispatch(config, console, app, &injections).await
 }
 
 /// Skip phases 3 and 3b — trust the operator's manual mount — and run
@@ -110,7 +110,7 @@ pub fn retry_boot(
 /// `Ok(None)` means the operator declined to commit; `Err` means
 /// scanning the profile directory failed (no generations / IO error)
 /// and the caller's modal-error path should fire.
-pub fn verify_kexec_readiness(
+pub async fn verify_kexec_readiness(
     config: &Config,
     console: &mut dyn Console,
     app: &mut App<'static>,
@@ -137,12 +137,13 @@ pub fn verify_kexec_readiness(
         "Yes",
         "Back",
         true,
-    )?;
+    )
+    .await?;
     match outcome {
         ConfirmOutcome::Yes => {
             // No passphrase injection: the operator skipped phase 3.
             let injections: Vec<KeyInjection> = Vec::new();
-            let decision = run_selector(config, &generations, console, &app.interaction)?;
+            let decision = run_selector(config, &generations, console, &app.interaction).await?;
             Ok(Some(decision_to_action(
                 config,
                 &generations,
@@ -157,7 +158,7 @@ pub fn verify_kexec_readiness(
 /// Drive the selector and translate its [`Decision`] into a
 /// [`TerminalAction`]. Shared by [`retry_boot`] (and could be used by
 /// `verify_kexec_readiness` if we hoist the empty-injection case).
-fn run_selector_and_dispatch(
+async fn run_selector_and_dispatch(
     config: &Config,
     console: &mut dyn Console,
     app: &mut App<'static>,
@@ -167,7 +168,7 @@ fn run_selector_and_dispatch(
         let mut reporter = BootReporter::overlay(console, app, "phase 4: scan generations (retry)");
         scan_generations(config, &mut reporter)?
     };
-    let decision = run_selector(config, &generations, console, &app.interaction)?;
+    let decision = run_selector(config, &generations, console, &app.interaction).await?;
     decision_to_action(config, &generations, injections, decision)
 }
 
@@ -218,14 +219,14 @@ fn decision_to_action(
 /// presses any key (or 10 s elapse). Errors from the modal itself
 /// are swallowed — by the time we're showing a modal error the
 /// console is already in a degraded state.
-pub fn surface_action_failure(
+pub async fn surface_action_failure(
     console: &mut dyn Console,
     app: &mut App<'static>,
     title: &str,
     err: &NmblError,
 ) {
     let chain = format_chain(err as &dyn std::error::Error);
-    let _ = show_modal_error_over(console, app, title, &chain, Duration::from_secs(10));
+    let _ = show_modal_error_over(console, app, title, &chain, Duration::from_secs(10)).await;
 }
 
 #[cfg(test)]

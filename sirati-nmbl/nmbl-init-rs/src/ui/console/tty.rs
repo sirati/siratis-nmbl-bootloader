@@ -41,8 +41,10 @@
 //! See `src/ui/console/parser.rs` for the byte-level state machine.
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
+use std::pin::Pin;
 use std::time::Duration;
 
 use crossterm::event::KeyEvent;
@@ -287,7 +289,29 @@ impl Console for TtyConsole {
             .map_err(tui_err)
     }
 
-    fn poll_event(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>> {
+    fn poll_event<'a>(
+        &'a mut self,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ConsoleEvent>>> + 'a>> {
+        Box::pin(async move {
+            // A key already classified from a previous cycle is ready
+            // now — no need to touch the fd / reactor.
+            if self.pending_keys.front().is_some() {
+                return self.poll_event_blocking(Duration::from_millis(0));
+            }
+            // Await readability (or the slice deadline) on the console
+            // fd through tokio's reactor instead of a blocking poll(2),
+            // then run the identical synchronous drain. The blocking
+            // path's internal 100ms cap is harmless after we've already
+            // waited: a ready fd reads immediately, a timeout drains
+            // nothing. No borrow is held across the `.await`.
+            let slice = timeout.min(POLL_SLICE);
+            super::await_fd_readable(self.fd.as_fd(), slice).await?;
+            self.poll_event_blocking(Duration::from_millis(0))
+        })
+    }
+
+    fn poll_event_blocking(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>> {
         // First: drain any keys already classified from a previous
         // poll cycle without going to the fd again.
         if let Some(k) = self.pending_keys.pop_front() {

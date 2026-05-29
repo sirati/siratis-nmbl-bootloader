@@ -64,13 +64,13 @@ const EMERGENCY_TIMEOUT: Duration = Duration::from_secs(30);
 /// starts fresh on every call. Production code uses
 /// [`run_emergency_screen_with_app`] instead so re-entries don't
 /// restart the timer.
-pub fn run_emergency_screen(console: &mut dyn Console, err: &NmblError) -> EmergencyChoice {
+pub async fn run_emergency_screen(console: &mut dyn Console, err: &NmblError) -> EmergencyChoice {
     let message = build_message(err);
     let items = default_items();
     // Convenience wrapper: no prior session to inherit, so start fresh.
     let session = SessionInteraction::new();
     let mut app = build_emergency_app(&message, &items, &session);
-    run_emergency_screen_with_app(console, &mut app)
+    run_emergency_screen_with_app(console, &mut app).await
 }
 
 /// Same as [`run_emergency_screen`] but reuses an externally-owned
@@ -85,7 +85,7 @@ pub fn run_emergency_screen(console: &mut dyn Console, err: &NmblError) -> Emerg
 /// latches the deadline at `now + 30s`; on re-entry the existing
 /// deadline is preserved. If the deadline has already elapsed on
 /// re-entry the loop reboots immediately.
-pub fn run_emergency_screen_with_app(
+pub async fn run_emergency_screen_with_app(
     console: &mut dyn Console,
     app: &mut App<'_>,
 ) -> EmergencyChoice {
@@ -94,6 +94,7 @@ pub fn run_emergency_screen_with_app(
     // elapsed deadline trips the "remaining = None" branch inside the
     // loop and returns Reboot at once.
     drive_emergency_loop(app, EMERGENCY_TIMEOUT, Instant::now, console)
+        .await
         .unwrap_or(EmergencyChoice::Reboot)
 }
 
@@ -182,7 +183,7 @@ pub(crate) fn build_emergency_app<'a>(
 ///
 /// `now` is injected so tests can drive the timeout machinery without
 /// real wall-clock waits.
-fn drive_emergency_loop<N>(
+async fn drive_emergency_loop<N>(
     app: &mut App<'_>,
     timeout: Duration,
     now: N,
@@ -253,11 +254,23 @@ where
             None => POLL_SLICE,
         };
 
-        // Use `poll_event` (not `poll_key`) so a host-reported terminal
-        // resize repaints immediately, matching the passphrase modal and
-        // the tty picker. `poll_key` silently drops `Resize`, which left
-        // this dialog stale until the next keystroke.
-        match console.poll_event(slice)? {
+        // Race the input poll against the latched-deadline slice with a
+        // `tokio::select!`. The `slice` above is still derived from
+        // `app.error_countdown_deadline` (set only when the Phase-0
+        // `app.interaction.get()` gating left the boot unattended), so
+        // the gating is preserved verbatim: with no deadline armed the
+        // slice is the plain POLL_SLICE and the timer arm just re-ticks
+        // the loop. We use `poll_event` (not `poll_key`) so a
+        // host-reported resize repaints immediately. `biased` polls
+        // input first so a keypress that lands exactly on the slice
+        // boundary still cancels the countdown rather than racing the
+        // timer.
+        let event = tokio::select! {
+            biased;
+            ev = console.poll_event(slice) => ev?,
+            () = tokio::time::sleep(slice) => None,
+        };
+        match event {
             Some(ConsoleEvent::Resize { .. }) => {
                 // Geometry changed; the next iteration must repaint the
                 // whole frame against the new size.
@@ -323,6 +336,20 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    /// Drive an async future to completion on a throwaway current-thread
+    /// runtime so the synchronous unit tests can exercise the now-async
+    /// emergency loop. The scripted console resolves `poll_event`
+    /// instantly and the loop's `select!` is `biased` (input arm first),
+    /// so the timer-sleep arm never wins and no real wall-clock time
+    /// elapses — the tests stay fast and deterministic.
+    fn block<F: std::future::Future>(fut: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build_local(tokio::runtime::LocalOptions::default())
+            .expect("test runtime");
+        rt.block_on(fut)
+    }
+
     /// Build an emergency `App` on a fresh (un-interacted) session — the
     /// unattended-boot case where the countdown is expected to arm.
     fn fresh_emergency_app(message: &str) -> App<'static> {
@@ -354,7 +381,14 @@ mod tests {
             self.renders = self.renders.saturating_add(1);
             Ok(())
         }
-        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+        fn poll_event<'a>(
+            &'a mut self,
+            timeout: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>>
+        {
+            Box::pin(async move { self.poll_event_blocking(timeout) })
+        }
+        fn poll_event_blocking(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
             let v = self.events.get(self.cursor).copied().flatten();
             self.cursor = self.cursor.saturating_add(1);
             Ok(v.map(ConsoleEvent::Key))
@@ -408,8 +442,13 @@ mod tests {
         let mut app = fresh_emergency_app("boot failed");
         let mut console = TestConsole::new(vec![None; 16]);
 
-        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, fake_now, &mut console)
-            .expect("loop must not error on timeout path");
+        let outcome = block(drive_emergency_loop(
+            &mut app,
+            EMERGENCY_TIMEOUT,
+            fake_now,
+            &mut console,
+        ))
+        .expect("loop must not error on timeout path");
         assert_eq!(outcome, EmergencyChoice::Reboot);
         assert!(console.renders >= 1, "must render at least one frame");
     }
@@ -427,8 +466,13 @@ mod tests {
         let mut app = fresh_emergency_app("boot failed");
         let mut console = TestConsole::new(vec![Some(press(KeyCode::Char('s')))]);
 
-        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
-            .expect("loop must not error on the happy path");
+        let outcome = block(drive_emergency_loop(
+            &mut app,
+            EMERGENCY_TIMEOUT,
+            frozen_now,
+            &mut console,
+        ))
+        .expect("loop must not error on the happy path");
         assert_eq!(outcome, EmergencyChoice::RawShell);
     }
 
@@ -442,8 +486,13 @@ mod tests {
         let mut app = fresh_emergency_app("boot failed");
         let mut console = TestConsole::new(vec![Some(press(KeyCode::Char('r')))]);
 
-        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
-            .expect("loop must succeed");
+        let outcome = block(drive_emergency_loop(
+            &mut app,
+            EMERGENCY_TIMEOUT,
+            frozen_now,
+            &mut console,
+        ))
+        .expect("loop must succeed");
         assert_eq!(outcome, EmergencyChoice::Reboot);
         assert!(app.countdown_remaining_secs.is_none());
         assert!(
@@ -468,8 +517,13 @@ mod tests {
         // One render then commit Reboot so the loop exits cleanly.
         let mut console = TestConsole::new(vec![None, Some(press(KeyCode::Char('r')))]);
 
-        let _ = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
-            .expect("loop must succeed");
+        let _ = block(drive_emergency_loop(
+            &mut app,
+            EMERGENCY_TIMEOUT,
+            frozen_now,
+            &mut console,
+        ))
+        .expect("loop must succeed");
 
         assert!(
             app.error_countdown_deadline.is_none(),
@@ -495,9 +549,13 @@ mod tests {
             }
         };
         let mut console2 = TestConsole::new(vec![None]);
-        let outcome =
-            drive_emergency_loop(&mut app2, EMERGENCY_TIMEOUT, staggered_now, &mut console2)
-                .expect("loop must succeed");
+        let outcome = block(drive_emergency_loop(
+            &mut app2,
+            EMERGENCY_TIMEOUT,
+            staggered_now,
+            &mut console2,
+        ))
+        .expect("loop must succeed");
         assert_eq!(outcome, EmergencyChoice::Reboot);
         // Deadline was latched before the loop body ticked. It stays
         // Some(_) on the timeout path (no keypress cleared it).
@@ -543,7 +601,15 @@ mod tests {
                 self.renders = self.renders.saturating_add(1);
                 Ok(())
             }
-            fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+            fn poll_event<'a>(
+                &'a mut self,
+                timeout: Duration,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>,
+            > {
+                Box::pin(async move { self.poll_event_blocking(timeout) })
+            }
+            fn poll_event_blocking(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
                 // Capture happened during the single render before
                 // this first poll; commit Reboot now so the loop
                 // exits cleanly (with the frozen clock the countdown
@@ -573,8 +639,13 @@ mod tests {
             captured_secs: Cell::new(None),
         };
 
-        let _ = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
-            .expect("loop must succeed");
+        let _ = block(drive_emergency_loop(
+            &mut app,
+            EMERGENCY_TIMEOUT,
+            frozen_now,
+            &mut console,
+        ))
+        .expect("loop must succeed");
 
         assert_eq!(
             console.captured_deadline.get(),
@@ -604,8 +675,13 @@ mod tests {
         // on the early-return guard.
         let mut console = TestConsole::new(vec![]);
 
-        let outcome = drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, frozen_now, &mut console)
-            .expect("loop must succeed");
+        let outcome = block(drive_emergency_loop(
+            &mut app,
+            EMERGENCY_TIMEOUT,
+            frozen_now,
+            &mut console,
+        ))
+        .expect("loop must succeed");
         assert_eq!(outcome, EmergencyChoice::Reboot);
         // Deadline preserved (the keypress branch never fired).
         assert_eq!(app.error_countdown_deadline, Some(past));
@@ -645,9 +721,13 @@ mod tests {
             Some(press(KeyCode::Char('r'))),
         ]);
 
-        let outcome =
-            drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, staggered_now, &mut console)
-                .expect("loop must succeed");
+        let outcome = block(drive_emergency_loop(
+            &mut app,
+            EMERGENCY_TIMEOUT,
+            staggered_now,
+            &mut console,
+        ))
+        .expect("loop must succeed");
         // Outcome is Reboot only because we explicitly pressed 'r',
         // NOT because the timer fired. The deadline was disarmed by
         // the earlier Down keypress and never re-armed.
@@ -685,9 +765,13 @@ mod tests {
         // if a deadline were armed) then an explicit 'r' to exit.
         let mut console = TestConsole::new(vec![None, None, None, Some(press(KeyCode::Char('r')))]);
 
-        let outcome =
-            drive_emergency_loop(&mut app, EMERGENCY_TIMEOUT, staggered_now, &mut console)
-                .expect("loop must succeed");
+        let outcome = block(drive_emergency_loop(
+            &mut app,
+            EMERGENCY_TIMEOUT,
+            staggered_now,
+            &mut console,
+        ))
+        .expect("loop must succeed");
         assert_eq!(outcome, EmergencyChoice::Reboot);
         assert!(
             app.error_countdown_deadline.is_none(),
@@ -711,7 +795,15 @@ mod tests {
                     source: std::io::Error::other("backend dead"),
                 })
             }
-            fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+            fn poll_event<'a>(
+                &'a mut self,
+                timeout: Duration,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>,
+            > {
+                Box::pin(async move { self.poll_event_blocking(timeout) })
+            }
+            fn poll_event_blocking(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
                 Ok(None)
             }
             fn size(&self) -> (u16, u16) {
@@ -738,7 +830,7 @@ mod tests {
             context: "test".to_string(),
         };
         let mut console = BrokenConsole;
-        let choice = run_emergency_screen(&mut console, &err);
+        let choice = block(run_emergency_screen(&mut console, &err));
         assert_eq!(choice, EmergencyChoice::Reboot);
     }
 

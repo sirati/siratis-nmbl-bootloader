@@ -23,6 +23,8 @@
 //! and constructs a fresh `BootReporter` around it; the `NoopConsole`
 //! is dropped at that point.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use crate::error::Result;
@@ -67,7 +69,14 @@ impl Console for NoopConsole {
     /// No input source is wired up before the real console comes up.
     /// Any caller that tries to poll us gets an immediate `None` so
     /// blocking flows do not deadlock against the sentinel.
-    fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+    fn poll_event<'a>(
+        &'a mut self,
+        _timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<ConsoleEvent>>> + 'a>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn poll_event_blocking(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
         Ok(None)
     }
 

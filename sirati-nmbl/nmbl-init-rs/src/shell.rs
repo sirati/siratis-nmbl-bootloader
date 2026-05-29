@@ -92,7 +92,7 @@ use crate::ui::{
 /// [`TerminalAction`] that `main` fires after the stack has unwound.
 ///
 /// [`RawShell`]: EmergencyChoice::RawShell
-pub fn drop_to_emergency(
+pub async fn drop_to_emergency(
     console: Box<dyn Console>,
     config: &Config,
     err: NmblError,
@@ -143,7 +143,7 @@ pub fn drop_to_emergency(
         // cleared before re-entering the picker; otherwise a stale
         // overlay would obscure the menu.
         app.modal = None;
-        let choice = run_emergency_screen_with_app(&mut *console, &mut app);
+        let choice = run_emergency_screen_with_app(&mut *console, &mut app).await;
 
         match choice {
             EmergencyChoice::Reboot => {
@@ -151,7 +151,7 @@ pub fn drop_to_emergency(
                 return TerminalAction::Reboot;
             }
             EmergencyChoice::RawShell => {
-                match crate::ui::console_picker::run_picker_session(&mut *console, config) {
+                match crate::ui::console_picker::run_picker_session(&mut *console, config).await {
                     Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached {
                         targets,
                     }) => {
@@ -168,7 +168,8 @@ pub fn drop_to_emergency(
                             "Shell spawned",
                             &body,
                             std::time::Duration::from_secs(5),
-                        );
+                        )
+                        .await;
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -180,7 +181,8 @@ pub fn drop_to_emergency(
                             "Emergency shell failed",
                             &chain,
                             std::time::Duration::from_secs(10),
-                        );
+                        )
+                        .await;
                         update_latest_error(
                             &mut app,
                             &mut error_count,
@@ -195,7 +197,9 @@ pub fn drop_to_emergency(
             }
             #[cfg(feature = "pretty-shell")]
             EmergencyChoice::PrettyShell => {
-                if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(&mut *console, config) {
+                if let Err(e) =
+                    crate::ui::pretty_shell::run_pretty_shell(&mut *console, config).await
+                {
                     let chain = format_chain(&e as &dyn std::error::Error);
                     nmbl_warn!("pretty-shell session failed: {chain}");
                     let _ = crate::ui::show_modal_error_over(
@@ -204,7 +208,8 @@ pub fn drop_to_emergency(
                         "Pretty Shell failed to start",
                         &chain,
                         std::time::Duration::from_secs(10),
-                    );
+                    )
+                    .await;
                     update_latest_error(
                         &mut app,
                         &mut error_count,
@@ -216,7 +221,7 @@ pub fn drop_to_emergency(
             }
             EmergencyChoice::RetryBoot => {
                 let mut supplier = TuiPasswordSupplier::new(config, session);
-                match retry_boot(config, &mut *console, &mut app, &mut supplier) {
+                match retry_boot(config, &mut *console, &mut app, &mut supplier).await {
                     Ok(action) => return action,
                     Err(e) => {
                         nmbl_warn!(
@@ -224,7 +229,7 @@ pub fn drop_to_emergency(
                             format_chain(&e as &dyn std::error::Error)
                         );
                         let title = abort_aware_title(&e, "Retry boot failed");
-                        surface_action_failure(&mut *console, &mut app, title, &e);
+                        surface_action_failure(&mut *console, &mut app, title, &e).await;
                         update_latest_error(
                             &mut app,
                             &mut error_count,
@@ -236,7 +241,7 @@ pub fn drop_to_emergency(
                 }
             }
             EmergencyChoice::VerifyKexecReadiness => {
-                match verify_kexec_readiness(config, &mut *console, &mut app) {
+                match verify_kexec_readiness(config, &mut *console, &mut app).await {
                     Ok(Some(action)) => return action,
                     Ok(None) => continue,
                     Err(e) => {
@@ -245,7 +250,7 @@ pub fn drop_to_emergency(
                             format_chain(&e as &dyn std::error::Error)
                         );
                         let title = abort_aware_title(&e, "Kexec readiness check failed");
-                        surface_action_failure(&mut *console, &mut app, title, &e);
+                        surface_action_failure(&mut *console, &mut app, title, &e).await;
                         update_latest_error(
                             &mut app,
                             &mut error_count,
@@ -290,7 +295,21 @@ pub fn open_console_and_drop_to_emergency(config: &Config, err: NmblError) -> Te
     // keypress could have happened yet — a fresh latch is correct.
     let session = SessionInteraction::new();
     match open_console(config, true) {
-        Ok(c) => drop_to_emergency(c, config, err, &session),
+        // Cross into the async interactive phase: build the LocalRuntime,
+        // spawn the reserve poller, and block_on the emergency session.
+        // On a runtime-build failure fall back to Reboot (same safety
+        // default as a console bring-up failure below).
+        Ok(c) => match crate::ui::block_on_tui(drop_to_emergency(c, config, err, &session)) {
+            Ok(action) => action,
+            Err(rt_err) => {
+                nmbl_warn!(
+                    "emergency runtime build failed: {}; defaulting to reboot",
+                    format_chain(&rt_err as &dyn std::error::Error),
+                );
+                eprintln!("[nmbl] operator (or timeout) chose reboot");
+                TerminalAction::Reboot
+            }
+        },
         Err(open_err) => {
             nmbl_warn!(
                 "emergency console bring-up failed: {}; defaulting to reboot",
@@ -503,7 +522,14 @@ mod tests {
         fn render(&mut self, _app: &App<'_>) -> Result<()> {
             Ok(())
         }
-        fn poll_event(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+        fn poll_event<'a>(
+            &'a mut self,
+            timeout: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>>
+        {
+            Box::pin(async move { self.poll_event_blocking(timeout) })
+        }
+        fn poll_event_blocking(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
             let v = self.events.get(self.cursor).copied().flatten();
             self.cursor = self.cursor.saturating_add(1);
             Ok(v.map(ConsoleEvent::Key))
@@ -523,6 +549,17 @@ mod tests {
         fn resume(&mut self) -> Result<()> {
             Ok(())
         }
+    }
+
+    /// Drive an async future to completion on a throwaway current-thread
+    /// runtime so the synchronous shell tests can exercise the now-async
+    /// `drop_to_emergency`.
+    fn block<F: std::future::Future>(fut: F) -> F::Output {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build_local(tokio::runtime::LocalOptions::default())
+            .expect("test runtime");
+        rt.block_on(fut)
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -553,12 +590,12 @@ mod tests {
             Some(press(KeyCode::Char('r'))),
         ]));
 
-        let action = drop_to_emergency(
+        let action = block(drop_to_emergency(
             console,
             &config,
             io_err("synthetic boot failure"),
             &SessionInteraction::new(),
-        );
+        ));
         assert!(
             matches!(action, TerminalAction::Reboot),
             "Raw Shell choice must NOT produce a TerminalAction::Execve any more; \
@@ -577,12 +614,12 @@ mod tests {
         let console: Box<dyn Console> =
             Box::new(ScriptedConsole::new(vec![Some(press(KeyCode::Char('r')))]));
 
-        let action = drop_to_emergency(
+        let action = block(drop_to_emergency(
             console,
             &config,
             io_err("synthetic"),
             &SessionInteraction::new(),
-        );
+        ));
 
         match action {
             TerminalAction::Reboot => {}

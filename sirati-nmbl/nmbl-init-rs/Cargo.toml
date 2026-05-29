@@ -74,6 +74,10 @@ image-splash = ["dep:drm", "dep:png", "dep:fontdue", "pretty-shell", "rustix/eve
 # pane to exercise modal sizing/scrolling without a VM. Compiled out
 # of release builds — production initramfs MUST NOT carry this code.
 mocking = []
+# Opt-in socket TUI / chrooted rescue / remote log viewer. Phase 2/3
+# socket/client/remote code is gated behind this; empty for now (the
+# tokio runtime + async migration is the new base and is NOT gated).
+remote-tui = []
 
 [dependencies]
 nix = { version = "0.29", default-features = false, features = ["mount", "fs", "process", "term", "user", "signal", "reboot", "feature"] }
@@ -111,7 +115,13 @@ zeroize = { version = "1", features = ["derive"] }
 # rustix is already pulled in transitively via crossterm; promote it to an
 # explicit dependency so its safe wrappers for open(2) / termios are visible
 # at the manifest level.
-rustix = { version = "0.38", default-features = false, features = ["fs", "termios", "std", "event"] }
+rustix = { version = "0.38", default-features = false, features = ["fs", "termios", "std", "event", "net"] }
+# Single-threaded (current-thread) async runtime for the interactive TUI
+# phase. NO `rt-multi-thread`: NMBL is single-OS-thread (PID 1, fork-safe),
+# so every task runs via `spawn_local` on a `LocalRuntime`. `net` pulls
+# `mio` (expected, needed by the later socket phases). The runtime + async
+# migration is the new base and is intentionally not feature-gated.
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "time", "net", "io-util", "sync"] }
 # Pure-Rust decompression for kernel modules. NixOS kernels are built
 # without CONFIG_MODULE_DECOMPRESS, so userspace must decompress
 # .ko.{xz,zst,gz} before calling init_module(2). C-FFI crates (xz2,

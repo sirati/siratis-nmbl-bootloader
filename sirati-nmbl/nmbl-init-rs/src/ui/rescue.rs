@@ -85,7 +85,12 @@ impl<'c> RatatuiRescueUi<'c> {
 
 impl RescueUi for RatatuiRescueUi<'_> {
     fn pick_source(&mut self, disk_reason: &str) -> Result<RescueSource> {
-        run_pick_source(self.console, disk_reason)
+        // The rescue dispatcher runs on the synchronous force-on-boot
+        // path with no enclosing runtime, but the screen loops drive the
+        // async `Console::poll_event`. Spin up a throwaway current-thread
+        // `LocalRuntime` and `block_on` the screen future.
+        let rt = crate::ui::build_local_runtime()?;
+        rt.block_on(run_pick_source(self.console, disk_reason))
     }
 
     fn prompt_url(&mut self, prefill: &str) -> Result<String> {
@@ -94,7 +99,9 @@ impl RescueUi for RatatuiRescueUi<'_> {
         } else {
             self.url_cursor.min(prefill.len())
         };
-        let (out, final_cursor) = run_prompt_url(self.console, prefill, cursor_seed)?;
+        let rt = crate::ui::build_local_runtime()?;
+        let (out, final_cursor) =
+            rt.block_on(run_prompt_url(self.console, prefill, cursor_seed))?;
         self.url_cursor = final_cursor;
         Ok(out)
     }
@@ -128,8 +135,13 @@ impl RescueUi for RatatuiRescueUi<'_> {
         } else {
             self.expected_cursor.min(prefill_expected.len())
         };
-        let (out, final_cursor) =
-            run_confirm_hash(self.console, computed_hex, prefill_expected, cursor_seed)?;
+        let rt = crate::ui::build_local_runtime()?;
+        let (out, final_cursor) = rt.block_on(run_confirm_hash(
+            self.console,
+            computed_hex,
+            prefill_expected,
+            cursor_seed,
+        ))?;
         self.expected_cursor = final_cursor;
         Ok(out)
     }
@@ -142,7 +154,7 @@ impl RescueUi for RatatuiRescueUi<'_> {
 /// Drive the source-picker screen in a poll-input + render loop until
 /// the operator commits with N/R/H (or arrow + Enter). All paint and
 /// input goes through the orchestrator-held [`Console`].
-fn run_pick_source(console: &mut dyn Console, disk_reason: &str) -> Result<RescueSource> {
+async fn run_pick_source(console: &mut dyn Console, disk_reason: &str) -> Result<RescueSource> {
     let mut highlight: usize = 0;
     let options = [
         RescueSource::Network,
@@ -155,7 +167,7 @@ fn run_pick_source(console: &mut dyn Console, disk_reason: &str) -> Result<Rescu
             console.draw_with(&mut |f| render_pick_source(f, disk_reason, highlight))?;
             dirty = false;
         }
-        let key = match console.poll_event(POLL_SLICE)? {
+        let key = match console.poll_event(POLL_SLICE).await? {
             Some(ConsoleEvent::Resize { .. }) => {
                 dirty = true;
                 continue;
@@ -249,7 +261,7 @@ pub(crate) fn render_pick_source(frame: &mut Frame<'_>, disk_reason: &str, highl
 /// Single-line URL editor. Returns the confirmed URL and the final
 /// cursor position so a follow-up call can resume editing. All paint
 /// and input goes through the orchestrator-held [`Console`].
-fn run_prompt_url(
+async fn run_prompt_url(
     console: &mut dyn Console,
     prefill: &str,
     cursor_seed: usize,
@@ -265,7 +277,7 @@ fn run_prompt_url(
             console.draw_with(&mut |f| render_prompt_url(f, &snapshot_buf, snapshot_cursor))?;
             dirty = false;
         }
-        let key = match console.poll_event(POLL_SLICE)? {
+        let key = match console.poll_event(POLL_SLICE).await? {
             Some(ConsoleEvent::Resize { .. }) => {
                 dirty = true;
                 continue;
@@ -508,7 +520,7 @@ pub(crate) fn handle_hash_key(
 /// Two-pane hash confirm screen. Returns the chosen outcome and the
 /// final cursor offset on the (editable) expected pane. All paint and
 /// input goes through the orchestrator-held [`Console`].
-fn run_confirm_hash(
+async fn run_confirm_hash(
     console: &mut dyn Console,
     computed_hex: &str,
     prefill_expected: &str,
@@ -522,7 +534,7 @@ fn run_confirm_hash(
         console.draw_with(&mut |f| {
             render_confirm_hash(f, computed_hex, &snapshot_expected, snapshot_cursor);
         })?;
-        let key = match console.poll_event(POLL_SLICE)? {
+        let key = match console.poll_event(POLL_SLICE).await? {
             // A `dirty` flag is unnecessary here because every loop
             // iteration already repaints from the latest state — just
             // re-iterate so the new size lands in `console.size()`
