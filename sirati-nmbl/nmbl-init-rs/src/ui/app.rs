@@ -368,6 +368,21 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Replace the error text shown on the emergency screen so the
+    /// operator always sees the *latest* failure, not the first one
+    /// the session ever hit. Called whenever a new error is surfaced
+    /// (an emergency action failing, a re-entry after a sub-flow) so
+    /// the menu's "error" box tracks the most recent diagnostic
+    /// instead of latching the original boot error forever. No-op when
+    /// the App is on any other screen.
+    pub fn set_emergency_message(&mut self, new_message: impl Into<String>) {
+        if let Screen::Emergency { message, .. } = &mut self.screen {
+            *message = new_message.into();
+        } else {
+            debug_assert!(false, "set_emergency_message called on non-Emergency screen");
+        }
+    }
+
     /// Append a human-readable parsed-event string to the key-echo
     /// events ring, evicting the oldest entry when full. No-op when
     /// the App is on any other screen.
@@ -1253,6 +1268,47 @@ mod tests {
         assert!(!app.on_key(press(KeyCode::Down)));
         assert!(app.on_key(press(KeyCode::Enter)));
         assert_eq!(emergency_state(&app).1, Some(EmergencyChoice::RawShell));
+    }
+
+    #[test]
+    fn set_emergency_message_replaces_displayed_error() {
+        // Regression: the emergency screen used to latch the first
+        // error it was built with. set_emergency_message must overwrite
+        // the displayed text so the operator always sees the LATEST
+        // failure (e.g. a failed Raw Shell), not the original boot one.
+        let mut app = emergency_app();
+        match &app.screen {
+            Screen::Emergency { message, .. } => {
+                assert_eq!(message, "boot failed: test");
+            }
+            _ => panic!("expected Emergency screen"),
+        }
+
+        app.set_emergency_message("Latest error (#1): Raw Shell failed\n\nEACCES");
+        match &app.screen {
+            Screen::Emergency { message, .. } => {
+                assert!(
+                    message.contains("Latest error (#1)"),
+                    "message not updated: {message}"
+                );
+                assert!(message.contains("Raw Shell failed"), "missing title: {message}");
+                assert!(!message.contains("boot failed: test"), "stale first error retained");
+            }
+            _ => panic!("expected Emergency screen"),
+        }
+
+        // A second update wins again (most-recent-wins, no latch).
+        app.set_emergency_message("Latest error (#2): Retry failed\n\nENOENT");
+        match &app.screen {
+            Screen::Emergency { message, .. } => {
+                assert!(message.contains("Latest error (#2)"), "second update lost: {message}");
+                assert!(!message.contains("(#1)"), "stale #1 retained: {message}");
+            }
+            _ => panic!("expected Emergency screen"),
+        }
+
+        // Selection / items are untouched by a message-only update.
+        assert_eq!(emergency_state(&app).0, 0);
     }
 
     #[test]
