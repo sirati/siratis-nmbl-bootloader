@@ -876,8 +876,10 @@ impl<'a> App<'a> {
                 // cmdline editor. The secret stays in the Zeroizing
                 // buffer (which derefs to &mut String); only the
                 // renderer masks it. The cursor tracks the real index.
+                // `allow_word_motion = false`: word jumps would leak
+                // where the spaces sit in the masked secret.
                 let (new_cursor, _handled) =
-                    crate::ui::editline::handle_key_on(buffer, *cursor, key);
+                    crate::ui::editline::handle_key_on(buffer, *cursor, key, false);
                 *cursor = new_cursor;
                 false
             }
