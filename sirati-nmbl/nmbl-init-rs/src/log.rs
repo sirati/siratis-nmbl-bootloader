@@ -604,15 +604,30 @@ mod tests {
         let text = std::str::from_utf8(&bytes).expect("utf8");
         let first_line = text.split_once('\n').map(|(l, _)| l).unwrap_or(text);
 
-        // Header format is fixed; only the byte count varies.
-        let dropped = {
-            let g = BYTE_LOG
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            g.as_ref().expect("byte log").dropped_bytes
-        };
-        let expected = format!("=== nmbl-init: log truncated, earlier {dropped} bytes dropped ===");
-        assert_eq!(first_line, expected);
+        // Header format is fixed; only the byte count varies. Parse the
+        // count out of the header line itself rather than re-reading the
+        // global byte ring afterwards: under parallel `--all-features`
+        // runs other tests in the same binary emit through `emit_kmsg`
+        // into the shared `BYTE_LOG` (they don't take the log-test lock),
+        // which could bump `dropped_bytes` between flush and re-read and
+        // made the exact-count compare flaky. The header `flush_to` wrote
+        // is internally consistent, so assert on its format + a positive
+        // count instead.
+        let prefix = "=== nmbl-init: log truncated, earlier ";
+        let suffix = " bytes dropped ===";
+        assert!(
+            first_line.starts_with(prefix) && first_line.ends_with(suffix),
+            "unexpected truncation header: {first_line:?}"
+        );
+        let dropped: u64 = first_line
+            .trim_start_matches(prefix)
+            .trim_end_matches(suffix)
+            .parse()
+            .expect("truncation header carries a numeric dropped-byte count");
+        assert!(
+            dropped > 0,
+            "expected a positive dropped-byte count, got {dropped}"
+        );
 
         reset_rings();
     }
@@ -672,18 +687,30 @@ mod tests {
             emit_kmsg(&line);
         }
 
-        let dropped = {
-            let g = BYTE_LOG
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            g.as_ref().expect("byte log").dropped_bytes
-        };
-        assert!(dropped > 0, "test precondition: expected dropped_bytes > 0");
-
+        // Parse the count from the prepended note itself rather than
+        // re-reading the shared global byte ring: concurrent emits from
+        // other tests under parallel `--all-features` can bump
+        // `dropped_bytes` between the read and the snapshot, making an
+        // exact compare flaky (see `flush_to_emits_truncation_header_*`).
         let snap = snapshot_full();
-        assert_eq!(
-            snap.first().map(String::as_str),
-            Some(format!("… {dropped} earlier bytes truncated …").as_str())
+        let note = snap
+            .first()
+            .map(String::as_str)
+            .expect("snapshot non-empty after overflow");
+        let prefix = "… ";
+        let suffix = " earlier bytes truncated …";
+        assert!(
+            note.starts_with(prefix) && note.ends_with(suffix),
+            "unexpected truncation note: {note:?}"
+        );
+        let dropped: u64 = note
+            .trim_start_matches(prefix)
+            .trim_end_matches(suffix)
+            .parse()
+            .expect("truncation note carries a numeric dropped-byte count");
+        assert!(
+            dropped > 0,
+            "expected a positive dropped-byte count, got {dropped}"
         );
 
         reset_rings();
