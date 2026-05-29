@@ -1,0 +1,385 @@
+#![allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "tests can panic on assertion failure"
+)]
+
+use std::path::PathBuf;
+
+use crate::config::Config;
+#[cfg(feature = "image-splash")]
+use crate::config::SplashBackgroundLocation;
+use crate::config::entries::FilesystemEntry;
+use crate::config::rescue_cfg::RescueConfig;
+use crate::error::NmblError;
+use crate::rescue::RescueMode;
+
+fn fs_entry(device: &str, mountpoint: &str) -> FilesystemEntry {
+    FilesystemEntry {
+        device: device.to_string(),
+        mountpoint: PathBuf::from(mountpoint),
+        fstype: "ext4".to_string(),
+        options: String::new(),
+        is_root: false,
+    }
+}
+
+fn config_with(entries: Vec<FilesystemEntry>) -> Config {
+    let mut c = Config::recovery_default();
+    c.filesystems = entries;
+    c
+}
+
+#[test]
+fn validate_accepts_dev_disk_by_label_paths() {
+    // After the udev-less symlink populator landed, by-* paths
+    // are valid `fileSystems[].device` strings.
+    let c = config_with(vec![
+        fs_entry("/dev/disk/by-label/boot", "/boot"),
+        fs_entry("/dev/disk/by-partlabel/disk-main-ESP", "/boot"),
+        fs_entry("/dev/disk/by-uuid/1234-ABCD", "/"),
+        fs_entry("/dev/disk/by-partuuid/abcdef01-1234", "/data"),
+    ]);
+    c.validate().expect("by-* paths must validate");
+}
+
+#[test]
+fn validate_accepts_raw_dev_paths() {
+    let c = config_with(vec![fs_entry("/dev/vda1", "/boot")]);
+    c.validate().expect("raw /dev/* paths must validate");
+}
+
+#[test]
+fn validate_still_rejects_label_short_form() {
+    let c = config_with(vec![fs_entry("LABEL=boot", "/boot")]);
+    let err = c
+        .validate()
+        .expect_err("LABEL= short form must be rejected");
+    match err {
+        NmblError::ConfigInvalid { reason, .. } => {
+            assert!(
+                reason.contains("LABEL=") || reason.contains("short form"),
+                "rejection message should mention LABEL=/short form, got: {reason}",
+            );
+            assert!(
+                reason.contains("/dev/disk/by-"),
+                "rejection should point at the by-* symlink form, got: {reason}",
+            );
+        }
+        other => panic!("expected ConfigInvalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn validate_still_rejects_uuid_short_form() {
+    let c = config_with(vec![fs_entry("UUID=1234-ABCD", "/")]);
+    c.validate().expect_err("UUID= short form must be rejected");
+}
+
+#[test]
+fn validate_still_rejects_partuuid_short_form() {
+    let c = config_with(vec![fs_entry("PARTUUID=abc-123", "/data")]);
+    c.validate()
+        .expect_err("PARTUUID= short form must be rejected");
+}
+
+#[test]
+fn device_timeout_secs_defaults_to_thirty_when_absent() {
+    // External TOMLs predating the knob must keep parsing cleanly
+    // and observe the historic 30 s budget so the boot UX doesn't
+    // silently regress on upgrade.
+    let toml_text = "[general]\ntimeout_secs = 3\n";
+    let config: Config = toml::from_str(toml_text).expect("config must parse");
+    assert_eq!(config.general.device_timeout_secs, 30);
+}
+
+#[test]
+fn device_timeout_secs_is_honoured_when_present() {
+    let toml_text = "[general]\ndevice_timeout_secs = 90\n";
+    let config: Config = toml::from_str(toml_text).expect("config must parse");
+    assert_eq!(config.general.device_timeout_secs, 90);
+}
+
+#[cfg(feature = "image-splash")]
+#[test]
+fn config_parses_without_splash_table() {
+    // A config that doesn't mention [splash] at all must still parse,
+    // because the feature defaults to off and existing on-disk configs
+    // predate the new table.
+    let toml_text = "[general]\ntimeout_secs = 3\n";
+    let config: Config = toml::from_str(toml_text).expect("config must parse");
+    assert!(!config.splash.enable, "splash must default to disabled");
+    assert_eq!(
+        config.splash.background_image,
+        PathBuf::from("/etc/splash/image.png"),
+    );
+    assert_eq!(
+        config.splash.font_path,
+        PathBuf::from("/etc/splash/font.ttf"),
+    );
+    assert_eq!(config.splash.dri_path, PathBuf::from("/dev/dri/card0"));
+}
+
+#[cfg(feature = "image-splash")]
+#[test]
+fn config_parses_with_splash_table() {
+    let toml_text = "[splash]\nenable = true\nbackground_image = \"/foo.png\"\n";
+    let config: Config = toml::from_str(toml_text).expect("config must parse");
+    assert!(config.splash.enable, "enable = true must round-trip");
+    assert_eq!(config.splash.background_image, PathBuf::from("/foo.png"));
+    // Unset fields still pick up their defaults.
+    assert_eq!(
+        config.splash.font_path,
+        PathBuf::from("/etc/splash/font.ttf"),
+    );
+    assert_eq!(config.splash.dri_path, PathBuf::from("/dev/dri/card0"));
+}
+
+#[cfg(feature = "image-splash")]
+#[test]
+fn splash_background_location_defaults_to_initrd_when_absent() {
+    // Configs predating the sidecar knob must keep parsing and
+    // observe the embedded (initrd) behaviour so the boot UX does
+    // not silently change on upgrade.
+    let toml_text = "[splash]\nenable = true\n";
+    let config: Config = toml::from_str(toml_text).expect("config must parse");
+    assert_eq!(
+        config.splash.background_location,
+        SplashBackgroundLocation::Initrd,
+    );
+}
+
+#[cfg(feature = "image-splash")]
+#[test]
+fn splash_background_location_parses_both_modes() {
+    for (raw, expected) in [
+        ("initrd", SplashBackgroundLocation::Initrd),
+        ("boot-partition", SplashBackgroundLocation::BootPartition),
+    ] {
+        let toml_text = format!("[splash]\nbackground_location = \"{raw}\"\n");
+        let config: Config = toml::from_str(&toml_text).expect("mode value must parse");
+        assert_eq!(config.splash.background_location, expected, "mode={raw}");
+    }
+}
+
+#[cfg(feature = "image-splash")]
+#[test]
+fn splash_background_location_rejects_unknown_value() {
+    let toml_text = "[splash]\nbackground_location = \"sd-card\"\n";
+    toml::from_str::<Config>(toml_text).expect_err("unknown location value must reject");
+}
+
+#[cfg(feature = "image-splash")]
+#[test]
+fn config_rejects_unknown_splash_field() {
+    let toml_text = "[splash]\nfoo = 1\n";
+    let err =
+        toml::from_str::<Config>(toml_text).expect_err("unknown splash field must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("foo") || msg.contains("unknown"),
+        "rejection should mention the unknown field, got: {msg}",
+    );
+}
+
+#[test]
+fn rescue_section_defaults_when_absent() {
+    // Empty config — every section must default. The rescue section
+    // is `#[serde(default)]` so absence is the operator's signal
+    // that they want the legacy embedded shell behaviour.
+    let cfg: Config = toml::from_str("").expect("missing rescue section must default");
+    assert_eq!(cfg.rescue.mode, RescueMode::default());
+    assert!(cfg.rescue.sfs_path.is_none());
+}
+
+#[test]
+fn rescue_section_parses_all_three_modes() {
+    for (raw, expected) in [
+        ("embedded", RescueMode::Embedded),
+        ("external", RescueMode::External),
+        ("none", RescueMode::None),
+    ] {
+        let toml = format!(
+            r#"
+[rescue]
+mode = "{raw}"
+"#
+        );
+        let cfg: Config = toml::from_str(&toml).expect("mode value must parse");
+        assert_eq!(cfg.rescue.mode, expected, "mode={raw}");
+    }
+}
+
+#[test]
+fn rescue_section_parses_sfs_path_override() {
+    let toml = r#"
+[rescue]
+mode     = "external"
+sfs_path = "/mnt/boot/nmbl-rescue.sfs"
+"#;
+    let cfg: Config = toml::from_str(toml).expect("override must parse");
+    assert_eq!(cfg.rescue.mode, RescueMode::External);
+    assert_eq!(
+        cfg.rescue.sfs_path,
+        Some(PathBuf::from("/mnt/boot/nmbl-rescue.sfs")),
+    );
+}
+
+#[test]
+fn rescue_section_rejects_unknown_field() {
+    let toml = r#"
+[rescue]
+mode    = "external"
+mystery = "boom"
+"#;
+    toml::from_str::<Config>(toml).expect_err("unknown field must reject");
+}
+
+#[test]
+fn emergency_shell_defaults_to_empty_extra_consoles() {
+    // The default — no opt-in — must pin the picker to /dev/console
+    // only. Adding extra_consoles is an explicit operator action,
+    // not a side effect of upgrading the config schema.
+    let cfg: Config = toml::from_str("").expect("missing emergency_shell must default");
+    assert!(cfg.emergency_shell.extra_consoles.is_empty());
+}
+
+#[test]
+fn emergency_shell_parses_extra_consoles_list() {
+    let toml = r#"
+[emergency_shell]
+extra_consoles = ["/dev/ttyS0", "/dev/tty1"]
+"#;
+    let cfg: Config = toml::from_str(toml).expect("extra_consoles list must parse");
+    assert_eq!(
+        cfg.emergency_shell.extra_consoles,
+        vec!["/dev/ttyS0".to_string(), "/dev/tty1".to_string()],
+    );
+}
+
+#[test]
+fn emergency_shell_rejects_unknown_field() {
+    let toml = r#"
+[emergency_shell]
+extra_consoles = []
+mystery        = "boom"
+"#;
+    toml::from_str::<Config>(toml).expect_err("unknown emergency_shell field must be rejected");
+}
+
+#[test]
+fn rescue_default_mode_is_embedded() {
+    let cfg = RescueConfig::default();
+    assert_eq!(cfg.mode, RescueMode::Embedded);
+    assert!(cfg.sfs_path.is_none());
+}
+
+#[test]
+fn rescue_entrypoint_defaults_to_bin_sh_when_absent() {
+    // Flat busybox image (and every legacy config) leaves the
+    // entrypoint unset; the loader must fall back to /bin/sh.
+    let cfg: Config = toml::from_str("[rescue]\nmode = \"external\"\n")
+        .expect("config without entrypoint must parse");
+    assert_eq!(cfg.rescue.entrypoint, PathBuf::from("/bin/sh"));
+    assert_eq!(RescueConfig::default().entrypoint, PathBuf::from("/bin/sh"));
+}
+
+#[test]
+fn rescue_entrypoint_parses_init_override() {
+    // The full recovery system pins /init; config-toml.nix emits it
+    // only when fullSystem.enable is set.
+    let toml = r#"
+[rescue]
+mode       = "external"
+entrypoint = "/init"
+"#;
+    let cfg: Config = toml::from_str(toml).expect("entrypoint override must parse");
+    assert_eq!(cfg.rescue.entrypoint, PathBuf::from("/init"));
+}
+
+#[test]
+fn rescue_force_on_boot_defaults_false_and_parses() {
+    // Absent → production-safe false; present → honoured. The test
+    // harness flips this to drive a deterministic rescue boot.
+    let cfg: Config = toml::from_str("[rescue]\nmode = \"external\"\n")
+        .expect("config without force_on_boot must parse");
+    assert!(!cfg.rescue.force_on_boot);
+    assert!(!RescueConfig::default().force_on_boot);
+
+    let toml = r#"
+[rescue]
+mode          = "external"
+force_on_boot = true
+"#;
+    let cfg: Config = toml::from_str(toml).expect("force_on_boot override must parse");
+    assert!(cfg.rescue.force_on_boot);
+}
+
+#[test]
+fn recovery_default_has_no_runtime_boot_mountpoint() {
+    // Legacy embedded-config mode never mounts a boot partition, so
+    // the recovery-default Config must report None for the runtime
+    // mountpoint. `rescue::locate_sfs` keys off this to surface a
+    // clear diagnostic instead of fabricating a path.
+    let cfg = Config::recovery_default();
+    assert!(cfg.runtime_boot_mountpoint.is_none());
+}
+
+#[test]
+fn runtime_boot_mountpoint_is_not_parsed_from_toml() {
+    // The field is `#[serde(skip)]` so even if the operator's TOML
+    // contains a stray top-level `runtime_boot_mountpoint = "…"` it
+    // must be rejected as an unknown field by `deny_unknown_fields`.
+    let toml = r#"runtime_boot_mountpoint = "/mnt/boot""#;
+    toml::from_str::<Config>(toml).expect_err("runtime_boot_mountpoint is runtime-only");
+}
+
+#[cfg(feature = "stateful")]
+#[test]
+fn stateful_section_absent_decodes_to_none() {
+    // Configs that predate the stateful knob must still parse and
+    // produce `stateful = None`; the rollback flow only engages when
+    // the operator opts in.
+    let toml = "[general]\ntimeout_secs = 3\n";
+    let cfg: Config = toml::from_str(toml).expect("config must parse");
+    assert!(cfg.stateful.is_none());
+}
+
+#[cfg(feature = "stateful")]
+#[test]
+fn stateful_section_present_parses_required_fields() {
+    let toml = r#"
+[stateful]
+max_recovery_attempts = 5
+success_target        = "multi-user.target"
+"#;
+    let cfg: Config = toml::from_str(toml).expect("[stateful] must parse");
+    let s = cfg.stateful.expect("stateful should be Some");
+    assert_eq!(s.max_recovery_attempts, 5);
+    assert_eq!(s.success_target, "multi-user.target");
+}
+
+#[cfg(feature = "stateful")]
+#[test]
+fn stateful_section_rejects_unknown_field() {
+    let toml = r#"
+[stateful]
+max_recovery_attempts = 5
+success_target        = "multi-user.target"
+mystery               = "boom"
+"#;
+    let err =
+        toml::from_str::<Config>(toml).expect_err("unknown field in [stateful] must be rejected");
+    assert!(err.to_string().contains("mystery"), "{err}");
+}
+
+#[cfg(feature = "stateful")]
+#[test]
+fn stateful_section_requires_max_recovery_attempts() {
+    let toml = r#"
+[stateful]
+success_target = "multi-user.target"
+"#;
+    toml::from_str::<Config>(toml).expect_err("missing max_recovery_attempts must reject");
+}
