@@ -226,7 +226,8 @@ fn modal_poll(console: &mut dyn Console, timeout: Duration) -> Result<ModalPollO
     match console.poll_event(timeout)? {
         Some(crate::ui::console::ConsoleEvent::Key(k)) => Ok(ModalPollOutcome::Key(k)),
         Some(crate::ui::console::ConsoleEvent::Resize { .. }) => Ok(ModalPollOutcome::Resized),
-        None => Ok(ModalPollOutcome::Idle),
+        // Modals have no scrollback; wheel notches are idle here.
+        Some(crate::ui::console::ConsoleEvent::Scroll { .. }) | None => Ok(ModalPollOutcome::Idle),
     }
 }
 
@@ -829,7 +830,8 @@ fn run_selector_on_console(
                 }
                 dirty = true;
             }
-            None => {}
+            // No scrollback on the selector screen; ignore wheel notches.
+            Some(crate::ui::console::ConsoleEvent::Scroll { .. }) | None => {}
         }
         if app.decision.is_some() {
             break;
@@ -1284,7 +1286,8 @@ pub(crate) fn passphrase_prompt_on_console(
                 }
                 dirty = true;
             }
-            None => {}
+            // No scrollback on the passphrase modal; ignore wheel notches.
+            Some(crate::ui::console::ConsoleEvent::Scroll { .. }) | None => {}
         }
     }
 }
