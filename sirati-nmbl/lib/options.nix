@@ -581,9 +581,43 @@ in
         defaultText = lib.literalExpression "cosmic-greeter background.jpg converted to PNG";
         description = lib.mdDoc ''
           PNG to use as the splash background. Must be a real PNG, RGBA8.
-          Embedded into the initramfs at `/etc/splash/image.png`. The
-          default is the cosmic-greeter project's background.jpg, fetched
-          at Nix build time and converted to PNG via imagemagick.
+          The default is the cosmic-greeter project's background.jpg,
+          fetched at Nix build time and converted to PNG via imagemagick.
+
+          Where this PNG lands is controlled by `backgroundLocation`:
+          with `"initrd"` (the default) it is embedded into the
+          initramfs at `/etc/splash/image.png`; with `"boot-partition"`
+          it is staged on the boot partition next to the initrd as a
+          sidecar (`nmblsplash.png`) and read at runtime, keeping the
+          initramfs lean.
+        '';
+      };
+
+      # --- Splash background location (sidecar on the boot partition) ---
+      # Mirrors `rescue.mode`'s shape: `"initrd"` keeps today's embedded
+      # behaviour (PNG baked into the initramfs); `"boot-partition"`
+      # stages the PNG on the boot partition next to the initrd and the
+      # Rust /init reads it at runtime from the Phase-0.5 mountpoint.
+      # The sidecar basename is FIXED (`nmblsplash.png`) and not
+      # configurable — it always sits next to `nmbl-initrd` at the boot
+      # partition root.
+      backgroundLocation = lib.mkOption {
+        type = lib.types.enum [ "initrd" "boot-partition" ];
+        default = "initrd";
+        description = lib.mdDoc ''
+          Where the splash background PNG lives:
+          - `initrd`: embedded into the initramfs at
+            `/etc/splash/image.png` (legacy behaviour; keeps the image
+            available before any partition is mounted).
+          - `boot-partition`: staged on the boot partition next to the
+            initrd as a sidecar file (`nmblsplash.png`) and read at
+            runtime, after the bootstrap stage (Phase 0.5) mounts the
+            boot partition. This keeps the initramfs small. Requires
+            `boot.nmbl.configLocation = "external"` so the boot
+            partition is mounted before the splash comes up; if the
+            sidecar is missing or unreadable NMBL renders the menu over
+            a solid background instead of failing the boot. The sidecar
+            filename is fixed and not configurable.
         '';
       };
 
