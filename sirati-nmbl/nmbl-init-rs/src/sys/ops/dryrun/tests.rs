@@ -104,12 +104,12 @@ fn missing_shell_records_finding_and_preflight_errs() {
     let root = temp_closure("shell-missing", |_d| {});
     let mut s = sys(root.clone(), DryRunScenario::RawShell);
     let r = s.spawn_shell(Path::new("/bin/sh"), 80, 24);
-    // The contract: a clearly-marked preflight Err, NO fork performed.
+    // The contract: the typed preflight signal, NO fork performed.
     // (`PtyChild` is not `Debug`, so match instead of `expect_err`.)
     match r {
         Err(err) => assert!(
-            format!("{err}").contains("dry-run shell preflight"),
-            "{err}"
+            matches!(err, NmblError::DryRunShellPreflight),
+            "expected DryRunShellPreflight, got {err}"
         ),
         Ok(_) => panic!("spawn_shell must Err in dry-run, never fork"),
     }

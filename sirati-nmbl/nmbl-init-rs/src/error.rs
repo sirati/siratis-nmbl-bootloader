@@ -170,6 +170,18 @@ pub enum NmblError {
     /// silently rewrite the file because doing so could mask a bug.
     #[error("state.bin at {path} did not round-trip through encode/decode")]
     StateRoundtripMismatch { path: PathBuf },
+
+    /// `--validate-initrm`'s [`crate::sys::ops::dryrun::DryRunSys`] ran
+    /// the emergency-shell preflight (shell-binary presence + devpts /
+    /// ptmx checks) and stopped short of the real fork. A `PtyChild`
+    /// owns a live master fd + child Pid that cannot be faked without an
+    /// actual fork, which the dry-run must NOT do — so `spawn_shell`
+    /// returns THIS typed signal instead. The Phase-5 RawShell /
+    /// PrettyShell scenario drivers treat `matches!(err,
+    /// NmblError::DryRunShellPreflight)` as "preflight complete, no fork
+    /// performed", i.e. success.
+    #[error("dry-run shell preflight complete (no fork performed)")]
+    DryRunShellPreflight,
 }
 
 pub type Result<T> = std::result::Result<T, NmblError>;

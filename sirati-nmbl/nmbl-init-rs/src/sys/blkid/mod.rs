@@ -40,7 +40,7 @@ const CATEGORIES: &[(&str, &str)] = &[
 /// The Nix side wires `pkgs.util-linux`'s `bin/blkid` into `/bin/blkid`
 /// inside the initrd (see `lib/config.nix` baseContents). Production
 /// always invokes that path; tests skip when it is missing.
-const BLKID_BINARY: &str = "/bin/blkid";
+pub(crate) const BLKID_BINARY: &str = "/bin/blkid";
 
 /// Where /sys exposes the kernel-known block devices.
 const SYSFS_BLOCK_DIR: &str = "/sys/class/block";
