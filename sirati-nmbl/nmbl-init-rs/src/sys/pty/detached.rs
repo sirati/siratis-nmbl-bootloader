@@ -258,7 +258,10 @@ mod tests {
         let start = Instant::now();
         let res = open_tty_fd(Path::new("/dev/this-tty-does-not-exist-nmbl-test"));
         assert!(res.is_err(), "missing tty must Err, got Ok");
-        assert!(start.elapsed() < BOUND, "open_tty_fd blocked on missing path");
+        assert!(
+            start.elapsed() < BOUND,
+            "open_tty_fd blocked on missing path"
+        );
     }
 
     /// `/dev/null` is a chardev with no controlling session, so the open
@@ -300,11 +303,10 @@ mod tests {
             Err(_) => return, // sandbox without ptys
         };
         // Resolve the slave's /dev/pts/N path so we can re-open it by name.
-        let slave_path =
-            match std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())) {
-                Ok(p) => p,
-                Err(_) => return,
-            };
+        let slave_path = match std::fs::read_link(format!("/proc/self/fd/{}", slave.as_raw_fd())) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
         if !slave_path.starts_with("/dev/pts/") {
             return;
         }
