@@ -11,9 +11,9 @@ use nmbl_init::error::{NmblError, format_chain};
 use nmbl_init::modules::load_explicit_modules;
 use nmbl_init::panic::install_panic_hook;
 use nmbl_init::rescue::{self};
-use nmbl_init::sys::ops::RealSys;
+use nmbl_init::sys::ops::{ConsoleOps, RealSys};
 use nmbl_init::terminal::TerminalAction;
-use nmbl_init::ui::console::{Console, NoopConsole, open_console};
+use nmbl_init::ui::console::{Console, NoopConsole};
 use nmbl_init::ui::key_echo::run_key_echo_loop;
 use nmbl_init::ui::{BootReporter, SessionInteraction};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
@@ -182,7 +182,7 @@ pub(crate) async fn run_boot_inside_runtime(
             return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
         }
     }
-    let console: Box<dyn Console> = match open_console(&config, false) {
+    let console: Box<dyn Console> = match ops.open_console(&config, false) {
         Ok(c) => c,
         Err(err) => {
             nmbl_warn!("boot console bring-up failed: {err}");

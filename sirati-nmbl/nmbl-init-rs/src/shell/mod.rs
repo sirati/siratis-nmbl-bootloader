@@ -78,10 +78,11 @@ pub(crate) use dispatch::dispatch_emergency_choice;
 use crate::config::Config;
 use crate::error::{NmblError, format_chain};
 use crate::nmbl_warn;
+use crate::sys::ops::{ConsoleOps, RealSys};
 use crate::sys::poller::LocalSender;
 use crate::terminal::TerminalAction;
 use crate::ui::app::App;
-use crate::ui::console::{Console, open_console};
+use crate::ui::console::Console;
 use crate::ui::{
     SessionInteraction, build_emergency_app, build_message, default_items,
     resolve_emergency_timeout,
@@ -165,7 +166,11 @@ pub fn open_console_and_drop_to_emergency(config: &Config, err: NmblError) -> Te
     // failure, panic-recovery re-exec, pre-console phases), so no
     // keypress could have happened yet — a fresh latch is correct.
     let session = SessionInteraction::new();
-    match open_console(config, true) {
+    // This path runs pre/post-runtime with no poller in scope, so build a
+    // sender-less `RealSys` for the bring-up. `open_console` (ConsoleOps)
+    // is sync and never touches the sender, so `sync_only()` is safe.
+    let mut ops = RealSys::sync_only();
+    match ops.open_console(config, true) {
         // Cross into the async interactive phase: build the LocalRuntime,
         // spawn the reserve poller, and block_on the emergency session.
         // On a runtime-build failure fall back to Reboot (same safety

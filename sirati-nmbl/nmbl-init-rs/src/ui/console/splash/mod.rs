@@ -23,6 +23,7 @@ use crate::splash::input::SplashInput;
 use crate::splash::png;
 use crate::splash::scale;
 use crate::splash::types::CellDims;
+use crate::sys::ops::FsOps;
 
 use background::load_sidecar_background_or_fallback;
 
@@ -67,7 +68,12 @@ impl SplashConsole {
     /// backend is unavailable (no DRM device, no font, etc.; the
     /// orchestrator falls back to tty), and `Err(_)` only when a
     /// real, surfaced bring-up error occurred mid-flight.
-    pub fn open(config: &Config) -> Result<Option<SplashConsole>> {
+    ///
+    /// `fs` routes the plain-file reads (font, background PNG) through the
+    /// [`FsOps`] seam so a dry-run can satisfy them without real `open(2)`
+    /// calls. The DRM card and `/dev/tty1` raw-mode opens stay genuine
+    /// device syscalls.
+    pub fn open(fs: &mut dyn FsOps, config: &Config) -> Result<Option<SplashConsole>> {
         // 1. Open the DRM card. Missing / inaccessible nodes map to
         //    `Ok(None)` inside `open_card_with_fallback`, so this
         //    propagates only real bring-up errors.
@@ -97,11 +103,23 @@ impl SplashConsole {
         //      `nmbl-rescue.sfs` on the boot partition.
         let bg_scaled = match config.splash.background_location {
             SplashBackgroundLocation::Initrd => {
-                let bg_image = png::decode_rgba(&config.splash.background_image)?;
+                // Read the embedded PNG through the FsOps seam, then decode
+                // the bytes. A read failure here is a real bring-up error
+                // (the asset is baked into the initramfs) and propagates,
+                // mapped into the same `Tui` shape the decoder uses.
+                let bytes =
+                    fs.read_file(&config.splash.background_image)
+                        .map_err(|e| NmblError::Tui {
+                            source: std::io::Error::other(format!(
+                                "splash::png: open {}: {e}",
+                                config.splash.background_image.display()
+                            )),
+                        })?;
+                let bg_image = png::decode_rgba_from_bytes(&bytes)?;
                 scale::cover_scale_nearest(&bg_image.rgba, bg_image.width, bg_image.height, fb_dims)
             }
             SplashBackgroundLocation::BootPartition => {
-                load_sidecar_background_or_fallback(config, fb_dims)
+                load_sidecar_background_or_fallback(fs, config, fb_dims)
             }
         };
 
@@ -113,7 +131,16 @@ impl SplashConsole {
         //    so a bad operator font degrades gracefully instead of
         //    dropping splash entirely. Mirrors how the sidecar
         //    background falls back to a solid fill.
-        let cache = match glyph_cache::load(&config.splash.font_path, SPLASH_FONT_PX) {
+        // Read the font through the FsOps seam, then parse the bytes. Any
+        // failure (missing/unreadable file or an unparseable face) WARNs
+        // and falls back to the embedded DejaVu Sans Mono — identical
+        // graceful-degradation to before, just with the read routed.
+        let cache = match fs
+            .read_file(&config.splash.font_path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                glyph_cache::load_from_bytes(&bytes, SPLASH_FONT_PX).map_err(|e| e.to_string())
+            }) {
             Ok(cache) => cache,
             Err(e) => {
                 nmbl_warn!(

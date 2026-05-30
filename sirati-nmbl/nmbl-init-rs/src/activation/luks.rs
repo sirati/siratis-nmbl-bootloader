@@ -128,7 +128,13 @@ pub(super) async fn handle_wrong_password(
         WrongPasswordOutcome::Reboot => Ok(WrongPasswordHandled::Reboot),
         #[cfg(feature = "pretty-shell")]
         WrongPasswordOutcome::PrettyShell => {
-            if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(console, config).await {
+            // This path has no poller `sender` in scope; the shell spawn is
+            // sync and never touches the sender, so a sender-less `RealSys`
+            // satisfies the `ExecOps::spawn_shell` route safely.
+            let mut ops = crate::sys::ops::RealSys::sync_only();
+            if let Err(e) =
+                crate::ui::pretty_shell::run_pretty_shell(&mut ops, console, config).await
+            {
                 let chain = crate::error::format_chain(&e as &dyn std::error::Error);
                 crate::nmbl_warn!("wrong-password pretty-shell failed: {chain}");
                 let _ = crate::ui::show_modal_error(
@@ -146,7 +152,8 @@ pub(super) async fn handle_wrong_password(
             // fire-and-forget (no overlap). Errors are surfaced via a
             // modal-error so the wrong-password flow doesn't crash the
             // boot — we still want the operator to be able to retry.
-            match crate::ui::console_picker::run_picker_session(console, config).await {
+            let mut ops = crate::sys::ops::RealSys::sync_only();
+            match crate::ui::console_picker::run_picker_session(&mut ops, console, config).await {
                 Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached { targets }) => {
                     let joined = targets
                         .iter()

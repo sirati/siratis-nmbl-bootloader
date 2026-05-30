@@ -10,6 +10,7 @@ use crate::nmbl_warn;
 use crate::splash::png;
 use crate::splash::scale;
 use crate::splash::types::FramebufferDims;
+use crate::sys::ops::FsOps;
 
 /// FIXED basename of the sidecar splash background on the boot
 /// partition, used when
@@ -66,6 +67,7 @@ pub(super) fn solid_background(dims: FramebufferDims, rgba: [u8; 4]) -> Vec<u8> 
 /// an error: a sidecar background is best-effort and must not block
 /// boot.
 pub(super) fn load_sidecar_background_or_fallback(
+    fs: &mut dyn FsOps,
     config: &Config,
     fb_dims: FramebufferDims,
 ) -> Vec<u8> {
@@ -77,7 +79,14 @@ pub(super) fn load_sidecar_background_or_fallback(
         return solid_background(fb_dims, FALLBACK_BG_RGBA);
     };
 
-    let image = match png::decode_rgba(&path) {
+    // Read the sidecar PNG through the FsOps seam, then decode the bytes.
+    // Any failure (read or decode) WARNs and degrades to the solid
+    // fallback — best-effort, never blocks boot.
+    let image = match fs
+        .read_file(&path)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| png::decode_rgba_from_bytes(&bytes).map_err(|e| e.to_string()))
+    {
         Ok(img) => img,
         Err(e) => {
             nmbl_warn!(

@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::nmbl_warn;
-use crate::sys::pty::spawn_shell;
+use crate::sys::ops::ExecOps;
 use crate::ui::POLL_SLICE;
 use crate::ui::console::{Console, ConsoleEvent};
 
@@ -21,7 +21,11 @@ use super::{CHROME_COLS, CHROME_ROWS, PRETTY_SHELL_MIN_COLS, PRETTY_SHELL_MIN_RO
 /// `Err` only when the supporting plumbing fails (fork, openpty,
 /// terminal backend write). The caller in `src/shell.rs` treats both
 /// outcomes the same way: re-display the emergency menu.
-pub async fn run_pretty_shell(console: &mut dyn Console, config: &Config) -> Result<()> {
+pub async fn run_pretty_shell<E: ExecOps>(
+    ops: &mut E,
+    console: &mut dyn Console,
+    config: &Config,
+) -> Result<()> {
     // Derive the PTY grid size from the live console dimensions so the
     // alacritty terminal fills the bordered block. The renderer paints
     // a 3-row header + 1-row footer + bordered block (2 rows of border
@@ -34,7 +38,7 @@ pub async fn run_pretty_shell(console: &mut dyn Console, config: &Config) -> Res
         .saturating_sub(CHROME_ROWS)
         .max(PRETTY_SHELL_MIN_ROWS);
 
-    let child = spawn_shell(&config.paths.shell, cols, rows)?;
+    let child = ops.spawn_shell(&config.paths.shell, cols, rows)?;
     let mut state = PtyShellState::new(child, cols, rows);
 
     let outcome = drive(&mut state, console).await;

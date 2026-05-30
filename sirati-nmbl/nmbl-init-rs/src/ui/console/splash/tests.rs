@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::config::SplashBackgroundLocation;
 use crate::splash::types::FramebufferDims;
+use crate::sys::ops::RealSys;
 
 use super::background::{
     FALLBACK_BG_RGBA, SIDECAR_SPLASH_BG_BASENAME, load_sidecar_background_or_fallback,
@@ -74,7 +75,7 @@ fn sidecar_loader_reads_png_from_boot_partition() {
     let c = cfg_with_mountpoint(Some(dir.path().to_path_buf()));
 
     let fb = dims(4, 4);
-    let scaled = load_sidecar_background_or_fallback(&c, fb);
+    let scaled = load_sidecar_background_or_fallback(&mut RealSys::sync_only(), &c, fb);
     // A real decode+scale of the 1x1 red PNG to 4x4 yields a tight
     // 4*4*4 buffer of opaque-red pixels — distinct from the solid
     // fallback colour, proving the sidecar path was taken.
@@ -94,7 +95,7 @@ fn sidecar_loader_falls_back_when_file_missing() {
     let c = cfg_with_mountpoint(Some(dir.path().to_path_buf()));
 
     let fb = dims(4, 4);
-    let scaled = load_sidecar_background_or_fallback(&c, fb);
+    let scaled = load_sidecar_background_or_fallback(&mut RealSys::sync_only(), &c, fb);
     assert_eq!(scaled.len(), 4 * 4 * 4);
     assert_eq!(
         scaled.get(0..4),
@@ -114,7 +115,7 @@ fn sidecar_loader_falls_back_on_corrupt_png() {
     let c = cfg_with_mountpoint(Some(dir.path().to_path_buf()));
 
     let fb = dims(4, 4);
-    let scaled = load_sidecar_background_or_fallback(&c, fb);
+    let scaled = load_sidecar_background_or_fallback(&mut RealSys::sync_only(), &c, fb);
     assert_eq!(scaled.len(), 4 * 4 * 4);
     assert_eq!(scaled.get(0..4), Some(FALLBACK_BG_RGBA.as_slice()));
 }
@@ -123,7 +124,7 @@ fn sidecar_loader_falls_back_on_corrupt_png() {
 fn sidecar_loader_falls_back_without_mountpoint() {
     let c = cfg_with_mountpoint(None);
     let fb = dims(4, 4);
-    let scaled = load_sidecar_background_or_fallback(&c, fb);
+    let scaled = load_sidecar_background_or_fallback(&mut RealSys::sync_only(), &c, fb);
     assert_eq!(scaled.len(), 4 * 4 * 4);
     assert_eq!(scaled.get(0..4), Some(FALLBACK_BG_RGBA.as_slice()));
 }

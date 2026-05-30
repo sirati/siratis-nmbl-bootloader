@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use super::{preflight_shell, spawn_shell};
 use crate::error::NmblError;
+use crate::sys::ops::RealSys;
 
 #[test]
 fn preflight_shell_rejects_missing_binary() {
@@ -18,7 +19,8 @@ fn preflight_shell_rejects_missing_binary() {
     // preflight must turn a missing/non-exec shell into an Err the
     // emergency UI can surface, not a healthy-looking fork.
     let missing = PathBuf::from("/definitely/not/here/bin/sh");
-    let err = preflight_shell(&missing).expect_err("missing shell must error");
+    let err =
+        preflight_shell(&RealSys::sync_only(), &missing).expect_err("missing shell must error");
     assert!(matches!(err, NmblError::Tui { .. }), "got {err:?}");
 }
 
@@ -29,7 +31,7 @@ fn preflight_shell_accepts_executable() {
     for cand in ["/bin/sh", "/bin/echo", "/usr/bin/env"] {
         let p = PathBuf::from(cand);
         if std::fs::metadata(&p).is_ok() {
-            preflight_shell(&p).expect("executable must pass preflight");
+            preflight_shell(&RealSys::sync_only(), &p).expect("executable must pass preflight");
             return;
         }
     }
@@ -48,7 +50,7 @@ fn spawn_shell_basic_roundtrip() {
     if std::fs::metadata(&echo).is_err() {
         return;
     }
-    let child = match spawn_shell(&echo, 80, 24) {
+    let child = match spawn_shell(&mut RealSys::sync_only(), &echo, 80, 24) {
         Ok(c) => c,
         // Sandboxes that block fork or openpty return EPERM/ENOTTY.
         Err(_) => return,

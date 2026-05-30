@@ -14,6 +14,7 @@ use super::{
     EXEC_FAILED_EXIT_CODE, ensure_devpts_mounted, preflight_shell, prepare_shell_cstrings,
 };
 use crate::error::{NmblError, Result};
+use crate::sys::ops::FsOps;
 
 /// Open a PTY pair sized `cols`×`rows`, set the master non-blocking,
 /// and return `(master, slave, master_raw_fd, slave_raw_fd)`.
@@ -124,16 +125,23 @@ unsafe fn child_exec_on_pty(
 /// render the terminal into. The child inherits the parent's environment
 /// minus a minimal `TERM=xterm-256color` injection so curses-style
 /// applications work.
-pub fn spawn_shell(shell_path: &Path, cols: u16, rows: u16) -> Result<PtyChild> {
+pub fn spawn_shell(
+    fs: &mut dyn FsOps,
+    shell_path: &Path,
+    cols: u16,
+    rows: u16,
+) -> Result<PtyChild> {
     // Fail loudly up-front if the shell binary is missing/non-exec so
     // the operator gets a real error instead of a shell that silently
     // dies in the post-fork child (the "Raw Shell does nothing" bug).
-    preflight_shell(shell_path)?;
+    // The presence check routes through the FsOps seam.
+    preflight_shell(fs, shell_path)?;
 
     // `nmbl-init`'s phase 1 doesn't mount `/dev/pts`; openpty(3) reads
     // `/dev/ptmx` and writes the PTY name back to `/dev/pts/N`, so we
-    // mount devpts on demand before the first PTY allocation.
-    ensure_devpts_mounted()?;
+    // mount devpts on demand before the first PTY allocation. The mkdir +
+    // mount route through the FsOps seam.
+    ensure_devpts_mounted(fs)?;
 
     // === Parent-side allocation: ALL CString / Vec construction MUST
     // happen here, before fork(2). The post-fork child path is restricted
