@@ -117,12 +117,31 @@ fn collect_block_dev_paths() -> Result<Vec<PathBuf>> {
         };
 
         let dev_path = Path::new("/dev").join(entry.file_name());
-        // Skip entries the kernel exposes in /sys but for which no
-        // /dev/<name> node has materialised (device-mapper aliases,
-        // partitions without nodes, …).
-        if std::fs::symlink_metadata(&dev_path).is_ok() {
-            dev_paths.push(dev_path);
+
+        // Some block devices the kernel exposes in /sys have no
+        // materialised /dev node yet — notably GPT partitions when
+        // devtmpfs/udev did not auto-create `/dev/<disk><N>`. Without the
+        // node, blkid cannot probe the partition and its PARTLABEL is
+        // never turned into a by-partlabel symlink, so a disko-style
+        // `device = /dev/disk/by-partlabel/...` activation fails. Try to
+        // mknod the node from the sysfs `dev` (major:minor) attribute
+        // before probing. Device-mapper aliases and other entries without
+        // a usable `dev` attribute are still skipped.
+        if std::fs::symlink_metadata(&dev_path).is_err() {
+            match ensure_dev_node(&entry.path(), &dev_path) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    nmbl_warn!(
+                        "blkid: could not create node {}: {} — skipping",
+                        dev_path.display(),
+                        e,
+                    );
+                    continue;
+                }
+            }
         }
+        dev_paths.push(dev_path);
     }
     Ok(dev_paths)
 }
@@ -156,4 +175,62 @@ impl SymlinkAcc {
         );
         self.btrfs_devs
     }
+}
+
+/// Ensure a block-device node exists at `dev_path`, creating it from the
+/// sysfs `dev` (`major:minor`) attribute under `sysfs_entry` when udev /
+/// devtmpfs did not. Returns `Ok(true)` when the node exists (already or
+/// freshly created), `Ok(false)` when `sysfs_entry/dev` is absent or
+/// unparseable (e.g. a device-mapper alias with no usable node — caller
+/// skips it). Mirrors the mknod pattern in `sys::btrfs::ensure_btrfs_control`.
+fn ensure_dev_node(sysfs_entry: &Path, dev_path: &Path) -> Result<bool> {
+    if dev_path.exists() {
+        return Ok(true);
+    }
+
+    let dev_attr = sysfs_entry.join("dev");
+    let raw = match std::fs::read_to_string(&dev_attr) {
+        Ok(s) => s,
+        // No `dev` attribute → not a node-backed device (alias/holder).
+        Err(_) => return Ok(false),
+    };
+    let trimmed = raw.trim();
+    let Some((maj_str, min_str)) = trimmed.split_once(':') else {
+        return Ok(false);
+    };
+    let (Ok(major), Ok(minor)) = (maj_str.parse::<u32>(), min_str.parse::<u32>()) else {
+        return Ok(false);
+    };
+
+    let mode: libc::mode_t = libc::S_IFBLK | 0o600;
+    let dev = libc::makedev(major, minor);
+    let path_cstr =
+        std::ffi::CString::new(dev_path.as_os_str().as_encoded_bytes()).map_err(|_| {
+            NmblError::Io {
+                source: std::io::Error::from(std::io::ErrorKind::InvalidInput),
+                context: format!("device path {} contains NUL", dev_path.display()),
+            }
+        })?;
+    // SAFETY: mknod(2) with a block-device type. `path_cstr` is a valid
+    // NUL-terminated CString that outlives the call; `dev` is the numeric
+    // major:minor from libc::makedev. The kernel creates or rejects the
+    // node and writes no user-space buffers. No safe rustix wrapper for
+    // mknod exists in rustix 0.38 (matches sys::btrfs::ensure_btrfs_control).
+    let rc = unsafe { libc::mknod(path_cstr.as_ptr(), mode, dev) };
+    if rc < 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(true);
+        }
+        return Err(NmblError::Io {
+            source: e,
+            context: format!(
+                "mknod block node {} ({}:{})",
+                dev_path.display(),
+                major,
+                minor
+            ),
+        });
+    }
+    Ok(true)
 }
