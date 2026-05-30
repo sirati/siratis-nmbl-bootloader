@@ -241,11 +241,13 @@ impl ProgressSink for BootReporter<'_, '_> {
     /// underlying wait itself fails.
     ///
     /// Returns [`TickOutcome::Aborted`] when the operator presses Esc
-    /// on the boot-status screen — the caller (`devices::wait_for`,
-    /// `activation` waits, …) surfaces this as
+    /// on the boot-status screen — the callers (the `activation`
+    /// `run_with_tick` reap loop and the LUKS passphrase-modal spinner)
+    /// surface this as
     /// [`crate::error::NmblError::OperatorAborted`] so the emergency
     /// menu can re-appear with the operator's explicit "abort"
-    /// context.
+    /// context. `devices::wait_for` no longer calls `tick`; it renders
+    /// via [`ProgressSink::render_phase`] and has no Esc-abort.
     fn tick(&mut self, phase: &str) -> TickOutcome {
         let snap = log::snapshot(LOG_SNAPSHOT_LINES);
         write_phase(

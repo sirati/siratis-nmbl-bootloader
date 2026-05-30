@@ -197,15 +197,15 @@ fn outcome_from_status(status: nix::sys::wait::WaitStatus) -> Option<ProcessOutc
 /// Reuses [`reap_child`](crate::sys::poller::reap_child) rather than
 /// re-rolling a WNOHANG loop: the op is paced by the poller while the
 /// runtime keeps driving the concurrent remote-attach server and the
-/// local spinner. A `None` status (e.g. the child was already reaped,
-/// `ECHILD`) collapses to a synthetic success outcome — the child is
-/// gone, which is what the caller needs to know.
+/// local spinner. A `None` status means the reap was uncollectable
+/// (e.g. the child was already reaped elsewhere, `ECHILD`); we surface
+/// it as an error rather than fabricating a success, so an unlock can't
+/// be reported as succeeding when we never actually saw the exit.
 pub(super) async fn reap_child_outcome(
     child: nix::unistd::Pid,
     binary: &Path,
     sender: &crate::sys::poller::LocalSender,
 ) -> Result<ProcessOutcome> {
-    let _ = binary;
     match crate::sys::poller::reap_child(child, sender.clone()).await {
         Some(status) => Ok(outcome_from_status(status).unwrap_or(ProcessOutcome {
             // Defensive: the poller op only resolves on a terminal
@@ -213,12 +213,15 @@ pub(super) async fn reap_child_outcome(
             exit_code: 0,
             normal_exit: true,
         })),
-        // ECHILD / already reaped: the child is gone. Report a clean
-        // exit so the caller proceeds rather than hanging.
-        None => Ok(ProcessOutcome {
-            exit_code: 0,
-            normal_exit: true,
-        }),
+        // ECHILD / already reaped: we never collected a terminal status,
+        // so we cannot know the child's exit. Surface a fault instead of
+        // a synthetic success so an uncollectable reap can't masquerade
+        // as an unlock-success.
+        None => Err(nix_activation(
+            "reap",
+            Errno::ECHILD,
+            &format!("reap {}", binary.display()),
+        )),
     }
 }
 
