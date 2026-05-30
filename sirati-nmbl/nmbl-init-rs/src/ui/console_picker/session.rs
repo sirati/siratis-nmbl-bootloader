@@ -64,69 +64,16 @@ pub async fn run_picker_session<E: ExecOps>(
     // The relay (overlap) branch routes the shell spawn through
     // `ops.spawn_shell`; the fire-and-forget (no-overlap) branch uses
     // `spawn_shell_on_tty`, which is not part of `ExecOps` and builds its
-    // own sync-only `FsOps` for the pre-fork presence check. The pure
-    // dispatch logic lives in [`dispatch_spawn`] (pinned by tests); the
-    // production path inlines the same overlap branch directly so `ops`
-    // threads through `run_relay` without the boxed-future closure seam
-    // (which cannot carry the extra `ops` borrow in its HRTB shape).
+    // own sync-only `FsOps` for the pre-fork presence check. The decision
+    // is the pure [`display_overlaps_targets`] predicate (directly
+    // unit-tested); the two arms below are trivial wrappers around the
+    // already-tested relay / fire-and-forget helpers.
     if display_overlaps_targets(&display_target, &targets) {
         crate::ui::console_relay::run_relay(ops, console, config, &targets, &display_target)
             .await?;
         Ok(PickerSessionOutcome::ShellRan)
     } else {
         fire_and_forget_spawn(config, &targets)?;
-        Ok(PickerSessionOutcome::ShellDetached { targets })
-    }
-}
-
-/// Post-commit dispatch: given the operator's spawn set and the
-/// picker's authoritative display-target path, route into either the
-/// relay loop (display overlap) or the fire-and-forget spawn (no
-/// overlap). The `relay_fn` / `detach_fn` callbacks are parameters so
-/// unit tests can drive the dispatch without forking real shells.
-///
-/// The picker is the ONLY source of truth for `display_target`; the
-/// callbacks never re-derive it. See [`run_relay`]'s doc-comment for
-/// the historical bug that motivated this contract.
-///
-/// The production path in [`run_picker_session`] inlines the identical
-/// overlap branch directly (so `ops` threads into `run_relay` without the
-/// boxed-future closure seam, which cannot carry the extra borrow); this
-/// callback-parameterised form exists so the dispatch decision stays
-/// unit-testable without forking real shells.
-///
-/// [`run_relay`]: crate::ui::console_relay::run_relay
-#[cfg(test)]
-pub(super) async fn dispatch_spawn<R, D>(
-    console: &mut dyn Console,
-    config: &Config,
-    targets: Vec<PathBuf>,
-    display_target: &Path,
-    mut relay_fn: R,
-    mut detach_fn: D,
-) -> Result<PickerSessionOutcome>
-where
-    R: for<'a> FnMut(
-        &'a mut dyn Console,
-        &'a Config,
-        &'a [PathBuf],
-        &'a Path,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>,
-    D: FnMut(&Config, &[PathBuf]) -> Result<()>,
-{
-    if display_overlaps_targets(display_target, &targets) {
-        // The relay (overlap path) is async — it suspends the console,
-        // pumps the PTY relay loop, then resumes. The callback is a
-        // boxed-future seam so tests can drive the dispatch without
-        // forking a real shell.
-        relay_fn(console, config, &targets, display_target).await?;
-        Ok(PickerSessionOutcome::ShellRan)
-    } else {
-        // Fire-and-forget: spawn one shell per target so each line
-        // carries its own session. If a spawn fails we log + carry on;
-        // reporting back through a modal lets the operator retry or
-        // pick a different target.
-        detach_fn(config, &targets)?;
         Ok(PickerSessionOutcome::ShellDetached { targets })
     }
 }

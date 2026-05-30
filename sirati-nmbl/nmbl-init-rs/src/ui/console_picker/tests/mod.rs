@@ -28,8 +28,6 @@ pub(super) struct FakeConsole {
     pub(super) events: std::collections::VecDeque<Option<KeyEvent>>,
     pub(super) renders: u32,
     pub(super) kind: ConsoleKind,
-    pub(super) suspend_calls: u32,
-    pub(super) resume_calls: u32,
 }
 
 impl FakeConsole {
@@ -38,8 +36,6 @@ impl FakeConsole {
             events: events.into(),
             renders: 0,
             kind: ConsoleKind::Tty,
-            suspend_calls: 0,
-            resume_calls: 0,
         }
     }
 
@@ -75,11 +71,9 @@ impl Console for FakeConsole {
         Ok(())
     }
     fn suspend(&mut self) -> Result<()> {
-        self.suspend_calls = self.suspend_calls.saturating_add(1);
         Ok(())
     }
     fn resume(&mut self) -> Result<()> {
-        self.resume_calls = self.resume_calls.saturating_add(1);
         Ok(())
     }
 }
