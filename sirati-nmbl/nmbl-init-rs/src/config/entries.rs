@@ -32,6 +32,15 @@ pub struct Activation {
     #[serde(default)]
     pub produces_devices: Vec<PathBuf>,
 
+    /// Backing block devices this activation CONSUMES (not produces).
+    /// For luks kinds this is the encrypted backing device(s) whose
+    /// header `--validate-hardware` probes; for lvm/mdraid/zfs it is
+    /// empty because the config carries no backing-device info for
+    /// them. `serde(default)` keeps older configs (which never emitted
+    /// this key) parseable.
+    #[serde(default)]
+    pub source_devices: Vec<PathBuf>,
+
     pub description: String,
 
     #[serde(default)]
