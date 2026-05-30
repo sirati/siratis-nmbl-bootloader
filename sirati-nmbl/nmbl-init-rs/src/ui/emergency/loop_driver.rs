@@ -174,12 +174,19 @@ where
                 dirty = true;
                 continue;
             }
-            Some(ConsoleEvent::Key(key)) => {
-                // Any keypress cancels the auto-reboot countdown for the
-                // remainder of this session: clear both the display field
-                // and the latched deadline so re-entries don't re-arm it.
+            Some(ConsoleEvent::UserHasInteracted) => {
+                // The central latch layer signals the operator's first
+                // input of the session. Cancel the auto-reboot countdown
+                // for the remainder of this session: clear both the
+                // display field and the latched deadline so re-entries
+                // don't re-arm it. The real key that produced this notice
+                // arrives on the next poll and does its normal job.
                 app.countdown_remaining_secs = None;
                 app.error_countdown_deadline = None;
+                dirty = true;
+                continue;
+            }
+            Some(ConsoleEvent::Key(key)) => {
                 if app.on_key(key) {
                     break;
                 }

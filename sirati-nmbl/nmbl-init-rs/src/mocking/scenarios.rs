@@ -143,8 +143,14 @@ pub(super) async fn run_resize(console: &mut MockConsole, args: &[String]) -> Re
         let slice = remaining.min(POLL_SLICE);
         match console.poll_event(slice).await? {
             Some(ConsoleEvent::Key(_)) => break,
-            // Any further resize / scroll / no event: re-paint and wait again.
-            Some(ConsoleEvent::Resize { .. } | ConsoleEvent::Scroll { .. }) | None => continue,
+            // Any further resize / scroll / interaction-notice / no event:
+            // re-paint and wait again.
+            Some(
+                ConsoleEvent::Resize { .. }
+                | ConsoleEvent::Scroll { .. }
+                | ConsoleEvent::UserHasInteracted,
+            )
+            | None => continue,
         }
     }
     eprintln!("[mocking] resize dismissed");

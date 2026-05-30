@@ -41,7 +41,7 @@ pub(super) async fn run_prompt_url(
                 continue;
             }
             Some(ConsoleEvent::Key(k)) => k,
-            Some(ConsoleEvent::Scroll { .. }) | None => continue,
+            Some(ConsoleEvent::Scroll { .. } | ConsoleEvent::UserHasInteracted) | None => continue,
         };
         if key.kind != KeyEventKind::Press {
             continue;
