@@ -16,7 +16,7 @@ use crate::config::{Config, FilesystemEntry};
 use crate::error::{NmblError, Result};
 use crate::nmbl_info;
 use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
-use crate::sys::ops::SysOps;
+use crate::sys::ops::{FsOps, SysOps};
 use crate::ui::{BootReporter, ProgressSink};
 
 /// Sleep granularity between polls. Matches the 100 ms cadence of the
@@ -185,11 +185,15 @@ pub fn resolve_mountpoint(system_root: &Path, entry: &FilesystemEntry) -> PathBu
 /// Create `dir` (and parents) if absent. `create_dir_all` already
 /// treats `AlreadyExists` as success; a regular file in the way still
 /// surfaces as an error.
-fn ensure_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).map_err(|source| NmblError::Io {
-        source,
-        context: format!("creating mountpoint directory {}", dir.display()),
-    })
+fn ensure_dir(ops: &mut impl FsOps, dir: &Path) -> Result<()> {
+    match ops.ensure_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(source) => Err(NmblError::Io {
+            source,
+            context: format!("creating mountpoint directory {}", dir.display()),
+        }),
+    }
 }
 
 /// Wait for every configured device and mount each filesystem under
@@ -216,7 +220,7 @@ pub async fn mount_system_filesystems<S: SysOps>(
 ) -> Result<()> {
     let system_root = config.paths.system_root.as_path();
     let device_timeout = Duration::from_secs(config.general.device_timeout_secs);
-    ensure_dir(system_root)?;
+    ensure_dir(ops, system_root)?;
 
     let _ = reporter.set_phase("phase 3b: scanning /dev/disk/by-* symlinks");
     // NMBL has no udev, so /dev/disk/by-{partlabel,label,uuid,partuuid}/
@@ -235,101 +239,115 @@ pub async fn mount_system_filesystems<S: SysOps>(
     }
 
     for entry in &config.filesystems {
-        // Loop-backed entries (squashfs images etc.) name their backing
-        // FILE as the device. That file lives on a filesystem mounted
-        // earlier in this same cascade, so resolve an absolute device
-        // path against `system_root` (the file's post-pivot path is what
-        // the config carries; NMBL sees it under its mount prefix).
-        let raw_dev = Path::new(&entry.device);
-        let resolved_dev: PathBuf = if raw_dev.is_absolute() && !raw_dev.starts_with("/dev/") {
-            let stripped = raw_dev.strip_prefix("/").unwrap_or(raw_dev);
-            system_root.join(stripped)
-        } else {
-            raw_dev.to_path_buf()
-        };
-        let dev = resolved_dev.as_path();
-
-        let _ = reporter.set_phase(format!(
-            "phase 3b: waiting for {} -> {}",
-            dev.display(),
-            entry.mountpoint.display(),
-        ));
-        // Animate the wait so the operator sees the boot is alive (and an
-        // "elapsed / timeout" countdown) instead of a frozen phase label.
-        ops.wait_for_device(
-            dev,
-            device_timeout,
-            "phase 3b: waiting for",
-            Some(&mut *reporter),
-        )
-        .await?;
-
-        let target = resolve_mountpoint(system_root, entry);
-        ensure_dir(&target)?;
-
-        // If the entry is loop-backed, set up a loop device over the
-        // backing file and mount THAT instead. The kernel detaches the
-        // loop binding when the mount is torn down before kexec.
-        let mount_src: PathBuf = if entry_is_loop_backed(entry, dev) {
-            let loop_dev = ops.setup_loop(dev)?;
-            nmbl_info!(
-                "loop-backed {} attached to {}",
-                dev.display(),
-                loop_dev.display(),
-            );
-            loop_dev
-        } else {
-            dev.to_path_buf()
-        };
-
-        // Strip the `loop` pseudo-option: it is consumed here (we set up
-        // the loop device ourselves) and the kernel rejects it as mount
-        // data. Other options pass through unchanged.
-        let mount_opts: String = entry
-            .options
-            .split(',')
-            .filter(|o| !o.is_empty() && *o != "loop")
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let _ = reporter.set_phase(format!(
-            "phase 3b: mounting {} on {}",
-            mount_src.display(),
-            target.display(),
-        ));
-        match ops.mount(Some(&mount_src), &target, &entry.fstype, &mount_opts) {
-            Ok(()) => {}
-            Err(NmblError::Mount {
-                source: Errno::EBUSY,
-                ..
-            }) => {
-                // The device is already mounted — most likely the boot
-                // partition that Phase 0.5 mounted at
-                // `runtime_boot_mountpoint`. Bind-mount from there so the
-                // system root still gets the directory at the expected path.
-                if let Some(bootstrap_mp) = &config.runtime_boot_mountpoint {
-                    nmbl_info!(
-                        "device {} already mounted (EBUSY); bind-mounting {} -> {}",
-                        dev.display(),
-                        bootstrap_mp.display(),
-                        target.display(),
-                    );
-                    ops.mount(Some(bootstrap_mp.as_path()), &target, &entry.fstype, "bind")?;
-                } else {
-                    // No bootstrap mountpoint to fall back to — propagate.
-                    return Err(NmblError::Mount {
-                        src: Some(dev.to_path_buf()),
-                        dst: target,
-                        fstype: entry.fstype.clone(),
-                        source: Errno::EBUSY,
-                    });
-                }
-            }
-            Err(e) => return Err(e),
-        }
+        mount_one_filesystem(ops, config, entry, reporter, device_timeout).await?;
     }
 
     nmbl_info!("system filesystems mounted under {}", system_root.display());
+    Ok(())
+}
+
+/// Wait for and mount a single `entry` under `config.paths.system_root`.
+/// Extracted verbatim from [`mount_system_filesystems`] (resolve device →
+/// wait → optional loop setup → mount with the EBUSY bind-mount fallback)
+/// so each function stays within the per-function size limit.
+async fn mount_one_filesystem<S: SysOps>(
+    ops: &mut S,
+    config: &Config,
+    entry: &FilesystemEntry,
+    reporter: &mut BootReporter<'_, '_>,
+    device_timeout: Duration,
+) -> Result<()> {
+    let system_root = config.paths.system_root.as_path();
+    // Loop-backed entries (squashfs images etc.) name their backing
+    // FILE as the device. That file lives on a filesystem mounted
+    // earlier in this same cascade, so resolve an absolute device
+    // path against `system_root` (the file's post-pivot path is what
+    // the config carries; NMBL sees it under its mount prefix).
+    let raw_dev = Path::new(&entry.device);
+    let resolved_dev: PathBuf = if raw_dev.is_absolute() && !raw_dev.starts_with("/dev/") {
+        let stripped = raw_dev.strip_prefix("/").unwrap_or(raw_dev);
+        system_root.join(stripped)
+    } else {
+        raw_dev.to_path_buf()
+    };
+    let dev = resolved_dev.as_path();
+
+    let _ = reporter.set_phase(format!(
+        "phase 3b: waiting for {} -> {}",
+        dev.display(),
+        entry.mountpoint.display(),
+    ));
+    // Animate the wait so the operator sees the boot is alive (and an
+    // "elapsed / timeout" countdown) instead of a frozen phase label.
+    ops.wait_for_device(
+        dev,
+        device_timeout,
+        "phase 3b: waiting for",
+        Some(&mut *reporter),
+    )
+    .await?;
+
+    let target = resolve_mountpoint(system_root, entry);
+    ensure_dir(ops, &target)?;
+    // If the entry is loop-backed, set up a loop device over the
+    // backing file and mount THAT instead. The kernel detaches the
+    // loop binding when the mount is torn down before kexec.
+    let mount_src: PathBuf = if entry_is_loop_backed(entry, dev) {
+        let loop_dev = ops.setup_loop(dev)?;
+        nmbl_info!(
+            "loop-backed {} attached to {}",
+            dev.display(),
+            loop_dev.display(),
+        );
+        loop_dev
+    } else {
+        dev.to_path_buf()
+    };
+    // Strip the `loop` pseudo-option: it is consumed here (we set up
+    // the loop device ourselves) and the kernel rejects it as mount
+    // data. Other options pass through unchanged.
+    let mount_opts: String = entry
+        .options
+        .split(',')
+        .filter(|o| !o.is_empty() && *o != "loop")
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let _ = reporter.set_phase(format!(
+        "phase 3b: mounting {} on {}",
+        mount_src.display(),
+        target.display(),
+    ));
+    match ops.mount(Some(&mount_src), &target, &entry.fstype, &mount_opts) {
+        Ok(()) => {}
+        Err(NmblError::Mount {
+            source: Errno::EBUSY,
+            ..
+        }) => {
+            // The device is already mounted — most likely the boot
+            // partition that Phase 0.5 mounted at
+            // `runtime_boot_mountpoint`. Bind-mount from there so the
+            // system root still gets the directory at the expected path.
+            if let Some(bootstrap_mp) = &config.runtime_boot_mountpoint {
+                nmbl_info!(
+                    "device {} already mounted (EBUSY); bind-mounting {} -> {}",
+                    dev.display(),
+                    bootstrap_mp.display(),
+                    target.display(),
+                );
+                ops.mount(Some(bootstrap_mp.as_path()), &target, &entry.fstype, "bind")?;
+            } else {
+                // No bootstrap mountpoint to fall back to — propagate.
+                return Err(NmblError::Mount {
+                    src: Some(dev.to_path_buf()),
+                    dst: target,
+                    fstype: entry.fstype.clone(),
+                    source: Errno::EBUSY,
+                });
+            }
+        }
+        Err(e) => return Err(e),
+    }
     Ok(())
 }
 
