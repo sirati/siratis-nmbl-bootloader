@@ -162,8 +162,11 @@ fn run_inner(
     // runs inside the one interactive runtime so no wait ever blocks the
     // single runtime thread.
     {
+        // Phase 1 is pre-runtime (no poller yet); its pseudo-fs mounts are
+        // sync `FsOps` only, so a sender-less `RealSys` drives them.
+        let mut ops = nmbl_init::sys::ops::RealSys::sync_only();
         let mut reporter = BootReporter::new(&mut noop, "phase 1: mount pseudo-filesystems");
-        if let Err(err) = run_phase_1(&mut reporter) {
+        if let Err(err) = run_phase_1(&mut ops, &mut reporter) {
             return Err(Box::new((err, config)));
         }
     }

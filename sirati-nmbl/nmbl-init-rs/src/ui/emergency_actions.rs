@@ -30,6 +30,7 @@ use crate::devices::mount_system_filesystems;
 use crate::error::{NmblError, Result, format_chain};
 use crate::generations::scan_generations;
 use crate::nmbl_info;
+use crate::sys::ops::RealSys;
 use crate::terminal::TerminalAction;
 use crate::ui::app::App;
 use crate::ui::console::Console;
@@ -73,20 +74,25 @@ pub async fn retry_boot(
 ) -> Result<TerminalAction> {
     nmbl_info!("emergency action: retry boot from config");
 
+    // The retry path runs inside the live emergency runtime, so it has a
+    // poller `sender`; build the genuine in-runtime system-ops impl and
+    // route phase 3/3b through it exactly as the main boot spine does.
+    let mut ops = RealSys::new(sender);
+
     // Phase 3: activations. The reporter overlays the emergency menu
     // App so the menu remains visible behind the progress indicator;
     // the reporter's Drop impl clears `app.modal` on scope exit.
     let injections = {
         let mut reporter =
             BootReporter::overlay(console, app, "phase 3: storage activations (retry)");
-        run_all_activations(config, &mut reporter, Some(supplier), sender).await?
+        run_all_activations(&mut ops, config, &mut reporter, Some(supplier), sender).await?
     };
 
     // Phase 3b: mount system filesystems.
     {
         let mut reporter =
             BootReporter::overlay(console, app, "phase 3b: mount system filesystems (retry)");
-        mount_system_filesystems(config, &mut reporter, sender).await?;
+        mount_system_filesystems(&mut ops, config, &mut reporter).await?;
     }
 
     run_selector_and_dispatch(config, console, app, &injections).await

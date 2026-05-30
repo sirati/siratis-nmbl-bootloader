@@ -74,5 +74,7 @@ fn force_path_loads_explicit_set_before_dispatch() {
     empty.kernel_modules.explicit.clear();
     let mut noop = NoopConsole::new();
     let mut reporter = BootReporter::new(&mut noop, "test");
-    load_explicit_modules(&empty, &mut reporter).expect("empty explicit set must be a no-op");
+    let mut ops = nmbl_init::sys::ops::RealSys::sync_only();
+    load_explicit_modules(&mut ops, &empty, &mut reporter)
+        .expect("empty explicit set must be a no-op");
 }

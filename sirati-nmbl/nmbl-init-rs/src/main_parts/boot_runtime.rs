@@ -11,6 +11,7 @@ use nmbl_init::error::{NmblError, format_chain};
 use nmbl_init::modules::load_explicit_modules;
 use nmbl_init::panic::install_panic_hook;
 use nmbl_init::rescue::{self};
+use nmbl_init::sys::ops::RealSys;
 use nmbl_init::terminal::TerminalAction;
 use nmbl_init::ui::console::{Console, NoopConsole, open_console};
 use nmbl_init::ui::key_echo::run_key_echo_loop;
@@ -50,8 +51,11 @@ pub(crate) fn run_force_rescue(
     // before `rescue::dispatch` — using the pre-console NoopConsole
     // reporter exactly as phase 2a does.
     {
+        // Pre-runtime: no poller yet, so module loading (sync `ModuleOps`)
+        // goes through a sender-less `RealSys`.
+        let mut ops = RealSys::sync_only();
         let mut reporter = BootReporter::new(noop, "force_on_boot: load rescue kernel modules");
-        if let Err(err) = load_explicit_modules(&config, &mut reporter) {
+        if let Err(err) = load_explicit_modules(&mut ops, &config, &mut reporter) {
             nmbl_warn!("force_on_boot: loading rescue modules failed: {err}");
             return Err(Box::new((err, config)));
         }
@@ -150,8 +154,12 @@ pub(crate) async fn run_boot_inside_runtime(
     noop: &mut NoopConsole,
     sender: nmbl_init::sys::poller::LocalSender,
 ) -> BootOutcome {
+    // The genuine in-runtime system-ops impl: its async forwards reap
+    // subprocesses through the poller `sender`. Threaded `&mut` down the
+    // spine so every side-effecting call dispatches through it.
+    let mut ops = RealSys::new(&sender);
     if bootstrap_mode {
-        match run_bootstrap_phase(bootstrap_path, &sender).await {
+        match run_bootstrap_phase(&mut ops, bootstrap_path).await {
             Ok(loaded) => {
                 config = loaded;
                 install_panic_hook(&config.general.panic_report_dir);
@@ -164,12 +172,12 @@ pub(crate) async fn run_boot_inside_runtime(
         return BootOutcome::ForceRescue(Box::new(config));
     }
     #[cfg(feature = "stateful")]
-    if bootstrap_mode && let Err(err) = mount_state_twin(&mut config, bootstrap_path) {
+    if bootstrap_mode && let Err(err) = mount_state_twin(&mut ops, &mut config, bootstrap_path) {
         return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
     }
     {
         let mut reporter = BootReporter::new(noop, "phase 2a: load early kernel modules");
-        if let Err(err) = run_phase_2a(&config, &mut reporter) {
+        if let Err(err) = run_phase_2a(&mut ops, &config, &mut reporter) {
             nmbl_warn!("phase 2a (early modules) failed: {err}");
             return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
         }
@@ -188,7 +196,7 @@ pub(crate) async fn run_boot_inside_runtime(
     }
     let session = SessionInteraction::new();
     BootOutcome::Done(Box::new(Ok(run_tui_session(
-        &config, console, &session, &sender,
+        &mut ops, &config, console, &session, &sender,
     )
     .await)))
 }

@@ -17,10 +17,9 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use crate::config::{Activation, ActivationKind, Config};
-use crate::devices::wait_for;
 use crate::error::{NmblError, Result};
 use crate::nmbl_info;
-use crate::sys::activation::run;
+use crate::sys::ops::SysOps;
 use crate::ui::BootReporter;
 use crate::ui::console::Console;
 
@@ -72,7 +71,8 @@ pub trait PasswordSupplier {
 /// Returns the set of [`KeyInjection`]s the kexec path must append to
 /// the system initrd (one per `luks-password` activation whose TOML
 /// sets `pass_to_stage1`). The vec is empty when no activation opts in.
-pub async fn run_all_activations(
+pub async fn run_all_activations<S: SysOps>(
+    ops: &mut S,
     config: &Config,
     reporter: &mut BootReporter<'_, '_>,
     mut password_supplier: Option<&mut dyn PasswordSupplier>,
@@ -100,6 +100,7 @@ pub async fn run_all_activations(
             None => None,
         };
         let stdin_owned = run_one_activation(
+            ops,
             config,
             activation,
             &mut *reporter.console,
@@ -114,7 +115,7 @@ pub async fn run_all_activations(
         for device in &activation.produces_devices {
             // Drive the spinner / status line while we wait so a slow
             // activation (LUKS unlock, LVM scan) doesn't look frozen.
-            wait_for(
+            ops.wait_for_device(
                 device,
                 device_timeout,
                 &wait_operation,
@@ -156,7 +157,8 @@ pub async fn run_all_activations(
 /// On exit code 2 from a `luks-password` step the wrong-password modal
 /// is shown and the operator can retry without restarting the boot.
 /// Every other non-zero exit code is fatal.
-async fn run_one_activation(
+async fn run_one_activation<S: SysOps>(
+    ops: &mut S,
     config: &Config,
     activation: &Activation,
     console: &mut dyn Console,
@@ -193,7 +195,7 @@ async fn run_one_activation(
         let outcome = if activation.kind == ActivationKind::LuksPassword {
             run_luks_with_spinner(activation, stdin_slice, console, sender).await?
         } else {
-            run(&activation.binary, &activation.argv, stdin_slice, sender)
+            ops.run(&activation.binary, &activation.argv, stdin_slice)
                 .await
                 .map_err(|source| wrap_runner_error(activation, source))?
         };

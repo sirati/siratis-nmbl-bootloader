@@ -16,7 +16,7 @@ use crate::config::{Config, FilesystemEntry};
 use crate::error::{NmblError, Result};
 use crate::nmbl_info;
 use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
-use crate::sys::poller::LocalSender;
+use crate::sys::ops::SysOps;
 use crate::ui::{BootReporter, ProgressSink};
 
 /// Sleep granularity between polls. Matches the 100 ms cadence of the
@@ -209,10 +209,10 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// block device to a different path returns `EBUSY`. In that case we
 /// bind-mount from the bootstrap mountpoint so the system root sees the
 /// boot partition at its expected location without remounting the device.
-pub async fn mount_system_filesystems(
+pub async fn mount_system_filesystems<S: SysOps>(
+    ops: &mut S,
     config: &Config,
     reporter: &mut BootReporter<'_, '_>,
-    sender: &LocalSender,
 ) -> Result<()> {
     let system_root = config.paths.system_root.as_path();
     let device_timeout = Duration::from_secs(config.general.device_timeout_secs);
@@ -224,14 +224,14 @@ pub async fn mount_system_filesystems(
     // wait_for loop below — disko-style configs reference paths
     // under /dev/disk/by-*, and waiting for a symlink we'll never
     // create just burns the 30 s budget.
-    let btrfs_devs = crate::sys::blkid::populate_disk_by_symlinks(sender).await?;
+    let btrfs_devs = ops.populate_disk_symlinks().await?;
 
     // Issue BTRFS_IOC_SCAN_DEV on every btrfs member found by blkid so
     // the kernel assembles multi-device btrfs filesystems (RAID0/RAID1)
     // before mount(2) is called. Without this, mount fails with
     // "devid N uuid ... is missing" when only the first member is known.
     if !btrfs_devs.is_empty() {
-        crate::sys::btrfs::scan_devices(&btrfs_devs)?;
+        ops.btrfs_scan(&btrfs_devs)?;
     }
 
     for entry in &config.filesystems {
@@ -256,7 +256,7 @@ pub async fn mount_system_filesystems(
         ));
         // Animate the wait so the operator sees the boot is alive (and an
         // "elapsed / timeout" countdown) instead of a frozen phase label.
-        wait_for(
+        ops.wait_for_device(
             dev,
             device_timeout,
             "phase 3b: waiting for",
@@ -271,7 +271,7 @@ pub async fn mount_system_filesystems(
         // backing file and mount THAT instead. The kernel detaches the
         // loop binding when the mount is torn down before kexec.
         let mount_src: PathBuf = if entry_is_loop_backed(entry, dev) {
-            let loop_dev = setup_loop_device(dev)?;
+            let loop_dev = ops.setup_loop(dev)?;
             nmbl_info!(
                 "loop-backed {} attached to {}",
                 dev.display(),
@@ -297,7 +297,7 @@ pub async fn mount_system_filesystems(
             mount_src.display(),
             target.display(),
         ));
-        match crate::sys::mount::mount_fs(Some(&mount_src), &target, &entry.fstype, &mount_opts) {
+        match ops.mount(Some(&mount_src), &target, &entry.fstype, &mount_opts) {
             Ok(()) => {}
             Err(NmblError::Mount {
                 source: Errno::EBUSY,
@@ -314,12 +314,7 @@ pub async fn mount_system_filesystems(
                         bootstrap_mp.display(),
                         target.display(),
                     );
-                    crate::sys::mount::mount_fs(
-                        Some(bootstrap_mp.as_path()),
-                        &target,
-                        &entry.fstype,
-                        "bind",
-                    )?;
+                    ops.mount(Some(bootstrap_mp.as_path()), &target, &entry.fstype, "bind")?;
                 } else {
                     // No bootstrap mountpoint to fall back to — propagate.
                     return Err(NmblError::Mount {
