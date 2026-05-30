@@ -3,11 +3,12 @@
 use std::path::Path;
 
 use crate::config::Config;
-use crate::error::{NmblError, Result};
+use crate::error::Result;
 use crate::nmbl_warn;
 use crate::ui::BootReporter;
 
 use super::Generation;
+use super::readiness::classify_scan_failure_live;
 use super::resolve::{
     mount_aware_resolve, read_kernel_params, read_label, resolve_init_path, resolve_kernel_initrd,
 };
@@ -24,8 +25,16 @@ pub(super) fn parse_generation_number(name: &str) -> Option<u32> {
 /// Scan `config.paths.nix_profiles_dir` for `system-*-link` entries and return
 /// the matching generations sorted by `number` DESCENDING (newest first).
 ///
-/// Returns [`NmblError::NoGenerations`] when the directory cannot be read or
-/// has no usable entries.
+/// When the scan finds nothing, the failure is classified (see
+/// [`super::readiness::classify_scan_failure_live`]) into the most
+/// specific cause:
+///   - [`crate::error::NmblError::SystemRootNotMounted`] — nothing is
+///     mounted at the system-root mountpoint;
+///   - [`crate::error::NmblError::ProfilesDirMissing`] — a filesystem is
+///     mounted but it lacks the `nix/var/nix/profiles` directory (wrong
+///     fs / wrong mountpoint, e.g. a bad hand-mount);
+///   - [`crate::error::NmblError::NoGenerations`] — the directory exists
+///     and was read but holds no `system-N-link` entries.
 ///
 /// `reporter` carries the live boot console; we surface the scan path
 /// as the boot-status phase label so the operator sees what's being
@@ -44,7 +53,7 @@ pub fn scan_generations(
         Ok(it) => it,
         Err(err) => {
             nmbl_warn!("cannot read {}: {err}", dir.display());
-            return Err(NmblError::NoGenerations { searched: dir });
+            return Err(classify_scan_failure_live(&dir, mount_prefix));
         }
     };
 
@@ -102,7 +111,10 @@ pub fn scan_generations(
     }
 
     if generations.is_empty() {
-        return Err(NmblError::NoGenerations { searched: dir });
+        // The dir read fine but held no usable `system-N-link` entries;
+        // classification keeps this as NoGenerations (dir present) while
+        // still routing the missing-dir / not-mounted cases above.
+        return Err(classify_scan_failure_live(&dir, mount_prefix));
     }
 
     // Newest first; the active-profile lookup below maps the operator's

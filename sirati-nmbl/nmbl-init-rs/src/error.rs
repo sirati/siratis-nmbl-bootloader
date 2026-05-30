@@ -76,6 +76,23 @@ pub enum NmblError {
     #[error("no NixOS generations found under {searched}")]
     NoGenerations { searched: PathBuf },
 
+    /// The system-root mountpoint NMBL scans for generations is not
+    /// actually a mount — nothing is mounted there at all. Almost always
+    /// means the operator dropped to the emergency screen and hasn't yet
+    /// mounted the NixOS system root, or mounted it somewhere else.
+    #[error("nothing is mounted at {mountpoint}")]
+    SystemRootNotMounted { mountpoint: PathBuf },
+
+    /// A filesystem *is* mounted at the system root, but it does not
+    /// contain the `nix/var/nix/profiles` directory NMBL needs. Signals a
+    /// bad hand-mount: the wrong filesystem, or the right one mounted at
+    /// the wrong place. `path` is the missing profiles dir; `mountpoint`
+    /// is where the system root is expected.
+    #[error(
+        "required profiles directory {path} does not exist (system root mounted at {mountpoint})"
+    )]
+    ProfilesDirMissing { path: PathBuf, mountpoint: PathBuf },
+
     #[error("TUI failed: {source}")]
     Tui {
         #[source]
