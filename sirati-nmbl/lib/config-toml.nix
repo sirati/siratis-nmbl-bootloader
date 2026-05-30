@@ -98,11 +98,16 @@ let
       fstype = fs.fsType;
       # The Rust `FilesystemEntry.options` is a single comma-joined
       # String, not a Vec<String>. Strip fstab/systemd pseudo-options
-      # (`x-*`, `nofail`, `_netdev`) — the kernel rejects them with
-      # EINVAL because they are not real mount(2) flags.
+      # (`x-*`, `nofail`, `noauto`, `_netdev`) — the kernel rejects them
+      # with EINVAL because they are not real mount(2) flags. `noauto`
+      # only tells systemd not to auto-mount the entry in the target's
+      # stage-1; NMBL mounts every entry in its list unconditionally
+      # pre-kexec, so dropping the token here is correct (it lets a
+      # filesystem be NMBL-mounted yet target-stage-1-skipped).
       options = lib.concatStringsSep "," (
         builtins.filter (
-          opt: !(lib.hasPrefix "x-" opt) && opt != "nofail" && opt != "_netdev"
+          opt:
+          !(lib.hasPrefix "x-" opt) && opt != "nofail" && opt != "noauto" && opt != "_netdev"
         ) fs.options
       );
       is_root = fs.mountPoint == "/";
