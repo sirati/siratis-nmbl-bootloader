@@ -234,7 +234,7 @@ async fn serve_session(
     shutdown: &Shutdown,
     sink: &ActionSink,
 ) {
-    let mut console = match TtyConsole::from_pty(handle.pty, handle.winsize) {
+    let console = match TtyConsole::from_pty(handle.pty, handle.winsize) {
         Ok(c) => c,
         Err(e) => {
             nmbl_warn!("remote-tui: cannot build console on pty: {e}");
