@@ -30,7 +30,7 @@ use crate::devices::mount_system_filesystems;
 use crate::error::{NmblError, Result, format_chain};
 use crate::generations::scan_generations;
 use crate::nmbl_info;
-use crate::sys::ops::RealSys;
+use crate::sys::ops::{RealSys, SysOps};
 use crate::terminal::TerminalAction;
 use crate::ui::app::App;
 use crate::ui::console::Console;
@@ -95,7 +95,7 @@ pub async fn retry_boot(
         mount_system_filesystems(&mut ops, config, &mut reporter).await?;
     }
 
-    run_selector_and_dispatch(config, console, app, &injections).await
+    run_selector_and_dispatch(&mut ops, config, console, app, &injections).await
 }
 
 /// Skip phases 3 and 3b — trust the operator's manual mount — and run
@@ -121,6 +121,7 @@ pub async fn verify_kexec_readiness(
     config: &Config,
     console: &mut dyn Console,
     app: &mut App<'static>,
+    sender: &crate::sys::poller::LocalSender,
 ) -> Result<Option<TerminalAction>> {
     nmbl_info!("emergency action: verify kexec readiness");
 
@@ -150,8 +151,12 @@ pub async fn verify_kexec_readiness(
         ConfirmOutcome::Yes => {
             // No passphrase injection: the operator skipped phase 3.
             let injections: Vec<KeyInjection> = Vec::new();
+            // In-runtime: build the genuine system-ops impl so the kexec
+            // load + teardown route through the same seam as the main spine.
+            let mut ops = RealSys::new(sender);
             let decision = run_selector(config, &generations, console, &app.interaction).await?;
             Ok(Some(decision_to_action(
+                &mut ops,
                 config,
                 &generations,
                 &injections,
@@ -165,7 +170,8 @@ pub async fn verify_kexec_readiness(
 /// Drive the selector and translate its [`Decision`] into a
 /// [`TerminalAction`]. Shared by [`retry_boot`] (and could be used by
 /// `verify_kexec_readiness` if we hoist the empty-injection case).
-async fn run_selector_and_dispatch(
+async fn run_selector_and_dispatch<S: SysOps>(
+    ops: &mut S,
     config: &Config,
     console: &mut dyn Console,
     app: &mut App<'static>,
@@ -176,7 +182,7 @@ async fn run_selector_and_dispatch(
         scan_generations(config, &mut reporter)?
     };
     let decision = run_selector(config, &generations, console, &app.interaction).await?;
-    decision_to_action(config, &generations, injections, decision)
+    decision_to_action(ops, config, &generations, injections, decision)
 }
 
 /// Map the selector's [`Decision`] onto a [`TerminalAction`].
@@ -189,7 +195,8 @@ async fn run_selector_and_dispatch(
 ///     can't drop to the emergency shell from inside the emergency
 ///     screen — that would be an infinite loop), so it surfaces as
 ///     an `Err` the caller routes through `show_modal_error`.
-fn decision_to_action(
+fn decision_to_action<S: SysOps>(
+    ops: &mut S,
     config: &Config,
     generations: &[crate::generations::Generation],
     injections: &[KeyInjection],
@@ -209,7 +216,7 @@ fn decision_to_action(
                     context: "emergency-retry decision dispatch".to_string(),
                 });
             };
-            kexec_into(config, target, cmdline_override.as_deref(), injections)
+            kexec_into(ops, config, target, cmdline_override.as_deref(), injections)
         }
         Decision::Reboot => Ok(TerminalAction::Reboot),
         Decision::Shell => Err(NmblError::Tui {
@@ -265,7 +272,8 @@ mod tests {
     fn decision_to_action_reboot_yields_reboot() {
         let cfg = Config::recovery_default();
         let gens = vec![fake_gen(1)];
-        let action = decision_to_action(&cfg, &gens, &[], Decision::Reboot)
+        let mut ops = RealSys::sync_only();
+        let action = decision_to_action(&mut ops, &cfg, &gens, &[], Decision::Reboot)
             .expect("Reboot decision must produce TerminalAction::Reboot");
         assert!(matches!(action, TerminalAction::Reboot));
     }
@@ -278,7 +286,8 @@ mod tests {
         // loop. Pin the explicit `NmblError::Tui` translation.
         let cfg = Config::recovery_default();
         let gens = vec![fake_gen(1)];
-        let err = decision_to_action(&cfg, &gens, &[], Decision::Shell)
+        let mut ops = RealSys::sync_only();
+        let err = decision_to_action(&mut ops, &cfg, &gens, &[], Decision::Shell)
             .expect_err("Shell decision must produce an error inside retry path");
         assert!(matches!(err, NmblError::Tui { .. }));
     }
@@ -291,7 +300,9 @@ mod tests {
         // a future regression is easy to bisect from the boot log.
         let cfg = Config::recovery_default();
         let gens = vec![fake_gen(1)];
+        let mut ops = RealSys::sync_only();
         let err = decision_to_action(
+            &mut ops,
             &cfg,
             &gens,
             &[],
