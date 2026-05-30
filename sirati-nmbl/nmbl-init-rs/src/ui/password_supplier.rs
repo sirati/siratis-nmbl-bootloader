@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::generations::Generation;
 use crate::ui::POLL_SLICE;
-use crate::ui::app::{App, Decision, Screen, SessionInteraction};
+use crate::ui::app::{App, Decision, Screen, SessionInteraction, SkipSelector};
 use crate::ui::console::Console;
 
 /// PasswordSupplier impl that pops a passphrase modal on the live
@@ -26,17 +26,28 @@ pub struct TuiPasswordSupplier {
     /// this session so a typed passphrase counts as "operator present"
     /// for the emergency screen's countdown decision.
     session: SessionInteraction,
+    /// Shared "skip the generation selector" latch, set at passphrase
+    /// submit from the modal's "Select NixOS Generation" checkbox.
+    /// Unchecked (default) ⇒ `true` (skip → boot default gen); checked
+    /// ⇒ `false` (show the selector, today's behaviour). Read by the
+    /// post-phase selector dispatch in `main_parts`.
+    skip_selector: SkipSelector,
 }
 
 impl TuiPasswordSupplier {
     #[must_use]
-    pub fn new(_config: &Config, session: &SessionInteraction) -> Self {
+    pub fn new(
+        _config: &Config,
+        session: &SessionInteraction,
+        skip_selector: &SkipSelector,
+    ) -> Self {
         // `_config` is accepted for forward-compatibility with
         // future per-config passphrase policy (retry counts, masking
         // toggles, …). Today the supplier is uniform — the same
         // ratatui modal everywhere.
         Self {
             session: session.clone(),
+            skip_selector: skip_selector.clone(),
         }
     }
 }
@@ -50,7 +61,12 @@ impl PasswordSupplier for TuiPasswordSupplier {
         // Fully async: the activation runner now drives this future
         // inside the single interactive runtime, so we just await the
         // passphrase modal directly — no nested runtime.
-        Box::pin(passphrase_prompt_on_console(console, label, &self.session))
+        Box::pin(passphrase_prompt_on_console(
+            console,
+            label,
+            &self.session,
+            &self.skip_selector,
+        ))
     }
 }
 
@@ -65,6 +81,7 @@ pub(crate) async fn passphrase_prompt_on_console(
     console: &mut dyn Console,
     label: &str,
     session: &SessionInteraction,
+    skip_selector: &SkipSelector,
 ) -> Result<Zeroizing<String>> {
     // No generations to render — pass an empty slice. The App is
     // only used here for its Passphrase screen state.
@@ -76,6 +93,9 @@ pub(crate) async fn passphrase_prompt_on_console(
         cursor: 0,
         verifying: false,
         spinner_frame: 0,
+        // Checkbox starts UNCHECKED: a plain unlock skips the selector
+        // and boots the default generation. Ctrl+G flips it.
+        select_generation: false,
     };
 
     let mut dirty = true;
@@ -121,7 +141,19 @@ pub(crate) async fn passphrase_prompt_on_console(
                     {
                         continue;
                     }
-                    if let Screen::Passphrase { buffer, .. } = app.screen {
+                    if let Screen::Passphrase {
+                        buffer,
+                        select_generation,
+                        ..
+                    } = app.screen
+                    {
+                        // Record the checkbox into the shared latch the
+                        // post-phase dispatch reads: UNCHECKED ⇒ skip the
+                        // selector and boot the default gen; CHECKED ⇒
+                        // show the selector (today's behaviour). A
+                        // wrong-password re-prompt re-runs this fn, so the
+                        // last successful submit's checkbox value wins.
+                        skip_selector.set(!select_generation);
                         return Ok(buffer);
                     }
                     return Err(NmblError::Tui {

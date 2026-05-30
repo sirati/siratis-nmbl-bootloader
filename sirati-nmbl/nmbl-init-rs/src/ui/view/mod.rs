@@ -85,6 +85,11 @@ pub struct PassphraseScreenData<'a> {
     /// warning rendered into a permanently-reserved row so the modal
     /// geometry is identical whether the warning shows or not.
     pub caps_lock_on: bool,
+    /// State of the "Select NixOS Generation" checkbox. `false`
+    /// (default/unchecked) renders `[ ]` and means a plain unlock skips
+    /// the selector; `true` renders `[x]` and shows the selector. Always
+    /// drawn with the `(Ctrl+G)` hint so the operator knows the hotkey.
+    pub select_generation: bool,
 }
 
 /// State needed to render the emergency-on-boot-failure screen.

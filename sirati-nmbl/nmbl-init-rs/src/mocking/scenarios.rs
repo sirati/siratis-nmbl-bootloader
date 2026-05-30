@@ -8,8 +8,8 @@ use crate::ui::POLL_SLICE;
 use crate::ui::app::App;
 use crate::ui::console::{Console, ConsoleEvent};
 use crate::ui::{
-    SessionInteraction, passphrase_prompt_on_console, show_modal_buttons, show_modal_confirm,
-    show_modal_error, show_wrong_password_modal,
+    SessionInteraction, SkipSelector, passphrase_prompt_on_console, show_modal_buttons,
+    show_modal_confirm, show_modal_error, show_wrong_password_modal,
 };
 
 use super::console::MockConsole;
@@ -78,7 +78,14 @@ pub(super) async fn run_wrong_password(console: &mut MockConsole, args: &[String
 /// test harness can distinguish the two outcomes from the exit code.
 pub(super) async fn run_passphrase(console: &mut MockConsole, args: &[String]) -> Result<()> {
     let label = arg_or_default(args, 0, "Unlock root");
-    match passphrase_prompt_on_console(console, &label, &SessionInteraction::new()).await {
+    match passphrase_prompt_on_console(
+        console,
+        &label,
+        &SessionInteraction::new(),
+        &SkipSelector::new(),
+    )
+    .await
+    {
         Ok(secret) => {
             eprintln!("[mocking] passphrase entered='{}'", &**secret);
             Ok(())

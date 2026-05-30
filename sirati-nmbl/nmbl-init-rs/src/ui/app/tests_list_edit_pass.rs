@@ -270,6 +270,7 @@ fn passphrase_screen_collects_chars_and_pops() {
         cursor: 0,
         verifying: false,
         spinner_frame: 0,
+        select_generation: false,
     };
     for c in "hi".chars() {
         assert!(!app.on_key(press(KeyCode::Char(c))));
@@ -295,6 +296,7 @@ fn passphrase_esc_drops_to_shell() {
         cursor: 0,
         verifying: false,
         spinner_frame: 0,
+        select_generation: false,
     };
     assert!(app.on_key(press(KeyCode::Esc)));
     assert!(matches!(app.decision, Some(Decision::Shell)));
@@ -310,6 +312,7 @@ fn passphrase_enter_signals_consumed_without_decision() {
         cursor: 0,
         verifying: false,
         spinner_frame: 0,
+        select_generation: false,
     };
     assert!(app.on_key(press(KeyCode::Enter)));
     assert!(app.decision.is_none(), "Enter must not set a Decision");
@@ -327,6 +330,7 @@ fn passphrase_set_verifying_toggles_flag_and_resets_spinner_on_clear() {
         cursor: 0,
         verifying: false,
         spinner_frame: 0,
+        select_generation: false,
     };
     app.set_passphrase_verifying(true);
     app.tick_passphrase_spinner();
@@ -366,6 +370,7 @@ fn passphrase_tick_spinner_wraps_modulo_frame_count() {
         cursor: 0,
         verifying: true,
         spinner_frame: 0,
+        select_generation: false,
     };
     for _ in 0..SPINNER_FRAMES {
         app.tick_passphrase_spinner();
@@ -388,6 +393,7 @@ fn passphrase_clear_buffer_resets_state() {
         cursor: 0,
         verifying: true,
         spinner_frame: 3,
+        select_generation: false,
     };
     app.clear_passphrase_buffer();
     match &app.screen {
