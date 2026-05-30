@@ -34,4 +34,13 @@ pub trait ProgressSink {
     /// only way `tick` should return [`TickOutcome::Aborted`] is when
     /// the operator pressed Esc on the boot-status screen.
     fn tick(&mut self, phase: &str) -> TickOutcome;
+
+    /// Update the phase label, advance the spinner one frame, and
+    /// re-render — WITHOUT polling the backend for input.
+    ///
+    /// The async device-appearance wait drives the cadence itself with
+    /// `tokio::time::sleep` so the single-threaded runtime keeps serving
+    /// concurrent work; it must never block on input. Render errors are
+    /// swallowed for the same reason as [`ProgressSink::tick`].
+    fn render_phase(&mut self, phase: &str);
 }

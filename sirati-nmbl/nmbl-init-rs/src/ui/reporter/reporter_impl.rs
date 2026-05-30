@@ -266,4 +266,15 @@ impl ProgressSink for BootReporter<'_, '_> {
             _ => TickOutcome::Continue,
         }
     }
+
+    fn render_phase(&mut self, phase: &str) {
+        let snap = log::snapshot(LOG_SNAPSHOT_LINES);
+        write_phase(
+            &mut self.app,
+            Cow::<'static, str>::Owned(phase.to_string()),
+            Some(snap),
+            true,
+        );
+        let _ = self.console.render(self.app.as_ref());
+    }
 }

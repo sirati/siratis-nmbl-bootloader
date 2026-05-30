@@ -136,6 +136,7 @@ fn run_menu(console: &mut dyn Console) -> Option<TerminalAction> {
     let session = SessionInteraction::new();
     let mut app = fresh_app();
     let mut errs = 0u32;
+    let sender = crate::sys::poller::build().1;
     block(run_remote_menu(
         console,
         &mut app,
@@ -143,6 +144,7 @@ fn run_menu(console: &mut dyn Console) -> Option<TerminalAction> {
         &session,
         Duration::from_secs(30),
         &mut errs,
+        &sender,
     ))
 }
 
@@ -189,8 +191,9 @@ fn run_menu_with_session(
     let config = Config::recovery_default();
     let mut app = app_in_session(session);
     let mut errs = 0u32;
+    let sender = crate::sys::poller::build().1;
     block(run_remote_menu(
-        console, &mut app, &config, session, timeout, &mut errs,
+        console, &mut app, &config, session, timeout, &mut errs, &sender,
     ))
 }
 
@@ -309,7 +312,8 @@ fn server_returns_on_pre_signalled_shutdown_and_unlinks() {
     // test sandbox that may be unavailable. If the bind fails the server
     // returns early without creating the socket — the assertion below
     // (socket absent) still holds, so the test is meaningful either way.
-    block(run_remote_server(&config, shutdown, sink));
+    let sender = crate::sys::poller::build().1;
+    block(run_remote_server(&config, shutdown, sink, &sender));
 
     assert!(
         !std::path::Path::new(TUI_SOCK_PATH).exists(),

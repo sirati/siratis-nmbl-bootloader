@@ -4,6 +4,7 @@ use crate::config::{Activation, Config};
 use crate::error::Result;
 use crate::generations::Generation;
 use crate::sys::activation::{ProcessOutcome, run_with_tick};
+use crate::sys::poller::LocalSender;
 use crate::ui::app::{App, Screen};
 use crate::ui::console::Console;
 
@@ -36,10 +37,11 @@ pub(super) enum WrongPasswordHandled {
 /// overlaid. We do NOT share state with the supplier's App (which was
 /// consumed inside `collect_stdin`) — a fresh App is cheaper than
 /// threading a mutable reference through the supplier trait.
-pub(super) fn run_luks_with_spinner(
+pub(super) async fn run_luks_with_spinner(
     activation: &Activation,
     stdin_slice: Option<&[u8]>,
     console: &mut dyn Console,
+    sender: &LocalSender,
 ) -> Result<ProcessOutcome> {
     let label = activation
         .prompt_label
@@ -92,7 +94,9 @@ pub(super) fn run_luks_with_spinner(
         &activation.argv,
         stdin_slice,
         Some(&mut cb as &mut dyn FnMut()),
+        sender,
     )
+    .await
     .map_err(|source| wrap_runner_error(activation, source))?;
 
     // Done verifying — clear the overlay and repaint once so the next

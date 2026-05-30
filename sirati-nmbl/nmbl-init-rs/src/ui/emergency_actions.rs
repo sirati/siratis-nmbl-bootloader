@@ -69,6 +69,7 @@ pub async fn retry_boot(
     console: &mut dyn Console,
     app: &mut App<'static>,
     supplier: &mut dyn PasswordSupplier,
+    sender: &crate::sys::poller::LocalSender,
 ) -> Result<TerminalAction> {
     nmbl_info!("emergency action: retry boot from config");
 
@@ -78,14 +79,14 @@ pub async fn retry_boot(
     let injections = {
         let mut reporter =
             BootReporter::overlay(console, app, "phase 3: storage activations (retry)");
-        run_all_activations(config, &mut reporter, Some(supplier)).await?
+        run_all_activations(config, &mut reporter, Some(supplier), sender).await?
     };
 
     // Phase 3b: mount system filesystems.
     {
         let mut reporter =
             BootReporter::overlay(console, app, "phase 3b: mount system filesystems (retry)");
-        mount_system_filesystems(config, &mut reporter)?;
+        mount_system_filesystems(config, &mut reporter, sender).await?;
     }
 
     run_selector_and_dispatch(config, console, app, &injections).await

@@ -76,6 +76,7 @@ pub use banner::{print_banner, print_halt_banner};
 use crate::config::Config;
 use crate::error::{NmblError, format_chain};
 use crate::nmbl_warn;
+use crate::sys::poller::LocalSender;
 use crate::terminal::TerminalAction;
 use crate::ui::app::App;
 use crate::ui::console::{Console, open_console};
@@ -109,6 +110,7 @@ pub async fn drop_to_emergency(
     config: &Config,
     err: NmblError,
     session: &SessionInteraction,
+    sender: &LocalSender,
 ) -> TerminalAction {
     let mut console = console;
 
@@ -138,7 +140,15 @@ pub async fn drop_to_emergency(
     // `emergency_timeout_secs` overrides the built-in 30 s default.
     let emergency_timeout = resolve_emergency_timeout(config);
 
-    recovery::drive_recovery(&mut *console, app, config, session, emergency_timeout).await
+    recovery::drive_recovery(
+        &mut *console,
+        app,
+        config,
+        session,
+        emergency_timeout,
+        sender,
+    )
+    .await
 }
 
 /// Run one emergency-menu choice. Returns `Some(action)` when the choice
@@ -156,6 +166,7 @@ pub(crate) async fn dispatch_emergency_choice(
     error_count: &mut u32,
     config: &Config,
     session: &SessionInteraction,
+    sender: &LocalSender,
 ) -> Option<TerminalAction> {
     match choice {
         EmergencyChoice::Reboot => {
@@ -174,7 +185,7 @@ pub(crate) async fn dispatch_emergency_choice(
         }
         EmergencyChoice::RetryBoot => {
             let mut supplier = TuiPasswordSupplier::new(config, session);
-            run_retry_boot_arm(config, console, app, error_count, &mut supplier).await
+            run_retry_boot_arm(config, console, app, error_count, &mut supplier, sender).await
         }
         EmergencyChoice::VerifyKexecReadiness => {
             run_verify_kexec_arm(config, console, app, error_count).await
@@ -256,8 +267,9 @@ async fn run_retry_boot_arm(
     app: &mut App<'static>,
     error_count: &mut u32,
     supplier: &mut TuiPasswordSupplier,
+    sender: &LocalSender,
 ) -> Option<TerminalAction> {
-    match retry_boot(config, console, app, supplier).await {
+    match retry_boot(config, console, app, supplier, sender).await {
         Ok(action) => Some(action),
         Err(e) => {
             let title = abort_aware_title(&e, "Retry boot failed");
@@ -375,12 +387,16 @@ pub fn open_console_and_drop_to_emergency(config: &Config, err: NmblError) -> Te
         // panic / pre-console failure path) cancels the auto-reboot
         // countdown — same as every other session. `drop_to_emergency`
         // then sees a wrapped console just like the local boot path does.
-        Ok(c) => match crate::ui::block_on_tui(drop_to_emergency(
-            Box::new(crate::ui::console::LatchingConsole::new(c, session.clone())),
-            config,
-            err,
-            &session,
-        )) {
+        Ok(c) => match crate::ui::block_on_tui_with_poller(|sender| async move {
+            drop_to_emergency(
+                Box::new(crate::ui::console::LatchingConsole::new(c, session.clone())),
+                config,
+                err,
+                &session,
+                &sender,
+            )
+            .await
+        }) {
             Ok(action) => action,
             Err(rt_err) => {
                 nmbl_warn!(

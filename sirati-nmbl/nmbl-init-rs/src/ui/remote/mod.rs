@@ -156,7 +156,12 @@ pub type ActionSink = Rc<RefCell<Option<TerminalAction>>>;
 /// When a session commits a [`TerminalAction`] it is stored in `sink`
 /// and `shutdown` is signalled so the whole recovery resolves to that
 /// action. On return the socket path is unlinked.
-pub async fn run_remote_server(config: &Config, shutdown: Shutdown, sink: ActionSink) {
+pub async fn run_remote_server(
+    config: &Config,
+    shutdown: Shutdown,
+    sink: ActionSink,
+    sender: &crate::sys::poller::LocalSender,
+) {
     let listener = match bind_listener() {
         Ok(l) => l,
         Err(e) => {
@@ -169,7 +174,7 @@ pub async fn run_remote_server(config: &Config, shutdown: Shutdown, sink: Action
     // the local menu and drop it when the local operator acts first). A
     // drop guard guarantees the stale socket never outlives the server.
     let _unlink = SocketUnlinkGuard;
-    driver::accept_loop(&listener, config, &shutdown, &sink).await;
+    driver::accept_loop(&listener, config, &shutdown, &sink, sender).await;
 }
 
 /// Unlinks the control socket on drop. Covers both the normal return of
@@ -194,6 +199,7 @@ async fn handle_connection(
     config: &Config,
     shutdown: &Shutdown,
     sink: &ActionSink,
+    sender: &crate::sys::poller::LocalSender,
 ) {
     let handle = match authenticate_and_receive(&mut stream).await {
         Ok(Some(handle)) => handle,
@@ -204,7 +210,7 @@ async fn handle_connection(
             return;
         }
     };
-    serve_session(stream, handle, config, shutdown, sink).await;
+    serve_session(stream, handle, config, shutdown, sink, sender).await;
     // `stream` and the session's TtyConsole (owning the pty fd) drop
     // here → the client's blocking read hits EOF → client exits 0.
 }
@@ -233,6 +239,7 @@ async fn serve_session(
     config: &Config,
     shutdown: &Shutdown,
     sink: &ActionSink,
+    sender: &crate::sys::poller::LocalSender,
 ) {
     let console = match TtyConsole::from_pty(handle.pty, handle.winsize) {
         Ok(c) => c,
@@ -284,6 +291,7 @@ async fn serve_session(
         &session,
         emergency_timeout,
         &mut error_count,
+        sender,
     )
     .await;
 
@@ -309,6 +317,7 @@ async fn run_remote_menu(
     session: &SessionInteraction,
     emergency_timeout: std::time::Duration,
     error_count: &mut u32,
+    sender: &crate::sys::poller::LocalSender,
 ) -> Option<TerminalAction> {
     loop {
         app.modal = None;
@@ -343,6 +352,7 @@ async fn run_remote_menu(
             error_count,
             config,
             session,
+            sender,
         )
         .await
         {

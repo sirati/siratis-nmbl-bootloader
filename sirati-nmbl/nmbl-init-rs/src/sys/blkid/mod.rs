@@ -18,8 +18,12 @@ use std::path::{Path, PathBuf};
 use crate::error::{NmblError, Result};
 use crate::{nmbl_info, nmbl_warn};
 
-use parse::blkid_for;
+use std::collections::HashMap;
+
+use parse::{blkid_for, blkid_for_blocking};
 use symlink::create_links_for;
+
+use crate::sys::poller::LocalSender;
 
 /// Filesystem locations + blkid attribute keys we care about. Kept as
 /// a slice constant so tests can iterate the same set the production
@@ -57,7 +61,52 @@ const BLKID_EXIT_NO_SUPERBLOCK: i32 = 2;
 ///
 /// Also returns the list of block devices whose blkid TYPE is "btrfs"
 /// so the caller can issue `BTRFS_IOC_SCAN_DEV` before mounting.
-pub fn populate_disk_by_symlinks() -> Result<Vec<PathBuf>> {
+///
+/// Async because each per-device blkid reap goes through the poller's
+/// non-blocking `waitpid` op, so the single-threaded runtime keeps
+/// serving concurrent work while we scan. The pre-runtime bootstrap
+/// sweep uses [`populate_disk_by_symlinks_blocking`] instead.
+pub async fn populate_disk_by_symlinks(sender: &LocalSender) -> Result<Vec<PathBuf>> {
+    let dev_paths = collect_block_dev_paths()?;
+    let mut acc = SymlinkAcc::default();
+    for dev_path in dev_paths {
+        let attrs = match blkid_for(&dev_path, sender).await {
+            Ok(map) => map,
+            Err(e) => {
+                nmbl_warn!("blkid: scanning {} failed: {}", dev_path.display(), e);
+                continue;
+            }
+        };
+        acc.record(&dev_path, &attrs);
+    }
+    Ok(acc.finish())
+}
+
+/// Blocking sibling of [`populate_disk_by_symlinks`] for the pre-runtime
+/// early-boot bootstrap phase, where no async runtime exists and nothing
+/// runs concurrently. Reaps each blkid child with a blocking
+/// `waitpid(None)` — never call this from the interactive runtime.
+pub fn populate_disk_by_symlinks_blocking() -> Result<Vec<PathBuf>> {
+    let dev_paths = collect_block_dev_paths()?;
+    let mut acc = SymlinkAcc::default();
+    for dev_path in dev_paths {
+        let attrs = match blkid_for_blocking(&dev_path) {
+            Ok(map) => map,
+            Err(e) => {
+                nmbl_warn!("blkid: scanning {} failed: {}", dev_path.display(), e);
+                continue;
+            }
+        };
+        acc.record(&dev_path, &attrs);
+    }
+    Ok(acc.finish())
+}
+
+/// Read /sys/class/block, pre-create the four by-* target directories,
+/// and return the `/dev/<name>` paths for every block device that has a
+/// materialised node. Shared by both the async and blocking sweeps so
+/// the only difference between them is how each blkid child is reaped.
+fn collect_block_dev_paths() -> Result<Vec<PathBuf>> {
     let sysfs = Path::new(SYSFS_BLOCK_DIR);
     let entries = std::fs::read_dir(sysfs).map_err(|source| NmblError::Io {
         source,
@@ -77,10 +126,7 @@ pub fn populate_disk_by_symlinks() -> Result<Vec<PathBuf>> {
         }
     }
 
-    let mut device_count: usize = 0;
-    let mut link_count: usize = 0;
-    let mut btrfs_devs: Vec<PathBuf> = Vec::new();
-
+    let mut dev_paths: Vec<PathBuf> = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -90,38 +136,45 @@ pub fn populate_disk_by_symlinks() -> Result<Vec<PathBuf>> {
             }
         };
 
-        let name = entry.file_name();
-        let dev_path = Path::new("/dev").join(&name);
-
+        let dev_path = Path::new("/dev").join(entry.file_name());
         // Skip entries the kernel exposes in /sys but for which no
         // /dev/<name> node has materialised (device-mapper aliases,
         // partitions without nodes, …).
-        match std::fs::symlink_metadata(&dev_path) {
-            Ok(_) => {}
-            Err(_) => continue,
+        if std::fs::symlink_metadata(&dev_path).is_ok() {
+            dev_paths.push(dev_path);
         }
+    }
+    Ok(dev_paths)
+}
 
-        device_count = device_count.saturating_add(1);
+/// Accumulator for a by-* sweep: counts scanned devices and created
+/// links, and collects btrfs members. Folds the shared post-blkid logic
+/// (btrfs detection + symlink creation) so the async and blocking sweeps
+/// stay byte-identical past the reap.
+#[derive(Default)]
+struct SymlinkAcc {
+    device_count: usize,
+    link_count: usize,
+    btrfs_devs: Vec<PathBuf>,
+}
 
-        let attrs = match blkid_for(&dev_path) {
-            Ok(map) => map,
-            Err(e) => {
-                nmbl_warn!("blkid: scanning {} failed: {}", dev_path.display(), e);
-                continue;
-            }
-        };
-
+impl SymlinkAcc {
+    fn record(&mut self, dev_path: &Path, attrs: &HashMap<String, String>) {
+        self.device_count = self.device_count.saturating_add(1);
         if attrs.get("TYPE").map(String::as_str) == Some("btrfs") {
-            btrfs_devs.push(dev_path.clone());
+            self.btrfs_devs.push(dev_path.to_path_buf());
         }
-
-        link_count = link_count.saturating_add(create_links_for(&dev_path, &attrs));
+        self.link_count = self
+            .link_count
+            .saturating_add(create_links_for(dev_path, attrs));
     }
 
-    nmbl_info!(
-        "blkid: scanned {} block device(s), created/updated {} by-* symlink(s)",
-        device_count,
-        link_count,
-    );
-    Ok(btrfs_devs)
+    fn finish(self) -> Vec<PathBuf> {
+        nmbl_info!(
+            "blkid: scanned {} block device(s), created/updated {} by-* symlink(s)",
+            self.device_count,
+            self.link_count,
+        );
+        self.btrfs_devs
+    }
 }

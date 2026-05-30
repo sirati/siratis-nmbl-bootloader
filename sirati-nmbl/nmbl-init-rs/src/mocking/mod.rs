@@ -103,7 +103,7 @@ pub fn run(args: DebugTuiArgs) -> Result<()> {
     // reserve poller spawned, exactly like the production interactive
     // phase. `block_on_tui` returns `Err` only if the runtime fails to
     // build.
-    let res = crate::ui::block_on_tui(async {
+    let res = crate::ui::block_on_tui_with_poller(|sender| async move {
         let mut console = MockConsole::new()?;
         match args.scenario.as_str() {
             "modal-error" => run_modal_error(&mut console, &args.args).await,
@@ -113,7 +113,7 @@ pub fn run(args: DebugTuiArgs) -> Result<()> {
             "boot-status" => run_boot_status(&mut console, &args.args).await,
             "passphrase" => run_passphrase(&mut console, &args.args).await,
             "resize" => run_resize(&mut console, &args.args).await,
-            "emergency" => run_emergency(&mut console, &args.args).await,
+            "emergency" => run_emergency(&mut console, &args.args, &sender).await,
             other => Err(NmblError::Io {
                 source: std::io::Error::other(format!("unknown --debug-tui scenario {other:?}")),
                 context: "mocking harness dispatch".to_string(),

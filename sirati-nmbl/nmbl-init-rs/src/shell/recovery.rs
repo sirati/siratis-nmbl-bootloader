@@ -5,6 +5,7 @@
 use crate::config::Config;
 #[cfg(feature = "remote-tui")]
 use crate::error::NmblError;
+use crate::sys::poller::LocalSender;
 use crate::terminal::TerminalAction;
 use crate::ui::app::App;
 use crate::ui::console::Console;
@@ -31,8 +32,9 @@ pub(super) async fn drive_recovery(
     config: &Config,
     session: &SessionInteraction,
     emergency_timeout: std::time::Duration,
+    sender: &LocalSender,
 ) -> TerminalAction {
-    run_local_menu(console, app, config, session, emergency_timeout).await
+    run_local_menu(console, app, config, session, emergency_timeout, sender).await
 }
 
 /// `remote-tui` build: run the local menu and the remote server together.
@@ -43,14 +45,15 @@ pub(super) async fn drive_recovery(
     config: &Config,
     session: &SessionInteraction,
     emergency_timeout: std::time::Duration,
+    sender: &LocalSender,
 ) -> TerminalAction {
     use crate::ui::remote::{ActionSink, Shutdown, run_remote_server};
 
     let shutdown = Shutdown::new();
     let sink: ActionSink = std::rc::Rc::new(std::cell::RefCell::new(None));
 
-    let local = run_local_menu(console, app, config, session, emergency_timeout);
-    let server = run_remote_server(config, shutdown.clone(), sink.clone());
+    let local = run_local_menu(console, app, config, session, emergency_timeout, sender);
+    let server = run_remote_server(config, shutdown.clone(), sink.clone(), sender);
 
     tokio::select! {
         biased;
@@ -83,6 +86,7 @@ pub(super) async fn drive_recovery(
                         config,
                         session,
                         emergency_timeout,
+                        sender,
                     )
                     .await
                 }
@@ -118,6 +122,7 @@ async fn run_local_menu(
     config: &Config,
     session: &SessionInteraction,
     emergency_timeout: std::time::Duration,
+    sender: &LocalSender,
 ) -> TerminalAction {
     // Count of distinct failures surfaced this session. Used so the
     // persistent emergency-screen "error" box can show the LATEST
@@ -131,9 +136,16 @@ async fn run_local_menu(
         app.modal = None;
         let choice = run_emergency_screen_with_app(console, &mut app, emergency_timeout).await;
 
-        if let Some(action) =
-            dispatch_emergency_choice(choice, console, &mut app, &mut error_count, config, session)
-                .await
+        if let Some(action) = dispatch_emergency_choice(
+            choice,
+            console,
+            &mut app,
+            &mut error_count,
+            config,
+            session,
+            sender,
+        )
+        .await
         {
             return action;
         }
