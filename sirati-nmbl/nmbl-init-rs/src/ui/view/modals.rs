@@ -215,8 +215,9 @@ pub fn render_passphrase(frame: &mut Frame<'_>, data: &PassphraseScreenData<'_>)
     // Modal height is FIXED regardless of the Caps-Lock warning so the
     // box geometry never reflows when the operator toggles Caps Lock —
     // the warning row is always present in the layout (blank when off).
-    // Verifying mode adds one row for the spinner line, as before.
-    let modal_height: u16 = if data.verifying { 9 } else { 8 };
+    // The "Select NixOS Generation" checkbox adds one permanent row.
+    // Verifying mode adds one more row for the spinner line, as before.
+    let modal_height: u16 = if data.verifying { 10 } else { 9 };
     let modal = centered_rect(body, 60, modal_height);
     frame.render_widget(Clear, modal);
     // Cap the visible mask so a huge typo doesn't overflow the box. The
@@ -227,10 +228,19 @@ pub fn render_passphrase(frame: &mut Frame<'_>, data: &PassphraseScreenData<'_>)
     let caret_at = data.cursor_column.min(visible);
     let before: String = "*".repeat(caret_at);
     let after: String = "*".repeat(visible.saturating_sub(caret_at));
+    // "Select NixOS Generation" checkbox row. ASCII `[ ]` / `[x]` so the
+    // splash glyph cache (ASCII + box-drawing only) renders it on the
+    // framebuffer; the `(Ctrl+G)` hint is always shown so the operator
+    // knows the toggle. Unchecked (default) skips the selector on unlock.
+    let checkbox_mark = if data.select_generation { "[x]" } else { "[ ]" };
     let mut lines: Vec<Line<'_>> = vec![
         Line::raw(data.prompt_label.to_owned()),
         Line::raw(String::new()),
         Line::from(vec![Span::raw(before), Span::raw("|"), Span::raw(after)]),
+        Line::from(vec![
+            Span::raw(format!("{checkbox_mark} Select NixOS Generation")),
+            Span::styled("   (Ctrl+G)", Style::default().add_modifier(Modifier::DIM)),
+        ]),
         // Permanently-reserved Caps-Lock warning row. Always emitted so
         // the box height is identical whether or not the warning shows;
         // blank when Caps Lock is off.

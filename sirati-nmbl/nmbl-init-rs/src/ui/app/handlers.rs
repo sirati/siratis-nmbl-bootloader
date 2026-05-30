@@ -52,6 +52,18 @@ impl<'a> App<'a> {
                     }
                     return false;
                 }
+                KeyCode::Char('g') => {
+                    // Toggle the "Select NixOS Generation" checkbox while
+                    // the passphrase modal is active. No-op on every other
+                    // screen so Ctrl+G is inert outside the unlock prompt.
+                    if let Screen::Passphrase {
+                        select_generation, ..
+                    } = &mut self.screen
+                    {
+                        *select_generation = !*select_generation;
+                    }
+                    return false;
+                }
                 _ => {}
             }
         }

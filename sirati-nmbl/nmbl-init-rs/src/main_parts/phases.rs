@@ -7,7 +7,7 @@ use nmbl_init::error::{NmblError, Result};
 use nmbl_init::modules::{load_early_modules, load_explicit_modules, load_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
 use nmbl_init::sys::{blkid, mount as sys_mount};
-use nmbl_init::ui::{BootReporter, SessionInteraction, TuiPasswordSupplier};
+use nmbl_init::ui::{BootReporter, SessionInteraction, SkipSelector, TuiPasswordSupplier};
 use nmbl_init::{nmbl_info, nmbl_warn};
 
 /// Phase 1: mount /proc, /sys, /dev. Lives at the top of `main` so the
@@ -44,6 +44,7 @@ pub(super) async fn run_phases_post_console(
     config: &Config,
     console: &mut dyn nmbl_init::ui::console::Console,
     session: &SessionInteraction,
+    skip_selector: &SkipSelector,
     sender: &nmbl_init::sys::poller::LocalSender,
 ) -> Result<Vec<KeyInjection>> {
     let mut reporter = BootReporter::new(console, "phase 2b: loading kernel modules");
@@ -77,7 +78,7 @@ pub(super) async fn run_phases_post_console(
     }
 
     nmbl_info!("phase 3: storage activations");
-    let mut supplier = TuiPasswordSupplier::new(config, session);
+    let mut supplier = TuiPasswordSupplier::new(config, session, skip_selector);
     let injections =
         run_all_activations(config, &mut reporter, Some(&mut supplier), sender).await?;
 

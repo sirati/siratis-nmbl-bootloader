@@ -126,6 +126,7 @@ fn render_screen_body(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
             cursor,
             verifying,
             spinner_frame,
+            select_generation,
         } => {
             let data = PassphraseScreenData {
                 prompt_label,
@@ -137,6 +138,7 @@ fn render_screen_body(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
                 verifying: *verifying,
                 spinner_frame: *spinner_frame,
                 caps_lock_on: app.caps_lock_warning,
+                select_generation: *select_generation,
             };
             render_passphrase(frame, &data);
         }

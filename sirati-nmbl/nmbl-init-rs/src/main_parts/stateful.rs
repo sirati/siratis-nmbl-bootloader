@@ -114,6 +114,93 @@ pub(super) async fn select_with_stateful(
     }
 }
 
+/// Skip-selector counterpart of [`select_with_stateful`]. Used when the
+/// operator unlocked LUKS with the "Select NixOS Generation" checkbox
+/// OFF: boot the default generation immediately, but keep stateful
+/// rollback safety intact — `state::decide` still runs, so a `ForcePick`
+/// (rollback) or `Exhausted` (no known-good left) overrides the
+/// operator's "just boot the default" intent exactly as it would have if
+/// the selector's countdown had expired. On the `HonourTui` branch we
+/// pick the active-profile default instead of rendering the picker, and
+/// record the attempt in state.bin like the normal path does.
+///
+/// No `console`/`session`: this path never draws, so it cannot reach
+/// `run_selector`. The non-stateful fall-backs collapse to a plain
+/// default-index `Boot` (the same target the legacy selector's timeout
+/// would have chosen).
+pub(super) fn select_default_with_stateful(
+    config: &Config,
+    generations: &[Generation],
+) -> Result<Decision> {
+    let active_index = active_generation_index(generations, &config.paths.nix_profiles_dir);
+    let default_boot = || Decision::Boot {
+        generation_index: active_index,
+        cmdline_override: None,
+    };
+
+    // No opt-in: boot the default index directly (legacy selector's
+    // timeout target).
+    let (Some(_stateful), Some(state_mp)) = (
+        config.stateful.as_ref(),
+        config.runtime_state_mountpoint.as_deref(),
+    ) else {
+        return Ok(default_boot());
+    };
+
+    let state_path = state_mp.join("nmbl").join("state.bin");
+    let mut state = match nmbl_init::state::read(&state_path) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            nmbl_warn!(
+                "state.bin at {} absent or unsupported; booting default generation this cycle",
+                state_path.display(),
+            );
+            return Ok(default_boot());
+        }
+        Err(err) => {
+            nmbl_warn!(
+                "state.bin at {} could not be read ({err}); booting default generation this cycle",
+                state_path.display(),
+            );
+            return Ok(default_boot());
+        }
+    };
+
+    let max_attempts = _stateful.max_recovery_attempts;
+    match nmbl_init::state::decide(&mut state, generations, active_index, max_attempts) {
+        nmbl_init::state::StatefulDecision::HonourTui => {
+            nmbl_info!(
+                "phase 5: selector skipped; booting default generation (recovery_attempt={})",
+                state.recovery_attempt,
+            );
+            record_attempt(&mut state, generations, active_index, &state_path);
+            Ok(default_boot())
+        }
+        nmbl_init::state::StatefulDecision::ForcePick(idx) => {
+            let Some(target) = generations.get(idx) else {
+                return Err(NmblError::ConfigInvalid {
+                    reason: format!(
+                        "state::decide returned ForcePick({idx}) but only {} generations",
+                        generations.len()
+                    ),
+                    context: "stateful dispatch".to_string(),
+                });
+            };
+            nmbl_info!(
+                "phase 5: stateful rollback forced generation {} (recovery_attempt={})",
+                target.number,
+                state.recovery_attempt,
+            );
+            record_attempt(&mut state, generations, idx, &state_path);
+            Ok(Decision::Boot {
+                generation_index: idx,
+                cmdline_override: None,
+            })
+        }
+        nmbl_init::state::StatefulDecision::Exhausted => Err(exhausted_rescue_error()),
+    }
+}
+
 /// Build the `NmblError::Rescue` that the `Exhausted` decision surfaces.
 ///
 /// The emergency menu reads the source chain via `format_chain`, so wrap
