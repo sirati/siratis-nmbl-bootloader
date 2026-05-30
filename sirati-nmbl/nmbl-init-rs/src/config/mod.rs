@@ -124,6 +124,84 @@ impl Config {
                 });
             }
         }
+        self.validate_activation_covers_filesystems()?;
+        Ok(())
+    }
+
+    /// Defense-in-depth satisfiability check (mirrors the Nix-side
+    /// LVM-on-LUKS assertion). NMBL replaces NixOS stage-1, so it can
+    /// only mount a filesystem whose device it can actually bring up
+    /// with its own activation plan. We can't see `boot.initrd.luks`
+    /// here (that's post-kexec config), but we CAN reject configs that
+    /// are internally unsatisfiable: a `/dev/mapper/<X>` filesystem
+    /// device that no activation could ever produce.
+    ///
+    /// A `/dev/mapper/*` device is satisfiable if AT LEAST ONE of:
+    ///   - a `luks*` activation lists exactly that path in
+    ///     `produces_devices`, OR
+    ///   - an `lvm` activation is present (`vgchange -ay` can yield any
+    ///     `/dev/mapper/<vg>-<lv>`), OR
+    ///   - an `mdraid` activation is present.
+    ///
+    /// Bare `/dev/sd*`, `/dev/nvme*`, `/dev/vd*`, `/dev/md*` devices are
+    /// not device-mapper nodes and are never subject to this check. We
+    /// reject ONLY the definitely-unsatisfiable case — a false reject
+    /// would brick a valid machine at boot.
+    fn validate_activation_covers_filesystems(&self) -> Result<()> {
+        let has_lvm = self
+            .activations
+            .iter()
+            .any(|a| a.kind == ActivationKind::Lvm);
+        let has_mdraid = self
+            .activations
+            .iter()
+            .any(|a| a.kind == ActivationKind::Mdraid);
+        // An LVM or mdraid activation can produce arbitrary mapper nodes,
+        // so any mapper filesystem is plausibly satisfiable.
+        if has_lvm || has_mdraid {
+            return Ok(());
+        }
+
+        let is_luks = |k: ActivationKind| {
+            matches!(
+                k,
+                ActivationKind::LuksTpm
+                    | ActivationKind::LuksKeyfile
+                    | ActivationKind::LuksPassword
+            )
+        };
+
+        for fs in &self.filesystems {
+            let dev = fs.device.as_str();
+            if !dev.starts_with("/dev/mapper/") {
+                continue;
+            }
+            let produced_by_luks = self.activations.iter().any(|a| {
+                is_luks(a.kind)
+                    && a.produces_devices
+                        .iter()
+                        .any(|p| p.as_os_str() == fs.device.as_str())
+            });
+            if !produced_by_luks {
+                return Err(NmblError::ConfigInvalid {
+                    reason: format!(
+                        "device-mapper filesystem {dev:?} cannot be produced by any \
+                         configured activation. NMBL replaces NixOS stage-1 and only \
+                         brings up the devices its own [[activation]] plan describes; \
+                         no luks activation produces this exact /dev/mapper node and \
+                         there is no lvm or mdraid activation that could. Add a matching \
+                         boot.nmbl.activation.luks entry (whose produces_devices is {dev:?}), \
+                         or an lvm/mdraid activation if this volume is an LVM LV / RAID \
+                         member — otherwise NMBL would wait for a device that never appears \
+                         and the boot would hang"
+                    ),
+                    context: format!(
+                        "validating activation coverage for filesystem {}",
+                        fs.mountpoint.display()
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 
