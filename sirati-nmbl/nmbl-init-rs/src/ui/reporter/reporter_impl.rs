@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use crossterm::event::KeyCode;
@@ -6,7 +8,7 @@ use crossterm::event::KeyCode;
 use crate::error::Result;
 use crate::log;
 use crate::ui::app::{App, ModalKind};
-use crate::ui::console::Console;
+use crate::ui::console::{Console, ConsoleEvent};
 
 use super::types::{ProgressSink, TickOutcome};
 
@@ -278,5 +280,17 @@ impl ProgressSink for BootReporter<'_, '_> {
             true,
         );
         let _ = self.console.render(self.app.as_ref());
+    }
+
+    fn poll_abort<'a>(&'a mut self, timeout: Duration) -> Pin<Box<dyn Future<Output = bool> + 'a>> {
+        Box::pin(async move {
+            // Await the backend's own cancel-safe async poll. A failed
+            // poll (transient DRM / tty error) is treated as "no key" —
+            // the same swallowing policy as `render_phase`/`tick`.
+            matches!(
+                self.console.poll_event(timeout).await,
+                Ok(Some(ConsoleEvent::Key(k))) if k.code == KeyCode::Esc
+            )
+        })
     }
 }

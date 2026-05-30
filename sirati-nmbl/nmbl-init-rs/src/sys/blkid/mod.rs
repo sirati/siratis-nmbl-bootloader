@@ -183,7 +183,7 @@ impl SymlinkAcc {
 /// freshly created), `Ok(false)` when `sysfs_entry/dev` is absent or
 /// unparseable (e.g. a device-mapper alias with no usable node — caller
 /// skips it). Mirrors the mknod pattern in `sys::btrfs::ensure_btrfs_control`.
-fn ensure_dev_node(sysfs_entry: &Path, dev_path: &Path) -> Result<bool> {
+pub(crate) fn ensure_dev_node(sysfs_entry: &Path, dev_path: &Path) -> Result<bool> {
     if dev_path.exists() {
         return Ok(true);
     }
