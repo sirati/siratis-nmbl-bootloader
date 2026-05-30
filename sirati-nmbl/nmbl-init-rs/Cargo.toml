@@ -85,6 +85,11 @@ remote-tui = ["dep:futures-util"]
 nix = { version = "0.29", default-features = false, features = ["mount", "fs", "process", "term", "user", "signal", "reboot", "feature"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
+# Parses the NixOS filesystem-closure JSON (`builtins.toJSON`) for the
+# build-time `--validate-nix-filesystem-closure` check. Pulled in as a
+# direct dependency (already present transitively); the standard,
+# audited JSON parser rather than a hand-rolled one.
+serde_json = { version = "1", default-features = false, features = ["std"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 thiserror = "1"
 ratatui = { version = "0.30", default-features = false, features = ["termwiz", "crossterm", "std"] }

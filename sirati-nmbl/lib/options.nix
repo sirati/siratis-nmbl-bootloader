@@ -818,6 +818,30 @@ in
       '';
     };
 
+    # Gate for the install-time `--validate-hardware` check. When true a
+    # failed check aborts the bootloader install; when false the check
+    # still runs but a failure is only a SEVERE WARNING and the install
+    # proceeds (useful for installs from a rescue environment where the
+    # target devices are not yet present).
+    refuseInvalidHardwareOnInstall = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = lib.mdDoc ''
+        Whether a failed install-time `nmbl-init --validate-hardware`
+        check aborts the bootloader installation.
+
+        Before writing the bootloader files, the installer runs a
+        read-only hardware validation of the staged `config.toml` against
+        the actual machine: each LUKS activation's backing device must
+        exist and carry a LUKS header, and each non-`/dev/mapper/`
+        filesystem device must exist.
+
+        When `true` (the default) a failure aborts the install. When
+        `false` the check still runs, but a failure prints a SEVERE
+        WARNING and the install continues anyway.
+      '';
+    };
+
     bootstrap = {
       configPath = lib.mkOption {
         # `types.str`, not `types.path`: this is a target-filesystem
