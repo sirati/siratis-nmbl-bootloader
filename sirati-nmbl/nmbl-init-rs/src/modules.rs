@@ -20,6 +20,7 @@ use std::path::Path;
 use crate::config::Config;
 use crate::error::Result;
 use crate::sys::module::{self, LoadOutcome, ModuleEntry, canonical_module_name};
+use crate::sys::ops::ModuleOps;
 use crate::ui::BootReporter;
 use crate::{nmbl_info, nmbl_verbose, nmbl_warn};
 
@@ -72,15 +73,23 @@ impl ModuleSet {
 /// The pre-console reporter wraps a [`crate::ui::console::NoopConsole`];
 /// status pushes do nothing visible, but the underlying log-ring is
 /// still populated for the post-console reporter to surface.
-pub fn load_early_modules(config: &Config, reporter: &mut BootReporter<'_, '_>) -> Result<()> {
-    load_module_set(config, reporter, ModuleSet::Early)
+pub fn load_early_modules(
+    ops: &mut impl ModuleOps,
+    config: &Config,
+    reporter: &mut BootReporter<'_, '_>,
+) -> Result<()> {
+    ops.load_module_set(config, reporter, ModuleSet::Early)
 }
 
 /// Load the [`ModuleSet::Explicit`] subset — storage, filesystem,
 /// activation drivers. Called in phase 2b after `open_console` so the
 /// operator sees per-module progress on the live boot console.
-pub fn load_explicit_modules(config: &Config, reporter: &mut BootReporter<'_, '_>) -> Result<()> {
-    load_module_set(config, reporter, ModuleSet::Explicit)
+pub fn load_explicit_modules(
+    ops: &mut impl ModuleOps,
+    config: &Config,
+    reporter: &mut BootReporter<'_, '_>,
+) -> Result<()> {
+    ops.load_module_set(config, reporter, ModuleSet::Explicit)
 }
 
 /// Walk the chosen [`ModuleSet`] list, loading each entry + its

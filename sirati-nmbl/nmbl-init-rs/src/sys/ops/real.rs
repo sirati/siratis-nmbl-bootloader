@@ -61,6 +61,11 @@ impl<'a> RealSys<'a> {
     /// Resolve the poller sender for an async forward, panicking with a
     /// clear message if this is a `sync_only` instance. The invariant
     /// (pre-runtime path never calls an async op) makes this unreachable.
+    #[allow(
+        clippy::expect_used,
+        reason = "documented invariant: only the pre-runtime phase 1 builds a \
+                  sender-less RealSys via sync_only(), and that path calls no async op"
+    )]
     fn sender(&self) -> &'a LocalSender {
         self.sender
             .expect("RealSys async op requires a poller sender (built via sync_only)")

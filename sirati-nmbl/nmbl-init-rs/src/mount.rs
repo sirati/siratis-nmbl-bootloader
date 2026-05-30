@@ -11,7 +11,7 @@ use std::path::Path;
 use nix::errno::Errno;
 
 use crate::error::{NmblError, Result};
-use crate::sys::mount::mount_fs;
+use crate::sys::ops::FsOps;
 use crate::ui::BootReporter;
 use crate::{nmbl_verbose, nmbl_warn};
 
@@ -59,14 +59,17 @@ const PSEUDO_FILESYSTEMS: &[PseudoFs] = &[
 /// `reporter` carries the live boot console; we surface the current
 /// pseudo-fs being mounted as the boot-status phase label so the
 /// operator sees what we're working on.
-pub fn mount_pseudo_filesystems(reporter: &mut BootReporter<'_, '_>) -> Result<()> {
+pub fn mount_pseudo_filesystems(
+    ops: &mut impl FsOps,
+    reporter: &mut BootReporter<'_, '_>,
+) -> Result<()> {
     for fs in PSEUDO_FILESYSTEMS {
         let target = Path::new(fs.target);
         // We swallow render errors here because pseudo-fs mounts are
         // critical and a flaky DRM ioctl should not abort phase 1.
         let _ = reporter.set_phase(format!("phase 1: mounting {}", fs.target));
-        ensure_dir(target)?;
-        match mount_fs(None, target, fs.fstype, fs.options) {
+        ensure_dir(ops, target)?;
+        match ops.mount(None, target, fs.fstype, fs.options) {
             Ok(()) => nmbl_verbose!("mounted {} on {}", fs.fstype, fs.target),
             Err(NmblError::Mount {
                 source: Errno::EBUSY,
@@ -88,8 +91,8 @@ pub fn mount_pseudo_filesystems(reporter: &mut BootReporter<'_, '_>) -> Result<(
 /// `Ok(())` if the directory already exists, since the cpio image often
 /// pre-creates these mountpoints; any other `io::Error` is wrapped with a
 /// path-aware context string.
-fn ensure_dir(path: &Path) -> Result<()> {
-    match std::fs::create_dir_all(path) {
+fn ensure_dir(ops: &mut impl FsOps, path: &Path) -> Result<()> {
+    match ops.ensure_dir(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(NmblError::Io {
@@ -114,7 +117,8 @@ mod tests {
         // `/` always exists on any host that can run cargo test; create_dir_all
         // on it must collapse to Ok(()), not surface a permission or
         // already-exists failure.
-        ensure_dir(Path::new("/")).expect("root always exists");
+        let mut ops = crate::sys::ops::RealSys::sync_only();
+        ensure_dir(&mut ops, Path::new("/")).expect("root always exists");
     }
 
     #[test]
@@ -127,9 +131,10 @@ mod tests {
         let base = std::env::temp_dir().join(format!("nmbl-ensure-dir-{pid}-{nonce}"));
         let nested = base.join("a/b/c");
 
-        ensure_dir(&nested).expect("nested create");
+        let mut ops = crate::sys::ops::RealSys::sync_only();
+        ensure_dir(&mut ops, &nested).expect("nested create");
         // Idempotency: a second call on the same path must also be Ok.
-        ensure_dir(&nested).expect("second call is a no-op");
+        ensure_dir(&mut ops, &nested).expect("second call is a no-op");
 
         let _ = std::fs::remove_dir_all(&base);
     }

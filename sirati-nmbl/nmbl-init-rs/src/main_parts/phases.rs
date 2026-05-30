@@ -4,9 +4,9 @@ use nmbl_init::activation::{KeyInjection, run_all_activations};
 use nmbl_init::config::{BootstrapConfig, Config, resolve_full_config_path};
 use nmbl_init::devices::mount_system_filesystems;
 use nmbl_init::error::{NmblError, Result};
-use nmbl_init::modules::{load_early_modules, load_explicit_modules, load_modules};
+use nmbl_init::modules::{load_early_modules, load_explicit_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
-use nmbl_init::sys::{blkid, mount as sys_mount};
+use nmbl_init::sys::ops::{FsOps, ModuleOps, SysOps};
 use nmbl_init::ui::{BootReporter, SessionInteraction, SkipSelector, TuiPasswordSupplier};
 use nmbl_init::{nmbl_info, nmbl_warn};
 
@@ -14,9 +14,9 @@ use nmbl_init::{nmbl_info, nmbl_warn};
 /// optional bootstrap phase (0.5) can see those pseudo-filesystems
 /// before it touches blkid or mounts the boot partition. Uses a
 /// [`NoopConsole`] sentinel because the real console is not open yet.
-pub(super) fn run_phase_1(reporter: &mut BootReporter<'_, '_>) -> Result<()> {
+pub(super) fn run_phase_1(ops: &mut impl FsOps, reporter: &mut BootReporter<'_, '_>) -> Result<()> {
     nmbl_info!("phase 1: mount pseudo-filesystems");
-    mount_pseudo_filesystems(reporter)
+    mount_pseudo_filesystems(ops, reporter)
 }
 
 /// Phase 2a: load early (graphics) kernel modules so the splash backend
@@ -24,10 +24,14 @@ pub(super) fn run_phase_1(reporter: &mut BootReporter<'_, '_>) -> Result<()> {
 /// `config.kernel_modules.early`. The reporter wraps a [`NoopConsole`];
 /// status pushes do nothing visible, but the underlying log ring is
 /// still populated for the post-console reporter to surface.
-pub(super) fn run_phase_2a(config: &Config, reporter: &mut BootReporter<'_, '_>) -> Result<()> {
+pub(super) fn run_phase_2a(
+    ops: &mut impl ModuleOps,
+    config: &Config,
+    reporter: &mut BootReporter<'_, '_>,
+) -> Result<()> {
     let _ = reporter.set_phase("phase 2a: load early kernel modules");
     nmbl_info!("phase 2a: load early kernel modules");
-    load_early_modules(config, reporter)
+    load_early_modules(ops, config, reporter)
 }
 
 /// Execute the post-console phases (2b, 3, 3b). The caller has already
@@ -40,7 +44,8 @@ pub(super) fn run_phase_2a(config: &Config, reporter: &mut BootReporter<'_, '_>)
 /// Returns the LUKS-passphrase injections that the kexec phase must
 /// thread into the chained initrd (one per `luks-password` activation
 /// whose TOML sets `pass_to_stage1`; empty when none opted in).
-pub(super) async fn run_phases_post_console(
+pub(super) async fn run_phases_post_console<S: SysOps>(
+    ops: &mut S,
     config: &Config,
     console: &mut dyn nmbl_init::ui::console::Console,
     session: &SessionInteraction,
@@ -56,7 +61,7 @@ pub(super) async fn run_phases_post_console(
     let _ = reporter.refresh_log();
 
     nmbl_info!("phase 2b: load explicit kernel modules");
-    load_explicit_modules(config, &mut reporter)?;
+    load_explicit_modules(ops, config, &mut reporter)?;
 
     // The splash backend opens /dev/tty1 and calls VT_ACTIVATE itself
     // (see `splash::input::SplashInput::open`); the tty backend uses
@@ -73,17 +78,17 @@ pub(super) async fn run_phases_post_console(
     // (idempotent) before the post-unlock mounts.
     let _ = reporter.set_phase("phase 2c: scanning /dev/disk/by-* symlinks");
     nmbl_info!("phase 2c: populating /dev/disk/by-* symlinks");
-    if let Err(err) = blkid::populate_disk_by_symlinks(sender).await {
+    if let Err(err) = ops.populate_disk_symlinks().await {
         nmbl_warn!("phase 2c: blkid sweep failed (continuing): {err}");
     }
 
     nmbl_info!("phase 3: storage activations");
     let mut supplier = TuiPasswordSupplier::new(config, session, skip_selector);
     let injections =
-        run_all_activations(config, &mut reporter, Some(&mut supplier), sender).await?;
+        run_all_activations(ops, config, &mut reporter, Some(&mut supplier), sender).await?;
 
     nmbl_info!("phase 3b: mount system filesystems");
-    mount_system_filesystems(config, &mut reporter, sender).await?;
+    mount_system_filesystems(ops, config, &mut reporter).await?;
 
     Ok(injections)
 }
@@ -103,9 +108,9 @@ pub(super) async fn run_phases_post_console(
 /// Runs inside the interactive [`crate::ui::block_on_tui_with_poller`]
 /// region; `module`/`mount` syscalls below are atomic and stay
 /// synchronous within the async region.
-pub(super) async fn run_bootstrap_phase(
+pub(super) async fn run_bootstrap_phase<S: SysOps>(
+    ops: &mut S,
     bootstrap_path: &Path,
-    sender: &nmbl_init::sys::poller::LocalSender,
 ) -> Result<Config> {
     nmbl_info!(
         "phase 0.5: loading bootstrap config {}",
@@ -119,7 +124,7 @@ pub(super) async fn run_bootstrap_phase(
         section.kernel_modules.explicit.len(),
         section.kernel_modules.modules_dir.display(),
     );
-    load_modules(
+    ops.load_modules(
         &section.kernel_modules.modules_dir,
         &section.kernel_modules.explicit,
         &[],
@@ -130,7 +135,7 @@ pub(super) async fn run_bootstrap_phase(
     })?;
 
     nmbl_info!("phase 0.5: populating /dev/disk/by-* symlinks");
-    blkid::populate_disk_by_symlinks(sender)
+    ops.populate_disk_symlinks()
         .await
         .map_err(|source| NmblError::Bootstrap {
             stage: "blkid-sweep",
@@ -161,14 +166,15 @@ pub(super) async fn run_bootstrap_phase(
         boot_fs.fstype,
         boot_options,
     );
-    std::fs::create_dir_all(&boot_fs.mountpoint).map_err(|source| NmblError::Bootstrap {
-        stage: "mount-boot",
-        source: Box::new(NmblError::Io {
-            source,
-            context: format!("creating boot mountpoint {}", boot_fs.mountpoint.display()),
-        }),
-    })?;
-    sys_mount::mount_fs(
+    ops.ensure_dir(&boot_fs.mountpoint)
+        .map_err(|source| NmblError::Bootstrap {
+            stage: "mount-boot",
+            source: Box::new(NmblError::Io {
+                source,
+                context: format!("creating boot mountpoint {}", boot_fs.mountpoint.display()),
+            }),
+        })?;
+    ops.mount(
         Some(Path::new(&boot_fs.device)),
         &boot_fs.mountpoint,
         &boot_fs.fstype,
@@ -214,7 +220,11 @@ pub(super) async fn run_bootstrap_phase(
 /// skips generation boot entirely, so it never touches `state.bin` and
 /// must not be blocked by a state-mount failure.
 #[cfg(feature = "stateful")]
-pub(super) fn mount_state_twin(config: &mut Config, bootstrap_path: &Path) -> Result<()> {
+pub(super) fn mount_state_twin(
+    ops: &mut impl FsOps,
+    config: &mut Config,
+    bootstrap_path: &Path,
+) -> Result<()> {
     let bootstrap = BootstrapConfig::load(bootstrap_path)?;
     let section = &bootstrap.bootstrap;
     let boot_fs = &section.boot_fs;
@@ -227,19 +237,18 @@ pub(super) fn mount_state_twin(config: &mut Config, bootstrap_path: &Path) -> Re
         boot_fs.mountpoint.display(),
         mp.display(),
     );
-    std::fs::create_dir_all(mp).map_err(|source| NmblError::Bootstrap {
+    ops.ensure_dir(mp).map_err(|source| NmblError::Bootstrap {
         stage: "mount-state",
         source: Box::new(NmblError::Io {
             source,
             context: format!("creating state mountpoint {}", mp.display()),
         }),
     })?;
-    sys_mount::mount_fs(Some(&boot_fs.mountpoint), mp, &boot_fs.fstype, "bind").map_err(
-        |source| NmblError::Bootstrap {
+    ops.mount(Some(&boot_fs.mountpoint), mp, &boot_fs.fstype, "bind")
+        .map_err(|source| NmblError::Bootstrap {
             stage: "mount-state",
             source: Box::new(source),
-        },
-    )?;
+        })?;
     config.runtime_state_mountpoint = Some(mp.clone());
     Ok(())
 }

@@ -238,7 +238,8 @@ pub(super) fn halt_final(reason: &str) -> ! {
 /// backend. It holds no globals and takes all state by parameter, so a
 /// later phase can `spawn_local` the same shape per connection. It is
 /// `block_on`'d once for the local console here.
-pub(super) async fn run_tui_session(
+pub(super) async fn run_tui_session<S: nmbl_init::sys::ops::SysOps>(
+    ops: &mut S,
     config: &Config,
     console: Box<dyn Console>,
     session: &SessionInteraction,
@@ -265,7 +266,8 @@ pub(super) async fn run_tui_session(
     // passphrase prompt / wrong-password modal `.await` the same
     // console — no nested runtime anywhere.
     let outcome =
-        match run_phases_post_console(config, &mut *console, session, &skip_selector, sender).await
+        match run_phases_post_console(ops, config, &mut *console, session, &skip_selector, sender)
+            .await
         {
             Ok(injections) => {
                 select_and_act(config, &mut *console, &injections, session, &skip_selector).await
