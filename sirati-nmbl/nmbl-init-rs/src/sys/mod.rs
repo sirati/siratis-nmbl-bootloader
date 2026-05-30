@@ -15,5 +15,6 @@ pub mod printk;
 // has no `alacritty_terminal` dependency.
 pub mod pty;
 pub mod tty;
+pub mod uki;
 pub mod uname;
 pub mod vt;
