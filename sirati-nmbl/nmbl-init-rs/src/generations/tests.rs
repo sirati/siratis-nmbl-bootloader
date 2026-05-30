@@ -304,3 +304,37 @@ fn ignores_garbage_entries() {
     assert_eq!(gens[0].number, 7);
     assert_eq!(gens[0].kernel_params, vec!["quiet".to_string()]);
 }
+
+#[test]
+fn missing_profiles_dir_on_unmounted_root_is_system_root_not_mounted() {
+    // system_root points at a path that exists on the test's own
+    // filesystem but is NOT a mount point, and the profiles dir under it
+    // does not exist. The scan must classify this as "nothing mounted"
+    // rather than the bare NoGenerations.
+    let tmp = TempDir::new().expect("temp dir");
+    let system_root = tmp.path().join("mnt/system");
+    std::fs::create_dir_all(&system_root).expect("system root");
+    let profiles = system_root.join("nix/var/nix/profiles");
+    let err = with_reporter(|r| scan_generations(&config_for(&profiles, &system_root), r))
+        .expect_err("must error");
+    match err {
+        NmblError::SystemRootNotMounted { mountpoint } => assert_eq!(mountpoint, system_root),
+        other => panic!("expected SystemRootNotMounted, got {other:?}"),
+    }
+}
+
+#[test]
+fn existing_empty_profiles_dir_stays_no_generations() {
+    // The profiles dir exists but holds no system-N-link entries — the
+    // classification must keep NoGenerations even though the system_root
+    // tempdir is not a real mount point.
+    let tmp = TempDir::new().expect("temp dir");
+    let profiles = tmp.path().join("nix/var/nix/profiles");
+    std::fs::create_dir_all(&profiles).expect("profiles");
+    let err = with_reporter(|r| scan_generations(&config_for(&profiles, tmp.path()), r))
+        .expect_err("must error");
+    match err {
+        NmblError::NoGenerations { searched } => assert_eq!(searched, profiles),
+        other => panic!("expected NoGenerations, got {other:?}"),
+    }
+}
