@@ -842,6 +842,30 @@ in
       '';
     };
 
+    # Gate for the install-time `--validate-initrm` check. When true a
+    # failed check aborts the bootloader install; when false the check
+    # still runs but a failure is only a SEVERE WARNING and the install
+    # proceeds (useful for installs where the running tree differs from
+    # the to-be-booted initramfs).
+    refuseInvalidInitrmOnInstall = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = lib.mdDoc ''
+        Whether a failed install-time `nmbl-init --validate-initrm`
+        check aborts the bootloader installation.
+
+        Before writing the bootloader files, the installer dry-runs the
+        real boot control flow against the initramfs closure: every file
+        the four boot scenarios touch must be present, so a missing
+        binary, module or config is caught before the install rather than
+        at boot.
+
+        When `true` (the default) a failure aborts the install. When
+        `false` the check still runs, but a failure prints a SEVERE
+        WARNING and the install continues anyway.
+      '';
+    };
+
     bootstrap = {
       configPath = lib.mkOption {
         # `types.str`, not `types.path`: this is a target-filesystem
