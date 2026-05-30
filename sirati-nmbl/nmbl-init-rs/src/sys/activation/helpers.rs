@@ -63,9 +63,9 @@ pub(super) fn io_activation(kind: &str, source: std::io::Error) -> NmblError {
 /// Build the `(binary_c, full_argv, env)` triple needed by `execve(2)`.
 ///
 /// All allocation happens here so the post-fork child path stays
-/// async-signal-safe. The returned `env` is intentionally empty —
-/// activation tools are NixOS-built static binaries that don't depend
-/// on PATH or locale env vars.
+/// async-signal-safe. The returned `env` carries only `DM_DISABLE_UDEV=1`
+/// (see below) — activation tools are NixOS-built static binaries that
+/// otherwise don't depend on PATH or locale env vars.
 pub(super) fn build_exec_args(
     binary: &Path,
     argv: &[String],
@@ -89,7 +89,19 @@ pub(super) fn build_exec_args(
         full_argv.push(c);
     }
 
-    let env: Vec<CString> = Vec::new();
+    // NMBL runs without udev. NixOS's cryptsetup / lvm / mdadm are built
+    // with libdevmapper udev-cookie support and, by default, WAIT for
+    // udev to create the `/dev/mapper/<name>` node after `cryptsetup
+    // open` — which never happens here, so the device-mapper node never
+    // appears and the post-activation device wait times out. Setting
+    // `DM_DISABLE_UDEV=1` tells libdevmapper to fall back to creating the
+    // nodes itself (direct mknod), exactly as it does in early-boot
+    // initramfs environments. Harmless for activations that don't use
+    // device-mapper.
+    let env: Vec<CString> = vec![
+        CString::new("DM_DISABLE_UDEV=1")
+            .map_err(|e| io_activation("execve-env", nul_to_io(e, "DM_DISABLE_UDEV")))?,
+    ];
     Ok((binary_c, full_argv, env))
 }
 
