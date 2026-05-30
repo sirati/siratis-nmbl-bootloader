@@ -41,9 +41,13 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Async so the inter-poll cadence comes from `tokio::time::sleep`
 /// rather than a blocking `thread::sleep` — the single-threaded runtime
 /// keeps serving the concurrent remote-attach server and the local
-/// spinner while we wait. The status line is render-only (no blocking
-/// input poll): the operator is not expected to type during a device
-/// wait, so this loop never blocks on `poll_key`.
+/// spinner while we wait. The operator can press Esc to abort a stuck
+/// wait: when a progress sink is present the cadence is driven by the
+/// sink's non-blocking async [`ProgressSink::poll_abort`], which resolves
+/// on the first of an Esc keypress or `POLL_INTERVAL` elapsing. Pressing
+/// Esc returns [`NmblError::OperatorAborted`]. Headless callers
+/// (`progress = None`) fall back to a plain `tokio::time::sleep` cadence
+/// with no abort path.
 pub async fn wait_for(
     device: &Path,
     timeout: Duration,
@@ -67,14 +71,25 @@ pub async fn wait_for(
             });
         }
 
-        // Render-only status update; the runtime, not a blocking
-        // `poll_key`, provides the cadence below.
+        // Render the status, then wait one cadence slice. With a sink the
+        // slice IS the Esc-abort poll: `poll_abort` awaits the backend up
+        // to POLL_INTERVAL and resolves early on a keypress, so a stuck
+        // wait aborts the instant Esc is pressed instead of one slice
+        // later. The freshly-built `poll_abort` future is the only thing
+        // in flight each iteration — it is cancel-safe and re-pollable, so
+        // even an early `return` drops nothing irreversible.
         if let Some(sink) = progress.as_deref_mut() {
             let elapsed = start.elapsed();
             let phase = format_wait_phase(operation, &device.display(), elapsed, timeout);
             sink.render_phase(&phase);
+            if sink.poll_abort(POLL_INTERVAL).await {
+                return Err(NmblError::OperatorAborted {
+                    context: format!("waiting for {}", device.display()),
+                });
+            }
+        } else {
+            tokio::time::sleep(POLL_INTERVAL).await;
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -331,7 +346,7 @@ fn entry_is_loop_backed(entry: &FilesystemEntry, resolved_device: &Path) -> bool
 /// backing), open the backing file `O_RDONLY | CLOEXEC`, and bind both
 /// via `LOOP_CONFIGURE`. The kernel cleans up the binding automatically
 /// when the loop mount is lazily unmounted in the pre-kexec teardown.
-fn setup_loop_device(file: &Path) -> Result<PathBuf> {
+pub(crate) fn setup_loop_device(file: &Path) -> Result<PathBuf> {
     let index = allocate_loop_device()?;
     let loop_fd = open_loop_device(index, true)?;
     let backing_fd = rustix::fs::open(file, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
