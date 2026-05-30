@@ -18,6 +18,7 @@
 //! mounts, block ops, and activation exec through `RealSys`. Kexec, shell
 //! spawn, and console bring-up are routed in later phases.
 
+pub mod dryrun;
 pub mod real;
 
 use std::io;
