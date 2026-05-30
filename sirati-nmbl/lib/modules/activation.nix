@@ -46,6 +46,18 @@ let
         && !(lib.elem n nmblLuksNames))
     nixosLuksNames;
 
+  # Stacked case: LVM-on-LUKS. The root fs device is then an LVM LV
+  # (/dev/mapper/<vg>-<lv>) whose name differs from the LUKS name, so the
+  # direct check above never fires — yet NMBL still can't assemble the VG
+  # because the LUKS PV is never unlocked. Conservatively flag when there
+  # is BOTH an uncovered LUKS device AND a device-mapper fs that isn't
+  # itself a declared LUKS mapping (i.e. an LVM LV / other dm target that
+  # could sit on the unopened PV).
+  uncoveredLuks = lib.filter (n: !(lib.elem n nmblLuksNames)) nixosLuksNames;
+  mapperFsNames = map (d: lib.removePrefix "/dev/mapper/" d)
+    (lib.filter (d: lib.hasPrefix "/dev/mapper/" d) nmblFsDevices);
+  lvmLikeMapperFs = lib.filter (n: !(lib.elem n nixosLuksNames)) mapperFsNames;
+
   # --- pkgsStatic.* with graceful fallback ----------------------------------
 
   tryStatic = attr:
@@ -187,7 +199,14 @@ let
             unlock = "password";  # or "tpm" / "keyfile"
           }];
       '';
-    }) uncoveredLuksFs;
+    }) uncoveredLuksFs
+    # Stacked LVM-on-LUKS: a dm filesystem may sit on an unopened LUKS PV.
+    ++ lib.optional (uncoveredLuks != [ ] && lvmLikeMapperFs != [ ]) {
+      assertion = false;
+      message = ''
+        NMBL: filesystem(s) on device-mapper volume(s) [${lib.concatStringsSep ", " lvmLikeMapperFs}] may be layered on LUKS device(s) [${lib.concatStringsSep ", " uncoveredLuks}] that are declared in boot.initrd.luks.devices but not covered by boot.nmbl.activation.luks. NMBL replaces NixOS stage-1; if these volumes sit on those LUKS devices, NMBL cannot unlock the PV, the volume group never assembles, and boot hangs. Declare each LUKS device in boot.nmbl.activation.luks (or, if a listed mapper volume is genuinely not on an encrypted PV, this is a false positive — report it).
+      '';
+    };
 
   # --- option types ---------------------------------------------------------
 
