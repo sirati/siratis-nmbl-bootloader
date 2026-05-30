@@ -6,9 +6,9 @@ use nmbl_init::devices::mount_system_filesystems;
 use nmbl_init::error::{NmblError, Result};
 use nmbl_init::modules::{load_early_modules, load_explicit_modules, load_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
-use nmbl_init::nmbl_info;
 use nmbl_init::sys::{blkid, mount as sys_mount};
 use nmbl_init::ui::{BootReporter, SessionInteraction, TuiPasswordSupplier};
+use nmbl_init::{nmbl_info, nmbl_warn};
 
 /// Phase 1: mount /proc, /sys, /dev. Lives at the top of `main` so the
 /// optional bootstrap phase (0.5) can see those pseudo-filesystems
@@ -61,6 +61,20 @@ pub(super) async fn run_phases_post_console(
     // (see `splash::input::SplashInput::open`); the tty backend uses
     // `/dev/console`, which already points at the kernel-chosen VT.
     // Neither path needs an extra VT switch here.
+
+    // Populate /dev/disk/by-{partlabel,label,uuid,partuuid} BEFORE storage
+    // activations. NMBL has no udev, so a `luks-password` activation whose
+    // `device` is a `/dev/disk/by-partlabel/...` path (the common disko
+    // shape) would otherwise hand cryptsetup a non-existent path and fail
+    // with exit 4. The external-config bootstrap (phase 0.5) already does
+    // this, but the embedded-config path reaches activations first, so we
+    // sweep blkid here too. `mount_system_filesystems` repeats the sweep
+    // (idempotent) before the post-unlock mounts.
+    let _ = reporter.set_phase("phase 2c: scanning /dev/disk/by-* symlinks");
+    nmbl_info!("phase 2c: populating /dev/disk/by-* symlinks");
+    if let Err(err) = blkid::populate_disk_by_symlinks(sender).await {
+        nmbl_warn!("phase 2c: blkid sweep failed (continuing): {err}");
+    }
 
     nmbl_info!("phase 3: storage activations");
     let mut supplier = TuiPasswordSupplier::new(config, session);

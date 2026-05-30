@@ -10,18 +10,28 @@ use crate::sys::poller::LocalSender;
 
 use super::{BLKID_BINARY, BLKID_EXIT_NO_SUPERBLOCK};
 
-/// Argv for `blkid -o export <dev>`.
+/// Argv for `blkid -p -o export <dev>`.
+///
+/// `-p` selects LOW-LEVEL probing (bypass the blkid cache). NMBL has no
+/// udev, so the cache-backed default mode returns only superblock
+/// attributes (LABEL/UUID/TYPE) and omits partition-table attributes
+/// (PARTLABEL/PARTUUID) — which a disko-style `device =
+/// /dev/disk/by-partlabel/...` LUKS/activation entry depends on. The
+/// low-level mode reads the GPT directly, but emits partition info under
+/// `PART_ENTRY_*` keys; `parse_blkid_export` aliases those back to the
+/// cache-mode `PARTLABEL`/`PARTUUID` names the symlink layer expects.
 fn blkid_argv(dev: &Path) -> Vec<String> {
     vec![
+        "-p".to_string(),
         "-o".to_string(),
         "export".to_string(),
         dev.display().to_string(),
     ]
 }
 
-/// Run `blkid -o export <dev>` and parse the result, reaping the child
-/// asynchronously via the poller. Exit code 2 is remapped to "empty
-/// attributes" — see [`BLKID_EXIT_NO_SUPERBLOCK`].
+/// Run `blkid -p -o export <dev>` and parse the result, reaping the
+/// child asynchronously via the poller. Exit code 2 is remapped to
+/// "empty attributes" — see [`BLKID_EXIT_NO_SUPERBLOCK`].
 pub(super) async fn blkid_for(dev: &Path, sender: &LocalSender) -> Result<HashMap<String, String>> {
     let (outcome, captured) =
         run_capture(Path::new(BLKID_BINARY), &blkid_argv(dev), sender).await?;
@@ -103,6 +113,24 @@ pub fn parse_blkid_export(text: &str) -> HashMap<String, String> {
         let value = value_with_eq.get(1..).unwrap_or_default();
         out.insert(key.to_string(), value.to_string());
     }
+
+    // Low-level (`blkid -p`) probing emits partition-table attributes
+    // under `PART_ENTRY_*`; alias them to the cache-mode names the
+    // symlink layer keys on, without clobbering any cache-mode value
+    // that was already present. PART_ENTRY_NAME is the GPT partition
+    // name (== PARTLABEL); PART_ENTRY_UUID is the partition GUID
+    // (== PARTUUID).
+    for (low_level, cache_mode) in [
+        ("PART_ENTRY_NAME", "PARTLABEL"),
+        ("PART_ENTRY_UUID", "PARTUUID"),
+    ] {
+        if !out.contains_key(cache_mode)
+            && let Some(value) = out.get(low_level).cloned()
+        {
+            out.insert(cache_mode.to_string(), value);
+        }
+    }
+
     out
 }
 
@@ -138,6 +166,44 @@ PARTUUID=abcdef01-1234-5678-9abc-def012345678
         assert_eq!(map.get("DEVNAME"), Some(&"/dev/sda1".to_string()));
         assert_eq!(map.get("TYPE"), Some(&"vfat".to_string()));
         assert_eq!(map.len(), 6);
+    }
+
+    #[test]
+    fn parse_low_level_part_entry_aliases_to_cache_names() {
+        // `blkid -p -o export` on a GPT partition emits partition-table
+        // attributes under PART_ENTRY_*; we alias them to PARTLABEL /
+        // PARTUUID so the symlink layer (which keys on the cache-mode
+        // names) creates by-partlabel / by-partuuid links in the
+        // udev-less environment.
+        let text = "\
+DEVNAME=/dev/vda2
+TYPE=crypto_LUKS
+PART_ENTRY_NAME=disk-main-luks
+PART_ENTRY_UUID=11111111-2222-3333-4444-555555555555
+PART_ENTRY_TYPE=0fc63daf-8483-4772-8e79-3d69d8477de4
+";
+        let map = parse_blkid_export(text);
+        assert_eq!(
+            map.get("PARTLABEL"),
+            Some(&"disk-main-luks".to_string()),
+            "PART_ENTRY_NAME must alias to PARTLABEL",
+        );
+        assert_eq!(
+            map.get("PARTUUID"),
+            Some(&"11111111-2222-3333-4444-555555555555".to_string()),
+            "PART_ENTRY_UUID must alias to PARTUUID",
+        );
+        // The crypto_LUKS TYPE is still surfaced unchanged.
+        assert_eq!(map.get("TYPE"), Some(&"crypto_LUKS".to_string()));
+    }
+
+    #[test]
+    fn parse_existing_cache_names_not_clobbered_by_alias() {
+        // If both cache-mode and low-level names are present (mixed
+        // output), the cache-mode value wins and is not overwritten.
+        let text = "PARTLABEL=keep-me\nPART_ENTRY_NAME=ignore-me\n";
+        let map = parse_blkid_export(text);
+        assert_eq!(map.get("PARTLABEL"), Some(&"keep-me".to_string()));
     }
 
     #[test]
