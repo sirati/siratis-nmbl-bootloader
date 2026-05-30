@@ -244,18 +244,34 @@ pub(super) enum BackendChoice {
 ///
 /// Mirrors the rules in the module docs without touching hardware, so
 /// tests can pin the same logic `open_console` runs in production.
-pub(super) fn decide_backend(config: &Config, panic_recovery: bool) -> BackendChoice {
+///
+/// `console_is_serial` is the kernel-elected-console classification
+/// (see [`crate::sys::tty::active_console_is_serial`]). When the primary
+/// interactive console is a serial line the splash backend would render
+/// to the (often QEMU-emulated) VGA framebuffer but read keyboard input
+/// from `/dev/tty1`, a VT the operator's serial keystrokes never reach —
+/// so we skip splash and use the tty backend, which reads `/dev/console`
+/// (the serial line) directly. Real VGA machines elect a `tty0`/`tty1`
+/// primary console, classify as non-serial, and keep the splash path.
+pub(super) fn decide_backend(
+    config: &Config,
+    panic_recovery: bool,
+    console_is_serial: bool,
+) -> BackendChoice {
     if panic_recovery {
         // Rule 1: panic re-exec → never re-enter splash.
         return BackendChoice::Tty;
     }
     #[cfg(feature = "image-splash")]
-    if config.splash.enable {
+    if config.splash.enable && !console_is_serial {
         return BackendChoice::SplashOrTty;
     }
     // Suppress unused-config warning when image-splash isn't compiled in.
     #[cfg(not(feature = "image-splash"))]
     let _ = config;
+    // Suppress unused warning when the splash arm above is compiled out.
+    #[cfg(not(feature = "image-splash"))]
+    let _ = console_is_serial;
     BackendChoice::Tty
 }
 
@@ -264,7 +280,22 @@ pub(super) fn decide_backend(config: &Config, panic_recovery: bool) -> BackendCh
 /// See module docs for the decision tree; [`decide_backend`] holds the
 /// pure decision logic and is the helper tests pin.
 pub fn open_console(config: &Config, panic_recovery: bool) -> Result<Box<dyn Console>> {
-    match decide_backend(config, panic_recovery) {
+    // Classify the kernel-elected primary console: a serial line has no
+    // keyboard on `/dev/tty1`, so the splash backend (which reads input
+    // there) would render but never see a keystroke. Detect that and
+    // route to the tty backend, which reads `/dev/console` — the serial
+    // line itself. Read-failure assumes a VT to keep the splash path on
+    // the common framebuffer machines.
+    let console_is_serial = crate::sys::tty::active_console_is_serial();
+    #[cfg(feature = "image-splash")]
+    if console_is_serial && config.splash.enable && !panic_recovery {
+        crate::nmbl_warn!(
+            "primary console is a serial line; using tty backend so serial \
+             keystrokes reach the selector (splash input on /dev/tty1 would be \
+             unreachable)"
+        );
+    }
+    match decide_backend(config, panic_recovery, console_is_serial) {
         #[cfg(feature = "image-splash")]
         BackendChoice::SplashOrTty => match SplashConsole::open(config) {
             Ok(Some(s)) => Ok(Box::new(s)),
@@ -317,15 +348,16 @@ mod tests {
     #[test]
     fn open_console_panic_recovery_picks_tty() {
         let config = Config::recovery_default();
-        // panic_recovery wins regardless of splash.enable.
-        assert_eq!(decide_backend(&config, true), BackendChoice::Tty);
+        // panic_recovery wins regardless of splash.enable / serial.
+        assert_eq!(decide_backend(&config, true, false), BackendChoice::Tty);
+        assert_eq!(decide_backend(&config, true, true), BackendChoice::Tty);
 
         #[cfg(feature = "image-splash")]
         {
             let mut config = Config::recovery_default();
             config.splash.enable = true;
             assert_eq!(
-                decide_backend(&config, true),
+                decide_backend(&config, true, false),
                 BackendChoice::Tty,
                 "panic_recovery must veto splash"
             );
@@ -338,7 +370,7 @@ mod tests {
         // recovery_default has splash.enable=false (and the field is
         // gated, so on no-feature builds the disabled-state is the
         // only state).
-        assert_eq!(decide_backend(&config, false), BackendChoice::Tty);
+        assert_eq!(decide_backend(&config, false, false), BackendChoice::Tty);
     }
 
     #[cfg(feature = "image-splash")]
@@ -347,9 +379,24 @@ mod tests {
         let mut config = Config::recovery_default();
         config.splash.enable = true;
         assert_eq!(
-            decide_backend(&config, false),
+            decide_backend(&config, false, false),
             BackendChoice::SplashOrTty,
-            "splash.enable=true must opt into the splash path",
+            "splash.enable=true on a VT console must opt into the splash path",
+        );
+    }
+
+    #[cfg(feature = "image-splash")]
+    #[test]
+    fn open_console_serial_console_vetoes_splash() {
+        let mut config = Config::recovery_default();
+        config.splash.enable = true;
+        // A serial primary console has no keyboard on /dev/tty1, so even
+        // with splash enabled we must fall back to the tty backend that
+        // reads /dev/console (the serial line).
+        assert_eq!(
+            decide_backend(&config, false, true),
+            BackendChoice::Tty,
+            "serial primary console must veto splash so keystrokes are read",
         );
     }
 }

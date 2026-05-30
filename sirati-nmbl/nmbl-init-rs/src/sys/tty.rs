@@ -152,6 +152,48 @@ fn parse_active_console(text: &str) -> Option<PathBuf> {
     Some(PathBuf::from("/dev").join(first))
 }
 
+/// Whether the kernel-elected primary console is a serial / non-VT
+/// line rather than an in-kernel virtual terminal.
+///
+/// The in-kernel VTs are named `ttyN` (`tty0`, `tty1`, …) and are the
+/// only consoles whose keystrokes land on `/dev/tty<N>`; the splash
+/// backend's `/dev/tty1` input path only works for those. Everything
+/// else — `ttyS*` (16550 serial), `ttyUSB*`/`ttyACM*` (USB serial),
+/// `ttyAMA*`/`hvc*` etc. — delivers operator keystrokes over
+/// `/dev/console` instead, so the splash backend would render but never
+/// see input. We classify by the leaf basename: a `tty<digits>` name is
+/// a VT, anything else is serial.
+///
+/// Pure function — no I/O — so the backend-selection decision tree can
+/// be unit-tested off-target.
+pub fn console_path_is_serial(path: &Path) -> bool {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    // A kernel VT is exactly `tty` followed by one-or-more ASCII digits;
+    // anything else (ttyS*, ttyUSB*, hvc*, …) is a serial/non-VT line.
+    !matches!(
+        name.strip_prefix("tty"),
+        Some(rest) if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+    )
+}
+
+/// Best-effort: is the kernel-elected primary interactive console a
+/// serial line (no keyboard on `/dev/tty1`)?
+///
+/// Reads [`read_active_console`] and classifies it with
+/// [`console_path_is_serial`]. On any read failure we return `false`
+/// ("assume VT") so the splash path is preserved on the well-trodden
+/// framebuffer machines; the serial fix only kicks in when we can
+/// positively confirm a serial primary console.
+pub fn active_console_is_serial() -> bool {
+    match read_active_console() {
+        Ok(path) => console_path_is_serial(&path),
+        Err(_) => false,
+    }
+}
+
 /// Wrap a `rustix::io::Errno` into our `NmblError::Tui` variant.
 /// `Errno` implements `From<Errno> for io::Error`, so the translation
 /// is lossless.
@@ -233,6 +275,24 @@ mod tests {
         }
         let resolved = read_active_console_from(&path).expect("fixture must read");
         assert_eq!(resolved, PathBuf::from("/dev/ttyS0"));
+    }
+
+    #[test]
+    fn console_path_is_serial_classifies_vt_vs_serial() {
+        // Kernel VTs: keystrokes reach /dev/tty<N>, so NOT serial.
+        assert!(!console_path_is_serial(Path::new("/dev/tty0")));
+        assert!(!console_path_is_serial(Path::new("/dev/tty1")));
+        assert!(!console_path_is_serial(Path::new("/dev/tty12")));
+        // Serial / non-VT lines: input arrives on /dev/console.
+        assert!(console_path_is_serial(Path::new("/dev/ttyS0")));
+        assert!(console_path_is_serial(Path::new("/dev/ttyS1")));
+        assert!(console_path_is_serial(Path::new("/dev/ttyUSB0")));
+        assert!(console_path_is_serial(Path::new("/dev/ttyACM0")));
+        assert!(console_path_is_serial(Path::new("/dev/ttyAMA0")));
+        assert!(console_path_is_serial(Path::new("/dev/hvc0")));
+        // `tty` with no trailing digit is not a VT name → serial-classed.
+        assert!(console_path_is_serial(Path::new("/dev/tty")));
+        assert!(console_path_is_serial(Path::new("/dev/ttyprintk")));
     }
 
     #[test]
