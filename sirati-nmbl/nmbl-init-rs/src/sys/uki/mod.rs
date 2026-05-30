@@ -311,11 +311,16 @@ fn parse_sections(bytes: &[u8]) -> std::result::Result<Vec<Section<'_>>, String>
 }
 
 /// Decode an 8-byte inline section name: bytes up to the first NUL, as UTF-8
-/// (lossy; PE names are ASCII).
+/// (lossy; PE names are ASCII). PE permits either NUL- or SPACE-padding for
+/// names shorter than 8 bytes, so trailing spaces are trimmed too — without
+/// this a valid space-padded `.linux  ` would be read as `.linux  ` and
+/// false-flagged as a missing `.linux` section.
 fn name_to_string(raw: &[u8]) -> String {
     let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     let slice = raw.get(..end).unwrap_or(raw);
-    String::from_utf8_lossy(slice).into_owned()
+    String::from_utf8_lossy(slice)
+        .trim_end_matches(' ')
+        .to_owned()
 }
 
 #[cfg(test)]
