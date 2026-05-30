@@ -217,11 +217,13 @@ pub async fn run_capture(
     Ok((outcome, captured))
 }
 
-/// Blocking sibling of [`run_capture`] for the pre-runtime early-boot
-/// bootstrap blkid sweep and the synchronous `--validate` CLI path,
-/// where no async runtime exists and nothing runs concurrently. Uses a
-/// blocking `waitpid(None)` reap — never call this from the interactive
-/// runtime (use [`run_capture`] instead).
+/// Blocking sibling of [`run_capture`], used EXCLUSIVELY by the
+/// runtime-less `--validate-hardware` CLI path (`crate::validate::hardware`
+/// runs `cryptsetup isLuks`) and the activation unit tests. That context
+/// has no async runtime and provably zero concurrent futures, so a
+/// blocking `waitpid(None)` reap is harmless. Early boot now runs inside
+/// the interactive runtime and uses the async [`run_capture`]; never call
+/// this from any runtime context.
 pub fn run_capture_blocking(binary: &Path, argv: &[String]) -> Result<(ProcessOutcome, Vec<u8>)> {
     let (child, captured) = capture_fork(binary, argv)?;
     let outcome = wait_for_child_blocking(child, binary)?;

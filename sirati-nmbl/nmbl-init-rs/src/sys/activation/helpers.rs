@@ -222,11 +222,13 @@ pub(super) async fn reap_child_outcome(
     }
 }
 
-/// Blocking `waitpid(None)` reap — used only by the pre-runtime early
-/// boot phase (bootstrap blkid) and the synchronous `--validate` CLI
-/// path, where nothing runs concurrently so blocking is harmless. EINTR
-/// is retried. The interactive/concurrent path uses
-/// [`reap_child_outcome`] instead.
+/// Blocking `waitpid(None)` reap — used EXCLUSIVELY by the runtime-less
+/// `--validate-hardware` CLI path (via [`run_capture_blocking`]) and the
+/// activation unit tests, where nothing runs concurrently so blocking is
+/// harmless. EINTR is retried. Early boot now runs inside the interactive
+/// runtime and reaps via [`reap_child_outcome`] instead.
+///
+/// [`run_capture_blocking`]: super::runner::run_capture_blocking
 pub(super) fn wait_for_child_blocking(
     child: nix::unistd::Pid,
     binary: &Path,
