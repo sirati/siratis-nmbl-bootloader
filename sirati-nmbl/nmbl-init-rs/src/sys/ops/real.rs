@@ -6,10 +6,11 @@
 //! [`LocalSender`] (the non-blocking `waitpid` reap channel), so `RealSys`
 //! borrows one for its lifetime.
 //!
-//! Unused this phase — the boot core still calls the free functions
-//! directly. The next phase threads `<S: SysOps>` through and this becomes
-//! the production impl; until then `#[allow(dead_code)]` keeps the
-//! `-D warnings` gate green.
+//! The boot spine threads `&mut RealSys` through and dispatches its
+//! side-effecting calls through these forwards. The pre-runtime phase 1
+//! (pseudo-fs mount) has no poller yet, so [`RealSys::sync_only`] builds
+//! a sender-less instance whose sync `FsOps` methods work and whose async
+//! methods are unreachable on that path (documented invariant).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,20 +32,41 @@ use super::{BlockOps, ConsoleOps, ExecOps, FsOps, KexecOps, KexecTarget, ModuleO
 /// Genuine system-operations impl. Borrows the poller's [`LocalSender`] so
 /// the async fork/exec and blkid forwarders can drive non-blocking
 /// `waitpid` reaps.
-#[allow(dead_code)] // wired into the boot core in the next phase
+///
+/// The sender is optional: the pre-runtime phase 1 (pseudo-fs mount) runs
+/// before the poller exists, but only uses the sync `FsOps` methods. A
+/// [`RealSys::sync_only`] instance carries `None`; calling an async method
+/// on it panics by the documented invariant that the pre-runtime path
+/// never reaches one.
 pub struct RealSys<'a> {
-    sender: &'a LocalSender,
+    sender: Option<&'a LocalSender>,
 }
 
-#[allow(dead_code)] // wired into the boot core in the next phase
 impl<'a> RealSys<'a> {
-    /// Build a `RealSys` borrowing the runtime's poller sender.
+    /// Build a `RealSys` borrowing the runtime's poller sender. Use for
+    /// every in-runtime boot phase (async fork/exec and blkid reaps).
     pub fn new(sender: &'a LocalSender) -> Self {
-        Self { sender }
+        Self {
+            sender: Some(sender),
+        }
+    }
+
+    /// Build a sender-less `RealSys` for the pre-runtime phase 1, whose
+    /// only side effects are the sync `FsOps` mounts. The async methods
+    /// must never be called on this instance — they `expect` the sender.
+    pub fn sync_only() -> Self {
+        Self { sender: None }
+    }
+
+    /// Resolve the poller sender for an async forward, panicking with a
+    /// clear message if this is a `sync_only` instance. The invariant
+    /// (pre-runtime path never calls an async op) makes this unreachable.
+    fn sender(&self) -> &'a LocalSender {
+        self.sender
+            .expect("RealSys async op requires a poller sender (built via sync_only)")
     }
 }
 
-#[allow(dead_code)] // wired into the boot core in the next phase
 impl FsOps for RealSys<'_> {
     fn exists(&self, path: &Path) -> bool {
         path.try_exists().unwrap_or(false)
@@ -73,7 +95,6 @@ impl FsOps for RealSys<'_> {
     }
 }
 
-#[allow(dead_code)] // wired into the boot core in the next phase
 impl BlockOps for RealSys<'_> {
     async fn wait_for_device(
         &mut self,
@@ -90,7 +111,7 @@ impl BlockOps for RealSys<'_> {
     }
 
     async fn populate_disk_symlinks(&mut self) -> Result<Vec<PathBuf>> {
-        crate::sys::blkid::populate_disk_by_symlinks(self.sender).await
+        crate::sys::blkid::populate_disk_by_symlinks(self.sender()).await
     }
 
     fn setup_loop(&mut self, file: &Path) -> Result<PathBuf> {
@@ -102,7 +123,6 @@ impl BlockOps for RealSys<'_> {
     }
 }
 
-#[allow(dead_code)] // wired into the boot core in the next phase
 impl ModuleOps for RealSys<'_> {
     fn load_module_set(
         &mut self,
@@ -123,7 +143,6 @@ impl ModuleOps for RealSys<'_> {
     }
 }
 
-#[allow(dead_code)] // wired into the boot core in the next phase
 impl ExecOps for RealSys<'_> {
     async fn run(
         &mut self,
@@ -131,7 +150,7 @@ impl ExecOps for RealSys<'_> {
         argv: &[String],
         stdin_data: Option<&[u8]>,
     ) -> Result<ProcessOutcome> {
-        crate::sys::activation::run(binary, argv, stdin_data, self.sender).await
+        crate::sys::activation::run(binary, argv, stdin_data, self.sender()).await
     }
 
     async fn run_capture(
@@ -139,7 +158,7 @@ impl ExecOps for RealSys<'_> {
         binary: &Path,
         argv: &[String],
     ) -> Result<(ProcessOutcome, Vec<u8>)> {
-        crate::sys::activation::run_capture(binary, argv, self.sender).await
+        crate::sys::activation::run_capture(binary, argv, self.sender()).await
     }
 
     fn spawn_shell(&mut self, shell_path: &Path, cols: u16, rows: u16) -> Result<PtyChild> {
@@ -147,7 +166,6 @@ impl ExecOps for RealSys<'_> {
     }
 }
 
-#[allow(dead_code)] // wired into the boot core in the next phase
 impl KexecOps for RealSys<'_> {
     fn kexec_load(&mut self, target: KexecTarget, cmdline: &str, flags: u32) -> Result<()> {
         match target {
@@ -169,7 +187,6 @@ impl KexecOps for RealSys<'_> {
     }
 }
 
-#[allow(dead_code)] // wired into the boot core in the next phase
 impl ConsoleOps for RealSys<'_> {
     fn open_console(&mut self, config: &Config, panic_recovery: bool) -> Result<Box<dyn Console>> {
         crate::ui::console::open_console(config, panic_recovery)
