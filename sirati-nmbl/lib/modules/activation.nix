@@ -28,6 +28,24 @@ let
   hasExplicitLuks = act.luks != [ ];
   lvmAutoDetected = hasMapper && !hasExplicitLuks;
 
+  # LUKS-backed filesystems NMBL must mount but won't unlock.
+  # /dev/mapper/* alone is ambiguous (LVM vs LUKS), so we key off
+  # config.boot.initrd.luks.devices — the canonical NixOS LUKS
+  # declaration. NMBL replaces stage-1, so any LUKS mapping backing a
+  # filesystem NMBL mounts MUST also be declared in
+  # boot.nmbl.activation.luks or NMBL can never open it.
+  # NOTE: stacking limitation — LUKS-under-LVM (fs device =
+  # /dev/mapper/<vg>-<lv>, whose name differs from the luks name) is
+  # NOT caught by this direct-device check; acceptable for now.
+  nixosLuksNames = lib.attrNames (config.boot.initrd.luks.devices or { });
+  nmblLuksNames = map (l: l.name) act.luks;
+  nmblFsDevices = map (fs: fs.device)
+    (lib.filter (fs: fs.device != null) fileSystems);
+  uncoveredLuksFs = lib.filter
+    (n: (lib.elem "/dev/mapper/${n}" nmblFsDevices)
+        && !(lib.elem n nmblLuksNames))
+    nixosLuksNames;
+
   # --- pkgsStatic.* with graceful fallback ----------------------------------
 
   tryStatic = attr:
@@ -151,7 +169,25 @@ let
     ++ lib.optional luksTpm {
       assertion = lib.any (m: lib.elem m extraKernelModules) [ "tpm_crb" "tpm_tis" ];
       message = "boot.nmbl.activation.luks entry requests TPM unlock but no TPM kernel modules were added to extraKernelModules";
-    };
+    }
+    # LUKS filesystems NMBL mounts but isn't told to unlock
+    ++ map (n: {
+      assertion = false;
+      message = ''
+        NMBL: filesystem on /dev/mapper/${n} is a LUKS device declared in
+        boot.initrd.luks.devices, but ${n} is not covered by
+        boot.nmbl.activation.luks. NMBL replaces NixOS stage-1 and will not
+        unlock it, so the filesystem cannot be mounted at boot.
+
+        Declare it for NMBL, e.g.:
+
+          boot.nmbl.activation.luks = [{
+            name = "${n}";
+            device = "<backing block device, e.g. /dev/nvme0n1p2>";
+            unlock = "password";  # or "tpm" / "keyfile"
+          }];
+      '';
+    }) uncoveredLuksFs;
 
   # --- option types ---------------------------------------------------------
 
