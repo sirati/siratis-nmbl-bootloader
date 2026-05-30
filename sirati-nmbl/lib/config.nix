@@ -172,17 +172,6 @@ let
       ;
   };
 
-  # Render the runtime configuration that the Rust /init reads at startup.
-  # All previously string-interpolated state (filesystems, modules, timeouts,
-  # serial console, verbosity, activation blocks) lives in this TOML file.
-  # The Rust binary used for `--validate-config` must match the one shipped
-  # in the initramfs, otherwise we could validate against a different schema
-  # than what actually runs at boot.
-  nmblConfigToml = import ./config-toml.nix {
-    inherit pkgs lib config;
-    nmblInit = selectedNmblInit;
-  };
-
   # Render the embedded bootstrap TOML used in external-config mode.
   # The bootstrap file points at /boot's device + fs + the relative path
   # to the full config.toml on the boot partition. Helper owned by B.2.
@@ -204,6 +193,50 @@ let
       # is a no-op fallback; passing them keeps the script self-describing.
       nicDrivers = lib.unique (cfg.rescue.nicDrivers ++ detectedNicModules);
     };
+  };
+
+  # The emergency menu's "Raw Shell" forks `cfg.paths.shell` while NMBL is
+  # PID 1 in the INITRAMFS (before any switch_root — see the Rust
+  # `sys::pty::preflight_shell` and `shell::drop_to_emergency`). So a usable
+  # shell binary must be staged into the initramfs whenever a rescue path
+  # can drop the operator to that menu. We ship busybox as `/bin/sh` for
+  # BOTH `embedded` and `external` modes: external used to omit it (the
+  # rescue squashfs carries its own /bin/sh, reached only via the heavier
+  # `rescue::dispatch` switch_root, NOT via the emergency menu), which left
+  # the menu's Raw Shell with nothing to execve — the real bug this fixes.
+  # `none` mode halts with a banner and never reaches the menu shell, so it
+  # stays busybox-free.
+  emergencyShellContents =
+    lib.optional (cfg.rescue.mode == "embedded" || cfg.rescue.mode == "external") {
+      object = "${pkgs.busybox}/bin/busybox";
+      symlink = "/bin/sh";
+    };
+
+  # Absolute paths the initramfs stages as executables. The build check in
+  # config-toml.nix asserts `cfg.paths.shell` is among these so an
+  # external-rescue misconfiguration (shell pointing at a binary absent
+  # from the initramfs) fails the build instead of dying silently at the
+  # emergency menu. Kept in sync with `baseContents` below.
+  initrdExecutablePaths =
+    [ "/init" "/bin/blkid" ] ++ map (c: c.symlink) emergencyShellContents;
+
+  # Render the runtime configuration that the Rust /init reads at startup.
+  # All previously string-interpolated state (filesystems, modules, timeouts,
+  # serial console, verbosity, activation blocks) lives in this TOML file.
+  # The Rust binary used for `--validate-config` must match the one shipped
+  # in the initramfs, otherwise we could validate against a different schema
+  # than what actually runs at boot. The check is target-aware: it confirms
+  # `paths.shell` resolves to a binary the initramfs stages, and — in
+  # external mode — lists the rescue squashfs (`unsquashfs -l`, no FUSE) to
+  # verify its switch_root handoff entrypoint exists.
+  nmblConfigToml = import ./config-toml.nix {
+    inherit pkgs lib config;
+    nmblInit = selectedNmblInit;
+    initrdExecutables = initrdExecutablePaths;
+    rescueSfs = if cfg.rescue.mode == "external" then nmblRescueSquashfs else null;
+    # `none` mode ships no emergency shell on purpose (the emergency path
+    # halts with a banner), so do not assert paths.shell is staged there.
+    checkEmergencyShell = cfg.rescue.mode != "none";
   };
 
   # Where the runtime config TOML lives at boot. In embedded mode it
@@ -280,15 +313,14 @@ in
     #                                   locate the full config on /boot
     #                                   (external mode only)
     #   - /bin/sh                     : busybox, used ONLY for the emergency
-    #                                   shell on failure (never by /init
-    #                                   itself); staged only when
-    #                                   `rescue.mode = "embedded"`. For the
-    #                                   "external" / "none" modes the
-    #                                   emergency path either pivots into
-    #                                   the rescue squashfs (which carries
-    #                                   its own /bin/sh) or halts with a
-    #                                   structured banner — no in-initramfs
-    #                                   shell is reachable.
+    #                                   menu's Raw Shell on failure (never by
+    #                                   /init itself); staged for the
+    #                                   "embedded" AND "external" modes so
+    #                                   the menu has a binary to execve while
+    #                                   NMBL is PID 1 in the initramfs. The
+    #                                   "none" mode halts with a structured
+    #                                   banner and never reaches the menu
+    #                                   shell, so it ships no /bin/sh.
     #   - /bin/blkid                  : util-linux's blkid, called by the
     #                                   Rust /init to populate /dev/disk/by-*
     #                                   symlinks (udev-less stage-0).
@@ -320,17 +352,15 @@ in
               }
             ];
 
-        # Busybox is only needed in the initramfs when the emergency
-        # path execs `cfg.paths.shell` directly (embedded mode). In
-        # "external" mode the rescue squashfs carries its own /bin/sh
-        # and is loop-mounted before any shell exec; in "none" mode the
-        # rescue dispatcher halts via `halt_with_banner` without ever
-        # touching a shell. Keeping busybox out of the initramfs for
-        # those two modes is the bulk of the F.6 size delta.
-        shellContents = lib.optional (cfg.rescue.mode == "embedded") {
-          object = "${pkgs.busybox}/bin/busybox";
-          symlink = "/bin/sh";
-        };
+        # Busybox `/bin/sh` for the emergency menu's Raw Shell. Shared
+        # with the build check via the top-level `emergencyShellContents`
+        # so the initramfs and the check agree on exactly what is staged.
+        # Present for `embedded` AND `external` (the latter previously
+        # omitted it, breaking the menu's Raw Shell — the rescue squashfs
+        # /bin/sh is only reachable via the heavier `rescue::dispatch`
+        # switch_root, not the menu). `none` mode halts with a banner and
+        # never reaches the menu shell, so it stays busybox-free.
+        shellContents = emergencyShellContents;
 
         baseContents = [
           {
