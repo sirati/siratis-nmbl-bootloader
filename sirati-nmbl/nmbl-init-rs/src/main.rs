@@ -185,7 +185,7 @@ fn run_force_rescue(
 /// lines.
 fn run_key_echo_diagnostic(
     config: Config,
-    mut console: Box<dyn Console>,
+    console: Box<dyn Console>,
 ) -> std::result::Result<TerminalAction, Box<(NmblError, Config)>> {
     nmbl_info!("nmbl.key_echo=1 in cmdline: entering key-echo diagnostic screen");
     let err = NmblError::Io {
@@ -196,6 +196,15 @@ fn run_key_echo_diagnostic(
     // both the key-echo loop and the follow-on emergency session.
     // The key-echo diagnostic owns its own App, so a fresh session is
     // correct. A runtime-build failure routes to a plain Reboot.
+    let session = SessionInteraction::new();
+    // Wrap the console in the central interaction-latch layer so a key
+    // pressed during the key-echo loop carries operator-presence into the
+    // follow-on emergency session (and cancels its auto-reboot countdown),
+    // matching every other interactive session.
+    let mut console: Box<dyn Console> = Box::new(nmbl_init::ui::console::LatchingConsole::new(
+        console,
+        session.clone(),
+    ));
     let action = nmbl_init::ui::block_on_tui(async {
         if let Err(e) = run_key_echo_loop(&mut *console).await {
             nmbl_warn!(
@@ -205,7 +214,7 @@ fn run_key_echo_diagnostic(
         }
         // Hand the live console down to drop_to_emergency so the
         // emergency UI paints through the same backend.
-        nmbl_init::shell::drop_to_emergency(console, &config, err, &SessionInteraction::new()).await
+        nmbl_init::shell::drop_to_emergency(console, &config, err, &session).await
     });
     match action {
         Ok(a) => Ok(a),

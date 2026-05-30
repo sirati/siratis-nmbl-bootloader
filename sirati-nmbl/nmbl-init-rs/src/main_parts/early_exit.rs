@@ -24,6 +24,61 @@ pub(super) fn handle_early_exit_modes(args: &Args) -> Option<ExitCode> {
         });
     }
 
+    // Target-machine hardware check (read-only, zero side effects). Loads
+    // the toml, probes each declared device against the real hardware,
+    // and ALWAYS hard-errors on any failure — the warn-vs-abort decision
+    // is the Nix install script's, not ours.
+    if let Some(path) = args.validate_hardware.as_deref() {
+        return Some(match Config::load(path) {
+            Ok(config) => {
+                let failures = nmbl_init::validate::validate_hardware(&config, &args.tools);
+                if failures.is_empty() {
+                    println!("nmbl-init: hardware OK for {}", path.display());
+                    ExitCode::from(0)
+                } else {
+                    eprintln!(
+                        "nmbl-init: hardware validation FAILED for {} ({} problem(s)):",
+                        path.display(),
+                        failures.len()
+                    );
+                    for f in &failures {
+                        eprintln!("  - {f}");
+                    }
+                    ExitCode::from(1)
+                }
+            }
+            Err(err) => {
+                eprintln!("nmbl-init: config invalid at {}: {err}", path.display());
+                ExitCode::from(1)
+            }
+        });
+    }
+
+    // NixOS-only sandbox check: the toml must MATCH the NixOS filesystem
+    // closure JSON. `config_toml` is guaranteed present by arg parsing.
+    if let Some(json) = args.validate_closure.as_deref() {
+        let toml = args
+            .config_toml
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new("/dev/null"));
+        return Some(
+            match nmbl_init::validate::validate_nix_filesystem_closure(json, toml) {
+                Ok(()) => {
+                    println!(
+                        "nmbl-init: config {} matches NixOS filesystem closure {}",
+                        toml.display(),
+                        json.display()
+                    );
+                    ExitCode::from(0)
+                }
+                Err(err) => {
+                    eprintln!("nmbl-init: NixOS filesystem closure validation FAILED: {err}");
+                    ExitCode::from(1)
+                }
+            },
+        );
+    }
+
     // Installer and systemd-unit early-exit dispatches.
     #[cfg(feature = "stateful")]
     {

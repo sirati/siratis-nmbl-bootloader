@@ -44,20 +44,44 @@ let
     "ntfs"     = "ntfs3";
     "exfat"    = "exfat";
     "zfs"      = "zfs";
+    # Read-only image filesystems, typically loop-mounted from a file
+    # (e.g. a /nix-only squashfs serving the target closure).
+    "squashfs" = "squashfs";
+    "erofs"    = "erofs";
+    "iso9660"  = "isofs";
     "tmpfs"    = null;
     "proc"     = null;
     "sysfs"    = null;
     "devtmpfs" = null;
   };
 
-  fsTypes = map (fs: fs.fsType) (lib.attrValues config.fileSystems);
+  fsEntries = lib.attrValues config.fileSystems;
+  fsTypes = map (fs: fs.fsType) fsEntries;
 
   # Look up each fsType; an unknown key returns null, so the two
   # filters below collapse both "no mapping" and "explicitly null"
   # entries into the same drop.
   rawModules = map (fst: fsTypeToModule.${fst} or null) fsTypes;
 
-  baseModules = lib.unique (lib.filter (m: m != null) rawModules);
+  fsModules = lib.unique (lib.filter (m: m != null) rawModules);
+
+  # A filesystem entry is loop-backed (and so needs the loop driver, since
+  # NMBL sets up the loop device itself — no losetup/udev) when its
+  # `options` carry `loop`, or its `device` is a regular-file path rather
+  # than a block device (anything not under /dev). NixOS's own stage-1
+  # uses the same heuristic for `boot.initrd.extraUtilsCommands` losetup.
+  isLoopBacked = fs:
+    (lib.elem "loop" (fs.options or [ ]))
+    || (
+      fs.device != null
+      && lib.isString fs.device
+      && lib.hasPrefix "/" fs.device
+      && !(lib.hasPrefix "/dev/" fs.device)
+    );
+
+  loopModules = lib.optional (lib.any isLoopBacked fsEntries) "loop";
+
+  baseModules = lib.unique (fsModules ++ loopModules);
 
   # Crypto helpers that the filesystem driver needs at mount(2) time.
   # Modern NixOS kernels build crypto as separate modules and require

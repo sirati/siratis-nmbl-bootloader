@@ -72,14 +72,19 @@ fn drive_emergency_loop_returns_selected_on_enter() {
 }
 
 #[test]
-fn drive_emergency_loop_keypress_cancels_countdown() {
-    // Press 'r' immediately, before the timer matters. Choice must
-    // be Reboot and BOTH countdown fields must have been cleared.
+fn drive_emergency_loop_interaction_cancels_countdown() {
+    // The central layer's `UserHasInteracted` notice (which precedes the
+    // operator's first key) disarms the countdown; the following 'r' then
+    // commits Reboot. Choice must be Reboot and BOTH countdown fields
+    // must have been cleared by the notice.
     let start = Instant::now();
     let frozen_now = move || start;
 
     let mut app = fresh_emergency_app("boot failed");
-    let mut console = TestConsole::new(vec![Some(press(KeyCode::Char('r')))]);
+    let mut console = TestConsole::with_events(vec![
+        Some(ConsoleEvent::UserHasInteracted),
+        Some(ConsoleEvent::Key(press(KeyCode::Char('r')))),
+    ]);
 
     let outcome = block(drive_emergency_loop(
         &mut app,
@@ -92,7 +97,7 @@ fn drive_emergency_loop_keypress_cancels_countdown() {
     assert!(app.countdown_remaining_secs.is_none());
     assert!(
         app.error_countdown_deadline.is_none(),
-        "keypress must disarm the deadline latch"
+        "UserHasInteracted must disarm the deadline latch"
     );
 }
 
@@ -109,8 +114,13 @@ fn drive_emergency_loop_fresh_entry_latches_deadline_and_sets_countdown() {
 
     let mut app = fresh_emergency_app("boot failed");
     assert!(app.error_countdown_deadline.is_none());
-    // One render then commit Reboot so the loop exits cleanly.
-    let mut console = TestConsole::new(vec![None, Some(press(KeyCode::Char('r')))]);
+    // One render, then the central layer's interaction notice (which
+    // clears the just-latched deadline), then 'r' to exit cleanly.
+    let mut console = TestConsole::with_events(vec![
+        None,
+        Some(ConsoleEvent::UserHasInteracted),
+        Some(ConsoleEvent::Key(press(KeyCode::Char('r')))),
+    ]);
 
     let _ = block(drive_emergency_loop(
         &mut app,
@@ -122,7 +132,7 @@ fn drive_emergency_loop_fresh_entry_latches_deadline_and_sets_countdown() {
 
     assert!(
         app.error_countdown_deadline.is_none(),
-        "the trailing keypress must have cleared the deadline again"
+        "the interaction notice must have cleared the deadline again"
     );
     // The crucial check is that the loop COULD set both fields
     // when starting from None. Verify by running a non-committing
@@ -282,17 +292,18 @@ fn drive_emergency_loop_past_deadline_reboots_immediately() {
 }
 
 #[test]
-fn drive_emergency_loop_keypress_disarms_deadline_for_session() {
-    // Non-committing keypress (Down) followed by a timeout's
-    // worth of empty polls. Bug A regression: the original code
-    // hid the display but the local Instant deadline still
-    // fired. After the fix, ANY keypress disarms the deadline
-    // and subsequent empty polls must NOT reboot.
+fn drive_emergency_loop_interaction_disarms_deadline_for_session() {
+    // The central layer's interaction notice (preceding the operator's
+    // first key) disarms the deadline; a following non-committing key
+    // (Down) plus a timeout's worth of empty polls must then NOT reboot.
+    // Bug A regression: the original code hid the display but the local
+    // Instant deadline still fired. After the fix the deadline is None
+    // and we keep looping until an explicit choice.
     let start = Instant::now();
     // The injected clock progresses way past the original 30s
-    // deadline after the first call. If the deadline were still
-    // armed, the second iteration would return Reboot. After
-    // the fix, the deadline is None and we keep looping.
+    // deadline after the first couple of calls. If the deadline were
+    // still armed, a later iteration would return Reboot. After the
+    // fix, the deadline is None and we keep looping.
     let calls = Cell::new(0u32);
     let staggered_now = || {
         let n = calls.get();
@@ -305,14 +316,15 @@ fn drive_emergency_loop_keypress_disarms_deadline_for_session() {
     };
 
     let mut app = fresh_emergency_app("boot failed");
-    // Sequence: Down (non-committing, disarms), then a few Nones
-    // (loop must NOT reboot), then 'r' to exit cleanly.
-    let mut console = TestConsole::new(vec![
-        Some(press(KeyCode::Down)),
+    // Sequence: UserHasInteracted (disarms), Down (non-committing),
+    // then a few Nones (loop must NOT reboot), then 'r' to exit cleanly.
+    let mut console = TestConsole::with_events(vec![
+        Some(ConsoleEvent::UserHasInteracted),
+        Some(ConsoleEvent::Key(press(KeyCode::Down))),
         None,
         None,
         None,
-        Some(press(KeyCode::Char('r'))),
+        Some(ConsoleEvent::Key(press(KeyCode::Char('r')))),
     ]);
 
     let outcome = block(drive_emergency_loop(
@@ -323,12 +335,12 @@ fn drive_emergency_loop_keypress_disarms_deadline_for_session() {
     ))
     .expect("loop must succeed");
     // Outcome is Reboot only because we explicitly pressed 'r',
-    // NOT because the timer fired. The deadline was disarmed by
-    // the earlier Down keypress and never re-armed.
+    // NOT because the timer fired. The deadline was disarmed by the
+    // interaction notice and never re-armed.
     assert_eq!(outcome, EmergencyChoice::Reboot);
     assert!(
         app.error_countdown_deadline.is_none(),
-        "deadline must remain None after a non-committing keypress"
+        "deadline must remain None after the interaction notice"
     );
     assert!(app.countdown_remaining_secs.is_none());
 }

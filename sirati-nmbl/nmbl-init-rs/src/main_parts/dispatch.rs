@@ -10,7 +10,7 @@ use nmbl_init::error::{NmblError, Result, format_chain};
 use nmbl_init::generations::scan_generations;
 use nmbl_init::shell::{drop_to_emergency, print_banner, print_halt_banner};
 use nmbl_init::terminal::{TerminalAction, redirect_stdio_for_execve};
-use nmbl_init::ui::console::Console;
+use nmbl_init::ui::console::{Console, LatchingConsole};
 #[cfg(not(feature = "stateful"))]
 use nmbl_init::ui::run_selector;
 use nmbl_init::ui::{BootReporter, Decision, SessionInteraction};
@@ -224,7 +224,17 @@ pub(super) async fn run_tui_session(
     console: Box<dyn Console>,
     session: &SessionInteraction,
 ) -> TerminalAction {
-    let mut console = console;
+    // Wrap the live boot console in the central interaction-latch layer
+    // for the whole session. Every consumer below — the early-boot
+    // reporter (phases 2b/3/3b), the generation selector, and the
+    // emergency menu — polls input through this one wrapper, so the first
+    // keypress anywhere (including the early boot-log window) sets the
+    // shared latch and emits `UserHasInteracted`. Boxed as
+    // `Box<dyn Console>` so it stands in transparently everywhere the
+    // bare console used to, including the by-value hand-off into
+    // `drop_to_emergency`; its Drop drops the real backend, preserving
+    // the VT-restore-before-reboot ordering.
+    let mut console: Box<dyn Console> = Box::new(LatchingConsole::new(console, session.clone()));
     // Phases 2b/3/3b run here too: their syscalls (modules, cryptsetup,
     // mount) are plain synchronous calls inside this async fn, and the
     // passphrase prompt / wrong-password modal `.await` the same

@@ -23,3 +23,4 @@ pub mod state;
 pub mod sys;
 pub mod terminal;
 pub mod ui;
+pub mod validate;

@@ -369,7 +369,18 @@ pub fn open_console_and_drop_to_emergency(config: &Config, err: NmblError) -> Te
         // spawn the reserve poller, and block_on the emergency session.
         // On a runtime-build failure fall back to Reboot (same safety
         // default as a console bring-up failure below).
-        Ok(c) => match crate::ui::block_on_tui(drop_to_emergency(c, config, err, &session)) {
+        //
+        // Wrap the freshly-opened console in the central interaction-latch
+        // layer so a keypress on THIS emergency session (the bootstrap /
+        // panic / pre-console failure path) cancels the auto-reboot
+        // countdown — same as every other session. `drop_to_emergency`
+        // then sees a wrapped console just like the local boot path does.
+        Ok(c) => match crate::ui::block_on_tui(drop_to_emergency(
+            Box::new(crate::ui::console::LatchingConsole::new(c, session.clone())),
+            config,
+            err,
+            &session,
+        )) {
             Ok(action) => action,
             Err(rt_err) => {
                 nmbl_warn!(

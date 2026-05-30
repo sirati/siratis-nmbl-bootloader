@@ -131,6 +131,7 @@ in
               lib.types.enum [
                 "grub"
                 "systemd"
+                "efi-stub"
               ]
             );
             default = null;
@@ -138,6 +139,11 @@ in
               Bootloader to use:
               - grub: GRUB bootloader (supports both BIOS and UEFI)
               - systemd: systemd-boot (UEFI only, formerly gummiboot)
+              - efi-stub: UEFI direct boot. NMBL's kernel + initrd are
+                combined into a single UKI (Unified Kernel Image) PE and
+                installed as EFI/BOOT/BOOTX64.EFI on the ESP. No GRUB or
+                systemd-boot binary is written — the ESP holds ONLY NMBL.
+                UEFI only.
               - null: No loader (used for qemu_kernel_invoke mode)
 
               Defaults to "grub" for bios/uefi modes, null for qemu_kernel_invoke.
@@ -809,6 +815,30 @@ in
         `config.toml` inside the initramfs; `"external"` embeds only the
         bootstrap.toml descriptor and reads `config.toml` from the boot
         partition at runtime.
+      '';
+    };
+
+    # Gate for the install-time `--validate-hardware` check. When true a
+    # failed check aborts the bootloader install; when false the check
+    # still runs but a failure is only a SEVERE WARNING and the install
+    # proceeds (useful for installs from a rescue environment where the
+    # target devices are not yet present).
+    refuseInvalidHardwareOnInstall = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = lib.mdDoc ''
+        Whether a failed install-time `nmbl-init --validate-hardware`
+        check aborts the bootloader installation.
+
+        Before writing the bootloader files, the installer runs a
+        read-only hardware validation of the staged `config.toml` against
+        the actual machine: each LUKS activation's backing device must
+        exist and carry a LUKS header, and each non-`/dev/mapper/`
+        filesystem device must exist.
+
+        When `true` (the default) a failure aborts the install. When
+        `false` the check still runs, but a failure prints a SEVERE
+        WARNING and the install continues anyway.
       '';
     };
 

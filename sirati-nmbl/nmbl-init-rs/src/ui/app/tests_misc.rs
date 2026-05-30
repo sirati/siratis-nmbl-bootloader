@@ -222,15 +222,22 @@ fn log_scroll_offset_moves_and_saturates() {
 
 #[test]
 fn shared_session_latch_spans_two_apps() {
-    // A keypress on one App built from a session must be visible to
-    // a second App built via new_in_session — proving the emergency
-    // screen sees interaction from the selector / passphrase prompt.
+    // Once the central `LatchingConsole` layer sets the session latch
+    // (on the operator's first input), that presence must be visible to
+    // every App built from the same session via new_in_session — proving
+    // the emergency screen sees interaction from the selector / passphrase
+    // prompt. We set the latch directly here (the wrapper is what sets it
+    // in production; `on_key` no longer does).
     let session = SessionInteraction::new();
     let gens = vec![fake_gen(1, &[])];
-    let mut first = App::new_in_session(&gens, &session);
+    let first = App::new_in_session(&gens, &session);
     assert!(!session.get());
-    first.on_key(press(KeyCode::Char('p')));
-    assert!(session.get());
+    assert!(!first.interaction.get());
+    session.set();
+    assert!(
+        first.interaction.get(),
+        "first App observes the shared latch"
+    );
 
     let second = App::new_in_session(&[], &session);
     assert!(

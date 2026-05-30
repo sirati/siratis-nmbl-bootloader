@@ -96,7 +96,14 @@ async fn run_selector_on_console(
                 dirty = true;
             }
             // No scrollback on the selector screen; ignore wheel notches.
-            Some(crate::ui::console::ConsoleEvent::Scroll { .. }) | None => {}
+            // `UserHasInteracted` only matters during the countdown phase
+            // (already past here); in the event loop the real key that
+            // follows it does the work, so the notice is a no-op.
+            Some(
+                crate::ui::console::ConsoleEvent::Scroll { .. }
+                | crate::ui::console::ConsoleEvent::UserHasInteracted,
+            )
+            | None => {}
         }
         if app.decision.is_some() {
             break;
@@ -146,15 +153,17 @@ async fn run_console_countdown(
         };
 
         let slice = remaining.min(POLL_SLICE);
-        // Any key cancels the countdown. A `Resize` only repaints (the
-        // selector loop below redraws at the new geometry); it does not
-        // count as the operator cancelling, matching the prior
-        // `poll_key` semantics which silently dropped resizes.
-        if let Some(crate::ui::console::ConsoleEvent::Key(_)) = console.poll_event(slice).await? {
-            // Cancelling the countdown is operator presence too — latch
-            // it just like `App::on_key` does, so a later screen this
-            // session sees the boot as attended.
-            app.interaction.set();
+        // Cancel the countdown on the central layer's one-shot
+        // `UserHasInteracted` — the single source of "operator is
+        // present". The wrapper already set the shared latch when it
+        // emitted this, so a later screen this session sees the boot as
+        // attended without the selector touching the latch itself. A
+        // `Resize` only repaints (the selector loop below redraws at the
+        // new geometry) and a raw `Key` is delivered *after* the notice,
+        // so neither needs to cancel here.
+        if let Some(crate::ui::console::ConsoleEvent::UserHasInteracted) =
+            console.poll_event(slice).await?
+        {
             return Ok(TimeoutOutcome::Cancelled);
         }
 
@@ -189,7 +198,7 @@ mod tests {
     use crate::error::Result;
     use crate::generations::Generation;
     use crate::ui::app::{App, SessionInteraction};
-    use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
+    use crate::ui::console::{Console, ConsoleEvent, ConsoleKind, LatchingConsole};
     use crate::ui::timeout::TimeoutOutcome;
 
     /// Console double that replays canned key events; once drained it
@@ -302,15 +311,18 @@ mod tests {
 
     #[test]
     fn countdown_cancel_records_operator_presence() {
-        // A keypress that cancels the countdown is operator presence and
-        // must latch it (mirrors App::on_key) so later screens this
-        // session treat the boot as attended.
+        // A keypress during the countdown is operator presence. The
+        // central `LatchingConsole` latches it and emits
+        // `UserHasInteracted`; the countdown cancels on that notice (NOT
+        // on the raw key) and the shared latch is set so later screens
+        // this session treat the boot as attended.
         let gens = vec![sel_gen(1)];
         let session = SessionInteraction::new();
         let mut app = App::new_in_session(&gens, &session);
         assert!(!session.get());
 
-        let mut console = ScriptedConsole::new(vec![press(KeyCode::Char('x'))]);
+        let scripted = ScriptedConsole::new(vec![press(KeyCode::Char('x'))]);
+        let mut console = LatchingConsole::new(Box::new(scripted), session.clone());
         let outcome = block(run_console_countdown(
             &mut console,
             &mut app,

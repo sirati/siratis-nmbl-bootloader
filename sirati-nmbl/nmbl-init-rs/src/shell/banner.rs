@@ -88,6 +88,21 @@ pub(super) fn suggested_action(err: &NmblError) -> String {
             "No system-N-link entries found under {}. Verify the system filesystem is mounted.",
             searched.display()
         ),
+        NmblError::SystemRootNotMounted { mountpoint } => format!(
+            "Nothing is mounted at {mp}. Mount the NixOS system root there first \
+             (e.g. `mount /dev/<root> {mp}`), then re-run [Verify kexec readiness].",
+            mp = mountpoint.display()
+        ),
+        NmblError::ProfilesDirMissing { path, mountpoint } => format!(
+            "WARNING: {p} does not exist even though something is mounted at {mp}. \
+             This usually means the wrong filesystem (or the wrong directory) was \
+             hand-mounted at {mp}. NMBL needs the NixOS system root mounted at {mp} — \
+             the filesystem that contains nix/var/nix/profiles/system-*-link and the \
+             nix store. Unmount {mp}, mount the correct system root there, then re-run \
+             [Verify kexec readiness].",
+            p = path.display(),
+            mp = mountpoint.display()
+        ),
         NmblError::Tui { .. } => "TUI failed — fall back to serial mode in config.".to_string(),
         NmblError::Activation { kind, .. } => {
             format!("Activation '{kind}' failed; check the relevant tool's stderr above.")
@@ -176,6 +191,44 @@ mod tests {
         };
         let s = suggested_action(&e);
         assert!(s.contains("/mnt/system/nix/var/nix/profiles"), "{s}");
+    }
+
+    #[test]
+    fn suggested_action_for_system_root_not_mounted_says_nothing_mounted() {
+        let e = NmblError::SystemRootNotMounted {
+            mountpoint: PathBuf::from("/mnt/system"),
+        };
+        let s = suggested_action(&e);
+        assert!(s.contains("Nothing is mounted"), "{s}");
+        assert!(s.contains("/mnt/system"), "{s}");
+        assert!(
+            s.contains("Mount the NixOS system root"),
+            "must tell the operator to mount the system root: {s}"
+        );
+    }
+
+    #[test]
+    fn suggested_action_for_profiles_dir_missing_warns_and_states_requirements() {
+        let e = NmblError::ProfilesDirMissing {
+            path: PathBuf::from("/mnt/system/nix/var/nix/profiles"),
+            mountpoint: PathBuf::from("/mnt/system"),
+        };
+        let s = suggested_action(&e);
+        // Warns the dir is missing.
+        assert!(s.contains("WARNING"), "must warn: {s}");
+        assert!(s.contains("/mnt/system/nix/var/nix/profiles"), "{s}");
+        // Hints the likely cause: a wrong hand-mount.
+        assert!(
+            s.contains("wrong filesystem") || s.contains("wrong directory"),
+            "must blame a bad hand-mount: {s}"
+        );
+        // States the layout requirements NMBL expects.
+        assert!(
+            s.contains("nix/var/nix/profiles/system-*-link"),
+            "must state the required profiles/store layout: {s}"
+        );
+        assert!(s.contains("nix store"), "must mention the store: {s}");
+        assert!(s.contains("/mnt/system"), "{s}");
     }
 
     #[test]

@@ -40,8 +40,14 @@ pub(super) async fn modal_poll(
     match console.poll_event(timeout).await? {
         Some(crate::ui::console::ConsoleEvent::Key(k)) => Ok(ModalPollOutcome::Key(k)),
         Some(crate::ui::console::ConsoleEvent::Resize { .. }) => Ok(ModalPollOutcome::Resized),
-        // Modals have no scrollback; wheel notches are idle here.
-        Some(crate::ui::console::ConsoleEvent::Scroll { .. }) | None => Ok(ModalPollOutcome::Idle),
+        // Modals have no scrollback; wheel notches are idle here. The
+        // central layer's `UserHasInteracted` notice is informational —
+        // modals don't gate on operator presence — so it is idle too.
+        Some(
+            crate::ui::console::ConsoleEvent::Scroll { .. }
+            | crate::ui::console::ConsoleEvent::UserHasInteracted,
+        )
+        | None => Ok(ModalPollOutcome::Idle),
     }
 }
 

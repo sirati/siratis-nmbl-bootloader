@@ -48,16 +48,33 @@ pub(super) fn fresh_emergency_app(message: &str) -> App<'static> {
 }
 
 /// In-process [`Console`] for unit-testing the emergency loop.
-/// Drives a scripted sequence of key events on `poll_event()` and
-/// counts renders.
+/// Drives a scripted sequence of events on `poll_event()` and counts
+/// renders. Most tests script keys via [`TestConsole::new`]; tests that
+/// exercise the central layer's `UserHasInteracted` notice (which the
+/// loop now keys its countdown-cancel off of) script full events via
+/// [`TestConsole::with_events`].
 pub(super) struct TestConsole {
-    pub(super) events: Vec<Option<KeyEvent>>,
+    pub(super) events: Vec<Option<ConsoleEvent>>,
     pub(super) cursor: usize,
     pub(super) renders: u32,
 }
 
 impl TestConsole {
-    pub(super) fn new(events: Vec<Option<KeyEvent>>) -> Self {
+    /// Script a sequence of optional KEY events. `None` models an idle
+    /// poll slice.
+    pub(super) fn new(keys: Vec<Option<KeyEvent>>) -> Self {
+        let events = keys.into_iter().map(|k| k.map(ConsoleEvent::Key)).collect();
+        Self {
+            events,
+            cursor: 0,
+            renders: 0,
+        }
+    }
+
+    /// Script a sequence of optional full console events — used to inject
+    /// the central layer's one-shot [`ConsoleEvent::UserHasInteracted`]
+    /// ahead of the key it precedes, exactly as `LatchingConsole` would.
+    pub(super) fn with_events(events: Vec<Option<ConsoleEvent>>) -> Self {
         Self {
             events,
             cursor: 0,
@@ -81,7 +98,7 @@ impl Console for TestConsole {
     fn poll_event_blocking(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
         let v = self.events.get(self.cursor).copied().flatten();
         self.cursor = self.cursor.saturating_add(1);
-        Ok(v.map(ConsoleEvent::Key))
+        Ok(v)
     }
     fn size(&self) -> (u16, u16) {
         (80, 24)

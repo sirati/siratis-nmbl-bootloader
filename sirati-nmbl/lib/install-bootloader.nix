@@ -22,6 +22,7 @@
   configLocation,
   nmblConfigToml,
   nmblRescueSquashfs,
+  nmblUki,
 }:
 
 let
@@ -41,6 +42,20 @@ let
       null
     else
       { };
+
+  # Resolve the cryptsetup the activation plan uses (prefer the static
+  # build, same as lib/modules/activation.nix's `tryStatic`). Handed to
+  # `--validate-hardware` so the read-only LUKS-header probe uses the
+  # exact tool the toml implies, with a self-magic fallback if absent.
+  tryStatic = attr:
+    let
+      s = pkgs.pkgsStatic.${attr} or null;
+      d = pkgs.${attr} or null;
+    in if s != null then s else d;
+  cryptsetupPkg = tryStatic "cryptsetup";
+  cryptsetupToolArg =
+    lib.optionalString (cryptsetupPkg != null)
+      "--tool=cryptsetup:${cryptsetupPkg}/bin/cryptsetup";
 in
 
 pkgs.writeScript "install-nmbl-bootloader" ''
@@ -73,15 +88,33 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     echo "WARNING: Boot partition filesystem is $BOOT_FS_TYPE, expected vfat/msdos"
   fi
 
-  KERNEL="${config.system.build.nmblKernel}/bzImage"
-  INITRD="${config.system.build.nmblInitramfs}/initrd"
+  # Read-only hardware validation of the SAME config.toml the bootloader
+  # ships, BEFORE any bootloader files are written. Probes each declared
+  # device against the real machine (LUKS headers, device existence);
+  # zero side effects. `refuseInvalidHardwareOnInstall` decides whether a
+  # failure aborts the install or is only a severe warning.
+  echo "Validating NMBL config against target hardware..."
+  ${
+    if cfg.refuseInvalidHardwareOnInstall then
+      # set -e is active: a non-zero exit aborts the install here.
+      ''${config.system.build.nmblInit}/bin/nmbl-init --validate-hardware=${nmblConfigToml} ${cryptsetupToolArg}''
+    else
+      ''${config.system.build.nmblInit}/bin/nmbl-init --validate-hardware=${nmblConfigToml} ${cryptsetupToolArg} || echo "SEVERE WARNING: NMBL hardware validation failed; installing anyway because refuseInvalidHardwareOnInstall=false"''
+  }
 
-  # Copy NMBL kernel and initrd to boot partition
-  echo "Copying NMBL bootloader files to /boot..."
-  mkdir -p /boot
-  cp -f "$KERNEL" /boot/nmbl-kernel
-  cp -f "$INITRD" /boot/nmbl-initrd
-  echo "✓ Bootloader files installed: /boot/nmbl-kernel, /boot/nmbl-initrd"
+  ${lib.optionalString (actualLoader != "efi-stub") ''
+    KERNEL="${config.system.build.nmblKernel}/bzImage"
+    INITRD="${config.system.build.nmblInitramfs}/initrd"
+
+    # Copy NMBL kernel and initrd to boot partition. SKIPPED in efi-stub
+    # mode: there the kernel + initrd live inside the UKI PE installed at
+    # EFI/BOOT/BOOTX64.EFI, so no separate files belong on the ESP.
+    echo "Copying NMBL bootloader files to /boot..."
+    mkdir -p /boot
+    cp -f "$KERNEL" /boot/nmbl-kernel
+    cp -f "$INITRD" /boot/nmbl-initrd
+    echo "✓ Bootloader files installed: /boot/nmbl-kernel, /boot/nmbl-initrd"
+  ''}
 
   ${lib.optionalString cfg.stateful.enable ''
     # Stateful mode: initialise (or upgrade) the persistent state.bin
@@ -308,6 +341,20 @@ pkgs.writeScript "install-nmbl-bootloader" ''
         fi
 
         echo "✓ systemd-boot bootloader installed"
+  ''}
+
+  ${lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "efi-stub") ''
+    # UEFI direct boot. The ESP holds ONLY NMBL: a single UKI PE at the
+    # firmware fallback path EFI/BOOT/BOOTX64.EFI, with NMBL's kernel +
+    # initrd inside it (systemd-stub passes the embedded .initrd section
+    # to the kernel). No GRUB, no systemd-boot, no loader/ dir, no
+    # separate nmbl-kernel/nmbl-initrd files (those copies are skipped
+    # above in this mode). No NVRAM entry is written — the fallback path
+    # makes the stick boot on any UEFI machine.
+    echo "Installing NMBL UKI (UEFI efi-stub mode) to /boot ESP..."
+    mkdir -p /boot/EFI/BOOT
+    cp -f ${nmblUki} /boot/EFI/BOOT/BOOTX64.EFI
+    echo "✓ NMBL UKI installed at /boot/EFI/BOOT/BOOTX64.EFI"
   ''}
 
   # Create /init symlink for NixOS stage-1
