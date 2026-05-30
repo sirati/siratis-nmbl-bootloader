@@ -10,6 +10,7 @@
 
 mod helpers;
 mod luks;
+mod source_wait;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -25,9 +26,10 @@ use crate::ui::console::Console;
 
 use helpers::{
     check_required_modules, collect_stdin, exit_code_error, is_activation_success, kind_label,
-    loaded_modules, wait_for_source_device, wrap_runner_error,
+    loaded_modules, wrap_runner_error,
 };
 use luks::{WrongPasswordHandled, handle_wrong_password, run_luks_with_spinner};
+use source_wait::wait_for_source_device;
 
 /// One passphrase to inject into the kexec'd initrd as a keyfile. The
 /// activation runner emits one of these per `luks-password` activation
@@ -101,7 +103,7 @@ pub async fn run_all_activations<S: SysOps>(
         // path (→ exit code 4). Re-sweep on each poll so the link appears
         // the instant the node does. The fast path (device already
         // present) is a single existence check — no added latency.
-        wait_for_source_devices(config, activation, reporter, sender).await?;
+        wait_for_source_devices(ops, config, activation, reporter).await?;
 
         // Per-iteration reborrow for password_supplier so the compiler
         // doesn't keep the mutable borrow live across loop turns.
@@ -164,13 +166,14 @@ pub async fn run_all_activations<S: SysOps>(
 /// partition node the kernel enumerated asynchronously gets its by-*
 /// links before cryptsetup is reached. Bounded per device by
 /// `config.general.device_timeout_secs`; the spinner advances via the
-/// reporter so Esc still aborts. Delegates to the generic, test-injectable
-/// [`wait_for_source_device`] with the real existence probe and sweep.
-async fn wait_for_source_devices(
+/// reporter so Esc still aborts. Delegates to the generic
+/// [`wait_for_source_device`], routing the existence check and re-sweep
+/// through `ops` so a dry-run makes the wait trivially-ready.
+async fn wait_for_source_devices<S: SysOps>(
+    ops: &mut S,
     config: &Config,
     activation: &Activation,
     reporter: &mut BootReporter<'_, '_>,
-    sender: &crate::sys::poller::LocalSender,
 ) -> Result<()> {
     if activation.source_devices.is_empty() {
         return Ok(());
@@ -181,22 +184,7 @@ async fn wait_for_source_devices(
         kind_label(activation.kind)
     );
     for device in &activation.source_devices {
-        wait_for_source_device(
-            device,
-            timeout,
-            &operation,
-            Some(&mut *reporter),
-            |p| p.exists(),
-            || async {
-                // Discard the btrfs-member list: phase-3b's own sweep in
-                // `mount_system_filesystems` re-collects it for the scan;
-                // here we only care about the by-* symlinks reappearing.
-                crate::sys::blkid::populate_disk_by_symlinks(sender)
-                    .await
-                    .map(|_| ())
-            },
-        )
-        .await?;
+        wait_for_source_device(ops, device, timeout, &operation, Some(&mut *reporter)).await?;
     }
     Ok(())
 }
