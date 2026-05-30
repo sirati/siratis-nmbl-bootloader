@@ -21,6 +21,23 @@ let
     map (req: storageValidation.makeStorageDriverAssertion config req) requiredStorageDrivers
   );
 
+  # --- known-bad NMBL stage-0 kernel / activation combinations --------------
+  #
+  # The NMBL stage-0 kernel (boot.nmbl.kernelPackage) is the kernel kexec'd by
+  # the bootloader; it is independent of the post-kexec target system kernel.
+  # Some stage-0 kernel versions have bugs that break specific activations.
+
+  nmblKernelVersion = cfg.kernelPackage.version or "0";
+  # Affected series: the linux_6_6 LTS line. The 6.6 series trips a crypto-API
+  # init-order bug (dm-crypt -> trusted-keys -> encrypted-keys -> ecb(aes)) that
+  # prevents dm_crypt from creating the LUKS mapping, so cryptsetup luksOpen
+  # never produces /dev/mapper/<name> and a LUKS-rooted system cannot boot.
+  # Gate on the 6.6.x series specifically (the only line confirmed affected);
+  # newer NMBL kernels (e.g. linuxPackages_latest.kernel) handle it correctly.
+  nmblKernelIs66 = lib.versions.majorMinor nmblKernelVersion == "6.6";
+  # Any LUKS activation declared on the NMBL side.
+  nmblHasLuks = cfg.activation.luks != [ ];
+
 in
 {
   # All NMBL configuration assertions
@@ -107,6 +124,14 @@ in
         || !actualLoaderExtraArgs.efiInstallAsRemovable
         || !actualLoaderExtraArgs.canTouchEfiVariables;
       message = "Cannot use both efiInstallAsRemovable and canTouchEfiVariables. Choose one.";
+    }
+    {
+      assertion = !(nmblKernelIs66 && nmblHasLuks);
+      message = ''
+        NMBL stage-0 kernel ${nmblKernelVersion} (linux_6_6 series) has a dm-crypt crypto-API bug that breaks LUKS unlock in stage-0: dm_crypt fails to create the mapping, so `cryptsetup luksOpen` never produces /dev/mapper/<name> and a LUKS-rooted system cannot boot.
+        Set boot.nmbl.kernelPackage (the NMBL stage-0 kernel, not the target system kernel) to a newer kernel, e.g. pkgs.linuxPackages_latest.kernel (>= 6.7).
+        The target system kernel (boot.kernelPackages) is unaffected by this assertion.
+      '';
     }
   ]
   # Add storage driver validation assertions
