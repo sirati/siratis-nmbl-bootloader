@@ -23,7 +23,7 @@ use std::path::Path;
 use rustix::fs::{Mode, OFlags};
 
 use crate::config::{ActivationKind, Config};
-use crate::sys::activation::run_capture;
+use crate::sys::activation::run_capture_blocking;
 
 use super::tools::ToolPaths;
 
@@ -122,8 +122,8 @@ fn has_luks_header(dev: &Path, cryptsetup: Option<&Path>) -> Result<bool, String
 /// `Err`; a non-zero exit is a legitimate "not LUKS" answer.
 fn cryptsetup_is_luks(cryptsetup: &Path, dev: &Path) -> Result<bool, String> {
     let argv = vec!["isLuks".to_string(), dev.display().to_string()];
-    let (outcome, _captured) =
-        run_capture(cryptsetup, &argv).map_err(|e| format!("running cryptsetup isLuks: {e}"))?;
+    let (outcome, _captured) = run_capture_blocking(cryptsetup, &argv)
+        .map_err(|e| format!("running cryptsetup isLuks: {e}"))?;
     Ok(outcome.normal_exit && outcome.exit_code == 0)
 }
 

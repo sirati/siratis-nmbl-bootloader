@@ -205,7 +205,7 @@ fn run_key_echo_diagnostic(
         console,
         session.clone(),
     ));
-    let action = nmbl_init::ui::block_on_tui(async {
+    let action = nmbl_init::ui::block_on_tui_with_poller(|sender| async move {
         if let Err(e) = run_key_echo_loop(&mut *console).await {
             nmbl_warn!(
                 "key-echo loop error: {}",
@@ -214,7 +214,7 @@ fn run_key_echo_diagnostic(
         }
         // Hand the live console down to drop_to_emergency so the
         // emergency UI paints through the same backend.
-        nmbl_init::shell::drop_to_emergency(console, &config, err, &session).await
+        nmbl_init::shell::drop_to_emergency(console, &config, err, &session, &sender).await
     });
     match action {
         Ok(a) => Ok(a),
@@ -300,7 +300,9 @@ fn run_inner(
         return run_key_echo_diagnostic(config, console);
     }
     let session = SessionInteraction::new();
-    match nmbl_init::ui::block_on_tui(run_tui_session(&config, console, &session)) {
+    match nmbl_init::ui::block_on_tui_with_poller(|sender| async move {
+        run_tui_session(&config, console, &session, &sender).await
+    }) {
         Ok(action) => Ok(action),
         Err(rt_err) => {
             nmbl_warn!(

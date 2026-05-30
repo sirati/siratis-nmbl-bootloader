@@ -223,6 +223,7 @@ pub(super) async fn run_tui_session(
     config: &Config,
     console: Box<dyn Console>,
     session: &SessionInteraction,
+    sender: &nmbl_init::sys::poller::LocalSender,
 ) -> TerminalAction {
     // Wrap the live boot console in the central interaction-latch layer
     // for the whole session. Every consumer below — the early-boot
@@ -239,7 +240,7 @@ pub(super) async fn run_tui_session(
     // mount) are plain synchronous calls inside this async fn, and the
     // passphrase prompt / wrong-password modal `.await` the same
     // console — no nested runtime anywhere.
-    let outcome = match run_phases_post_console(config, &mut *console, session).await {
+    let outcome = match run_phases_post_console(config, &mut *console, session, sender).await {
         Ok(injections) => select_and_act(config, &mut *console, &injections, session).await,
         Err(err) => Err(err),
     };
@@ -268,7 +269,7 @@ pub(super) async fn run_tui_session(
             // its [Retry boot from config] re-runs phase 3 and re-prompts
             // for the passphrase, which is what the operator wants after
             // a shell detour.
-            drop_to_emergency(console, config, err, session).await
+            drop_to_emergency(console, config, err, session, sender).await
         }
     }
 }

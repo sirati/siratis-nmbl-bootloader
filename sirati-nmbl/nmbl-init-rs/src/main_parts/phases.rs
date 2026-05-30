@@ -44,6 +44,7 @@ pub(super) async fn run_phases_post_console(
     config: &Config,
     console: &mut dyn nmbl_init::ui::console::Console,
     session: &SessionInteraction,
+    sender: &nmbl_init::sys::poller::LocalSender,
 ) -> Result<Vec<KeyInjection>> {
     let mut reporter = BootReporter::new(console, "phase 2b: loading kernel modules");
     // Paint the first frame so the operator sees a populated screen
@@ -63,10 +64,11 @@ pub(super) async fn run_phases_post_console(
 
     nmbl_info!("phase 3: storage activations");
     let mut supplier = TuiPasswordSupplier::new(config, session);
-    let injections = run_all_activations(config, &mut reporter, Some(&mut supplier)).await?;
+    let injections =
+        run_all_activations(config, &mut reporter, Some(&mut supplier), sender).await?;
 
     nmbl_info!("phase 3b: mount system filesystems");
-    mount_system_filesystems(config, &mut reporter)?;
+    mount_system_filesystems(config, &mut reporter, sender).await?;
 
     Ok(injections)
 }
@@ -104,7 +106,7 @@ pub(super) fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
     })?;
 
     nmbl_info!("phase 0.5: populating /dev/disk/by-* symlinks");
-    blkid::populate_disk_by_symlinks().map_err(|source| NmblError::Bootstrap {
+    blkid::populate_disk_by_symlinks_blocking().map_err(|source| NmblError::Bootstrap {
         stage: "blkid-sweep",
         source: Box::new(source),
     })?;

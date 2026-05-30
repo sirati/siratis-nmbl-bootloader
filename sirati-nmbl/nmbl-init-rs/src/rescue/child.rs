@@ -356,7 +356,7 @@ async fn reap_with_server(config: &Config, pid: Pid, sender: LocalSender) -> Opt
 
     let shutdown = Shutdown::new();
     let sink: ActionSink = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let server = run_remote_server(config, shutdown.clone(), sink);
+    let server = run_remote_server(config, shutdown.clone(), sink, &sender);
     // Clone the sender so the rare "server returned first" branch can
     // still reap the child (LocalSender is a cheap Rc handle).
     let reap = reap_child(pid, sender.clone());

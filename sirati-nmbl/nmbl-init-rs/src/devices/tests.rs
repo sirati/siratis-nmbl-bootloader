@@ -6,6 +6,7 @@
 )]
 
 use super::*;
+use crate::ui::TickOutcome;
 use std::path::PathBuf;
 
 fn fs_entry(device: &str, mountpoint: &str, is_root: bool) -> FilesystemEntry {
@@ -18,9 +19,10 @@ fn fs_entry(device: &str, mountpoint: &str, is_root: bool) -> FilesystemEntry {
     }
 }
 
-/// Counting ProgressSink for tests. Records every call and the most
-/// recent phase string so we can assert both the cadence (~N ticks
-/// per second of wait) and the format of the status line.
+/// Counting ProgressSink for tests. Records every `render_phase` call
+/// and the most recent phase string so we can assert both the cadence
+/// (~N renders per second of wait, driven by `tokio::time::sleep`) and
+/// the format of the status line.
 struct CountingSink {
     ticks: u32,
     last_phase: Option<String>,
@@ -36,50 +38,38 @@ impl CountingSink {
 }
 
 impl ProgressSink for CountingSink {
-    fn tick(&mut self, phase: &str) -> TickOutcome {
-        self.ticks = self.ticks.saturating_add(1);
-        self.last_phase = Some(phase.to_string());
-        // Production `BootReporter::tick` blocks up to ~100 ms on
-        // `poll_key`, which gives the wait loop its natural
-        // cadence. A bare counting sink would busy-spin and
-        // generate millions of ticks per second, so simulate the
-        // same cadence here. Tests asserting on tick counts can
-        // then trust wallclock math.
-        std::thread::sleep(POLL_INTERVAL);
+    fn tick(&mut self, _phase: &str) -> TickOutcome {
+        // The async `wait_for` no longer calls `tick` (no blocking input
+        // poll during a device wait); it renders via `render_phase`.
         TickOutcome::Continue
     }
-}
 
-/// ProgressSink that aborts on the Nth tick. Used to drive
-/// `wait_for` into the OperatorAborted path without standing up a
-/// full TUI console.
-struct AbortingSink {
-    ticks: u32,
-    abort_at: u32,
-}
-
-impl AbortingSink {
-    fn at(abort_at: u32) -> Self {
-        Self { ticks: 0, abort_at }
-    }
-}
-
-impl ProgressSink for AbortingSink {
-    fn tick(&mut self, _phase: &str) -> TickOutcome {
+    fn render_phase(&mut self, phase: &str) {
         self.ticks = self.ticks.saturating_add(1);
-        if self.ticks >= self.abort_at {
-            TickOutcome::Aborted
-        } else {
-            TickOutcome::Continue
-        }
+        self.last_phase = Some(phase.to_string());
     }
+}
+
+/// Build a single-thread `LocalRuntime` to drive the async `wait_for`
+/// in tests — mirrors the production interactive runtime.
+fn block<F: std::future::Future>(fut: F) -> F::Output {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build_local(tokio::runtime::LocalOptions::default())
+        .expect("test runtime");
+    rt.block_on(fut)
 }
 
 #[test]
 fn wait_for_missing_path_times_out() {
     let missing = Path::new("/nonexistent/path/nmbl-devices-test");
-    let err = wait_for(missing, Duration::from_millis(200), "waiting for", None)
-        .expect_err("missing path must time out");
+    let err = block(wait_for(
+        missing,
+        Duration::from_millis(200),
+        "waiting for",
+        None,
+    ))
+    .expect_err("missing path must time out");
     match err {
         NmblError::DeviceTimeout { device, timeout_ms } => {
             assert_eq!(device, missing.to_path_buf());
@@ -97,8 +87,13 @@ fn wait_for_dev_null_returns_quickly() {
         return;
     }
     let start = Instant::now();
-    wait_for(dev_null, Duration::from_secs(1), "waiting for", None)
-        .expect("/dev/null should be ready");
+    block(wait_for(
+        dev_null,
+        Duration::from_secs(1),
+        "waiting for",
+        None,
+    ))
+    .expect("/dev/null should be ready");
     let elapsed = start.elapsed();
     assert!(
         elapsed < Duration::from_secs(1),
@@ -108,82 +103,48 @@ fn wait_for_dev_null_returns_quickly() {
 
 #[test]
 fn wait_for_ticks_progress_sink_during_wait() {
-    // A 500 ms timeout on a 100 ms poll cadence should fire ~5 ticks
+    // A 500 ms timeout on a 100 ms poll cadence should fire ~5 renders
     // (give or take one for scheduler jitter). The exact bound is
     // intentionally loose — CI VMs run hot.
     let missing = Path::new("/nonexistent/nmbl-devices-tick-test");
     let mut sink = CountingSink::new();
-    let _ = wait_for(
+    let _ = block(wait_for(
         missing,
         Duration::from_millis(500),
         "waiting for",
         Some(&mut sink),
-    )
+    ))
     .expect_err("missing path must time out");
     assert!(
         sink.ticks >= 2,
-        "expected at least 2 ticks during a 500 ms wait, got {}",
+        "expected at least 2 renders during a 500 ms wait, got {}",
         sink.ticks
     );
     assert!(
         sink.ticks <= 15,
-        "expected at most 15 ticks during a 500 ms wait (defensive upper bound), got {}",
+        "expected at most 15 renders during a 500 ms wait (defensive upper bound), got {}",
         sink.ticks
-    );
-}
-
-#[test]
-fn wait_for_returns_operator_aborted_when_sink_aborts() {
-    // First tick fires Aborted; wait_for must surface that as
-    // NmblError::OperatorAborted carrying the device-context string
-    // so the emergency menu can show "waiting for <device>".
-    let missing = Path::new("/nonexistent/nmbl-devices-abort-test");
-    let mut sink = AbortingSink::at(1);
-    let err = wait_for(
-        missing,
-        Duration::from_secs(30),
-        "phase 3b: waiting for",
-        Some(&mut sink),
-    )
-    .expect_err("aborting sink must abort the wait");
-
-    match err {
-        NmblError::OperatorAborted { context } => {
-            assert!(
-                context.contains("nmbl-devices-abort-test"),
-                "context must name the device being waited on: {context:?}"
-            );
-            assert!(
-                context.starts_with("waiting for"),
-                "context must lead with the action verb: {context:?}"
-            );
-        }
-        other => panic!("expected OperatorAborted, got {other:?}"),
-    }
-    assert_eq!(
-        sink.ticks, 1,
-        "wait_for must surface the abort after exactly one tick"
     );
 }
 
 #[test]
 fn wait_for_phase_string_includes_target_elapsed_and_timeout() {
-    // Wait long enough for at least one whole-second tick to fire so
+    // Wait long enough for at least one whole-second render to fire so
     // the elapsed counter increments off zero.
     let missing = Path::new("/nonexistent/nmbl-devices-phase-test");
     let mut sink = CountingSink::new();
-    let _ = wait_for(
+    let _ = block(wait_for(
         missing,
         Duration::from_millis(1100),
         "phase 3b: waiting for",
         Some(&mut sink),
-    )
+    ))
     .expect_err("missing path must time out");
 
     let phase = sink
         .last_phase
         .as_deref()
-        .expect("at least one tick must fire during a 1.1 s wait");
+        .expect("at least one render must fire during a 1.1 s wait");
     assert!(
         phase.starts_with("phase 3b: waiting for"),
         "phase string must lead with the operation verb + phase context: {phase:?}"

@@ -168,62 +168,80 @@ pub(super) fn write_all(fd: &OwnedFd, mut buf: &[u8], binary: &Path) -> Result<(
     Ok(())
 }
 
-/// Wait for `child` to terminate and translate the resulting
-/// `WaitStatus` into a `ProcessOutcome`. EINTR is retried.
+/// Translate a terminal [`WaitStatus`] into a [`ProcessOutcome`].
 ///
-/// When `tick` is `Some`, this loop polls with `WNOHANG` and calls
-/// `tick` every [`super::TICK_INTERVAL`] so the caller can advance a UI
-/// spinner. When `tick` is `None`, the loop reverts to a blocking
-/// `waitpid(None)` — identical behaviour to the original
-/// non-tick-aware function.
-pub(super) fn wait_for_child<F: FnMut() + ?Sized>(
+/// Exited children report their raw exit code; signalled children
+/// report `128 + signal` (the POSIX shell convention) so callers and
+/// logs see a single integer regardless of how the child died.
+fn outcome_from_status(status: nix::sys::wait::WaitStatus) -> Option<ProcessOutcome> {
+    use nix::sys::wait::WaitStatus;
+    match status {
+        WaitStatus::Exited(_, code) => Some(ProcessOutcome {
+            exit_code: code,
+            normal_exit: true,
+        }),
+        WaitStatus::Signaled(_, sig, _) => {
+            let sig_num: i32 = sig as i32;
+            Some(ProcessOutcome {
+                exit_code: 128i32.saturating_add(sig_num),
+                normal_exit: false,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Reap `child` asynchronously via the poller's non-blocking
+/// `waitpid(WNOHANG)` op, never blocking the single-threaded runtime.
+///
+/// Reuses [`reap_child`](crate::sys::poller::reap_child) rather than
+/// re-rolling a WNOHANG loop: the op is paced by the poller while the
+/// runtime keeps driving the concurrent remote-attach server and the
+/// local spinner. A `None` status (e.g. the child was already reaped,
+/// `ECHILD`) collapses to a synthetic success outcome — the child is
+/// gone, which is what the caller needs to know.
+pub(super) async fn reap_child_outcome(
     child: nix::unistd::Pid,
     binary: &Path,
-    mut tick: Option<&mut F>,
+    sender: &crate::sys::poller::LocalSender,
 ) -> Result<ProcessOutcome> {
-    use std::thread::sleep;
+    let _ = binary;
+    match crate::sys::poller::reap_child(child, sender.clone()).await {
+        Some(status) => Ok(outcome_from_status(status).unwrap_or(ProcessOutcome {
+            // Defensive: the poller op only resolves on a terminal
+            // status, so this branch is unreachable in practice.
+            exit_code: 0,
+            normal_exit: true,
+        })),
+        // ECHILD / already reaped: the child is gone. Report a clean
+        // exit so the caller proceeds rather than hanging.
+        None => Ok(ProcessOutcome {
+            exit_code: 0,
+            normal_exit: true,
+        }),
+    }
+}
 
-    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+/// Blocking `waitpid(None)` reap — used only by the pre-runtime early
+/// boot phase (bootstrap blkid) and the synchronous `--validate` CLI
+/// path, where nothing runs concurrently so blocking is harmless. EINTR
+/// is retried. The interactive/concurrent path uses
+/// [`reap_child_outcome`] instead.
+pub(super) fn wait_for_child_blocking(
+    child: nix::unistd::Pid,
+    binary: &Path,
+) -> Result<ProcessOutcome> {
+    use nix::sys::wait::{WaitStatus, waitpid};
     loop {
-        // Choose blocking vs. WNOHANG based on whether a tick callback
-        // was supplied. The blocking branch matches the historical
-        // behaviour to keep callers without UI plumbing cheap.
-        let status = if tick.is_some() {
-            waitpid(child, Some(WaitPidFlag::WNOHANG))
-        } else {
-            waitpid(child, None)
-        };
-        match status {
-            Ok(WaitStatus::Exited(_, code)) => {
-                return Ok(ProcessOutcome {
-                    exit_code: code,
-                    normal_exit: true,
-                });
-            }
-            Ok(WaitStatus::Signaled(_, sig, _)) => {
-                // Mirror the POSIX shell convention (128 + signal)
-                // so callers and logs see a single integer regardless
-                // of how the child died.
-                let sig_num: i32 = sig as i32;
-                return Ok(ProcessOutcome {
-                    exit_code: 128i32.saturating_add(sig_num),
-                    normal_exit: false,
-                });
-            }
-            // `StillAlive` is the WNOHANG "child not yet exited"
-            // signal — invoke the spinner tick and sleep one slice
-            // before polling again.
-            Ok(WaitStatus::StillAlive) => {
-                if let Some(t) = tick.as_mut() {
-                    (*t)();
+        match waitpid(child, None) {
+            Ok(status @ (WaitStatus::Exited(..) | WaitStatus::Signaled(..))) => {
+                if let Some(outcome) = outcome_from_status(status) {
+                    return Ok(outcome);
                 }
-                sleep(super::TICK_INTERVAL);
-                continue;
             }
-            // Stopped/Continued/Ptrace* are not possible without
-            // WUNTRACED / WCONTINUED / ptrace — but waitpid returns
-            // only Exited/Signaled/StillAlive in practice. We loop on
-            // the unexpected variants rather than panic.
+            // Stopped/Continued/Ptrace*/StillAlive are not possible with
+            // a blocking `waitpid(None)` and no WUNTRACED/ptrace — loop
+            // defensively on the unexpected variants rather than panic.
             Ok(_) => continue,
             Err(Errno::EINTR) => continue,
             Err(e) => {

@@ -58,4 +58,4 @@ pub struct ProcessOutcome {
 /// the caller can distinguish a missing binary from a broken one.
 const EXEC_FAILED_EXIT_CODE: i32 = 127;
 
-pub use runner::{run, run_capture, run_with_tick};
+pub use runner::{run, run_capture, run_capture_blocking, run_with_tick};

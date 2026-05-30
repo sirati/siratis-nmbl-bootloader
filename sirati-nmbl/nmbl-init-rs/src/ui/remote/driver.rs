@@ -55,6 +55,7 @@ pub(super) async fn accept_loop(
     config: &Config,
     shutdown: &Shutdown,
     sink: &ActionSink,
+    sender: &crate::sys::poller::LocalSender,
 ) {
     let mut sessions: FuturesUnordered<Session<'_>> = FuturesUnordered::new();
 
@@ -78,7 +79,9 @@ pub(super) async fn accept_loop(
                 // and is a no-op for rejected peers, so pushing
                 // unconditionally is correct and keeps `accept`
                 // non-blocking.
-                sessions.push(Box::pin(handle_connection(stream, config, shutdown, sink)));
+                sessions.push(Box::pin(handle_connection(
+                    stream, config, shutdown, sink, sender,
+                )));
             }
             // The listener is wedged (e.g. fd exhaustion). Re-polling it
             // would spin at 100% CPU and flood the log, so stop accepting

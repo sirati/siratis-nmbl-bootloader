@@ -223,22 +223,26 @@ pub(super) async fn run_boot_status(console: &mut MockConsole, args: &[String]) 
 /// keep the current tty checked, hit `Spawn`, and confirm a live shell
 /// appears. The picker resolves real `/dev/...` targets, so run it from
 /// a real terminal (a tmux pane is ideal).
-pub(super) async fn run_emergency(_console: &mut MockConsole, args: &[String]) -> Result<()> {
+pub(super) async fn run_emergency(
+    _console: &mut MockConsole,
+    args: &[String],
+    sender: &crate::sys::poller::LocalSender,
+) -> Result<()> {
     let mut config = Config::recovery_default();
     if let Some(shell) = args.first() {
         config.paths.shell = std::path::PathBuf::from(shell);
     }
     // drop_to_emergency owns its console; hand it a fresh boxed
     // MockConsole (same stdin/stdout this process already uses). We are
-    // already inside `block_on_tui`'s runtime, so await the async
-    // emergency session directly.
+    // already inside the poller-backed runtime, so await the async
+    // emergency session directly with the live `LocalSender`.
     let boxed: Box<dyn Console> = Box::new(MockConsole::new()?);
     let err = NmblError::Io {
         source: std::io::Error::other("synthetic boot failure (mocking harness)"),
         context: "phase-3 generation discovery".to_string(),
     };
     let session = crate::ui::app::SessionInteraction::new();
-    let action = crate::shell::drop_to_emergency(boxed, &config, err, &session).await;
+    let action = crate::shell::drop_to_emergency(boxed, &config, err, &session, sender).await;
     eprintln!("[mocking] emergency action={action:?}");
     Ok(())
 }

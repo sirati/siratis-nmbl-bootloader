@@ -81,6 +81,13 @@ fn block<F: std::future::Future>(fut: F) -> F::Output {
     rt.block_on(fut)
 }
 
+/// A poller `LocalSender` for tests that don't reach the activation
+/// reap path (none of these scripts pick Retry boot), so the op is
+/// never enqueued and the undriven poller is harmless.
+fn test_sender() -> crate::sys::poller::LocalSender {
+    crate::sys::poller::build().1
+}
+
 fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -114,6 +121,7 @@ fn drop_to_emergency_shell_choice_cancels_picker_then_reboots() {
         &config,
         io_err("synthetic boot failure"),
         &SessionInteraction::new(),
+        &test_sender(),
     ));
     assert!(
         matches!(action, TerminalAction::Reboot),
@@ -138,6 +146,7 @@ fn drop_to_emergency_returns_reboot_on_r_hotkey() {
         &config,
         io_err("synthetic"),
         &SessionInteraction::new(),
+        &test_sender(),
     ));
 
     match action {

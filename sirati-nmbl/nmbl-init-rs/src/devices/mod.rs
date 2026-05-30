@@ -16,7 +16,8 @@ use crate::config::{Config, FilesystemEntry};
 use crate::error::{NmblError, Result};
 use crate::nmbl_info;
 use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
-use crate::ui::{BootReporter, ProgressSink, TickOutcome};
+use crate::sys::poller::LocalSender;
+use crate::ui::{BootReporter, ProgressSink};
 
 /// Sleep granularity between polls. Matches the 100 ms cadence of the
 /// shell loop this module replaces.
@@ -36,7 +37,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// spinner advances on every poll iteration so the operator sees the
 /// boot is alive alongside the `Ns / Ms` countdown. Pass `progress =
 /// None` to poll without driving a UI (tests, headless contexts).
-pub fn wait_for(
+///
+/// Async so the inter-poll cadence comes from `tokio::time::sleep`
+/// rather than a blocking `thread::sleep` — the single-threaded runtime
+/// keeps serving the concurrent remote-attach server and the local
+/// spinner while we wait. The status line is render-only (no blocking
+/// input poll): the operator is not expected to type during a device
+/// wait, so this loop never blocks on `poll_key`.
+pub async fn wait_for(
     device: &Path,
     timeout: Duration,
     operation: &str,
@@ -59,21 +67,14 @@ pub fn wait_for(
             });
         }
 
-        // The sink's `tick` itself blocks ~POLL_INTERVAL on `poll_key`,
-        // so when one is wired we let it provide the inter-poll cadence
-        // (and an Esc-abort hook). Without a sink (headless / tests)
-        // we still need the sleep so the loop doesn't busy-spin.
+        // Render-only status update; the runtime, not a blocking
+        // `poll_key`, provides the cadence below.
         if let Some(sink) = progress.as_deref_mut() {
             let elapsed = start.elapsed();
             let phase = format_wait_phase(operation, &device.display(), elapsed, timeout);
-            if let TickOutcome::Aborted = sink.tick(&phase) {
-                return Err(NmblError::OperatorAborted {
-                    context: format!("waiting for {}", device.display()),
-                });
-            }
-        } else {
-            std::thread::sleep(POLL_INTERVAL);
+            sink.render_phase(&phase);
         }
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
@@ -175,9 +176,10 @@ fn ensure_dir(dir: &Path) -> Result<()> {
 /// block device to a different path returns `EBUSY`. In that case we
 /// bind-mount from the bootstrap mountpoint so the system root sees the
 /// boot partition at its expected location without remounting the device.
-pub fn mount_system_filesystems(
+pub async fn mount_system_filesystems(
     config: &Config,
     reporter: &mut BootReporter<'_, '_>,
+    sender: &LocalSender,
 ) -> Result<()> {
     let system_root = config.paths.system_root.as_path();
     let device_timeout = Duration::from_secs(config.general.device_timeout_secs);
@@ -189,7 +191,7 @@ pub fn mount_system_filesystems(
     // wait_for loop below — disko-style configs reference paths
     // under /dev/disk/by-*, and waiting for a symlink we'll never
     // create just burns the 30 s budget.
-    let btrfs_devs = crate::sys::blkid::populate_disk_by_symlinks()?;
+    let btrfs_devs = crate::sys::blkid::populate_disk_by_symlinks(sender).await?;
 
     // Issue BTRFS_IOC_SCAN_DEV on every btrfs member found by blkid so
     // the kernel assembles multi-device btrfs filesystems (RAID0/RAID1)
@@ -226,7 +228,8 @@ pub fn mount_system_filesystems(
             device_timeout,
             "phase 3b: waiting for",
             Some(&mut *reporter),
-        )?;
+        )
+        .await?;
 
         let target = resolve_mountpoint(system_root, entry);
         ensure_dir(&target)?;

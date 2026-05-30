@@ -7,8 +7,12 @@ use nix::unistd::{ForkResult, close, dup2, execve, fork, pipe};
 
 use crate::error::Result;
 
-use super::helpers::{build_exec_args, nix_activation, read_all, wait_for_child, write_all};
+use super::helpers::{
+    build_exec_args, nix_activation, read_all, reap_child_outcome, wait_for_child_blocking,
+    write_all,
+};
 use super::{EXEC_FAILED_EXIT_CODE, ProcessOutcome};
+use crate::sys::poller::LocalSender;
 
 /// Run `binary` with `argv` (which is the *tail* of the new process's
 /// argv — `argv[0]` is automatically set to the basename of `binary`).
@@ -25,8 +29,13 @@ use super::{EXEC_FAILED_EXIT_CODE, ProcessOutcome};
 /// A non-zero `exit_code` is **not** an `Err`. The caller decides
 /// whether that's fatal: `cryptsetup` returning 2 (wrong passphrase)
 /// is operationally different from the binary failing to start.
-pub fn run(binary: &Path, argv: &[String], stdin_data: Option<&[u8]>) -> Result<ProcessOutcome> {
-    run_with_tick(binary, argv, stdin_data, None::<&mut dyn FnMut()>)
+pub async fn run(
+    binary: &Path,
+    argv: &[String],
+    stdin_data: Option<&[u8]>,
+    sender: &LocalSender,
+) -> Result<ProcessOutcome> {
+    run_with_tick(binary, argv, stdin_data, None::<&mut dyn FnMut()>, sender).await
 }
 
 /// Tick-aware variant of [`run`]: while waiting for the child to exit,
@@ -42,11 +51,12 @@ pub fn run(binary: &Path, argv: &[String], stdin_data: Option<&[u8]>) -> Result<
 /// child side nothing is changed — see the SAFETY comment in [`run`]
 /// for the post-fork constraints. Pass `None` to get the blocking
 /// behaviour of [`run`].
-pub fn run_with_tick<F: FnMut() + ?Sized>(
+pub async fn run_with_tick<F: FnMut() + ?Sized>(
     binary: &Path,
     argv: &[String],
     stdin_data: Option<&[u8]>,
     tick: Option<&mut F>,
+    sender: &LocalSender,
 ) -> Result<ProcessOutcome> {
     // All CString construction and Vec allocation MUST happen here,
     // in the parent, before fork(2). After the fork, the child is
@@ -110,7 +120,30 @@ pub fn run_with_tick<F: FnMut() + ?Sized>(
                 drop(write_end);
             }
 
-            wait_for_child(child, binary, tick)
+            reap_with_tick(child, binary, tick, sender).await
+        }
+    }
+}
+
+/// Await the child's reap via [`reap_child_outcome`], racing a
+/// `TICK_INTERVAL` timer against it when a `tick` callback is supplied
+/// so a UI spinner keeps animating during a slow unlock (e.g. Argon2id)
+/// while the reap itself stays non-blocking. With no `tick` the reap is
+/// simply awaited.
+async fn reap_with_tick<F: FnMut() + ?Sized>(
+    child: nix::unistd::Pid,
+    binary: &Path,
+    tick: Option<&mut F>,
+    sender: &LocalSender,
+) -> Result<ProcessOutcome> {
+    let Some(tick) = tick else {
+        return reap_child_outcome(child, binary, sender).await;
+    };
+    let mut reap = std::pin::pin!(reap_child_outcome(child, binary, sender));
+    loop {
+        tokio::select! {
+            outcome = &mut reap => return outcome,
+            () = tokio::time::sleep(super::TICK_INTERVAL) => (*tick)(),
         }
     }
 }
@@ -174,7 +207,33 @@ fn child_stdin_setup(pipe_fds: Option<(OwnedFd, OwnedFd)>) {
 /// non-zero exit code is still reported via `ProcessOutcome`, not
 /// `Err` — `blkid` legitimately exits 2 for "no superblock", which
 /// the caller treats as "empty attributes" rather than a fault.
-pub fn run_capture(binary: &Path, argv: &[String]) -> Result<(ProcessOutcome, Vec<u8>)> {
+pub async fn run_capture(
+    binary: &Path,
+    argv: &[String],
+    sender: &LocalSender,
+) -> Result<(ProcessOutcome, Vec<u8>)> {
+    let (child, captured) = capture_fork(binary, argv)?;
+    let outcome = reap_child_outcome(child, binary, sender).await?;
+    Ok((outcome, captured))
+}
+
+/// Blocking sibling of [`run_capture`] for the pre-runtime early-boot
+/// bootstrap blkid sweep and the synchronous `--validate` CLI path,
+/// where no async runtime exists and nothing runs concurrently. Uses a
+/// blocking `waitpid(None)` reap — never call this from the interactive
+/// runtime (use [`run_capture`] instead).
+pub fn run_capture_blocking(binary: &Path, argv: &[String]) -> Result<(ProcessOutcome, Vec<u8>)> {
+    let (child, captured) = capture_fork(binary, argv)?;
+    let outcome = wait_for_child_blocking(child, binary)?;
+    Ok((outcome, captured))
+}
+
+/// Fork `binary` with its stdout wired to a pipe, drain that pipe to
+/// EOF, and return `(child_pid, captured_stdout)`. The caller reaps the
+/// child (async via the poller, or blocking for early boot). Shared by
+/// [`run_capture`] and [`run_capture_blocking`] so the fork/exec site —
+/// and its `execve safety` comment — lives in exactly one place.
+fn capture_fork(binary: &Path, argv: &[String]) -> Result<(nix::unistd::Pid, Vec<u8>)> {
     // Same parent-side allocation discipline as `run`: anything that
     // can allocate must happen here so the post-fork child path stays
     // async-signal-safe.
@@ -229,8 +288,7 @@ pub fn run_capture(binary: &Path, argv: &[String]) -> Result<(ProcessOutcome, Ve
             let captured = read_all(&read_end, binary)?;
             drop(read_end);
 
-            let outcome = wait_for_child(child, binary, None::<&mut dyn FnMut()>)?;
-            Ok((outcome, captured))
+            Ok((child, captured))
         }
     }
 }
