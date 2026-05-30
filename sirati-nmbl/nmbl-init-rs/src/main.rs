@@ -181,21 +181,24 @@ fn run_force_rescue(
 }
 
 /// Key-echo diagnostic sub-flow. Runs the key-echo loop then drops to
-/// emergency. Extracted from `run_inner` to keep that fn under 100
-/// lines.
-fn run_key_echo_diagnostic(
+/// emergency. Extracted from `run_boot_inside_runtime` to keep that fn
+/// under 100 lines.
+///
+/// Async and driven by the caller's already-running interactive
+/// [`LocalRuntime`] (the `sender` flows in from there) — it no longer
+/// builds its own runtime now that the runtime starts right after the
+/// pseudo-fs mount. The key-echo diagnostic owns its own App, so a fresh
+/// `session` is correct.
+async fn run_key_echo_diagnostic(
     config: Config,
     console: Box<dyn Console>,
+    sender: &nmbl_init::sys::poller::LocalSender,
 ) -> std::result::Result<TerminalAction, Box<(NmblError, Config)>> {
     nmbl_info!("nmbl.key_echo=1 in cmdline: entering key-echo diagnostic screen");
     let err = NmblError::Io {
         source: std::io::Error::other("key-echo diagnostic mode terminated"),
         context: "key-echo".to_string(),
     };
-    // Cross into the async interactive phase: one LocalRuntime drives
-    // both the key-echo loop and the follow-on emergency session.
-    // The key-echo diagnostic owns its own App, so a fresh session is
-    // correct. A runtime-build failure routes to a plain Reboot.
     let session = SessionInteraction::new();
     // Wrap the console in the central interaction-latch layer so a key
     // pressed during the key-echo loop carries operator-presence into the
@@ -205,27 +208,15 @@ fn run_key_echo_diagnostic(
         console,
         session.clone(),
     ));
-    let action = nmbl_init::ui::block_on_tui_with_poller(|sender| async move {
-        if let Err(e) = run_key_echo_loop(&mut *console).await {
-            nmbl_warn!(
-                "key-echo loop error: {}",
-                format_chain(&e as &dyn std::error::Error)
-            );
-        }
-        // Hand the live console down to drop_to_emergency so the
-        // emergency UI paints through the same backend.
-        nmbl_init::shell::drop_to_emergency(console, &config, err, &session, &sender).await
-    });
-    match action {
-        Ok(a) => Ok(a),
-        Err(rt_err) => {
-            nmbl_warn!(
-                "key-echo runtime build failed: {}",
-                format_chain(&rt_err as &dyn std::error::Error)
-            );
-            Ok(TerminalAction::Reboot)
-        }
+    if let Err(e) = run_key_echo_loop(&mut *console).await {
+        nmbl_warn!(
+            "key-echo loop error: {}",
+            format_chain(&e as &dyn std::error::Error)
+        );
     }
+    // Hand the live console down to drop_to_emergency so the emergency UI
+    // paints through the same backend.
+    Ok(nmbl_init::shell::drop_to_emergency(console, &config, err, &session, sender).await)
 }
 
 /// Helper: run the boot phases and return the resulting
@@ -238,7 +229,7 @@ fn run_key_echo_diagnostic(
 /// `config` is taken by value because it is mutated in bootstrap
 /// mode (Phase 0.5 replaces it with the real config from `/boot`).
 fn run_inner(
-    mut config: Config,
+    config: Config,
     load_err: Option<NmblError>,
     bootstrap_probe: std::io::Result<bool>,
     bootstrap_path: &Path,
@@ -259,51 +250,36 @@ fn run_inner(
     }
     let bootstrap_mode = bootstrap_path.try_exists().unwrap_or(false);
     let mut noop = NoopConsole::new();
+    // Phase 1 (mount /proc,/sys,/dev) is atomic mount(2) syscalls with
+    // no subprocess reap and is needed before much else, so it stays a
+    // synchronous pre-runtime call. The runtime is then built right
+    // after it: everything from the bootstrap blkid sweep onward — whose
+    // child reaps must go through the poller's non-blocking `waitpid` —
+    // runs inside the one interactive runtime so no wait ever blocks the
+    // single runtime thread.
     {
         let mut reporter = BootReporter::new(&mut noop, "phase 1: mount pseudo-filesystems");
         if let Err(err) = run_phase_1(&mut reporter) {
             return Err(Box::new((err, config)));
         }
     }
-    if bootstrap_mode {
-        match run_bootstrap_phase(bootstrap_path) {
-            Ok(loaded) => {
-                config = loaded;
-                install_panic_hook(&config.general.panic_report_dir);
-                log::init(config.general.verbosity);
-            }
-            Err(err) => return Err(Box::new((err, config))),
+    let rt_result = nmbl_init::ui::block_on_tui_with_poller(move |sender| async move {
+        run_boot_inside_runtime(config, bootstrap_mode, bootstrap_path, &mut noop, sender).await
+    });
+    match rt_result {
+        // The runtime drove the boot to a terminal action (or a
+        // recoverable error already paired with its config).
+        Ok(BootOutcome::Done(inner)) => *inner,
+        // External force-rescue: `rescue::dispatch` builds its OWN
+        // `block_on_tui_with_poller` runtime for the chrooted child, so
+        // it must run AFTER this runtime has torn down — nesting two
+        // `block_on`s on one thread would panic. The bootstrap blkid
+        // reap that precedes the gate already ran async inside the
+        // runtime above; only the dispatch itself is deferred out here.
+        Ok(BootOutcome::ForceRescue(config)) => {
+            let mut noop = NoopConsole::new();
+            run_force_rescue(*config, &mut noop)
         }
-    }
-    if should_force_external_rescue(&config) {
-        return run_force_rescue(config, &mut noop);
-    }
-    #[cfg(feature = "stateful")]
-    if bootstrap_mode && let Err(err) = mount_state_twin(&mut config, bootstrap_path) {
-        return Err(Box::new((err, config)));
-    }
-    {
-        let mut reporter = BootReporter::new(&mut noop, "phase 2a: load early kernel modules");
-        if let Err(err) = run_phase_2a(&config, &mut reporter) {
-            nmbl_warn!("phase 2a (early modules) failed: {err}");
-            return Err(Box::new((err, config)));
-        }
-    }
-    let console: Box<dyn Console> = match open_console(&config, false) {
-        Ok(c) => c,
-        Err(err) => {
-            nmbl_warn!("boot console bring-up failed: {err}");
-            return Err(Box::new((err, config)));
-        }
-    };
-    if cmdline_has_key_echo_flag() {
-        return run_key_echo_diagnostic(config, console);
-    }
-    let session = SessionInteraction::new();
-    match nmbl_init::ui::block_on_tui_with_poller(|sender| async move {
-        run_tui_session(&config, console, &session, &sender).await
-    }) {
-        Ok(action) => Ok(action),
         Err(rt_err) => {
             nmbl_warn!(
                 "interactive runtime build failed: {}",
@@ -312,6 +288,81 @@ fn run_inner(
             Ok(TerminalAction::Reboot)
         }
     }
+}
+
+/// Result of [`run_boot_inside_runtime`]. Either the runtime drove the
+/// boot to a final outcome, or it hit the external force-rescue gate and
+/// hands the (bootstrap-loaded) config back so `run_inner` can run
+/// `rescue::dispatch` AFTER the runtime exits — `dispatch` builds its own
+/// runtime and cannot nest inside this one.
+enum BootOutcome {
+    // `TerminalAction` (the Ok arm) is the large payload here; box the
+    // whole `Done` result so this variant stays pointer-sized next to the
+    // tiny `ForceRescue` (clippy `large_enum_variant`).
+    Done(Box<std::result::Result<TerminalAction, Box<(NmblError, Config)>>>),
+    ForceRescue(Box<Config>),
+}
+
+/// The post-phase-1 boot flow that runs inside the interactive
+/// [`LocalRuntime`]: bootstrap (async blkid reap), the force-rescue and
+/// stateful gates, phase 2a (atomic `init_module` calls — synchronous
+/// within the async region), console bring-up, and the key-echo or main
+/// TUI session. The `sender` threads the poller down so every subprocess
+/// reap stays non-blocking.
+///
+/// `config` is taken by value because bootstrap mode replaces it with
+/// the real config read from `/boot`. The `noop` reporter sink is the
+/// pre-console sentinel reused across the synchronous phases. The
+/// force-rescue arm returns [`BootOutcome::ForceRescue`] instead of
+/// dispatching inline (see [`BootOutcome`]).
+async fn run_boot_inside_runtime(
+    mut config: Config,
+    bootstrap_mode: bool,
+    bootstrap_path: &Path,
+    noop: &mut NoopConsole,
+    sender: nmbl_init::sys::poller::LocalSender,
+) -> BootOutcome {
+    if bootstrap_mode {
+        match run_bootstrap_phase(bootstrap_path, &sender).await {
+            Ok(loaded) => {
+                config = loaded;
+                install_panic_hook(&config.general.panic_report_dir);
+                log::init(config.general.verbosity);
+            }
+            Err(err) => return BootOutcome::Done(Box::new(Err(Box::new((err, config))))),
+        }
+    }
+    if should_force_external_rescue(&config) {
+        return BootOutcome::ForceRescue(Box::new(config));
+    }
+    #[cfg(feature = "stateful")]
+    if bootstrap_mode && let Err(err) = mount_state_twin(&mut config, bootstrap_path) {
+        return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
+    }
+    {
+        let mut reporter = BootReporter::new(noop, "phase 2a: load early kernel modules");
+        if let Err(err) = run_phase_2a(&config, &mut reporter) {
+            nmbl_warn!("phase 2a (early modules) failed: {err}");
+            return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
+        }
+    }
+    let console: Box<dyn Console> = match open_console(&config, false) {
+        Ok(c) => c,
+        Err(err) => {
+            nmbl_warn!("boot console bring-up failed: {err}");
+            return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
+        }
+    };
+    if cmdline_has_key_echo_flag() {
+        return BootOutcome::Done(Box::new(
+            run_key_echo_diagnostic(config, console, &sender).await,
+        ));
+    }
+    let session = SessionInteraction::new();
+    BootOutcome::Done(Box::new(Ok(run_tui_session(
+        &config, console, &session, &sender,
+    )
+    .await)))
 }
 
 /// The orchestrator. Returns `ExitCode` so the `--validate-config`

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::error::Result;
 use crate::nmbl_warn;
-use crate::sys::activation::{ProcessOutcome, run_capture, run_capture_blocking};
+use crate::sys::activation::{ProcessOutcome, run_capture};
 use crate::sys::poller::LocalSender;
 
 use super::{BLKID_BINARY, BLKID_EXIT_NO_SUPERBLOCK};
@@ -25,13 +25,6 @@ fn blkid_argv(dev: &Path) -> Vec<String> {
 pub(super) async fn blkid_for(dev: &Path, sender: &LocalSender) -> Result<HashMap<String, String>> {
     let (outcome, captured) =
         run_capture(Path::new(BLKID_BINARY), &blkid_argv(dev), sender).await?;
-    Ok(interpret_blkid(dev, outcome, &captured))
-}
-
-/// Blocking sibling of [`blkid_for`] for the pre-runtime early-boot
-/// bootstrap sweep. Reaps the child with a blocking `waitpid(None)`.
-pub(super) fn blkid_for_blocking(dev: &Path) -> Result<HashMap<String, String>> {
-    let (outcome, captured) = run_capture_blocking(Path::new(BLKID_BINARY), &blkid_argv(dev))?;
     Ok(interpret_blkid(dev, outcome, &captured))
 }
 

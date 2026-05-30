@@ -82,7 +82,16 @@ pub(super) async fn run_phases_post_console(
 /// string the emergency-shell banner surfaces. Once `boot_fs` is
 /// mounted we intentionally leave it mounted on the error path so the
 /// operator's shell still sees it under `bootstrap.boot_fs.mountpoint`.
-pub(super) fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
+///
+/// Async because the blkid sweep reaps each child through the poller's
+/// non-blocking `waitpid` op rather than blocking the runtime thread.
+/// Runs inside the interactive [`crate::ui::block_on_tui_with_poller`]
+/// region; `module`/`mount` syscalls below are atomic and stay
+/// synchronous within the async region.
+pub(super) async fn run_bootstrap_phase(
+    bootstrap_path: &Path,
+    sender: &nmbl_init::sys::poller::LocalSender,
+) -> Result<Config> {
     nmbl_info!(
         "phase 0.5: loading bootstrap config {}",
         bootstrap_path.display()
@@ -106,10 +115,12 @@ pub(super) fn run_bootstrap_phase(bootstrap_path: &Path) -> Result<Config> {
     })?;
 
     nmbl_info!("phase 0.5: populating /dev/disk/by-* symlinks");
-    blkid::populate_disk_by_symlinks_blocking().map_err(|source| NmblError::Bootstrap {
-        stage: "blkid-sweep",
-        source: Box::new(source),
-    })?;
+    blkid::populate_disk_by_symlinks(sender)
+        .await
+        .map_err(|source| NmblError::Bootstrap {
+            stage: "blkid-sweep",
+            source: Box::new(source),
+        })?;
 
     let boot_fs = &section.boot_fs;
     // When stateful storage is configured the runtime needs to rewrite

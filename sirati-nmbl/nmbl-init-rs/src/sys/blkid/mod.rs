@@ -20,7 +20,7 @@ use crate::{nmbl_info, nmbl_warn};
 
 use std::collections::HashMap;
 
-use parse::{blkid_for, blkid_for_blocking};
+use parse::blkid_for;
 use symlink::create_links_for;
 
 use crate::sys::poller::LocalSender;
@@ -64,8 +64,9 @@ const BLKID_EXIT_NO_SUPERBLOCK: i32 = 2;
 ///
 /// Async because each per-device blkid reap goes through the poller's
 /// non-blocking `waitpid` op, so the single-threaded runtime keeps
-/// serving concurrent work while we scan. The pre-runtime bootstrap
-/// sweep uses [`populate_disk_by_symlinks_blocking`] instead.
+/// serving concurrent work while we scan. Both the early-boot bootstrap
+/// sweep and the interactive-phase sweep run inside the interactive
+/// runtime and use this path; there is no blocking variant.
 pub async fn populate_disk_by_symlinks(sender: &LocalSender) -> Result<Vec<PathBuf>> {
     let dev_paths = collect_block_dev_paths()?;
     let mut acc = SymlinkAcc::default();
@@ -82,30 +83,9 @@ pub async fn populate_disk_by_symlinks(sender: &LocalSender) -> Result<Vec<PathB
     Ok(acc.finish())
 }
 
-/// Blocking sibling of [`populate_disk_by_symlinks`] for the pre-runtime
-/// early-boot bootstrap phase, where no async runtime exists and nothing
-/// runs concurrently. Reaps each blkid child with a blocking
-/// `waitpid(None)` — never call this from the interactive runtime.
-pub fn populate_disk_by_symlinks_blocking() -> Result<Vec<PathBuf>> {
-    let dev_paths = collect_block_dev_paths()?;
-    let mut acc = SymlinkAcc::default();
-    for dev_path in dev_paths {
-        let attrs = match blkid_for_blocking(&dev_path) {
-            Ok(map) => map,
-            Err(e) => {
-                nmbl_warn!("blkid: scanning {} failed: {}", dev_path.display(), e);
-                continue;
-            }
-        };
-        acc.record(&dev_path, &attrs);
-    }
-    Ok(acc.finish())
-}
-
 /// Read /sys/class/block, pre-create the four by-* target directories,
 /// and return the `/dev/<name>` paths for every block device that has a
-/// materialised node. Shared by both the async and blocking sweeps so
-/// the only difference between them is how each blkid child is reaped.
+/// materialised node.
 fn collect_block_dev_paths() -> Result<Vec<PathBuf>> {
     let sysfs = Path::new(SYSFS_BLOCK_DIR);
     let entries = std::fs::read_dir(sysfs).map_err(|source| NmblError::Io {
@@ -149,8 +129,7 @@ fn collect_block_dev_paths() -> Result<Vec<PathBuf>> {
 
 /// Accumulator for a by-* sweep: counts scanned devices and created
 /// links, and collects btrfs members. Folds the shared post-blkid logic
-/// (btrfs detection + symlink creation) so the async and blocking sweeps
-/// stay byte-identical past the reap.
+/// (btrfs detection + symlink creation) behind the per-device reap.
 #[derive(Default)]
 struct SymlinkAcc {
     device_count: usize,
