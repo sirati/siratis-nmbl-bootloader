@@ -11,8 +11,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::reporter_impl::BootReporter;
 use super::types::{ProgressSink, TickOutcome};
 use crate::error::Result;
-use crate::ui::app::{App, Screen};
-use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
+use crate::ui::app::{App, Screen, SessionInteraction};
+use crate::ui::console::{Console, ConsoleEvent, ConsoleKind, LatchingConsole};
 
 /// Test double for [`Console`]. Records every render call so we can
 /// assert the reporter actually drives the backend on each API call.
@@ -172,6 +172,37 @@ fn progress_sink_tick_returns_aborted_on_esc_key() {
         outcome,
         TickOutcome::Aborted,
         "Esc on boot-status must produce TickOutcome::Aborted"
+    );
+}
+
+#[test]
+fn reporter_keypress_during_log_window_latches_presence() {
+    // Structural bug fix: a key pressed during the early boot-log window
+    // (the reporter polls via the blocking `poll_key`) must mark the
+    // operator present. The reporter holds no latch itself; it polls
+    // through the central `LatchingConsole`, which sets the shared
+    // SessionInteraction on the first input. A non-Esc key is dropped by
+    // `poll_key` (so the wait continues) but the latch is still set, so
+    // the selector/emergency screens later this session skip auto-boot.
+    let latch = SessionInteraction::new();
+    let inner = MockConsole::with_keys(vec![Some(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+    ))]);
+    let mut console = LatchingConsole::new(Box::new(inner), latch.clone());
+    assert!(!latch.get(), "latch starts clear before any input");
+
+    let mut reporter = BootReporter::new(&mut console, "phase 1: waiting");
+    let outcome = ProgressSink::tick(&mut reporter, "phase 1: waiting for /dev");
+
+    assert_eq!(
+        outcome,
+        TickOutcome::Continue,
+        "a non-Esc key must not abort the wait"
+    );
+    assert!(
+        latch.get(),
+        "a key during the boot-log window must latch operator presence"
     );
 }
 

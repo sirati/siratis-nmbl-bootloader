@@ -51,7 +51,8 @@ pub async fn run_key_echo_loop(console: &mut dyn Console) -> Result<()> {
             Some(crate::ui::console::ConsoleEvent::Key(k)) => Some(k),
             Some(
                 crate::ui::console::ConsoleEvent::Resize { .. }
-                | crate::ui::console::ConsoleEvent::Scroll { .. },
+                | crate::ui::console::ConsoleEvent::Scroll { .. }
+                | crate::ui::console::ConsoleEvent::UserHasInteracted,
             )
             | None => None,
         };

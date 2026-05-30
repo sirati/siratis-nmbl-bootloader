@@ -12,10 +12,13 @@ impl<'a> App<'a> {
             return self.decision.is_some();
         }
 
-        // Record that the operator is present. Per-session latch
-        // consulted by the emergency screen to suppress the auto-reboot
-        // countdown once any key has been pressed.
-        self.interaction.set();
+        // NOTE: operator-presence latching is NOT done here. The central
+        // `LatchingConsole` layer (which every input poll flows through)
+        // owns setting `self.interaction` on the first input of the
+        // session, so by the time a key reaches `on_key` the latch is
+        // already set. Keeping it out of here is what makes the early
+        // boot-log window correct for free: a key there latches presence
+        // even though it never reaches `on_key`.
 
         // Any keypress cancels the countdown — even one we ignore later.
         self.countdown_remaining_secs = None;

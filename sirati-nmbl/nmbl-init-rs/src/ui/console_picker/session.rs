@@ -186,7 +186,13 @@ pub(super) async fn drive_picker_loop(
                 }
             }
             // No scrollback in the console picker; ignore wheel notches.
-            Some(crate::ui::console::ConsoleEvent::Scroll { .. }) | None => {}
+            // The central layer's `UserHasInteracted` notice is a no-op
+            // here — the real key that follows drives the picker.
+            Some(
+                crate::ui::console::ConsoleEvent::Scroll { .. }
+                | crate::ui::console::ConsoleEvent::UserHasInteracted,
+            )
+            | None => {}
         }
     }
 }

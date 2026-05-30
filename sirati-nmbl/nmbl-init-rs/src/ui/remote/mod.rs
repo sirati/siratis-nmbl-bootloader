@@ -58,7 +58,7 @@ use crate::ipc::tui_socket::{
 use crate::nmbl_warn;
 use crate::terminal::TerminalAction;
 use crate::ui::app::{App, SessionInteraction};
-use crate::ui::console::{Console, TtyConsole};
+use crate::ui::console::{Console, LatchingConsole, TtyConsole};
 use crate::ui::{build_emergency_app, build_message, default_items, resolve_emergency_timeout};
 
 mod driver;
@@ -267,8 +267,18 @@ async fn serve_session(
     let emergency_timeout = resolve_emergency_timeout(config);
     let mut error_count: u32 = 0;
 
+    // Drive this session's pty through the central interaction-latch
+    // layer, exactly as the local console does. The session is already
+    // marked attended above (a remote operator who connected is present),
+    // so this wrapper's job here is uniform input handling: it emits the
+    // one-shot `UserHasInteracted` on the operator's first keypress so the
+    // emergency loop cancels any countdown through the same declarative
+    // path the local menu uses.
+    let mut console: Box<dyn Console> =
+        Box::new(LatchingConsole::new(Box::new(console), session.clone()));
+
     let action = run_remote_menu(
-        &mut console,
+        &mut *console,
         &mut app,
         config,
         &session,
