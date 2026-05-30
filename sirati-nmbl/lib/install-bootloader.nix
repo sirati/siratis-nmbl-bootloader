@@ -41,6 +41,20 @@ let
       null
     else
       { };
+
+  # Resolve the cryptsetup the activation plan uses (prefer the static
+  # build, same as lib/modules/activation.nix's `tryStatic`). Handed to
+  # `--validate-hardware` so the read-only LUKS-header probe uses the
+  # exact tool the toml implies, with a self-magic fallback if absent.
+  tryStatic = attr:
+    let
+      s = pkgs.pkgsStatic.${attr} or null;
+      d = pkgs.${attr} or null;
+    in if s != null then s else d;
+  cryptsetupPkg = tryStatic "cryptsetup";
+  cryptsetupToolArg =
+    lib.optionalString (cryptsetupPkg != null)
+      "--tool=cryptsetup:${cryptsetupPkg}/bin/cryptsetup";
 in
 
 pkgs.writeScript "install-nmbl-bootloader" ''
@@ -72,6 +86,20 @@ pkgs.writeScript "install-nmbl-bootloader" ''
   if [ "$BOOT_FS_TYPE" != "msdos" ] && [ "$BOOT_FS_TYPE" != "vfat" ]; then
     echo "WARNING: Boot partition filesystem is $BOOT_FS_TYPE, expected vfat/msdos"
   fi
+
+  # Read-only hardware validation of the SAME config.toml the bootloader
+  # ships, BEFORE any bootloader files are written. Probes each declared
+  # device against the real machine (LUKS headers, device existence);
+  # zero side effects. `refuseInvalidHardwareOnInstall` decides whether a
+  # failure aborts the install or is only a severe warning.
+  echo "Validating NMBL config against target hardware..."
+  ${
+    if cfg.refuseInvalidHardwareOnInstall then
+      # set -e is active: a non-zero exit aborts the install here.
+      ''${config.system.build.nmblInit}/bin/nmbl-init --validate-hardware=${nmblConfigToml} ${cryptsetupToolArg}''
+    else
+      ''${config.system.build.nmblInit}/bin/nmbl-init --validate-hardware=${nmblConfigToml} ${cryptsetupToolArg} || echo "SEVERE WARNING: NMBL hardware validation failed; installing anyway because refuseInvalidHardwareOnInstall=false"''
+  }
 
   KERNEL="${config.system.build.nmblKernel}/bzImage"
   INITRD="${config.system.build.nmblInitramfs}/initrd"
