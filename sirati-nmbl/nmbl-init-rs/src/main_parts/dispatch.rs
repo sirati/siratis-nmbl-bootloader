@@ -22,6 +22,40 @@ use super::stateful::{select_default_with_stateful, select_with_stateful};
 
 use log::NMBL_LOG_PATH;
 
+/// Headless default-boot decision: the `Decision::Boot` a fully
+/// unattended boot would settle on without rendering the selector.
+/// Drives the skip-selector fast path (LUKS unlocked with the "Select
+/// Generation" checkbox off) and is reusable as a later dry-run's
+/// headless entry point.
+///
+/// With the `stateful` feature on it delegates to
+/// `select_default_with_stateful` so rollback `ForcePick` / `Exhausted`
+/// still override the "just boot the default" intent; otherwise it
+/// returns the plain active-profile index the legacy selector's timeout
+/// would have chosen. Behaviour is byte-identical to the inline skip
+/// branches it replaces.
+#[cfg(feature = "stateful")]
+fn default_boot_decision(
+    config: &Config,
+    generations: &[nmbl_init::generations::Generation],
+) -> Result<Decision> {
+    select_default_with_stateful(config, generations)
+}
+
+#[cfg(not(feature = "stateful"))]
+fn default_boot_decision(
+    config: &Config,
+    generations: &[nmbl_init::generations::Generation],
+) -> Result<Decision> {
+    Ok(Decision::Boot {
+        generation_index: nmbl_init::generations::active_generation_index(
+            generations,
+            &config.paths.nix_profiles_dir,
+        ),
+        cmdline_override: None,
+    })
+}
+
 /// Run phases 4→6 (generation discovery, UI, decision dispatch). Kept
 /// separate so the call sites for `drop_to_emergency` stay obvious.
 ///
@@ -30,7 +64,8 @@ use log::NMBL_LOG_PATH;
 /// directory. The reporter is dropped before phase 5 so the bare
 /// console can be handed to `run_selector`, which swaps the App over
 /// to the boot-menu screen on top of the same backend.
-pub(super) async fn select_and_act(
+pub(super) async fn select_and_act<S: nmbl_init::sys::ops::SysOps>(
+    ops: &mut S,
     config: &Config,
     console: &mut dyn Console,
     key_injections: &[nmbl_init::activation::KeyInjection],
@@ -52,7 +87,7 @@ pub(super) async fn select_and_act(
     #[cfg(feature = "stateful")]
     let decision = if skip_selector.get() {
         nmbl_info!("phase 5: selector skipped (checkbox off) — booting default generation");
-        select_default_with_stateful(config, &generations)?
+        default_boot_decision(config, &generations)?
     } else {
         // Stateful rollback gate. When the operator opted into stateful
         // storage AND state.bin is readable, `select_with_stateful`
@@ -64,13 +99,7 @@ pub(super) async fn select_and_act(
     #[cfg(not(feature = "stateful"))]
     let decision = if skip_selector.get() {
         nmbl_info!("phase 5: selector skipped (checkbox off) — booting default generation");
-        Decision::Boot {
-            generation_index: nmbl_init::generations::active_generation_index(
-                &generations,
-                &config.paths.nix_profiles_dir,
-            ),
-            cmdline_override: None,
-        }
+        default_boot_decision(config, &generations)?
     } else {
         nmbl_info!("phase 5: TUI generation selector");
         run_selector(config, &generations, console, session).await?
@@ -90,7 +119,13 @@ pub(super) async fn select_and_act(
                     context: "decision dispatch".to_string(),
                 });
             };
-            kexec_into(config, target, cmdline_override.as_deref(), key_injections)
+            kexec_into(
+                ops,
+                config,
+                target,
+                cmdline_override.as_deref(),
+                key_injections,
+            )
         }
         Decision::Shell => Err(NmblError::Io {
             source: std::io::Error::other("operator chose emergency shell"),
@@ -270,7 +305,15 @@ pub(super) async fn run_tui_session<S: nmbl_init::sys::ops::SysOps>(
             .await
         {
             Ok(injections) => {
-                select_and_act(config, &mut *console, &injections, session, &skip_selector).await
+                select_and_act(
+                    ops,
+                    config,
+                    &mut *console,
+                    &injections,
+                    session,
+                    &skip_selector,
+                )
+                .await
             }
             Err(err) => Err(err),
         };
