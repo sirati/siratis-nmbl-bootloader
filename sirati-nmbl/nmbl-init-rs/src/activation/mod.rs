@@ -26,7 +26,7 @@ use crate::ui::console::Console;
 
 use helpers::{
     check_required_modules, collect_stdin, exit_code_error, is_activation_success, kind_label,
-    loaded_modules, wrap_runner_error,
+    loaded_modules, wait_for_source_device, wrap_runner_error,
 };
 use luks::{WrongPasswordHandled, handle_wrong_password, run_luks_with_spinner};
 
@@ -93,6 +93,16 @@ pub async fn run_all_activations(
         ));
         check_required_modules(activation, &loaded);
 
+        // Wait for each backing (source) device to materialise BEFORE we
+        // prompt for a passphrase / exec cryptsetup. USB storage and slow
+        // HBAs enumerate partition nodes asynchronously a moment after the
+        // driver loads, so the one-shot phase-2c by-* sweep can miss them
+        // and hand cryptsetup a non-existent /dev/disk/by-partlabel/...
+        // path (→ exit code 4). Re-sweep on each poll so the link appears
+        // the instant the node does. The fast path (device already
+        // present) is a single existence check — no added latency.
+        wait_for_source_devices(config, activation, reporter, sender).await?;
+
         // Per-iteration reborrow for password_supplier so the compiler
         // doesn't keep the mutable borrow live across loop turns.
         let supplier_ref: Option<&mut dyn PasswordSupplier> = match password_supplier {
@@ -146,6 +156,48 @@ pub async fn run_all_activations(
     }
 
     Ok(injections)
+}
+
+/// Wait for every `source_devices` entry of `activation` to appear,
+/// re-running the `/dev/disk/by-*` symlink sweep on each poll so a
+/// partition node the kernel enumerated asynchronously gets its by-*
+/// links before cryptsetup is reached. Bounded per device by
+/// `config.general.device_timeout_secs`; the spinner advances via the
+/// reporter so Esc still aborts. Delegates to the generic, test-injectable
+/// [`wait_for_source_device`] with the real existence probe and sweep.
+async fn wait_for_source_devices(
+    config: &Config,
+    activation: &Activation,
+    reporter: &mut BootReporter<'_, '_>,
+    sender: &crate::sys::poller::LocalSender,
+) -> Result<()> {
+    if activation.source_devices.is_empty() {
+        return Ok(());
+    }
+    let timeout = Duration::from_secs(config.general.device_timeout_secs);
+    let operation = format!(
+        "phase 3: {} waiting for source",
+        kind_label(activation.kind)
+    );
+    for device in &activation.source_devices {
+        wait_for_source_device(
+            device,
+            timeout,
+            &operation,
+            Some(&mut *reporter),
+            |p| p.exists(),
+            || async {
+                // Discard the btrfs-member list: phase-3b's own sweep in
+                // `mount_system_filesystems` re-collects it for the scan;
+                // here we only care about the by-* symlinks reappearing.
+                crate::sys::blkid::populate_disk_by_symlinks(sender)
+                    .await
+                    .map(|_| ())
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Drive the retry loop for a single activation entry. Returns the stdin
