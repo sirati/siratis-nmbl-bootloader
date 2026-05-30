@@ -112,21 +112,29 @@ let
   luksBaseMods = [ "dm_mod" "dm-crypt" "aesni_intel" "xts" "sha256_generic" ];
   luksTpmMods = luksBaseMods ++ [ "tpm_crb" "tpm_tis" ];
 
+  # `source_devices` is the backing device this activation CONSUMES (vs
+  # `produces_devices`, the mapper node it yields). `--validate-hardware`
+  # probes each source device's LUKS header. luks kinds list `l.device`;
+  # lvm/mdraid/zfs carry no backing-device info in the config, so they
+  # emit `[ ]` (do NOT fabricate).
   mkLuksBlock = l:
     let mapper = "/dev/mapper/${l.name}"; in
     if l.unlock == "tpm" then {
       kind = "luks-tpm"; required_modules = luksTpmMods;
       binary = "/bin/cryptsetup"; argv = [ "open" "--token-only" l.device l.name ];
-      produces_devices = [ mapper ]; description = "Unlock ${l.name} via TPM-sealed token";
+      produces_devices = [ mapper ]; source_devices = [ l.device ];
+      description = "Unlock ${l.name} via TPM-sealed token";
     } else if l.unlock == "keyfile" then {
       kind = "luks-keyfile"; required_modules = luksBaseMods;
       binary = "/bin/cryptsetup";
       argv = [ "open" l.device l.name "--key-file=${toString l.keyfile}" ];
-      produces_devices = [ mapper ]; description = "Unlock ${l.name} via keyfile";
+      produces_devices = [ mapper ]; source_devices = [ l.device ];
+      description = "Unlock ${l.name} via keyfile";
     } else {
       kind = "luks-password"; required_modules = luksBaseMods;
       binary = "/bin/cryptsetup"; argv = [ "open" l.device l.name "--key-file=-" ];
-      produces_devices = [ mapper ]; description = "Unlock ${l.name} via passphrase";
+      produces_devices = [ mapper ]; source_devices = [ l.device ];
+      description = "Unlock ${l.name} via passphrase";
       prompt_label = l.promptLabel;
       pass_to_stage1 = l.passToStage1;
     };
