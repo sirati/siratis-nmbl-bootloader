@@ -34,6 +34,7 @@ fn activation(kind: ActivationKind, produces: &[&str]) -> Activation {
         binary: PathBuf::from("/bin/true"),
         argv: Vec::new(),
         produces_devices: produces.iter().map(PathBuf::from).collect(),
+        source_devices: Vec::new(),
         description: "test".to_string(),
         prompt_label: None,
         pass_to_stage1: None,

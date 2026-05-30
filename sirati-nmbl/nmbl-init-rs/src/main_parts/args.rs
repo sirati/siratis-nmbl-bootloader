@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use nmbl_init::validate::ToolPaths;
+
 const DEFAULT_CONFIG_PATH: &str = "/etc/nmbl/config.toml";
 
 #[derive(Debug)]
@@ -7,6 +9,18 @@ pub(super) struct Args {
     pub(super) config_path: PathBuf,
     pub(super) errored_report: Option<PathBuf>,
     pub(super) validate_config: Option<PathBuf>,
+    /// `--validate-hardware=<toml>`: read-only hardware check on the real
+    /// target machine. Mutually exclusive with the other early-exit modes.
+    pub(super) validate_hardware: Option<PathBuf>,
+    /// `--validate-nix-filesystem-closure=<json>`: NixOS-only sandbox
+    /// check. Paired with `config_toml` (its own `--config-toml=<toml>`).
+    pub(super) validate_closure: Option<PathBuf>,
+    /// Companion toml for `--validate-nix-filesystem-closure` (the plain
+    /// `--validate-config` arg is mutually exclusive, so the closure mode
+    /// carries its toml separately).
+    pub(super) config_toml: Option<PathBuf>,
+    /// Tool paths supplied to `--validate-hardware` via `--tool=<kind>:<path>`.
+    pub(super) tools: ToolPaths,
     /// Installer-side: initialise (or validate) state.bin under the
     /// given directory and exit. Mutually exclusive with
     /// `validate_config` and `boot_succeeded_dir`.
@@ -46,6 +60,10 @@ where
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut errored_report: Option<PathBuf> = None;
     let mut validate_config: Option<PathBuf> = None;
+    let mut validate_hardware: Option<PathBuf> = None;
+    let mut validate_closure: Option<PathBuf> = None;
+    let mut config_toml: Option<PathBuf> = None;
+    let mut tools = ToolPaths::default();
     #[cfg(feature = "stateful")]
     let mut init_state_dir: Option<PathBuf> = None;
     #[cfg(feature = "stateful")]
@@ -72,6 +90,30 @@ where
             && let Some(v) = iter.next()
         {
             validate_config = Some(PathBuf::from(v));
+        } else if let Some(rest) = arg.strip_prefix("--validate-hardware=") {
+            validate_hardware = Some(PathBuf::from(rest));
+        } else if arg == "--validate-hardware"
+            && let Some(v) = iter.next()
+        {
+            validate_hardware = Some(PathBuf::from(v));
+        } else if let Some(rest) = arg.strip_prefix("--validate-nix-filesystem-closure=") {
+            validate_closure = Some(PathBuf::from(rest));
+        } else if arg == "--validate-nix-filesystem-closure"
+            && let Some(v) = iter.next()
+        {
+            validate_closure = Some(PathBuf::from(v));
+        } else if let Some(rest) = arg.strip_prefix("--config-toml=") {
+            config_toml = Some(PathBuf::from(rest));
+        } else if arg == "--config-toml"
+            && let Some(v) = iter.next()
+        {
+            config_toml = Some(PathBuf::from(v));
+        } else if let Some(rest) = arg.strip_prefix("--tool=") {
+            tools.insert_spec(rest)?;
+        } else if arg == "--tool"
+            && let Some(v) = iter.next()
+        {
+            tools.insert_spec(&v.to_string_lossy())?;
         } else if let Some(value) = parse_stateful_flag(&arg, "--init-state", &mut iter)? {
             #[cfg(feature = "stateful")]
             {
@@ -93,27 +135,41 @@ where
         }
     }
 
-    // Mutual exclusion across the three early-exit modes. Each mode
-    // funnels into a different exit path (validate, init-state,
-    // boot-succeeded); combining them would silently pick one and
-    // drop the others, masking an operator typo.
+    // Mutual exclusion across all early-exit modes. Each funnels into a
+    // different exit path; combining them would silently pick one and
+    // drop the rest, masking an operator typo. The three validate modes
+    // are always present; the stateful pair only in stateful builds.
     #[cfg(feature = "stateful")]
-    {
-        let count = u8::from(validate_config.is_some())
-            + u8::from(init_state_dir.is_some())
-            + u8::from(boot_succeeded_dir.is_some());
-        if count > 1 {
-            return Err(
-                "--validate-config, --init-state, and --boot-succeeded are mutually exclusive"
-                    .to_string(),
-            );
-        }
+    let stateful_modes =
+        u8::from(init_state_dir.is_some()) + u8::from(boot_succeeded_dir.is_some());
+    #[cfg(not(feature = "stateful"))]
+    let stateful_modes = 0u8;
+    let early_exit_count = u8::from(validate_config.is_some())
+        + u8::from(validate_hardware.is_some())
+        + u8::from(validate_closure.is_some())
+        + stateful_modes;
+    if early_exit_count > 1 {
+        return Err(
+            "the early-exit modes (--validate-config, --validate-hardware, \
+             --validate-nix-filesystem-closure, --init-state, --boot-succeeded) \
+             are mutually exclusive"
+                .to_string(),
+        );
+    }
+
+    // The closure check needs its companion toml.
+    if validate_closure.is_some() && config_toml.is_none() {
+        return Err("--validate-nix-filesystem-closure requires --config-toml=<toml>".to_string());
     }
 
     Ok(Args {
         config_path,
         errored_report,
         validate_config,
+        validate_hardware,
+        validate_closure,
+        config_toml,
+        tools,
         #[cfg(feature = "stateful")]
         init_state_dir,
         #[cfg(feature = "stateful")]
@@ -292,5 +348,68 @@ mod tests {
             args.validate_config.as_deref(),
             Some(Path::new("/etc/nmbl/config.toml"))
         );
+    }
+
+    #[test]
+    fn validate_hardware_parses_both_forms() {
+        let a = parse_args_from(["--validate-hardware=/c.toml"]).expect("equals form");
+        assert_eq!(a.validate_hardware.as_deref(), Some(Path::new("/c.toml")));
+        let b = parse_args_from(["--validate-hardware", "/c.toml"]).expect("space form");
+        assert_eq!(b.validate_hardware.as_deref(), Some(Path::new("/c.toml")));
+    }
+
+    #[test]
+    fn validate_hardware_collects_tool_paths() {
+        let a = parse_args_from([
+            "--validate-hardware=/c.toml",
+            "--tool=cryptsetup:/store/bin/cryptsetup",
+        ])
+        .expect("tool path should parse");
+        assert_eq!(
+            a.tools.cryptsetup(),
+            Some(PathBuf::from("/store/bin/cryptsetup"))
+        );
+    }
+
+    #[test]
+    fn bad_tool_spec_errors() {
+        let err = parse_args_from(["--tool=cryptsetup"]).expect_err("missing ':' must error");
+        assert!(err.contains("<kind>:<path>"), "{err}");
+    }
+
+    #[test]
+    fn validate_closure_requires_config_toml() {
+        let err = parse_args_from(["--validate-nix-filesystem-closure=/fs.json"])
+            .expect_err("closure without --config-toml must error");
+        assert!(err.contains("--config-toml"), "{err}");
+    }
+
+    #[test]
+    fn validate_closure_parses_with_config_toml() {
+        let a = parse_args_from([
+            "--validate-nix-filesystem-closure=/fs.json",
+            "--config-toml=/c.toml",
+        ])
+        .expect("closure + config-toml should parse");
+        assert_eq!(a.validate_closure.as_deref(), Some(Path::new("/fs.json")));
+        assert_eq!(a.config_toml.as_deref(), Some(Path::new("/c.toml")));
+    }
+
+    #[test]
+    fn validate_hardware_and_config_are_mutually_exclusive() {
+        let err = parse_args_from(["--validate-config=/a", "--validate-hardware=/b"])
+            .expect_err("two validate modes at once must be rejected");
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn validate_hardware_and_closure_are_mutually_exclusive() {
+        let err = parse_args_from([
+            "--validate-hardware=/a",
+            "--validate-nix-filesystem-closure=/b",
+            "--config-toml=/c",
+        ])
+        .expect_err("hardware + closure at once must be rejected");
+        assert!(err.contains("mutually exclusive"), "{err}");
     }
 }
