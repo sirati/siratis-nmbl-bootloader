@@ -18,6 +18,7 @@ use std::ffi::CString;
 use std::path::Path;
 
 use crate::error::{NmblError, Result};
+use crate::sys::ops::FsOps;
 
 mod child;
 mod detached;
@@ -41,8 +42,22 @@ pub(super) const EXEC_FAILED_EXIT_CODE: i32 = 127;
 /// child execve'd nothing and exited instantly while the parent saw a
 /// healthy fork and reported success. Checking up here turns that into
 /// a descriptive `Err` the emergency UI can surface.
-pub(super) fn preflight_shell(shell_path: &Path) -> Result<()> {
+pub(super) fn preflight_shell(fs: &dyn FsOps, shell_path: &Path) -> Result<()> {
     use rustix::fs::{Access, access};
+    // Presence goes through the FsOps seam so a dry-run can satisfy it
+    // from a closure; the exec-bit check stays a real `access(2)` —
+    // FsOps has no executability predicate and a dry-run that satisfied
+    // `exists` will short-circuit before reaching the live fork anyway.
+    if !fs.exists(shell_path) {
+        return Err(NmblError::Tui {
+            source: std::io::Error::other(format!(
+                "emergency shell {} does not exist; \
+                 in external-rescue mode the initramfs ships no /bin/sh — \
+                 set boot.nmbl.paths.shell to a binary present in the initrd",
+                shell_path.display()
+            )),
+        });
+    }
     match access(shell_path, Access::EXEC_OK) {
         Ok(()) => Ok(()),
         Err(e) => Err(NmblError::Tui {
@@ -100,13 +115,15 @@ pub(super) fn prepare_shell_cstrings(
 /// (`/proc`, `/sys`, `/dev`, `/run`, `/tmp`); devpts only matters here,
 /// inside the pretty-shell session, so we mount on demand rather than
 /// pay the cost on every boot.
-pub(super) fn ensure_devpts_mounted() -> Result<()> {
+pub(super) fn ensure_devpts_mounted(fs: &mut dyn FsOps) -> Result<()> {
     use crate::nmbl_warn;
     use nix::errno::Errno;
-    use nix::mount::{MsFlags, mount};
 
     let target = Path::new("/dev/pts");
-    if let Err(e) = std::fs::create_dir_all(target) {
+    // Route the mountpoint mkdir through the FsOps seam. `ensure_dir`
+    // (mkdir -p) is idempotent: a pre-existing directory is the happy
+    // path on a second invocation.
+    if let Err(e) = fs.ensure_dir(target) {
         // `AlreadyExists` is the happy path on a second invocation.
         if e.kind() != std::io::ErrorKind::AlreadyExists {
             return Err(NmblError::Io {
@@ -116,31 +133,27 @@ pub(super) fn ensure_devpts_mounted() -> Result<()> {
         }
     }
     // gid=5 mirrors the standard `tty` group on most distros. mode=620
-    // matches what util-linux mounts at boot.
-    let opts = "newinstance,ptmxmode=0666,mode=0620,gid=5";
-    match mount(
-        Some("devpts"),
-        target,
-        Some("devpts"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
-        Some(opts),
-    ) {
+    // matches what util-linux mounts at boot. `nosuid,noexec` lead so
+    // `mount_fs`'s option-folding reproduces the exact same MS_NOSUID|
+    // MS_NOEXEC flags the direct `mount(2)` call set; the remaining
+    // tokens forward verbatim as the devpts `data` string.
+    let opts = "nosuid,noexec,newinstance,ptmxmode=0666,mode=0620,gid=5";
+    match fs.mount(Some(Path::new("devpts")), target, "devpts", opts) {
         Ok(()) => {}
-        Err(Errno::EBUSY) => {
-            // Already mounted; benign.
-        }
-        Err(e) => {
-            return Err(NmblError::Mount {
-                src: Some(std::path::PathBuf::from("devpts")),
-                dst: target.to_path_buf(),
-                fstype: "devpts".to_string(),
-                source: e,
-            });
-        }
+        // Already mounted; benign. `mount_fs` wraps the raw errno in
+        // `NmblError::Mount`, so match the EBUSY through that shape.
+        Err(NmblError::Mount {
+            source: Errno::EBUSY,
+            ..
+        }) => {}
+        Err(e) => return Err(e),
     }
     // A `newinstance` mount populates `/dev/pts/ptmx` but leaves
     // `/dev/ptmx` (which libc's openpty uses) untouched. Symlink it.
-    // Best-effort: pre-existing `/dev/ptmx` is left alone.
+    // Best-effort: pre-existing `/dev/ptmx` is left alone. FsOps has no
+    // symlink op, so this stays a genuine best-effort `symlink(2)`; a
+    // dry-run reaches this only after a real devpts mount it cannot
+    // perform, so it implicitly no-ops symlink creation along that path.
     let ptmx = Path::new("/dev/ptmx");
     if let Err(e) = std::fs::symlink_metadata(ptmx)
         && e.kind() == std::io::ErrorKind::NotFound

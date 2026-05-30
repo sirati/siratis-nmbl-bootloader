@@ -167,7 +167,9 @@ impl ExecOps for RealSys<'_> {
     }
 
     fn spawn_shell(&mut self, shell_path: &Path, cols: u16, rows: u16) -> Result<PtyChild> {
-        crate::sys::pty::spawn_shell(shell_path, cols, rows)
+        // `RealSys` is itself the `FsOps` the pre-fork mkdir/mount/exists
+        // route through; pass `self` so they dispatch through the seam.
+        crate::sys::pty::spawn_shell(self, shell_path, cols, rows)
     }
 }
 
@@ -202,6 +204,8 @@ impl KexecOps for RealSys<'_> {
 
 impl ConsoleOps for RealSys<'_> {
     fn open_console(&mut self, config: &Config, panic_recovery: bool) -> Result<Box<dyn Console>> {
-        crate::ui::console::open_console(config, panic_recovery)
+        // `RealSys` is itself the `FsOps` the splash file-reads route
+        // through; pass `self` so font/PNG loads dispatch through the seam.
+        crate::ui::console::open_console(self, config, panic_recovery)
     }
 }

@@ -10,6 +10,7 @@
 use crate::config::Config;
 use crate::error::{NmblError, format_chain};
 use crate::nmbl_warn;
+use crate::sys::ops::{ExecOps, RealSys};
 use crate::sys::poller::LocalSender;
 use crate::terminal::TerminalAction;
 use crate::ui::app::App;
@@ -40,13 +41,20 @@ pub(crate) async fn dispatch_emergency_choice(
             Some(TerminalAction::Reboot)
         }
         EmergencyChoice::RawShell => {
-            run_raw_shell_choice(console, app, error_count, config).await;
+            // The picker's spawn paths route through `ExecOps::spawn_shell`.
+            // This live emergency session has a real poller `sender`, so
+            // build the genuine in-runtime `RealSys` for it. (spawn_shell
+            // is sync and never touches the sender; only the borrow shape
+            // matters here.)
+            let mut ops = RealSys::new(sender);
+            run_raw_shell_choice(&mut ops, console, app, error_count, config).await;
             // Picker session done (shell exited, detached, or cancelled); re-show menu.
             None
         }
         #[cfg(feature = "pretty-shell")]
         EmergencyChoice::PrettyShell => {
-            run_pretty_shell_choice(console, app, error_count, config).await;
+            let mut ops = RealSys::new(sender);
+            run_pretty_shell_choice(&mut ops, console, app, error_count, config).await;
             None
         }
         EmergencyChoice::RetryBoot => {
@@ -68,13 +76,14 @@ pub(crate) async fn dispatch_emergency_choice(
 /// Handle the [`EmergencyChoice::RawShell`] picker arm: run the in-process
 /// console picker session and show a toast or error modal over the emergency
 /// menu so the operator knows what happened before re-entering the loop.
-async fn run_raw_shell_choice(
+async fn run_raw_shell_choice<E: ExecOps>(
+    ops: &mut E,
     console: &mut dyn Console,
     app: &mut App<'static>,
     error_count: &mut u32,
     config: &Config,
 ) {
-    match crate::ui::console_picker::run_picker_session(console, config).await {
+    match crate::ui::console_picker::run_picker_session(ops, console, config).await {
         Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached { targets }) => {
             // Fire-and-forget regime: tell the operator their shell(s) have
             // been started elsewhere so they don't wonder why the menu
@@ -110,13 +119,14 @@ async fn run_raw_shell_choice(
 /// Handle the [`EmergencyChoice::PrettyShell`] arm: launch the alacritty-backed
 /// pty terminal and show an error modal if it fails to start.
 #[cfg(feature = "pretty-shell")]
-async fn run_pretty_shell_choice(
+async fn run_pretty_shell_choice<E: ExecOps>(
+    ops: &mut E,
     console: &mut dyn Console,
     app: &mut App<'static>,
     error_count: &mut u32,
     config: &Config,
 ) {
-    if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(console, config).await {
+    if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(ops, console, config).await {
         let chain = format_chain(&e as &dyn std::error::Error);
         nmbl_warn!("pretty-shell session failed: {chain}");
         let _ = crate::ui::show_modal_error_over(

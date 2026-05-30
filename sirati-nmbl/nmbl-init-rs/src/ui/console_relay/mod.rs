@@ -38,7 +38,7 @@ use rustix::fs::{Mode, OFlags, fcntl_setfl, open};
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::nmbl_warn;
-use crate::sys::pty::spawn_shell;
+use crate::sys::ops::ExecOps;
 use crate::ui::console::Console;
 use crate::ui::console_picker::display_overlaps_targets;
 
@@ -113,7 +113,8 @@ fn open_target_nonblocking(path: &Path) -> Option<OwnedFd> {
 /// the cmdline ordering. Re-reading sysfs here used to flip the overlap
 /// verdict and leave the operator staring at a frozen "Shell running"
 /// modal with the shell painting invisibly behind it.
-pub async fn run_relay(
+pub async fn run_relay<E: ExecOps>(
+    ops: &mut E,
     console: &mut dyn Console,
     config: &Config,
     targets: &[PathBuf],
@@ -155,7 +156,7 @@ pub async fn run_relay(
 
     // Now the shell. spawn_shell forks, sets up controlling terminal,
     // execve's busybox; on return we own the master fd.
-    let child = spawn_shell(&config.paths.shell, SHELL_COLS, SHELL_ROWS)?;
+    let child = ops.spawn_shell(&config.paths.shell, SHELL_COLS, SHELL_ROWS)?;
 
     if overlap {
         // Hand the framebuffer / kernel-VT back to the kernel for the

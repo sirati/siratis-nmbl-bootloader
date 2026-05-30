@@ -35,6 +35,14 @@ pub fn decode_rgba(path: &Path) -> Result<Image> {
     decode_rgba_from_reader(BufReader::new(file))
 }
 
+/// Decode already-read PNG `bytes` into an [`Image`]. Used by the splash
+/// backend after the file content is fetched through the `FsOps` seam so
+/// a dry-run can supply the bytes without a real `open(2)`. The decode
+/// logic is identical to [`decode_rgba`].
+pub fn decode_rgba_from_bytes(bytes: &[u8]) -> Result<Image> {
+    decode_rgba_from_reader(bytes)
+}
+
 /// Internal helper: works on any `Read`, which keeps the unit test
 /// from having to touch the filesystem.
 fn decode_rgba_from_reader<R: Read>(reader: R) -> Result<Image> {

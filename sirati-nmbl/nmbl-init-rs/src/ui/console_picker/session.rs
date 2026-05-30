@@ -5,6 +5,7 @@ use ratatui::Frame;
 use crate::config::Config;
 use crate::error::Result;
 use crate::nmbl_warn;
+use crate::sys::ops::ExecOps;
 use crate::sys::tty::read_active_console;
 use crate::ui::POLL_SLICE;
 use crate::ui::console::{Console, ConsoleKind};
@@ -44,7 +45,8 @@ pub enum PickerSessionOutcome {
 /// The function NEVER produces a [`crate::terminal::TerminalAction`]:
 /// NMBL stays at PID 1 throughout. This is the deliberate departure
 /// from the legacy `EmergencyChoice::RawShell` -> execve path.
-pub async fn run_picker_session(
+pub async fn run_picker_session<E: ExecOps>(
+    ops: &mut E,
     console: &mut dyn Console,
     config: &Config,
 ) -> Result<PickerSessionOutcome> {
@@ -59,22 +61,22 @@ pub async fn run_picker_session(
         Some(PickerOutcome::Cancel) | None => return Ok(PickerSessionOutcome::Cancelled),
     };
     let display_target = display_target_for(console);
-    dispatch_spawn(
-        console,
-        config,
-        targets,
-        &display_target,
-        |console, config, targets, display_target| {
-            Box::pin(crate::ui::console_relay::run_relay(
-                console,
-                config,
-                targets,
-                display_target,
-            ))
-        },
-        fire_and_forget_spawn,
-    )
-    .await
+    // The relay (overlap) branch routes the shell spawn through
+    // `ops.spawn_shell`; the fire-and-forget (no-overlap) branch uses
+    // `spawn_shell_on_tty`, which is not part of `ExecOps` and builds its
+    // own sync-only `FsOps` for the pre-fork presence check. The pure
+    // dispatch logic lives in [`dispatch_spawn`] (pinned by tests); the
+    // production path inlines the same overlap branch directly so `ops`
+    // threads through `run_relay` without the boxed-future closure seam
+    // (which cannot carry the extra `ops` borrow in its HRTB shape).
+    if display_overlaps_targets(&display_target, &targets) {
+        crate::ui::console_relay::run_relay(ops, console, config, &targets, &display_target)
+            .await?;
+        Ok(PickerSessionOutcome::ShellRan)
+    } else {
+        fire_and_forget_spawn(config, &targets)?;
+        Ok(PickerSessionOutcome::ShellDetached { targets })
+    }
 }
 
 /// Post-commit dispatch: given the operator's spawn set and the
@@ -87,7 +89,14 @@ pub async fn run_picker_session(
 /// callbacks never re-derive it. See [`run_relay`]'s doc-comment for
 /// the historical bug that motivated this contract.
 ///
+/// The production path in [`run_picker_session`] inlines the identical
+/// overlap branch directly (so `ops` threads into `run_relay` without the
+/// boxed-future closure seam, which cannot carry the extra borrow); this
+/// callback-parameterised form exists so the dispatch decision stays
+/// unit-testable without forking real shells.
+///
 /// [`run_relay`]: crate::ui::console_relay::run_relay
+#[cfg(test)]
 pub(super) async fn dispatch_spawn<R, D>(
     console: &mut dyn Console,
     config: &Config,
@@ -147,8 +156,13 @@ pub(super) fn display_target_for(console: &dyn Console) -> PathBuf {
 /// surfaces a success modal so the operator knows the spawn was
 /// attempted.
 fn fire_and_forget_spawn(config: &Config, targets: &[PathBuf]) -> Result<()> {
+    // `spawn_shell_on_tty` is fire-and-forget and not part of `ExecOps`;
+    // its only pre-fork fs work is the shell-presence preflight, which a
+    // sender-less `RealSys` satisfies (the preflight is sync and never
+    // touches the poller). The fork/exec stays a genuine syscall.
+    let fs = crate::sys::ops::RealSys::sync_only();
     for t in targets {
-        match crate::sys::pty::spawn_shell_on_tty(&config.paths.shell, t) {
+        match crate::sys::pty::spawn_shell_on_tty(&fs, &config.paths.shell, t) {
             Ok(_) => {}
             Err(e) => {
                 nmbl_warn!(

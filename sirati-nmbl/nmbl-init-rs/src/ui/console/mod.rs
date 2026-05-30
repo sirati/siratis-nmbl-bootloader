@@ -27,6 +27,7 @@ use ratatui::Frame;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
+use crate::sys::ops::FsOps;
 use crate::ui::app::App;
 
 /// A single input event from a console backend.
@@ -290,10 +291,18 @@ pub(super) fn decide_backend(config: &Config, panic_recovery: bool) -> BackendCh
 ///
 /// See module docs for the decision tree; [`decide_backend`] holds the
 /// pure decision logic and is the helper tests pin.
-pub fn open_console(config: &Config, panic_recovery: bool) -> Result<Box<dyn Console>> {
+///
+/// `fs` routes the splash backend's plain-file reads (font, background
+/// PNG) through the [`FsOps`] seam so a dry-run can satisfy them from a
+/// closure; the genuine DRM/tty device opens stay real syscalls.
+pub fn open_console(
+    fs: &mut dyn FsOps,
+    config: &Config,
+    panic_recovery: bool,
+) -> Result<Box<dyn Console>> {
     match decide_backend(config, panic_recovery) {
         #[cfg(feature = "image-splash")]
-        BackendChoice::SplashOrTty => match SplashConsole::open(config) {
+        BackendChoice::SplashOrTty => match SplashConsole::open(fs, config) {
             Ok(Some(s)) => Ok(Box::new(s)),
             Ok(None) => {
                 crate::nmbl_warn!(
@@ -310,11 +319,12 @@ pub fn open_console(config: &Config, panic_recovery: bool) -> Result<Box<dyn Con
             }
         },
         BackendChoice::Tty => {
-            // Suppress unused-config warning when image-splash isn't
-            // compiled in — `decide_backend` reads it but the splash
-            // arm above is the only consumer of the actual value.
+            // Suppress unused-config/fs warnings when image-splash isn't
+            // compiled in — `decide_backend` reads config but the splash
+            // arm above is the only consumer of the actual value, and `fs`
+            // is only touched by the splash file-reads.
             #[cfg(not(feature = "image-splash"))]
-            let _ = config;
+            let _ = (config, fs);
             open_tty()
         }
     }
