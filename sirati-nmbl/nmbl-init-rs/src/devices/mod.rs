@@ -42,12 +42,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// rather than a blocking `thread::sleep` — the single-threaded runtime
 /// keeps serving the concurrent remote-attach server and the local
 /// spinner while we wait. The operator can press Esc to abort a stuck
-/// wait: when a progress sink is present the cadence is driven by the
-/// sink's non-blocking async [`ProgressSink::poll_abort`], which resolves
-/// on the first of an Esc keypress or `POLL_INTERVAL` elapsing. Pressing
-/// Esc returns [`NmblError::OperatorAborted`]. Headless callers
-/// (`progress = None`) fall back to a plain `tokio::time::sleep` cadence
-/// with no abort path.
+/// wait: when a progress sink is present each iteration races a
+/// guaranteed `POLL_INTERVAL` floor sleep against the sink's non-blocking
+/// async [`ProgressSink::poll_abort`], with Esc breaking early. The floor
+/// guarantees a minimum cadence even against a backend whose `poll_event`
+/// ignores its timeout (e.g. `NoopConsole`), so the wait can never become
+/// a 100% busy-loop. Pressing Esc returns [`NmblError::OperatorAborted`].
+/// Headless callers (`progress = None`) fall back to a plain
+/// `tokio::time::sleep` cadence with no abort path.
 pub async fn wait_for(
     device: &Path,
     timeout: Duration,
@@ -71,21 +73,37 @@ pub async fn wait_for(
             });
         }
 
-        // Render the status, then wait one cadence slice. With a sink the
-        // slice IS the Esc-abort poll: `poll_abort` awaits the backend up
-        // to POLL_INTERVAL and resolves early on a keypress, so a stuck
-        // wait aborts the instant Esc is pressed instead of one slice
-        // later. The freshly-built `poll_abort` future is the only thing
-        // in flight each iteration — it is cancel-safe and re-pollable, so
-        // even an early `return` drops nothing irreversible.
+        // Render the status, then wait one cadence slice. With a sink we
+        // race a guaranteed `POLL_INTERVAL` floor sleep against the
+        // Esc-abort poll so a stuck wait aborts the instant Esc is
+        // pressed, while the floor guarantees a minimum cadence even
+        // against a backend whose `poll_event` ignores its timeout (e.g.
+        // NoopConsole) — without it that loop would busy-spin at 100% CPU
+        // and starve the single-threaded runtime.
         if let Some(sink) = progress.as_deref_mut() {
             let elapsed = start.elapsed();
             let phase = format_wait_phase(operation, &device.display(), elapsed, timeout);
             sink.render_phase(&phase);
-            if sink.poll_abort(POLL_INTERVAL).await {
-                return Err(NmblError::OperatorAborted {
-                    context: format!("waiting for {}", device.display()),
-                });
+            // `floor` is pinned OUTSIDE the select and only `&mut`-borrowed,
+            // so the select never drops it. The only future the select can
+            // drop is the short-lived `poll_abort`, which is cancel-safe (it
+            // just awaits the backend's cancel-safe `poll_event`, consuming
+            // no byte it would lose), so an early `return` drops nothing
+            // irreversible.
+            let mut floor = std::pin::pin!(tokio::time::sleep(POLL_INTERVAL));
+            tokio::select! {
+                () = &mut floor => {}
+                aborted = sink.poll_abort(POLL_INTERVAL) => {
+                    if aborted {
+                        return Err(NmblError::OperatorAborted {
+                            context: format!("waiting for {}", device.display()),
+                        });
+                    }
+                    // poll_abort resolved early with "no abort" (e.g. an
+                    // instant NoopConsole): still honour the remaining floor
+                    // so we never spin.
+                    floor.await;
+                }
             }
         } else {
             tokio::time::sleep(POLL_INTERVAL).await;

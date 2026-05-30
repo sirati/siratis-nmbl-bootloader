@@ -159,6 +159,48 @@ fn progress_sink_tick_updates_phase_advances_spinner_and_renders() {
     assert_eq!(console.last_spinner, 2, "two ticks land on frame 2");
 }
 
+/// Drive an async future to completion on a throwaway current-thread
+/// runtime. The mock console's `poll_event` resolves instantly, so no
+/// wall-clock time elapses.
+fn block<F: std::future::Future>(fut: F) -> F::Output {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build_local(tokio::runtime::LocalOptions::default())
+        .expect("test runtime");
+    rt.block_on(fut)
+}
+
+#[test]
+fn poll_abort_returns_false_on_non_esc_key() {
+    // Exercises the REAL `BootReporter::poll_abort` Esc-match logic
+    // against a mock console: a non-Esc key (here Enter) must be
+    // swallowed and report `false` so the device wait keeps going.
+    let mut console = MockConsole::with_keys(vec![Some(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::NONE,
+    ))]);
+    let mut reporter = BootReporter::new(&mut console, "phase 3b: waiting");
+    let aborted = block(ProgressSink::poll_abort(
+        &mut reporter,
+        Duration::from_millis(100),
+    ));
+    assert!(!aborted, "a non-Esc key must not abort the wait");
+}
+
+#[test]
+fn poll_abort_returns_true_on_esc_key() {
+    // Esc must drive the real `poll_abort` match to `true` so the
+    // device wait surfaces an OperatorAborted error.
+    let mut console =
+        MockConsole::with_keys(vec![Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))]);
+    let mut reporter = BootReporter::new(&mut console, "phase 3b: waiting");
+    let aborted = block(ProgressSink::poll_abort(
+        &mut reporter,
+        Duration::from_millis(100),
+    ));
+    assert!(aborted, "Esc must abort the wait");
+}
+
 #[test]
 fn progress_sink_tick_returns_aborted_on_esc_key() {
     // Operator presses Esc on the boot-status screen while a wait
