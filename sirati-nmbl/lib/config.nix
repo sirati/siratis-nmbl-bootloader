@@ -422,6 +422,43 @@ in
     # Build the bootloader kernel
     system.build.nmblKernel = cfg.kernelPackage;
 
+    # Build the NMBL UKI (Unified Kernel Image): the NMBL kernel + initrd
+    # spliced into ONE EFI-stub PE via systemd's `ukify`. This is what the
+    # `loader = "efi-stub"` install path drops at EFI/BOOT/BOOTX64.EFI so
+    # the ESP holds ONLY NMBL (no GRUB/systemd-boot binary, no separate
+    # kernel/initrd files — both live inside the PE's `.linux`/`.initrd`
+    # sections, which systemd-stub hands to the kernel at boot).
+    #
+    # The cmdline matches `nmblBootConfig` (kernelParams + the optional
+    # serial console=). x86_64 bzImage is already an EFI-stub-capable PE;
+    # systemd-stub reliably passes the embedded `.initrd` section, so no
+    # on-disk initrd is needed. Always evaluable (cheap when unreferenced);
+    # only built when the efi-stub install path consumes it.
+    system.build.nmblUki =
+      let
+        kernel = config.system.build.nmblKernel;
+        initrd = config.system.build.nmblInitramfs;
+        cmdline = lib.concatStringsSep " " (
+          cfg.kernelParams ++ lib.optional (cfg.serialConsole != null) "console=${cfg.serialConsole}"
+        );
+      in
+      pkgs.runCommand "nmbl-uki.efi"
+        {
+          nativeBuildInputs = [ pkgs.systemdUkify ];
+        }
+        ''
+          # ukify defaults to reading /usr/lib/os-release for the .osrel
+          # section, which does not exist in the Nix sandbox. Pass an
+          # explicit minimal os-release so the build is hermetic.
+          printf 'NAME=NMBL\nID=nmbl\nPRETTY_NAME="NMBL Bootloader"\n' > os-release
+          ukify build \
+            --linux=${kernel}/bzImage \
+            --initrd=${initrd}/initrd \
+            --cmdline=${lib.escapeShellArg cmdline} \
+            --os-release=@os-release \
+            --output=$out
+        '';
+
     # Expose the actually-selected /init binary for downstream tooling
     # (debug scripts, manual nix builds). Mirrors nmblKernel/nmblInitramfs.
     system.build.nmblInit = selectedNmblInit;
@@ -488,7 +525,10 @@ in
         Initrd: ${initrd}/initrd
         Kernel Parameters: ${kernelParams}
         Loader Timeout: ${
-          if actualLoaderExtraArgs == null then "N/A" else toString actualLoaderExtraArgs.timeout
+          if actualLoaderExtraArgs == null || !(actualLoaderExtraArgs ? timeout) then
+            "N/A"
+          else
+            toString actualLoaderExtraArgs.timeout
         }
       '';
 
@@ -531,6 +571,7 @@ in
         nmblConfigToml
         nmblRescueSquashfs
         ;
+      nmblUki = config.system.build.nmblUki;
     };
 
     # Custom installation script (imported from module)

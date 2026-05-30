@@ -131,6 +131,7 @@ in
               lib.types.enum [
                 "grub"
                 "systemd"
+                "efi-stub"
               ]
             );
             default = null;
@@ -138,6 +139,11 @@ in
               Bootloader to use:
               - grub: GRUB bootloader (supports both BIOS and UEFI)
               - systemd: systemd-boot (UEFI only, formerly gummiboot)
+              - efi-stub: UEFI direct boot. NMBL's kernel + initrd are
+                combined into a single UKI (Unified Kernel Image) PE and
+                installed as EFI/BOOT/BOOTX64.EFI on the ESP. No GRUB or
+                systemd-boot binary is written — the ESP holds ONLY NMBL.
+                UEFI only.
               - null: No loader (used for qemu_kernel_invoke mode)
 
               Defaults to "grub" for bios/uefi modes, null for qemu_kernel_invoke.
