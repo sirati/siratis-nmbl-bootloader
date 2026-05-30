@@ -54,6 +54,48 @@ pub(super) fn handle_early_exit_modes(args: &Args) -> Option<ExitCode> {
         });
     }
 
+    // Initramfs dry-run validator: run the REAL boot control flow ×4
+    // scenarios against the extracted-initrd closure under the
+    // side-effect-free `DryRunSys`, collect "missing file" findings, and
+    // (optionally) structurally validate the efi-stub UKI. Sandbox-safe:
+    // touches only the closure root + the passed paths. Lists every finding
+    // (mirroring validate_hardware's style) and exits 1 when not clean.
+    if let Some(path) = args.validate_initrm.as_deref() {
+        return Some(match Config::load(path) {
+            Ok(config) => {
+                let closure_root = args
+                    .initrm_closure
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("/"));
+                let report = crate::validate_initrm::validate_initrm(
+                    &config,
+                    args.uki.as_deref(),
+                    closure_root,
+                );
+                if report.is_clean() {
+                    println!(
+                        "nmbl-init: initramfs OK for {} (closure {})",
+                        path.display(),
+                        closure_root.display()
+                    );
+                    ExitCode::from(0)
+                } else {
+                    eprint!(
+                        "nmbl-init: initramfs validation FAILED for {} (closure {}):\n{}",
+                        path.display(),
+                        closure_root.display(),
+                        report.render()
+                    );
+                    ExitCode::from(1)
+                }
+            }
+            Err(err) => {
+                eprintln!("nmbl-init: config invalid at {}: {err}", path.display());
+                ExitCode::from(1)
+            }
+        });
+    }
+
     // NixOS-only sandbox check: the toml must MATCH the NixOS filesystem
     // closure JSON. `config_toml` is guaranteed present by arg parsing.
     if let Some(json) = args.validate_closure.as_deref() {

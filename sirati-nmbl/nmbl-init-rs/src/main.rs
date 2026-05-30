@@ -43,6 +43,8 @@ mod phases;
 #[cfg(feature = "stateful")]
 #[path = "main_parts/stateful.rs"]
 mod stateful;
+#[path = "main_parts/validate_initrm/mod.rs"]
+mod validate_initrm;
 
 use args::{Args, parse_args};
 use boot_runtime::{BootOutcome, run_boot_inside_runtime, run_force_rescue};
