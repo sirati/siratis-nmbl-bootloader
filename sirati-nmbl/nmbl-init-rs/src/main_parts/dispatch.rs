@@ -13,12 +13,12 @@ use nmbl_init::terminal::{TerminalAction, redirect_stdio_for_execve};
 use nmbl_init::ui::console::{Console, LatchingConsole};
 #[cfg(not(feature = "stateful"))]
 use nmbl_init::ui::run_selector;
-use nmbl_init::ui::{BootReporter, Decision, SessionInteraction};
+use nmbl_init::ui::{BootReporter, Decision, SessionInteraction, SkipSelector};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
 
 use super::phases::run_phases_post_console;
 #[cfg(feature = "stateful")]
-use super::stateful::select_with_stateful;
+use super::stateful::{select_default_with_stateful, select_with_stateful};
 
 use log::NMBL_LOG_PATH;
 
@@ -35,6 +35,7 @@ pub(super) async fn select_and_act(
     console: &mut dyn Console,
     key_injections: &[nmbl_init::activation::KeyInjection],
     session: &SessionInteraction,
+    skip_selector: &SkipSelector,
 ) -> Result<TerminalAction> {
     nmbl_info!("phase 4: scan generations");
     let generations = {
@@ -43,16 +44,34 @@ pub(super) async fn select_and_act(
         // reporter drops here, releasing the &mut console borrow.
     };
 
-    // Stateful rollback gate. When the operator opted into stateful
-    // storage AND state.bin is readable, `select_with_stateful` decides
-    // whether to honour the TUI countdown, force-pick a known-good
-    // generation, or surface an Exhausted rescue condition. In every
-    // other case (no feature, no opt-in, missing/unsupported state.bin,
-    // IO failure) the call collapses to the legacy `run_selector` path.
+    // Skip-selector fast path. Set only when the operator unlocked LUKS
+    // with the "Select NixOS Generation" checkbox left UNCHECKED: boot the
+    // same default generation the selector's timeout would pick, without
+    // rendering the picker or running its countdown. `false` (non-LUKS
+    // boots, or a CHECKED submit) falls through to the normal selector.
     #[cfg(feature = "stateful")]
-    let decision = select_with_stateful(config, &generations, console, session).await?;
+    let decision = if skip_selector.get() {
+        nmbl_info!("phase 5: selector skipped (checkbox off) — booting default generation");
+        select_default_with_stateful(config, &generations)?
+    } else {
+        // Stateful rollback gate. When the operator opted into stateful
+        // storage AND state.bin is readable, `select_with_stateful`
+        // decides whether to honour the TUI countdown, force-pick a
+        // known-good generation, or surface an Exhausted rescue
+        // condition. Otherwise it collapses to the legacy selector.
+        select_with_stateful(config, &generations, console, session).await?
+    };
     #[cfg(not(feature = "stateful"))]
-    let decision = {
+    let decision = if skip_selector.get() {
+        nmbl_info!("phase 5: selector skipped (checkbox off) — booting default generation");
+        Decision::Boot {
+            generation_index: nmbl_init::generations::active_generation_index(
+                &generations,
+                &config.paths.nix_profiles_dir,
+            ),
+            cmdline_override: None,
+        }
+    } else {
         nmbl_info!("phase 5: TUI generation selector");
         run_selector(config, &generations, console, session).await?
     };
@@ -236,14 +255,23 @@ pub(super) async fn run_tui_session(
     // `drop_to_emergency`; its Drop drops the real backend, preserving
     // the VT-restore-before-reboot ordering.
     let mut console: Box<dyn Console> = Box::new(LatchingConsole::new(console, session.clone()));
+    // Shared "skip the generation selector" latch for this session. The
+    // passphrase modal sets it from its checkbox; the post-phase selector
+    // dispatch reads it. Default `false` (= show the selector) means a
+    // boot with no passphrase prompt is completely unaffected.
+    let skip_selector = SkipSelector::new();
     // Phases 2b/3/3b run here too: their syscalls (modules, cryptsetup,
     // mount) are plain synchronous calls inside this async fn, and the
     // passphrase prompt / wrong-password modal `.await` the same
     // console — no nested runtime anywhere.
-    let outcome = match run_phases_post_console(config, &mut *console, session, sender).await {
-        Ok(injections) => select_and_act(config, &mut *console, &injections, session).await,
-        Err(err) => Err(err),
-    };
+    let outcome =
+        match run_phases_post_console(config, &mut *console, session, &skip_selector, sender).await
+        {
+            Ok(injections) => {
+                select_and_act(config, &mut *console, &injections, session, &skip_selector).await
+            }
+            Err(err) => Err(err),
+        };
     match outcome {
         Ok(action) => {
             // `console` falls out of scope on return, running

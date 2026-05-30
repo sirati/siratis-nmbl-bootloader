@@ -25,10 +25,11 @@ fn tui_password_supplier_satisfies_password_supplier_trait() {
     // breaks the build instead of breaking at boot.
     use crate::activation::PasswordSupplier;
     use crate::config::Config;
-    use crate::ui::TuiPasswordSupplier;
+    use crate::ui::{SkipSelector, TuiPasswordSupplier};
     let cfg: Config = toml::from_str("").expect("default cfg");
     let session = SessionInteraction::new();
-    let mut sup = TuiPasswordSupplier::new(&cfg, &session);
+    let skip = SkipSelector::new();
+    let mut sup = TuiPasswordSupplier::new(&cfg, &session, &skip);
     let _coerced: &mut dyn PasswordSupplier = &mut sup;
 }
 

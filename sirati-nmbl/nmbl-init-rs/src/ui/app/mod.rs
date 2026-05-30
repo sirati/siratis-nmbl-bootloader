@@ -29,7 +29,7 @@ mod types;
 pub(super) use types::LOG_PAGE;
 pub use types::{
     App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, KEY_ECHO_RING_CAP, ModalKind,
-    SPINNER_FRAMES, SPINNER_GLYPHS, Screen, SessionInteraction,
+    SPINNER_FRAMES, SPINNER_GLYPHS, Screen, SessionInteraction, SkipSelector,
 };
 
 #[cfg(test)]
