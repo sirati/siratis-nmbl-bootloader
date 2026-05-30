@@ -23,6 +23,11 @@
   nmblConfigToml,
   nmblRescueSquashfs,
   nmblUki,
+  # Build-time initramfs-completeness gate (lib/config.nix). Referenced in a
+  # comment below so its store path is a real build dependency of this
+  # script: building the bootloader thus BUILDS the gate, failing the build
+  # on an incomplete initramfs before the install-time check ever runs.
+  nmblInitrmCheck,
 }:
 
 let
@@ -56,6 +61,15 @@ let
   cryptsetupToolArg =
     lib.optionalString (cryptsetupPkg != null)
       "--tool=cryptsetup:${cryptsetupPkg}/bin/cryptsetup";
+
+  # Structural UKI check is passed to `--validate-initrm` ONLY in efi-stub
+  # mode — the same condition `nmblUki` is installed under below.
+  initrmUkiArg = lib.optionalString (actualLoader == "efi-stub") "--uki=${nmblUki}";
+
+  # Shared `nmbl_extract_initrm <initrd> <dest>` snippet, identical to the
+  # one the build-time gate (lib/config.nix) uses, so both validate against
+  # an identically-shaped extracted closure.
+  extractInitrmSnippet = import ./extract-initrm.nix { inherit pkgs; };
 in
 
 pkgs.writeScript "install-nmbl-bootloader" ''
@@ -100,6 +114,28 @@ pkgs.writeScript "install-nmbl-bootloader" ''
       ''${config.system.build.nmblInit}/bin/nmbl-init --validate-hardware=${nmblConfigToml} ${cryptsetupToolArg}''
     else
       ''${config.system.build.nmblInit}/bin/nmbl-init --validate-hardware=${nmblConfigToml} ${cryptsetupToolArg} || echo "SEVERE WARNING: NMBL hardware validation failed; installing anyway because refuseInvalidHardwareOnInstall=false"''
+  }
+
+  # Read-only initramfs-completeness validation of the SAME initramfs the
+  # bootloader ships, BEFORE any bootloader files are written. We extract
+  # the to-be-installed initrd into a temp dir (preferred over
+  # `--initrm-closure=/`: it validates the ACTUAL artifact, not the running
+  # tree) and dry-run the real boot flow ×4 against it; zero side effects.
+  # `refuseInvalidInitrmOnInstall` decides whether a failure aborts the
+  # install or is only a severe warning. The build-time gate
+  # (${nmblInitrmCheck}) already enforced this at `nix build` time; this is
+  # the on-target re-check.
+  echo "Validating NMBL initramfs completeness..."
+  ${extractInitrmSnippet}
+  NMBL_INITRM_DIR=$(mktemp -d)
+  trap 'rm -rf "$NMBL_INITRM_DIR"' EXIT
+  nmbl_extract_initrm ${config.system.build.nmblInitramfs}/initrd "$NMBL_INITRM_DIR"
+  ${
+    if cfg.refuseInvalidInitrmOnInstall then
+      # set -e is active: a non-zero exit aborts the install here.
+      ''${config.system.build.nmblInit}/bin/nmbl-init --validate-initrm=${nmblConfigToml} --initrm-closure="$NMBL_INITRM_DIR" ${initrmUkiArg}''
+    else
+      ''${config.system.build.nmblInit}/bin/nmbl-init --validate-initrm=${nmblConfigToml} --initrm-closure="$NMBL_INITRM_DIR" ${initrmUkiArg} || echo "SEVERE WARNING: NMBL initramfs validation failed; installing anyway because refuseInvalidInitrmOnInstall=false"''
   }
 
   ${lib.optionalString (actualLoader != "efi-stub") ''

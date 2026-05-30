@@ -84,6 +84,12 @@ let
   # Import storage validation module
   storageValidation = import ./modules/storage-validation.nix { inherit lib; };
 
+  # Shared `nmbl_extract_initrm <initrd> <dest>` shell snippet used by BOTH
+  # the build-time gate below and the install-time gate
+  # (install-bootloader.nix), so the two validate against an
+  # identically-shaped extracted closure.
+  extractInitrmSnippet = import ./extract-initrm.nix { inherit pkgs; };
+
   # Auto-detected NIC drivers from hardware-configuration.nix
   # (boot.initrd.{kernelModules,availableKernelModules}). Only consumed
   # when the rescue network path is enabled; otherwise the list is
@@ -463,6 +469,48 @@ in
     # (debug scripts, manual nix builds). Mirrors nmblKernel/nmblInitramfs.
     system.build.nmblInit = selectedNmblInit;
 
+    # Build-time initramfs-completeness gate. Mirrors the build-time
+    # `--validate-config` gate baked into `nmblConfigToml` (config-toml.nix):
+    # there a non-zero validator exit fails `nix build` before any install.
+    # Here we extract the BUILT initramfs into a sandbox dir and run the real
+    # boot flow ×4 against it under a side-effect-free dry-run; any file the
+    # boot path needs but the initramfs lacks is listed and fails the build.
+    #
+    # FEATURE-PARITY: the validator is `selectedNmblInit` — the EXACT same
+    # feature-resolved /init binary the initramfs embeds (lib/config.nix
+    # `selectedNmblInit`, used for both the `/init` content and the
+    # `--validate-config` check). This matters because the dry-run's splash
+    # font/PNG presence checks are `#[cfg(feature = "image-splash")]`-gated:
+    # a default-feature validator would silently skip them. Reusing the same
+    # binding guarantees the check covers exactly the features that ship.
+    #
+    # The `--uki` structural check is passed ONLY in efi-stub mode, the same
+    # condition `nmblUki` itself is installed under (install-bootloader.nix).
+    system.build.nmblInitrmCheck =
+      let
+        initrd = config.system.build.nmblInitramfs;
+        ukiArg =
+          lib.optionalString (actualLoader == "efi-stub")
+            "--uki=${config.system.build.nmblUki}";
+      in
+      pkgs.runCommand "nmbl-initrm-check" { }
+        ''
+          # Extract + reshape the BUILT initramfs into a closure the dry-run
+          # can probe (shared helper: decompress, unpack cpio, rewrite the
+          # staged store symlinks to relative, alias the sandbox kernel
+          # release to the shipped modules tree). See lib/extract-initrm.nix.
+          ${extractInitrmSnippet}
+          mkdir closure
+          nmbl_extract_initrm ${initrd}/initrd "$PWD/closure"
+
+          # Same config.toml the initramfs is built from (config-toml.nix).
+          ${selectedNmblInit}/bin/nmbl-init \
+            --validate-initrm=${nmblConfigToml} \
+            --initrm-closure="$PWD/closure" \
+            ${ukiArg}
+          touch $out
+        '';
+
     # Expose the rendered runtime config TOML so it can be inspected
     # (and validated) independently of the initramfs build. Used by
     # the C.2 validation step (`nix eval ... --raw`) and by the
@@ -558,7 +606,13 @@ in
       lib.listToAttrs (map (fs: lib.nameValuePair fs.fsType true) nmblFileSystems)
     );
 
-    # Hook for NixOS to install NMBL bootloader during VM builds and system installations
+    # Hook for NixOS to install NMBL bootloader during VM builds and system
+    # installations. The build-time initramfs gate (`nmblInitrmCheck`) is
+    # threaded in as `nmblInitrmCheck` so its store path is a real build
+    # dependency of the install script: a system build that pulls in the
+    # bootloader must therefore BUILD the check, and an incomplete initramfs
+    # fails the build — exactly like the `--validate-config` gate baked into
+    # `nmblConfigToml`.
     system.build.installBootLoader = import ./install-bootloader.nix {
       inherit
         lib
@@ -572,6 +626,7 @@ in
         nmblRescueSquashfs
         ;
       nmblUki = config.system.build.nmblUki;
+      nmblInitrmCheck = config.system.build.nmblInitrmCheck;
     };
 
     # Custom installation script (imported from module)
