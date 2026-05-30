@@ -122,7 +122,7 @@ zeroize = { version = "1", features = ["derive"] }
 # rustix is already pulled in transitively via crossterm; promote it to an
 # explicit dependency so its safe wrappers for open(2) / termios are visible
 # at the manifest level.
-rustix = { version = "0.38", default-features = false, features = ["fs", "termios", "std", "event", "net"] }
+rustix = { version = "0.38", default-features = false, features = ["fs", "termios", "std", "event", "net", "process"] }
 # Single-threaded (current-thread) async runtime for the interactive TUI
 # phase. NO `rt-multi-thread`: NMBL is single-OS-thread (PID 1, fork-safe),
 # so every task runs via `spawn_local` on a `LocalRuntime`. `net` pulls
