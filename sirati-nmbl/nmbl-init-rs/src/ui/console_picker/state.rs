@@ -46,8 +46,24 @@ impl PickerState {
             }
         };
 
+        // Label the kernel console with the device it ACTUALLY resolves
+        // to at runtime (read from `/sys/class/tty/console/active`), not a
+        // config-derived guess. When that resolved device is NOT the
+        // framebuffer VT the splash is painted on (e.g. cmdline pins
+        // `console=ttyS0` but the box booted headless off a USB stick and
+        // the operator is looking at `/dev/tty1`), flag it so the operator
+        // understands the pre-checked target is a possibly-dead headless
+        // line rather than the screen in front of them.
+        let console_label = if active_path == Path::new(super::session::SPLASH_DISPLAY_TTY) {
+            format!("/dev/console (-> {})", active_path.display())
+        } else {
+            format!(
+                "/dev/console (-> {}, NOT the live screen)",
+                active_path.display()
+            )
+        };
         candidates.push(PickerCandidate {
-            label: format!("/dev/console (-> {})", active_path.display()),
+            label: console_label,
             target: active_path.clone(),
             origin: CandidateOrigin::KernelConsole,
         });
