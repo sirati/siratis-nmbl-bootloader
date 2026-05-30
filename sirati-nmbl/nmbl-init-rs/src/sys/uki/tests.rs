@@ -91,6 +91,29 @@ fn well_formed_uki_with_matching_cmdline_has_no_findings() {
 }
 
 #[test]
+fn space_padded_section_name_is_recognised() {
+    // PE permits SPACE-padding (not just NUL) for names shorter than 8
+    // bytes. `.linux  ` fills the whole 8-byte field with two trailing
+    // spaces and NO NUL terminator. The decoder must trim those spaces so
+    // the section is recognised as `.linux` rather than false-flagged as
+    // a missing `.linux` section. (`.initrd ` is likewise space-padded.)
+    let linux = bzimage_payload();
+    let initrd = gzip_payload();
+    let pe = build_pe(&[
+        (".linux  ", &linux),
+        (".initrd ", &initrd),
+        (".cmdline", b"root=/dev/sda1 quiet"),
+        (".osrel", b"NAME=NMBL\n"),
+    ]);
+    let f = write_tmp(&pe);
+    let findings = validate_uki(f.path(), Some("root=/dev/sda1 quiet")).expect("validate ok");
+    assert!(
+        findings.is_empty(),
+        "space-padded .linux/.initrd names must not be flagged missing, got {findings:?}"
+    );
+}
+
+#[test]
 fn cmdline_trailing_nul_and_whitespace_is_trimmed() {
     let linux = bzimage_payload();
     let initrd = gzip_payload();
