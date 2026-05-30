@@ -39,17 +39,13 @@ use crate::sys::pty::PtyChild;
 use crate::ui::console::{Console, NoopConsole};
 use crate::ui::{BootReporter, ProgressSink};
 
+use crate::sys::blkid::BLKID_BINARY;
+
 use super::{BlockOps, ConsoleOps, ExecOps, FsOps, KexecOps, KexecTarget, ModuleOps};
 
 pub use closure::ClosureView;
 pub use report::{Findings, MissingFile};
 pub use scenario::{DryRunScenario, ExecRole};
-
-/// Absolute path of the `blkid` binary the genuine
-/// `sys::blkid::populate_disk_by_symlinks` execs. Kept in sync with the
-/// private `sys::blkid::BLKID_BINARY` const; the Nix side wires
-/// `util-linux`'s `bin/blkid` to this path in the initramfs.
-const BLKID_BINARY: &str = "/bin/blkid";
 
 /// Side-effect-free [`SysOps`](super::SysOps) impl over an initramfs
 /// closure. Records [`MissingFile`] findings for every file the boot
@@ -303,10 +299,11 @@ impl ExecOps for DryRunSys {
         // PtyChild owns a real master OwnedFd + child Pid; it cannot be
         // faked without an actual fork, which the dry-run must NOT do. So
         // we run the SAME preflight the genuine path does (shell presence
-        // + devpts mount + ptmx) recording findings, then return a clearly
-        // marked Err. The Phase-5 RawShell/PrettyShell drivers treat THIS
-        // specific Err — message prefixed "dry-run shell preflight" — as
-        // "shell preflight complete, no fork performed", i.e. success.
+        // + devpts mount + ptmx) recording findings, then return the typed
+        // `NmblError::DryRunShellPreflight` signal. The Phase-5
+        // RawShell/PrettyShell drivers treat `matches!(err,
+        // NmblError::DryRunShellPreflight)` as "shell preflight complete,
+        // no fork performed", i.e. success.
         if !self.closure.exists(shell_path) {
             self.findings.push(MissingFile::new(
                 "spawn_shell",
@@ -322,9 +319,7 @@ impl ExecOps for DryRunSys {
             "devpts",
             "",
         );
-        Err(NmblError::Tui {
-            source: io::Error::other("dry-run shell preflight complete (no fork performed)"),
-        })
+        Err(NmblError::DryRunShellPreflight)
     }
 }
 

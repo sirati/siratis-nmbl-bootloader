@@ -135,6 +135,9 @@ pub(super) fn suggested_action(err: &NmblError) -> String {
             "state.bin at {} did not round-trip through encode/decode; refusing to overwrite.",
             path.display()
         ),
+        NmblError::DryRunShellPreflight => {
+            "Dry-run shell preflight completed without forking — informational only.".to_string()
+        }
     }
 }
 
