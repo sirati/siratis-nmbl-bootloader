@@ -250,3 +250,42 @@ fn resolve_mountpoint_absolute_not_under_root_joined() {
         PathBuf::from("/mnt/system/boot"),
     );
 }
+
+#[test]
+fn loop_backed_when_options_carry_loop() {
+    // The `loop` mount pseudo-option marks an entry loop-backed even
+    // when the resolved device path does not exist (it is created by the
+    // image builder; at config time only the option is authoritative).
+    let mut entry = fs_entry("/.nix-image/nix.sqfs", "/nix", false);
+    entry.fstype = "squashfs".to_string();
+    entry.options = "loop,ro".to_string();
+    assert!(entry_is_loop_backed(
+        &entry,
+        Path::new("/nonexistent/nmbl-loop-test.sqfs"),
+    ));
+}
+
+#[test]
+fn loop_backed_detected_for_regular_file_without_option() {
+    // A regular-file device with no explicit `loop` option is still
+    // loop-backed: the resolved path stats as a regular file.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let img = dir.path().join("image.sqfs");
+    std::fs::write(&img, b"squashfs-placeholder").expect("write image");
+    let mut entry = fs_entry(&img.display().to_string(), "/nix", false);
+    entry.fstype = "squashfs".to_string();
+    assert!(entry_is_loop_backed(&entry, &img));
+}
+
+#[test]
+fn not_loop_backed_for_block_device_node() {
+    // A real block/char device node (e.g. /dev/null is char) with no
+    // `loop` option must NOT be treated as loop-backed.
+    let dev_null = Path::new("/dev/null");
+    if !dev_null.exists() {
+        eprintln!("skipping: /dev/null missing in this sandbox");
+        return;
+    }
+    let entry = fs_entry("/dev/null", "/x", false);
+    assert!(!entry_is_loop_backed(&entry, dev_null));
+}

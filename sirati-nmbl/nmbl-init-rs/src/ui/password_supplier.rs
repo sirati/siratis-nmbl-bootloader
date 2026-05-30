@@ -131,7 +131,13 @@ pub(crate) async fn passphrase_prompt_on_console(
                 dirty = true;
             }
             // No scrollback on the passphrase modal; ignore wheel notches.
-            Some(crate::ui::console::ConsoleEvent::Scroll { .. }) | None => {}
+            // `UserHasInteracted` is informational only — the real key
+            // that triggered it follows and is typed into the buffer.
+            Some(
+                crate::ui::console::ConsoleEvent::Scroll { .. }
+                | crate::ui::console::ConsoleEvent::UserHasInteracted,
+            )
+            | None => {}
         }
     }
 }

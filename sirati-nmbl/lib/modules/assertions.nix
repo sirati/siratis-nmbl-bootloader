@@ -37,8 +37,12 @@ in
       message = "boot.nmbl.bootstrapper.bootMode must be 'bios', 'uefi', or 'qemu_kernel_invoke'";
     }
     {
-      assertion = actualLoader == null || actualLoader == "grub" || actualLoader == "systemd";
-      message = "boot.nmbl.bootstrapper.loader must be 'grub', 'systemd', or null";
+      assertion =
+        actualLoader == null
+        || actualLoader == "grub"
+        || actualLoader == "systemd"
+        || actualLoader == "efi-stub";
+      message = "boot.nmbl.bootstrapper.loader must be 'grub', 'systemd', 'efi-stub', or null";
     }
     {
       assertion = bootstrapper.bootMode == "qemu_kernel_invoke" || actualLoader != null;
@@ -55,6 +59,10 @@ in
     {
       assertion = actualLoader != "systemd" || bootstrapper.bootMode == "uefi";
       message = "systemd-boot (loader='systemd') requires UEFI boot mode. Use loader='grub' for BIOS boot.";
+    }
+    {
+      assertion = actualLoader != "efi-stub" || bootstrapper.bootMode == "uefi";
+      message = "efi-stub (loader='efi-stub') requires UEFI boot mode. The UKI is an EFI executable booted directly by UEFI firmware.";
     }
     {
       assertion =
@@ -88,8 +96,13 @@ in
       message = "NMBL boot partition must be FAT32 (fsType = \"vfat\")";
     }
     {
+      # efi-stub writes a single UKI to the ESP fallback path and never
+      # touches NVRAM, so loader_extra_args (and these grub/systemd-only
+      # EFI knobs) do not apply — guard the access so the default empty
+      # set doesn't trip the lookup.
       assertion =
         bootstrapper.bootMode == "qemu_kernel_invoke"
+        || actualLoader == "efi-stub"
         || actualLoaderExtraArgs == null
         || !actualLoaderExtraArgs.efiInstallAsRemovable
         || !actualLoaderExtraArgs.canTouchEfiVariables;

@@ -134,12 +134,21 @@ fn any_keypress_in_list_cancels_countdown() {
 }
 
 #[test]
-fn any_keypress_sets_user_interacted_latch() {
+fn on_key_does_not_set_the_latch() {
+    // Operator-presence latching now lives ONLY in the central
+    // `LatchingConsole` layer, which every input poll flows through; by
+    // the time a key reaches `on_key` the latch is already set by that
+    // layer. `on_key` itself must NOT touch the latch — keeping it out is
+    // what makes the early boot-log window (which never reaches `on_key`)
+    // latch correctly.
     let gens = vec![fake_gen(1, &[])];
     let mut app = App::new(&gens);
     assert!(!app.interaction.get());
     app.on_key(press(KeyCode::Char('p')));
-    assert!(app.interaction.get());
+    assert!(
+        !app.interaction.get(),
+        "on_key must not set the latch; the central console layer owns that"
+    );
 }
 
 #[test]

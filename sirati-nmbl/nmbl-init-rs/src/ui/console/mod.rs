@@ -46,6 +46,25 @@ pub enum ConsoleEvent {
     /// tty/termwiz path with xterm mouse reporting produces this; the
     /// kernel-VT splash path never emits it (no xterm mouse sequences).
     Scroll { up: bool },
+    /// One-shot synthetic notice that the operator just produced their
+    /// FIRST real input of the session. Emitted by [`LatchingConsole`]
+    /// (the central latch layer that wraps every session's backend)
+    /// immediately *before* it surfaces that first real input event;
+    /// the real Key/Resize/Scroll then follows on the next poll and does
+    /// its normal job. Never emitted again for the rest of the session.
+    ///
+    /// Screens that gate an auto-action on operator presence (the
+    /// generation selector's auto-boot countdown, the emergency screen's
+    /// auto-reboot countdown) cancel that countdown on this event instead
+    /// of re-deriving presence from raw keys. Screens that don't care
+    /// simply ignore it. The latch itself ([`SessionInteraction`]) is set
+    /// by the same layer at the same moment, so a screen entered *after*
+    /// the first input sees `interaction.get() == true` and never arms
+    /// its countdown at all.
+    ///
+    /// [`LatchingConsole`]: crate::ui::console::latch::LatchingConsole
+    /// [`SessionInteraction`]: crate::ui::app::SessionInteraction
+    UserHasInteracted,
 }
 
 /// Which backend a [`Console`] is. Surfaced via [`Console::kind`] so
@@ -114,7 +133,12 @@ pub trait Console {
             // target). Scroll events only matter to scrollback-aware
             // consumers (the pretty shell) that call `poll_event`
             // directly. The caller asked for a key, so report no key.
-            Some(ConsoleEvent::Resize { .. } | ConsoleEvent::Scroll { .. }) | None => Ok(None),
+            Some(
+                ConsoleEvent::Resize { .. }
+                | ConsoleEvent::Scroll { .. }
+                | ConsoleEvent::UserHasInteracted,
+            )
+            | None => Ok(None),
         }
     }
     /// Backend grid size in (cols, rows). Useful for centring modals
@@ -205,6 +229,9 @@ pub(crate) async fn await_fd_readable(
         Err(_elapsed) => Ok(false),
     }
 }
+
+pub mod latch;
+pub use self::latch::LatchingConsole;
 
 pub mod noop;
 pub use self::noop::NoopConsole;

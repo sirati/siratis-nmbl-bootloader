@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+mod readiness;
 mod resolve;
 mod scan;
 

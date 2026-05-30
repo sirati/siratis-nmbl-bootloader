@@ -28,6 +28,36 @@ let
   hasExplicitLuks = act.luks != [ ];
   lvmAutoDetected = hasMapper && !hasExplicitLuks;
 
+  # LUKS-backed filesystems NMBL must mount but won't unlock.
+  # /dev/mapper/* alone is ambiguous (LVM vs LUKS), so we key off
+  # config.boot.initrd.luks.devices — the canonical NixOS LUKS
+  # declaration. NMBL replaces stage-1, so any LUKS mapping backing a
+  # filesystem NMBL mounts MUST also be declared in
+  # boot.nmbl.activation.luks or NMBL can never open it.
+  # NOTE: stacking limitation — LUKS-under-LVM (fs device =
+  # /dev/mapper/<vg>-<lv>, whose name differs from the luks name) is
+  # NOT caught by this direct-device check; acceptable for now.
+  nixosLuksNames = lib.attrNames (config.boot.initrd.luks.devices or { });
+  nmblLuksNames = map (l: l.name) act.luks;
+  nmblFsDevices = map (fs: fs.device)
+    (lib.filter (fs: fs.device != null) fileSystems);
+  uncoveredLuksFs = lib.filter
+    (n: (lib.elem "/dev/mapper/${n}" nmblFsDevices)
+        && !(lib.elem n nmblLuksNames))
+    nixosLuksNames;
+
+  # Stacked case: LVM-on-LUKS. The root fs device is then an LVM LV
+  # (/dev/mapper/<vg>-<lv>) whose name differs from the LUKS name, so the
+  # direct check above never fires — yet NMBL still can't assemble the VG
+  # because the LUKS PV is never unlocked. Conservatively flag when there
+  # is BOTH an uncovered LUKS device AND a device-mapper fs that isn't
+  # itself a declared LUKS mapping (i.e. an LVM LV / other dm target that
+  # could sit on the unopened PV).
+  uncoveredLuks = lib.filter (n: !(lib.elem n nmblLuksNames)) nixosLuksNames;
+  mapperFsNames = map (d: lib.removePrefix "/dev/mapper/" d)
+    (lib.filter (d: lib.hasPrefix "/dev/mapper/" d) nmblFsDevices);
+  lvmLikeMapperFs = lib.filter (n: !(lib.elem n nixosLuksNames)) mapperFsNames;
+
   # --- pkgsStatic.* with graceful fallback ----------------------------------
 
   tryStatic = attr:
@@ -82,21 +112,29 @@ let
   luksBaseMods = [ "dm_mod" "dm-crypt" "aesni_intel" "xts" "sha256_generic" ];
   luksTpmMods = luksBaseMods ++ [ "tpm_crb" "tpm_tis" ];
 
+  # `source_devices` is the backing device this activation CONSUMES (vs
+  # `produces_devices`, the mapper node it yields). `--validate-hardware`
+  # probes each source device's LUKS header. luks kinds list `l.device`;
+  # lvm/mdraid/zfs carry no backing-device info in the config, so they
+  # emit `[ ]` (do NOT fabricate).
   mkLuksBlock = l:
     let mapper = "/dev/mapper/${l.name}"; in
     if l.unlock == "tpm" then {
       kind = "luks-tpm"; required_modules = luksTpmMods;
       binary = "/bin/cryptsetup"; argv = [ "open" "--token-only" l.device l.name ];
-      produces_devices = [ mapper ]; description = "Unlock ${l.name} via TPM-sealed token";
+      produces_devices = [ mapper ]; source_devices = [ l.device ];
+      description = "Unlock ${l.name} via TPM-sealed token";
     } else if l.unlock == "keyfile" then {
       kind = "luks-keyfile"; required_modules = luksBaseMods;
       binary = "/bin/cryptsetup";
       argv = [ "open" l.device l.name "--key-file=${toString l.keyfile}" ];
-      produces_devices = [ mapper ]; description = "Unlock ${l.name} via keyfile";
+      produces_devices = [ mapper ]; source_devices = [ l.device ];
+      description = "Unlock ${l.name} via keyfile";
     } else {
       kind = "luks-password"; required_modules = luksBaseMods;
       binary = "/bin/cryptsetup"; argv = [ "open" l.device l.name "--key-file=-" ];
-      produces_devices = [ mapper ]; description = "Unlock ${l.name} via passphrase";
+      produces_devices = [ mapper ]; source_devices = [ l.device ];
+      description = "Unlock ${l.name} via passphrase";
       prompt_label = l.promptLabel;
       pass_to_stage1 = l.passToStage1;
     };
@@ -151,6 +189,31 @@ let
     ++ lib.optional luksTpm {
       assertion = lib.any (m: lib.elem m extraKernelModules) [ "tpm_crb" "tpm_tis" ];
       message = "boot.nmbl.activation.luks entry requests TPM unlock but no TPM kernel modules were added to extraKernelModules";
+    }
+    # LUKS filesystems NMBL mounts but isn't told to unlock
+    ++ map (n: {
+      assertion = false;
+      message = ''
+        NMBL: filesystem on /dev/mapper/${n} is a LUKS device declared in
+        boot.initrd.luks.devices, but ${n} is not covered by
+        boot.nmbl.activation.luks. NMBL replaces NixOS stage-1 and will not
+        unlock it, so the filesystem cannot be mounted at boot.
+
+        Declare it for NMBL, e.g.:
+
+          boot.nmbl.activation.luks = [{
+            name = "${n}";
+            device = "<backing block device, e.g. /dev/nvme0n1p2>";
+            unlock = "password";  # or "tpm" / "keyfile"
+          }];
+      '';
+    }) uncoveredLuksFs
+    # Stacked LVM-on-LUKS: a dm filesystem may sit on an unopened LUKS PV.
+    ++ lib.optional (uncoveredLuks != [ ] && lvmLikeMapperFs != [ ]) {
+      assertion = false;
+      message = ''
+        NMBL: filesystem(s) on device-mapper volume(s) [${lib.concatStringsSep ", " lvmLikeMapperFs}] may be layered on LUKS device(s) [${lib.concatStringsSep ", " uncoveredLuks}] that are declared in boot.initrd.luks.devices but not covered by boot.nmbl.activation.luks. NMBL replaces NixOS stage-1; if these volumes sit on those LUKS devices, NMBL cannot unlock the PV, the volume group never assembles, and boot hangs. Declare each LUKS device in boot.nmbl.activation.luks (or, if a listed mapper volume is genuinely not on an encrypted PV, this is a false positive — report it).
+      '';
     };
 
   # --- option types ---------------------------------------------------------
