@@ -8,13 +8,14 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use rustix::fs::{FileType, stat};
+use rustix::fs::{FileType, Mode, OFlags, stat};
 
 use nix::errno::Errno;
 
 use crate::config::{Config, FilesystemEntry};
 use crate::error::{NmblError, Result};
 use crate::nmbl_info;
+use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
 use crate::ui::{BootReporter, ProgressSink, TickOutcome};
 
 /// Sleep granularity between polls. Matches the 100 ms cadence of the
@@ -96,7 +97,10 @@ pub fn format_wait_phase(
     )
 }
 
-/// `true` if `device` exists and is a block- or char-device node.
+/// `true` if `device` exists and is a block-/char-device node OR a
+/// regular file. Regular files are accepted because a loop-backed
+/// filesystem entry (e.g. a squashfs image) names its backing file as
+/// the `device`; the mount cascade sets up the loop device itself.
 /// Stat failures collapse to `false` so the caller keeps polling
 /// rather than aborting on a startup race.
 fn device_ready(device: &Path) -> bool {
@@ -111,7 +115,7 @@ fn device_ready(device: &Path) -> bool {
 
     matches!(
         FileType::from_raw_mode(st.st_mode as rustix::fs::RawMode),
-        FileType::BlockDevice | FileType::CharacterDevice,
+        FileType::BlockDevice | FileType::CharacterDevice | FileType::RegularFile,
     )
 }
 
@@ -196,7 +200,20 @@ pub fn mount_system_filesystems(
     }
 
     for entry in &config.filesystems {
-        let dev = Path::new(&entry.device);
+        // Loop-backed entries (squashfs images etc.) name their backing
+        // FILE as the device. That file lives on a filesystem mounted
+        // earlier in this same cascade, so resolve an absolute device
+        // path against `system_root` (the file's post-pivot path is what
+        // the config carries; NMBL sees it under its mount prefix).
+        let raw_dev = Path::new(&entry.device);
+        let resolved_dev: PathBuf = if raw_dev.is_absolute() && !raw_dev.starts_with("/dev/") {
+            let stripped = raw_dev.strip_prefix("/").unwrap_or(raw_dev);
+            system_root.join(stripped)
+        } else {
+            raw_dev.to_path_buf()
+        };
+        let dev = resolved_dev.as_path();
+
         let _ = reporter.set_phase(format!(
             "phase 3b: waiting for {} -> {}",
             dev.display(),
@@ -214,12 +231,37 @@ pub fn mount_system_filesystems(
         let target = resolve_mountpoint(system_root, entry);
         ensure_dir(&target)?;
 
+        // If the entry is loop-backed, set up a loop device over the
+        // backing file and mount THAT instead. The kernel detaches the
+        // loop binding when the mount is torn down before kexec.
+        let mount_src: PathBuf = if entry_is_loop_backed(entry, dev) {
+            let loop_dev = setup_loop_device(dev)?;
+            nmbl_info!(
+                "loop-backed {} attached to {}",
+                dev.display(),
+                loop_dev.display(),
+            );
+            loop_dev
+        } else {
+            dev.to_path_buf()
+        };
+
+        // Strip the `loop` pseudo-option: it is consumed here (we set up
+        // the loop device ourselves) and the kernel rejects it as mount
+        // data. Other options pass through unchanged.
+        let mount_opts: String = entry
+            .options
+            .split(',')
+            .filter(|o| !o.is_empty() && *o != "loop")
+            .collect::<Vec<_>>()
+            .join(",");
+
         let _ = reporter.set_phase(format!(
             "phase 3b: mounting {} on {}",
-            dev.display(),
+            mount_src.display(),
             target.display(),
         ));
-        match crate::sys::mount::mount_fs(Some(dev), &target, &entry.fstype, &entry.options) {
+        match crate::sys::mount::mount_fs(Some(&mount_src), &target, &entry.fstype, &mount_opts) {
             Ok(()) => {}
             Err(NmblError::Mount {
                 source: Errno::EBUSY,
@@ -258,6 +300,44 @@ pub fn mount_system_filesystems(
 
     nmbl_info!("system filesystems mounted under {}", system_root.display());
     Ok(())
+}
+
+/// A filesystem entry is loop-backed when its `options` carry `loop` or
+/// its `device` is a regular file rather than a block-device node. The
+/// canonical use is a squashfs image (e.g. a `/nix`-only squashfs
+/// serving the target closure) named directly as a `fileSystems` device.
+/// Mirrors the Nix-side heuristic in `lib/modules/fs-modules.nix` that
+/// derives the `loop` driver for such entries.
+fn entry_is_loop_backed(entry: &FilesystemEntry, resolved_device: &Path) -> bool {
+    if entry.options.split(',').any(|o| o == "loop") {
+        return true;
+    }
+    match stat(resolved_device) {
+        Ok(st) => matches!(
+            FileType::from_raw_mode(st.st_mode as rustix::fs::RawMode),
+            FileType::RegularFile,
+        ),
+        Err(_) => false,
+    }
+}
+
+/// Allocate + configure a loop device backed by `file` (read-only) and
+/// return its `/dev/loopN` path. Reuses the same `sys::loopdev`
+/// machinery the external-rescue path uses: allocate a free minor, open
+/// `/dev/loopN` read-write (LOOP_CONFIGURE refuses an RO fd even for RO
+/// backing), open the backing file `O_RDONLY | CLOEXEC`, and bind both
+/// via `LOOP_CONFIGURE`. The kernel cleans up the binding automatically
+/// when the loop mount is lazily unmounted in the pre-kexec teardown.
+fn setup_loop_device(file: &Path) -> Result<PathBuf> {
+    let index = allocate_loop_device()?;
+    let loop_fd = open_loop_device(index, true)?;
+    let backing_fd = rustix::fs::open(file, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(|e| NmblError::Io {
+            source: std::io::Error::from_raw_os_error(e.raw_os_error()),
+            context: format!("opening loop backing file {}", file.display()),
+        })?;
+    configure_loop_device(&loop_fd, &backing_fd, true)?;
+    Ok(PathBuf::from(format!("/dev/loop{index}")))
 }
 
 #[cfg(test)]
