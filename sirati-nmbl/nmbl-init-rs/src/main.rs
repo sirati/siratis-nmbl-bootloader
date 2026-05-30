@@ -85,6 +85,7 @@ fn early_init() {
         for (target, fstype, options) in [
             ("/dev", "devtmpfs", "mode=755,nosuid"),
             ("/proc", "proc", "nosuid,noexec,nodev"),
+            ("/sys", "sysfs", "nosuid,noexec,nodev"),
         ] {
             let path = Path::new(target);
             let _ = std::fs::create_dir_all(path);
@@ -97,12 +98,66 @@ fn early_init() {
                 Err(_) => { /* swallow: Phase 1 re-mounts with reporting */ }
             }
         }
+
+        // Now that devtmpfs is mounted, wire stdin/stdout/stderr to
+        // `/dev/console`. This is the load-bearing part. The initramfs
+        // ships an empty `/dev`, so the kernel hands PID 1 **no
+        // `/dev/console`** at exec time and fd 0/1/2 are left invalid;
+        // the first `open()` then reuses fd 0/1/2 for unrelated files,
+        // so any later code that assumes those descriptors are the
+        // console (logging, the panic hook, the boot reporter, the
+        // emergency console grab) operates on the wrong fds.
+        //
+        // This was the real-hardware boot failure: on a Lenovo where the
+        // boot aborted in early startup, PID 1 fell through musl
+        // `abort()`'s final `hlt`, which the kernel reports as a #GP
+        // "Attempted to kill init". A control image that mounts these
+        // filesystems and reopens the console **before** the real init
+        // runs (then execs it as PID 1) boots cleanly, whereas mounting
+        // `/dev` alone (no console reopen) still aborts — so the console
+        // reopen here is the operative fix, not the mounts by themselves.
+        wire_console_stdio();
     }
 
     // Hook installed before parse_args / Config::load so their panics are
     // caught. Uses the panic module's default report dir; re-installed
     // with the operator's configured dir once the config is loaded.
     install_panic_hook(Path::new(nmbl_init::panic::DEFAULT_PANIC_REPORT_DIR));
+}
+
+/// Open `/dev/console` and `dup2` it onto fd 0/1/2 so the process has a
+/// valid, connected stdin/stdout/stderr. PID 1 booted from an initramfs
+/// with an empty `/dev` starts with those descriptors invalid; this
+/// repairs them so logging, the panic hook's `eprintln!`, and the boot
+/// reporter all have somewhere to write. Best-effort: every step is
+/// swallowed so a missing/odd console can never make `early_init` itself
+/// the thing that kills PID 1.
+fn wire_console_stdio() {
+    use std::os::fd::IntoRawFd;
+
+    // RDWR so stdin reads (operator key presses on the console) work too.
+    let Ok(console) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/console")
+    else {
+        return;
+    };
+    // Take the raw fd out of the `File` so its `Drop` can't close a
+    // descriptor we are about to alias onto 0/1/2 (the open may itself
+    // have landed on fd 0 when stdio was unallocated).
+    let cfd = console.into_raw_fd();
+    for target in 0..=2 {
+        if cfd != target {
+            // dup2 onto the canonical stdio fds; ignore errors (best-effort).
+            let _ = nix::unistd::dup2(cfd, target);
+        }
+    }
+    // Close the source fd only if it isn't one of the stdio fds we just
+    // populated; otherwise it stays open as the live console.
+    if cfd > 2 {
+        let _ = nix::unistd::close(cfd);
+    }
 }
 
 // Tmpfs path the byte-ring is flushed to right before every terminal
