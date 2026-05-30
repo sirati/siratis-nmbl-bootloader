@@ -17,12 +17,42 @@
   lib,
   config,
   nmblInit,
+  # Absolute paths the initramfs stages as executables (the `symlink`
+  # fields of the initrd `contents`, e.g. `/init`, `/bin/sh`, `/bin/blkid`).
+  # Used by the target-aware build check to confirm `paths.shell` actually
+  # resolves to a binary present in the initramfs — the environment the
+  # emergency shell forks in (NMBL is PID 1, before any switch_root).
+  # Defaults to the always-present set so older callers still evaluate.
+  initrdExecutables ? [ "/init" "/bin/blkid" ],
+  # Whether to assert `paths.shell` is staged in the initramfs. True for
+  # `rescue.mode` embedded/external (the emergency menu's Raw Shell forks
+  # it); false for `none`, where the emergency path halts with a banner
+  # and ships no shell on purpose — asserting there would break that
+  # intentional config.
+  checkEmergencyShell ? true,
+  # The external rescue squashfs derivation (or null when not in external
+  # mode). When non-null the check additionally lists it with
+  # `unsquashfs -l` (no FUSE — works in the nix sandbox) and confirms the
+  # rescue handoff entrypoint exists inside, so an external-rescue build
+  # is verified against its actual rescue target.
+  rescueSfs ? null,
 }:
 
 let
   cfg = config.boot.nmbl;
 
   tomlFormat = pkgs.formats.toml { };
+
+  # Absolute path the emergency shell forks at runtime (NMBL PID 1, in the
+  # initramfs). Mirrors the Rust `paths.shell` / preflight_shell check.
+  shellPath = toString cfg.paths.shell;
+
+  # The rescue handoff entrypoint baked into the external sfs:
+  # `/init` for the full recovery system, `/bin/sh` (busybox) for the flat
+  # image. We confirm this exists inside the sfs so the
+  # `rescue::dispatch` / force-on-boot switch_root has something to exec.
+  rescueEntrypoint =
+    if cfg.rescue.mode == "external" && cfg.rescue.fullSystem.enable then "/init" else "/bin/sh";
 
   tomlValue = {
     general = {
@@ -181,8 +211,60 @@ let
   };
 
   rawToml = tomlFormat.generate "nmbl-config.toml" tomlValue;
+
+  # Newline-joined absolute paths the initramfs provides as executables.
+  # The check greps this set for `paths.shell`.
+  initrdExecutableList = lib.concatStringsSep "\n" initrdExecutables;
 in
-pkgs.runCommand "nmbl-config.toml" { } ''
-  ${nmblInit}/bin/nmbl-init --validate-config=${rawToml}
-  cp ${rawToml} $out
-''
+pkgs.runCommand "nmbl-config.toml"
+  {
+    nativeBuildInputs = lib.optional (rescueSfs != null) pkgs.squashfsTools;
+  }
+  (
+    ''
+    # 1. Schema validation: the Rust binary parses the TOML against the
+    #    runtime structs (`serde(deny_unknown_fields)`). A schema mismatch
+    #    crashes `nix build` rather than surprising the operator at boot.
+    ${nmblInit}/bin/nmbl-init --validate-config=${rawToml}
+  '' + lib.optionalString checkEmergencyShell ''
+    # 2. Target-aware emergency-shell check. `paths.shell` (${shellPath}) is
+    #    execve'd by the emergency menu's Raw Shell while NMBL is PID 1 in
+    #    the INITRAMFS (before any switch_root), so it must be a binary the
+    #    initramfs actually stages. The initrd here provides:
+    #      ${lib.concatStringsSep ", " initrdExecutables}
+    #    Fail the build with an actionable message when the configured
+    #    shell is not among them — this is exactly the external-rescue
+    #    misconfiguration where the initramfs ships no /bin/sh. Skipped for
+    #    rescue.mode=none, where no emergency shell is shipped on purpose.
+    if ! printf '%s\n' "${initrdExecutableList}" | grep -qxF '${shellPath}'; then
+      echo "nmbl: boot.nmbl.paths.shell = ${shellPath} is not staged in the initramfs." >&2
+      echo "nmbl: the emergency shell forks this path while NMBL is PID 1 in the" >&2
+      echo "nmbl: initramfs (before switch_root), so it must exist there." >&2
+      echo "nmbl: rescue.mode = ${cfg.rescue.mode}. initramfs executables:" >&2
+      printf '  %s\n' "${initrdExecutableList}" >&2
+      echo "nmbl: set boot.nmbl.paths.shell to one of the above, or (for" >&2
+      echo "nmbl: rescue.mode=external) keep the default /bin/sh which is" >&2
+      echo "nmbl: now staged from busybox." >&2
+      exit 1
+    fi
+    echo "nmbl: emergency shell ${shellPath} is present in the initramfs."
+  '' + lib.optionalString (rescueSfs != null) ''
+    # 3. External rescue: inspect the ACTUAL rescue squashfs without
+    #    mounting it (the nix sandbox has no /dev/fuse, so squashfuse
+    #    cannot mount — `unsquashfs -l` lists the contents instead).
+    #    Confirm the rescue handoff entrypoint (${rescueEntrypoint}) the
+    #    `rescue::dispatch` / force-on-boot switch_root execs is really in
+    #    the image, so a built external rescue is verified end-to-end.
+    echo "nmbl: listing rescue squashfs ${rescueSfs}"
+    unsquashfs -l ${rescueSfs} > sfs-listing.txt
+    if ! grep -qxF 'squashfs-root${rescueEntrypoint}' sfs-listing.txt; then
+      echo "nmbl: rescue squashfs is missing its handoff entrypoint ${rescueEntrypoint}." >&2
+      echo "nmbl: rescue.mode=external, fullSystem.enable=${lib.boolToString cfg.rescue.fullSystem.enable}." >&2
+      echo "nmbl: the external rescue switch_root execs this path; the .sfs must provide it." >&2
+      exit 1
+    fi
+    echo "nmbl: rescue squashfs provides its handoff entrypoint ${rescueEntrypoint}."
+  '' + ''
+    cp ${rawToml} $out
+  ''
+  )
