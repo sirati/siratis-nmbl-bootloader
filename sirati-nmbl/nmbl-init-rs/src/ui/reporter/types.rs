@@ -48,10 +48,10 @@ pub trait ProgressSink {
     ///
     /// Awaits the backend's async `poll_event` for up to `timeout` and
     /// returns `true` iff the operator pressed Esc within that window.
-    /// `devices::wait_for` races this against the inter-poll cadence so a
-    /// stuck wait can be aborted early; the returned future is the wait's
-    /// cadence source when a sink is present (it resolves on the first of
-    /// an Esc keypress or `timeout` elapsing).
+    /// `devices::wait_for` races this against a guaranteed `POLL_INTERVAL`
+    /// floor sleep so a stuck wait aborts early on Esc while the floor —
+    /// not this future — pins the inter-poll cadence (a backend whose
+    /// `poll_event` ignores its timeout could otherwise busy-spin).
     ///
     /// Cancel-safe: the future only `.await`s the backend's own
     /// cancel-safe `poll_event` and never consumes a byte it would then
