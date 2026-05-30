@@ -156,9 +156,17 @@ pub trait ExecOps {
 
 /// Kexec image load.
 pub trait KexecOps {
-    /// Load `target` into the kexec image slot — see
-    /// [`crate::sys::kexec`].
-    fn kexec_load(&mut self, target: KexecTarget, cmdline: &str, flags: u32) -> Result<()>;
+    /// Load `target` into the kexec image slot, splicing `extra_cpio`
+    /// (keyfiles + log fragment) after the system initrd — see
+    /// [`crate::sys::kexec`]. The genuine impl also performs the
+    /// pre-handoff `sync(2)` + settle so a dry-run impl can no-op it.
+    fn kexec_load(
+        &mut self,
+        target: KexecTarget,
+        extra_cpio: &[u8],
+        cmdline: &str,
+        flags: u32,
+    ) -> Result<()>;
 }
 
 /// Console bring-up.

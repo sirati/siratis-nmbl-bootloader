@@ -60,7 +60,7 @@ pub(crate) async fn dispatch_emergency_choice(
             run_retry_boot_arm(config, console, app, error_count, &mut supplier, sender).await
         }
         EmergencyChoice::VerifyKexecReadiness => {
-            run_verify_kexec_arm(config, console, app, error_count).await
+            run_verify_kexec_arm(config, console, app, error_count, sender).await
         }
     }
 }
@@ -168,8 +168,9 @@ async fn run_verify_kexec_arm(
     console: &mut dyn Console,
     app: &mut App<'static>,
     error_count: &mut u32,
+    sender: &LocalSender,
 ) -> Option<TerminalAction> {
-    match verify_kexec_readiness(config, console, app).await {
+    match verify_kexec_readiness(config, console, app, sender).await {
         Ok(Some(action)) => Some(action),
         Ok(None) => None,
         Err(e) => {

@@ -5,7 +5,6 @@
 //! is loaded is logged + swallowed; we're about to replace this kernel.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use nix::mount::MntFlags;
 
@@ -15,8 +14,8 @@ use crate::devices::resolve_mountpoint;
 use crate::error::Result;
 use crate::generations::Generation;
 use crate::log;
-use crate::sys;
 use crate::sys::cpio::{InjectionEntry, build_fragment};
+use crate::sys::ops::{KexecTarget, SysOps};
 use crate::terminal::TerminalAction;
 use crate::{nmbl_info, nmbl_warn};
 
@@ -28,10 +27,6 @@ const PSEUDO_FS: &[&str] = &["/proc", "/sys", "/dev", "/run", "/tmp"];
 // `kexec_file_load(2)` below, so a stage-1 helper (e.g. `nmbl-log-import`)
 // can pick the transcript up. Single source of truth in `log`.
 use crate::log::NMBL_LOG_PATH;
-
-/// Post-`sync(2)` settle window. `sync` only schedules writeback; real
-/// hardware needs a beat to commit before we cut the mounts out.
-const POST_SYNC_FLUSH: Duration = Duration::from_millis(50);
 
 /// Final cmdline.
 ///
@@ -127,9 +122,11 @@ fn stage_log_for_kexec() -> Vec<u8> {
     }
 }
 
-/// Lazy-unmount `target`; log + swallow any failure.
-fn detach(target: &Path) {
-    if let Err(err) = sys::mount::umount(target, MntFlags::MNT_DETACH) {
+/// Lazy-unmount `target` through `ops`; log + swallow any failure.
+/// Routed through [`FsOps::umount`](crate::sys::ops::FsOps::umount) so a
+/// dry-run impl can no-op the pre-kexec teardown.
+fn detach<S: SysOps>(ops: &mut S, target: &Path) {
+    if let Err(err) = ops.umount(target, MntFlags::MNT_DETACH) {
         nmbl_warn!("umount({}) failed: {err}", target.display());
     }
 }
@@ -149,7 +146,8 @@ fn detach(target: &Path) {
 /// containing those files is appended to the system initrd via
 /// `memfd_create(2)` before `kexec_file_load(2)` — the typed
 /// passphrases never touch disk.
-pub fn kexec_into(
+pub fn kexec_into<S: SysOps>(
+    ops: &mut S,
     config: &Config,
     generation: &Generation,
     cmdline_override: Option<&str>,
@@ -199,17 +197,19 @@ pub fn kexec_into(
             fragment.len()
         );
     }
-    sys::kexec::load_with_extra_initrd_cpio(
-        &generation.kernel,
-        &generation.initrd,
+    // Route the load (+ the pre-handoff sync/settle) through the kexec
+    // seam carrying the fragment as a separate borrowed slice so a
+    // dry-run impl can no-op it without dropping the key/log injection.
+    ops.kexec_load(
+        KexecTarget::MultiFile {
+            kernel: generation.kernel.clone(),
+            initrd: generation.initrd.clone(),
+        },
         fragment.as_slice(),
         &cmdline,
         0,
     )?;
     nmbl_info!("kexec: image loaded ({} bytes cmdline)", cmdline.len());
-
-    nix::unistd::sync();
-    std::thread::sleep(POST_SYNC_FLUSH);
 
     // Dedupe: the root filesystem's mountpoint resolves to system_root,
     // so reverse_mount_targets already covers it. detaching twice gets
@@ -223,19 +223,19 @@ pub fn kexec_into(
     if let Some(state_mp) = config.runtime_state_mountpoint.as_deref()
         && already.insert(state_mp.to_path_buf())
     {
-        detach(state_mp);
+        detach(ops, state_mp);
     }
     for target in reverse_mount_targets(config) {
         if already.insert(target.clone()) {
-            detach(&target);
+            detach(ops, &target);
         }
     }
     let system_root = config.paths.system_root.clone();
     if already.insert(system_root.clone()) {
-        detach(&system_root);
+        detach(ops, &system_root);
     }
     for pseudo in PSEUDO_FS.iter().rev() {
-        detach(Path::new(pseudo));
+        detach(ops, Path::new(pseudo));
     }
 
     nmbl_info!("kexec: image staged; dispatcher will hand off to new kernel");

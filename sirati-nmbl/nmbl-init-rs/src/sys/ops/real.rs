@@ -172,20 +172,28 @@ impl ExecOps for RealSys<'_> {
 }
 
 impl KexecOps for RealSys<'_> {
-    fn kexec_load(&mut self, target: KexecTarget, cmdline: &str, flags: u32) -> Result<()> {
+    fn kexec_load(
+        &mut self,
+        target: KexecTarget,
+        extra_cpio: &[u8],
+        cmdline: &str,
+        flags: u32,
+    ) -> Result<()> {
         match target {
             KexecTarget::MultiFile { kernel, initrd } => {
-                // Thin forward: load kernel + initrd with an empty extra
-                // cpio fragment. The keyfile/log injection that
-                // `boot::kexec_into` layers on top is built by the boot
-                // core, which passes the fragment here in the next phase.
+                // Load kernel + initrd with the caller's `extra_cpio`
+                // (keyfiles + log) spliced after the system initrd.
                 crate::sys::kexec::load_with_extra_initrd_cpio(
-                    &kernel,
-                    &initrd,
-                    &[],
-                    cmdline,
-                    flags,
-                )
+                    &kernel, &initrd, extra_cpio, cmdline, flags,
+                )?;
+                // Pre-kexec commit, kept synchronous on purpose: this is
+                // the deliberate flush right before the no-return handoff,
+                // not a runtime wait. We're single-threaded and about to
+                // hand off, so there is nothing left to yield to — an async
+                // sleep here would only schedule the same idle wait.
+                nix::unistd::sync();
+                std::thread::sleep(crate::sys::kexec::POST_SYNC_FLUSH);
+                Ok(())
             }
             KexecTarget::Uki { path } => crate::sys::kexec::load(&path, None, cmdline, flags),
         }

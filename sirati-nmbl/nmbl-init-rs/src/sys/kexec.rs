@@ -10,12 +10,20 @@ use std::ffi::CString;
 use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
+use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::sys::reboot::{RebootMode, reboot};
 use rustix::fs::{MemfdFlags, Mode, OFlags};
 
 use crate::error::{NmblError, Result};
+
+/// Post-`sync(2)` settle window before the kexec handoff. `sync` only
+/// schedules writeback; real hardware needs a beat to commit before the
+/// caller cuts the mounts out. Lives here (next to the genuine kexec
+/// load) so [`crate::sys::ops::RealSys::kexec_load`] can apply it inside
+/// the seam while a dry-run impl no-ops it.
+pub const POST_SYNC_FLUSH: Duration = Duration::from_millis(50);
 
 /// `KEXEC_FILE_NO_INITRAMFS` — passed when no initrd is supplied.
 pub const KEXEC_FILE_NO_INITRAMFS: u32 = 0x0000_0004;
