@@ -212,6 +212,23 @@ let
 
   rawToml = tomlFormat.generate "nmbl-config.toml" tomlValue;
 
+  # NixOS filesystem closure as `builtins.toJSON` of a LIST of per-fs
+  # objects, the exact shape the Rust `--validate-nix-filesystem-closure`
+  # struct (`NixFilesystem`) deserialises: mountPoint, device, fsType,
+  # options (list), neededForBoot (bool), depends (list). The full
+  # `config.fileSystems` is emitted (not just the boot subset) so the Rust
+  # check can confirm the NMBL toml covers every root/neededForBoot fs and
+  # contains no stray entry.
+  fsClosureList = map (fs: {
+    mountPoint = fs.mountPoint;
+    device = fs.device;
+    fsType = fs.fsType;
+    options = fs.options;
+    neededForBoot = fs.neededForBoot;
+    depends = fs.depends;
+  }) (lib.attrValues config.fileSystems);
+  fsClosureJson = pkgs.writeText "nmbl-fs-closure.json" (builtins.toJSON fsClosureList);
+
   # Newline-joined absolute paths the initramfs provides as executables.
   # The check greps this set for `paths.shell`.
   initrdExecutableList = lib.concatStringsSep "\n" initrdExecutables;
@@ -226,6 +243,14 @@ pkgs.runCommand "nmbl-config.toml"
     #    runtime structs (`serde(deny_unknown_fields)`). A schema mismatch
     #    crashes `nix build` rather than surprising the operator at boot.
     ${nmblInit}/bin/nmbl-init --validate-config=${rawToml}
+
+    # 1b. NixOS-closure correspondence: confirm the staged config.toml
+    #     MATCHES the NixOS filesystem configuration — every root /
+    #     neededForBoot NixOS fs is present with the same device, fsType
+    #     and mountpoint, and the toml declares no filesystem the NixOS
+    #     config does not. Runs against the SAME rawToml the bootloader
+    #     ships, so a mismatch fails `nix build` before any install.
+    ${nmblInit}/bin/nmbl-init --validate-nix-filesystem-closure=${fsClosureJson} --config-toml=${rawToml}
   '' + lib.optionalString checkEmergencyShell ''
     # 2. Target-aware emergency-shell check. `paths.shell` (${shellPath}) is
     #    execve'd by the emergency menu's Raw Shell while NMBL is PID 1 in
