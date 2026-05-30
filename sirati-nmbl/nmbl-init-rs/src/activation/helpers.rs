@@ -336,6 +336,13 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
             TickOutcome::Continue
         }
         fn render_phase(&mut self, _phase: &str) {}
+        fn poll_abort(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + '_>> {
+            // This sink drives the legacy `tick`-based wait and never aborts.
+            Box::pin(async { false })
+        }
     }
 
     /// `ProgressSink` that aborts on the first tick — exercises the
@@ -346,6 +353,13 @@ crc32c_generic 16384 1 ext4, Live 0x0000000000000000
             TickOutcome::Aborted
         }
         fn render_phase(&mut self, _phase: &str) {}
+        fn poll_abort(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + '_>> {
+            // Mirror the `tick` abort: this sink always signals Esc.
+            Box::pin(async { true })
+        }
     }
 
     #[test]
