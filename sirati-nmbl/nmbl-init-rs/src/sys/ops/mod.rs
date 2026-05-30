@@ -14,8 +14,9 @@
 //! async / generic methods) because later phases hand `&mut dyn FsOps` to
 //! the splash and pty init helpers.
 //!
-//! Nothing wires these traits into the real boot yet — that is the next
-//! phase. The `RealSys` impl carries `#[allow(dead_code)]` until then.
+//! The boot spine threads `<S: SysOps>` through and routes module loads,
+//! mounts, block ops, and activation exec through `RealSys`. Kexec, shell
+//! spawn, and console bring-up are routed in later phases.
 
 pub mod real;
 
