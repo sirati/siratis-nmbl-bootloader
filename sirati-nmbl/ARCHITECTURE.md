@@ -86,8 +86,12 @@ Any phase that returns `Err` routes to `shell::drop_to_emergency`,
 which dispatches based on `boot.nmbl.rescue.mode` (see
 **Rescue dispatch** below) — for `embedded` the legacy `execve` of
 `/bin/sh` from the initramfs runs, for `external` the squashfs is
-loop-mounted and switch_rooted into, for `none` the system halts
-with a structured banner.
+loop-mounted as a writable overlay and run as a chrooted child while
+NMBL stays PID 1, for `none` the system halts with a structured
+banner. Neither `drop_to_emergency` nor the rescue dispatcher fires a
+no-return syscall itself: every path returns a `TerminalAction` that
+the single `main::execute_terminal_action` site performs once the
+stack has unwound (see **Async TUI and remote attach** below).
 
 ### Rescue dispatch
 
@@ -98,26 +102,28 @@ with a structured banner.
  shell::drop_to_emergency(config, err)
         |
         v
- rescue::dispatch(config, &err)            (Result<Infallible>)
+ rescue::dispatch(config, console, cause)   (Result<TerminalAction>)
         |
         +-- mode = "embedded" -----------+
         |                                |
         |                                v
-        |                       execve(cfg.paths.shell)        // /bin/sh from initramfs
+        |                       TerminalAction::Execve(cfg.paths.shell)  // /bin/sh from initramfs
         |
-        +-- mode = "external"
+        +-- mode = "external"  (rescue::dispatch_external)
         |        |
         |        v
-        |   rescue::disk::try_disk_rescue
+        |   rescue::disk::prepare_disk_rescue
         |     locate_sfs(config)                                // <runtime_boot_mountpoint>/<sfs_path>
         |     allocate_loop_device   (LOOP_CTL_GET_FREE)
         |     open_loop_device       (/dev/loopN, O_RDWR)
-        |     open(sfs, O_RDONLY)
+        |     open(sfs, O_RDONLY | CLOEXEC)
         |     configure_loop_device  (LOOP_CONFIGURE, RO)
-        |     mount(/dev/loopN, /rescue, squashfs, ro)
-        |     switch_root_and_exec(/rescue)
+        |     mount_overlay_root(/dev/loopN)                     // live-CD overlay:
+        |        mount squashfs ro -> /run/nmbl-rescue/lower
+        |        mount tmpfs       -> /run/nmbl-rescue/rw {upper,work}
+        |        mount overlay     -> /rescue   (writable)
         |        |
-        |        +-- success --> execve("/bin/sh", TERM=linux PATH=...)
+        |        +-- success --> run_chrooted_external(/rescue)   // see below
         |        |
         |        +-- failure
         |              |
@@ -135,49 +141,172 @@ with a structured banner.
         |                ui::prompt_url  (pre-filled from rescue.defaultUrl)
         |                http::get  +  Sha256::update  -->  memfd_create
         |                ui::confirm_hash (pre-filled from rescue.defaultSha256)
-        |                allocate + configure loop, mount, switch_root_and_exec
+        |                loop-mount the memfd, mount_overlay_root, run_chrooted_external
         |                  on hash mismatch / operator abort: loop back to source picker
         |                  on any fatal error: halt_with_banner
         |
         +-- mode = "none" ---------------> halt_with_banner
                                                   |
                                                   v
-                                  banner + reboot(RB_HALT_SYSTEM)
-                                  fallback: libc::_exit(1)
+                                  TerminalAction::HaltWithBanner
+                                  -> main: banner + reboot(RB_HALT_SYSTEM)
+                                     fallback: libc::_exit(1)
 ```
 
 The source-picker UI only appears in the network branch — disk
 rescue is tried unconditionally first when `mode = "external"`. If
 the disk path fails AND `rescue.network = true`, the network arm
 shows the picker with the disk-failure reason embedded so the
-operator knows why they were promoted to the network flow.
+operator knows why they were promoted to the network flow. Both
+paths converge on the same writable `/rescue` overlay and the same
+`run_chrooted_external` runner.
 
-`switch_root_and_exec` is shared by both rescue paths (disk and
-network) and lives in `src/rescue/mod.rs`. Its sequence is:
+#### Chrooted child — NMBL stays PID 1
 
-```rust
-chdir(new_root)                                  // step 1
-mount(Some("."), "/", None, MS_MOVE, None)       // step 2
-chroot(".")                                      // step 3
-chdir("/")                                       // step 4
-execve("/bin/sh", ["sh"], [TERM=linux, PATH=...])// step 5
+There is no `switch_root` / `execve` handoff. Instead of detaching
+the initramfs and replacing PID 1, NMBL runs the rescue system as a
+**chrooted child** while PID 1 stays put on the initramfs rootfs.
+`run_chrooted_external` drops the live boot console (so its backend
+`Drop` restores KD_TEXT/termios before the child paints), then crosses
+into the async runtime via `block_on_tui_with_poller` and calls
+`rescue::child::run_external_rescue_child`. Its sequence:
+
+```text
+// pre-fork, PID 1, safe nix wrappers (rescue::child::mount_plan):
+mkdir -p /mnt /rescue/nmbl-root /rescue/mnt
+bind        /rescue/mnt -> /rescue/mnt       // self-bind so it is a mount
+make-shared /rescue/mnt                      // MS_SHARED
+rbind       /rescue/mnt -> /mnt              // PID 1 observes the child's mounts
+rbind       /           -> /rescue/nmbl-root // expose NMBL root + TUI socket
+
+fork()
+  // child — async-signal-safe only (mirrors sys::pty):
+  chroot("/rescue"); chdir("/"); setsid()
+  open("/dev/console"); dup2 -> 0,1,2
+  execve(rescue /init, [argv0], [TERM, PATH, NMBL_TUI_SOCK])
+
+  // PID 1 — reaps the child via the poller's non-blocking
+  // waitpid(WNOHANG) op, CONCURRENTLY with the remote-attach server;
+  // on child exit it tears the binds down (lazy MNT_DETACH) and
+  // returns TerminalAction::Reboot.
 ```
 
-This replaces `pivot_root(2)`, which always returns `EINVAL` when
-the outgoing root is the initramfs rootfs pseudo-filesystem (which
-it always is in NMBL). `MS_MOVE` reassigns the new-root mount onto
-`/` atomically, detaching the initramfs; the `chroot(".")` then
-re-anchors the process's root at the squashfs's `/`. After
-`chdir("/")` resets the cwd, `execve` replaces the process image
-with the rescue shell.
+The `/mnt` shared-subtree (bind → make-shared → rbind) lets the
+child's `/mnt` mounts propagate back so PID 1 can observe them, and
+the `rbind /` → `/rescue/nmbl-root` exposes NMBL's own root inside
+the chroot — which is what makes the root-only TUI socket reachable at
+`/nmbl-root/nmbl-run/tui.sock` from within the rescue system (see
+**Async TUI and remote attach**).
 
 A subtlety: NMBL's rescue squashfs uses `pkgs.busybox-sandbox-shell`
 (a statically-linked busybox) rather than `pkgs.busybox`. The
 dynamically-linked default would carry an ELF interpreter path like
 `/nix/store/<hash>/lib/ld-musl-x86_64.so.1` that the `execve` after
-`chroot` cannot resolve — the squashfs is rooted at `/` and has no
-`/nix/store` tree. A static binary has no interpreter, so `execve`
-succeeds.
+`chroot` cannot resolve — the overlay root has no `/nix/store` tree.
+A static binary has no interpreter, so `execve` succeeds.
+
+## Async TUI and remote attach
+
+The interactive menu, the emergency recovery menu, and the chrooted
+rescue runner all share one async runtime so they can be driven
+concurrently without threads. The remote-attach half is gated behind
+the `remote-tui` Cargo feature.
+
+### Single-threaded runtime
+
+NMBL is one OS thread (PID 1, fork-safe), so the TUI runs on a tokio
+**current-thread** `LocalRuntime` (`ui/runtime.rs`): every task is
+`spawn_local`'d, no worker threads are ever spawned, and every existing
+`fork()` site stays fork-safe. The synchronous orchestrator
+(`main.rs`, `shell.rs`, the rescue dispatcher) crosses into the async
+phase through `block_on_tui` / `block_on_tui_with_poller`.
+
+Two mechanisms feed the runtime:
+
+- The `Console` trait's `poll_event` is `async`: the real backends
+  register the console fd with `tokio::io::unix::AsyncFd` and `.await`
+  readiness (`ui/console/await_fd_readable`), so the menu yields the
+  thread while idle.
+- `sys/poller` is a custom single-threaded poller for syscall-style ops
+  that have **no** async wrapper. It is `spawn_local`'d at runtime
+  startup with a 1 ms tokio-timer pacer (`TokioPacer`). Its first real
+  consumer is the rescue child reap: a non-blocking `waitpid(WNOHANG)`
+  op (`sys/poller/waitpid.rs`) lets PID 1 await the chrooted child
+  asynchronously, concurrently with the remote server.
+
+### Root-only control socket
+
+```
+ PID 1 (server)                          non-PID-1 nmbl-init (client)
+ ipc::tui_socket::bind_listener          ipc::tui_socket::connect_and_serve
+   mkdir  /nmbl-run        (0700)          open /dev/tty (controlling terminal)
+   bind   /nmbl-run/tui.sock (0600)        connect /nmbl-run/tui.sock
+        |                                  sendmsg: Handshake (TERM, winsize)
+        |                                    + SCM_RIGHTS pty fd
+        v                                          |
+ authenticate_and_receive                          |
+   SO_PEERCRED  -> uid 0 ? --no--> "N" + reason ----+--> client prints, exits 1
+        | yes                                       |
+   recvmsg pty fd + handshake                       |
+   write "K"  --------------------------------------+--> client goes quiescent,
+        |                                                 blocks on socket EOF
+        v
+ serve_session: drive an independent TUI on the received pty
+```
+
+The socket dir is `0700`, the socket `0600`, and every peer is gated by
+an `SO_PEERCRED` root check; the controlling-terminal pty is passed as
+an `SCM_RIGHTS` fd. A **non-PID-1** `nmbl-init` invocation auto-detects
+`getpid() != 1` (`main_parts/early_exit.rs`) → CLIENT mode: it connects,
+passes its controlling terminal, and goes quiescent while PID 1 drives
+an independent TUI on that pty. PID 1 itself (the boot path) never takes
+this branch.
+
+### Concurrent recovery sessions
+
+In recovery (`shell/recovery.rs`), PID 1 runs the **local** emergency
+menu AND a **remote** accept loop (`ui/remote/`) concurrently on the one
+runtime, raced with `tokio::select!`; whichever produces a
+`TerminalAction` first wins, the other is torn down, and the socket is
+unlinked. Because the recovery state (`config`, the boot error) is
+borrowed rather than `'static`, the per-connection futures cannot be
+`spawn_local`'d (that bound is `'static`); instead the accept driver
+holds the live session futures in a boxed `FuturesUnordered` and polls
+`accept`, that set, and a wakeable `Shutdown` flag together each turn. A
+stuck session just stays `Pending` and never starves `accept` — the same
+guarantee `spawn_local` would give, without `'static` and without a
+worker thread.
+
+Each remote connection gets a **fully independent** session: its own
+`SessionInteraction` latch and its own `TtyConsole` built on the
+received pty — it never touches the local console's DRM/printk/stderr.
+Within a remote session, `Ctrl+E` ends it with no action
+(`app.exit_session`), and `Ctrl+L` opens a scrollable full-boot-log
+viewer (a snapshot of the boot transcript, popped back with Esc /
+`Ctrl+L`). A render/poll error on a remote pty means the client vanished
+and just ends that session — it must never silently commit a
+machine-wide `Reboot`.
+
+### Attaching from inside the chrooted rescue
+
+Because NMBL stays PID 1 during the external rescue and rbinds `/` →
+`/rescue/nmbl-root`, the control socket is visible inside the chroot at
+`/nmbl-root/nmbl-run/tui.sock`. The rescue system's init exports
+`NMBL_TUI_SOCK=/nmbl-root/nmbl-run/tui.sock` and ships a `nmbl-tui`
+shim (a `/bin` entry onto NMBL's own static binary, which auto-detects
+non-PID-1 → client mode), so an operator who ssh'd into the running
+rescue system can attach to NMBL's live TUI while the rescue runs. The
+client resolves its socket path as `$NMBL_TUI_SOCK`, else
+`/nmbl-run/tui.sock`, else the chroot view `/nmbl-root/nmbl-run/tui.sock`.
+
+### Actions funnel back through PID 1
+
+A remote session never `execve`s in PID 1. When it picks a terminal
+action (reboot / shell / kexec) it stores the `TerminalAction` into a
+shared first-committer `ActionSink` (`Rc<RefCell<Option<…>>>`) and
+signals shutdown; the single `main::execute_terminal_action` site then
+performs the no-return syscall after the stack unwinds, exactly as it
+does for a locally-chosen action.
 
 ## Source layout
 
@@ -590,9 +719,10 @@ Rust path inside these end-to-end runs is still being expanded.
   install time from `rescue.squashfsContents` (default:
   `busybox-sandbox-shell`, `cryptsetup`, `lvm2`, `mdadm`) and stages
   it on the boot partition. The Rust /init loop-mounts it on demand
-  via `LOOP_CTL_GET_FREE` + `LOOP_CONFIGURE`, then `switch_root`s
-  into it and execs its `/bin/sh`. `rescue.mode = "none"` halts with
-  a structured banner instead.
+  via `LOOP_CTL_GET_FREE` + `LOOP_CONFIGURE`, layers a writable
+  overlay (tmpfs upper) at `/rescue`, and runs its `/init` as a
+  chrooted child while NMBL stays PID 1. `rescue.mode = "none"` halts
+  with a structured banner instead.
 - **Network rescue fallback.** `boot.nmbl.rescue.network = true`
   enables the `network-rescue` Cargo feature, bundles NIC drivers +
   DHCP + an HTTP/1.0 client, and offers an in-band download flow
