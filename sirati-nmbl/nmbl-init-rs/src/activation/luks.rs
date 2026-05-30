@@ -66,6 +66,9 @@ pub(super) async fn run_luks_with_spinner(
         cursor: 0,
         verifying: true,
         spinner_frame: 0,
+        // Display-only verifying frame; the checkbox is irrelevant here
+        // (this path never reads it back). Default unchecked.
+        select_generation: false,
     };
 
     // Paint the first verifying frame BEFORE the child starts — so the

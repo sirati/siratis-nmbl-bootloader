@@ -27,6 +27,35 @@ impl SessionInteraction {
     }
 }
 
+/// Per-boot-session "skip the generation selector" latch. Mirrors
+/// [`SessionInteraction`]: a shared `Rc<Cell<bool>>` cloned across the
+/// passphrase prompt and the post-phase selector dispatch (everything
+/// runs on the single `LocalRuntime`, so a `Cell` is enough).
+///
+/// Default = `false` = "show the selector" — today's behaviour, which
+/// is what non-LUKS boots (no passphrase prompt ever runs) and CHECKED
+/// passphrase submits both keep. Set to `true` ONLY when the operator
+/// submits the LUKS passphrase with the "Select NixOS Generation"
+/// checkbox left UNCHECKED, instructing the dispatcher to boot the
+/// default generation immediately without rendering the selector.
+#[derive(Clone, Default)]
+pub struct SkipSelector(Rc<Cell<bool>>);
+impl SkipSelector {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    #[must_use]
+    pub fn get(&self) -> bool {
+        self.0.get()
+    }
+    /// Record the operator's checkbox state at passphrase submit:
+    /// `true` ⇒ skip the selector, `false` ⇒ show it.
+    pub fn set(&self, skip: bool) {
+        self.0.set(skip);
+    }
+}
+
 /// Page size (in rows) for [`Screen::Log`] PageUp/PageDown scrolling.
 pub(crate) const LOG_PAGE: u16 = 20;
 
@@ -160,6 +189,12 @@ pub enum Screen<'a> {
         /// [`App::tick_passphrase_spinner`]. Indexes
         /// [`SPINNER_GLYPHS`] modulo [`SPINNER_FRAMES`].
         spinner_frame: u8,
+        /// "Select NixOS Generation" checkbox. Default `false`
+        /// (unchecked): on submit the generation selector is SKIPPED and
+        /// the default generation boots immediately. Toggled by Ctrl+G
+        /// while this screen is active. `true` (checked) keeps today's
+        /// behaviour — show the selector after unlock.
+        select_generation: bool,
     },
     /// Boot has failed. Show the error and let the operator pick
     /// between Reboot and Shell. Defaults are owned by the caller —

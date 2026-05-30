@@ -64,7 +64,7 @@ use std::time::Duration;
 
 pub use app::{
     App, BootStatusData, Decision, EmergencyChoice, EmergencyItem, ModalKind, Screen,
-    SessionInteraction,
+    SessionInteraction, SkipSelector,
 };
 pub(crate) use emergency::{build_emergency_app, build_message, default_items};
 pub use emergency::{

@@ -169,6 +169,7 @@ fn test_render_passphrase_dots_and_label() {
         buffer_len: 5,
         cursor_column: 5,
         caps_lock_on: false,
+        select_generation: false,
         verifying: false,
         spinner_frame: 0,
     };
@@ -198,6 +199,7 @@ fn test_render_passphrase_verifying_shows_spinner_and_label() {
             buffer_len: 8,
             cursor_column: 8,
             caps_lock_on: false,
+            select_generation: false,
             verifying: true,
             spinner_frame: frame_idx,
         };
@@ -235,6 +237,7 @@ fn test_render_passphrase_verifying_out_of_range_frame_does_not_panic() {
         buffer_len: 2,
         cursor_column: 2,
         caps_lock_on: false,
+        select_generation: false,
         verifying: true,
         spinner_frame: 99,
     };
@@ -253,6 +256,7 @@ fn test_render_passphrase_submit_hint_dim_when_buffer_empty() {
         buffer_len: 0,
         cursor_column: 0,
         caps_lock_on: false,
+        select_generation: false,
         verifying: false,
         spinner_frame: 0,
     };
@@ -269,6 +273,7 @@ fn test_render_passphrase_submit_hint_dim_when_buffer_empty() {
         buffer_len: 3,
         cursor_column: 3,
         caps_lock_on: false,
+        select_generation: false,
         verifying: false,
         spinner_frame: 0,
     };
@@ -293,6 +298,7 @@ fn test_render_passphrase_caret_tracks_cursor_column() {
         verifying: false,
         spinner_frame: 0,
         caps_lock_on: false,
+        select_generation: false,
     };
     let mut term = new_term(80, 24);
     term.draw(|f| render_passphrase(f, &data)).expect("draw");
@@ -315,6 +321,7 @@ fn test_render_passphrase_caps_lock_warning_does_not_resize_box() {
         verifying: false,
         spinner_frame: 0,
         caps_lock_on: caps,
+        select_generation: false,
     };
 
     let mut term_off = new_term(80, 24);

@@ -15,7 +15,7 @@ use crate::terminal::TerminalAction;
 use crate::ui::app::App;
 use crate::ui::console::Console;
 use crate::ui::emergency_actions::{retry_boot, surface_action_failure, verify_kexec_readiness};
-use crate::ui::{EmergencyChoice, SessionInteraction, TuiPasswordSupplier};
+use crate::ui::{EmergencyChoice, SessionInteraction, SkipSelector, TuiPasswordSupplier};
 
 /// Run one emergency-menu choice. Returns `Some(action)` when the choice
 /// is terminal (the caller should return it) or `None` when the sub-flow
@@ -50,7 +50,13 @@ pub(crate) async fn dispatch_emergency_choice(
             None
         }
         EmergencyChoice::RetryBoot => {
-            let mut supplier = TuiPasswordSupplier::new(config, session);
+            // Rescue retry always shows the selector (the operator
+            // explicitly chose "retry boot from config"), so the
+            // skip-selector latch is a fresh, never-read default here —
+            // the checkbox renders and toggles but `run_selector_and_dispatch`
+            // does not consult it.
+            let skip_selector = SkipSelector::new();
+            let mut supplier = TuiPasswordSupplier::new(config, session, &skip_selector);
             run_retry_boot_arm(config, console, app, error_count, &mut supplier, sender).await
         }
         EmergencyChoice::VerifyKexecReadiness => {
