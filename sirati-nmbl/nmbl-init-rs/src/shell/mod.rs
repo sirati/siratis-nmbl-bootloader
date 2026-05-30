@@ -62,6 +62,7 @@
 //! not to the dispatcher.
 
 mod banner;
+mod dispatch;
 mod recovery;
 #[cfg(test)]
 #[allow(
@@ -72,6 +73,7 @@ mod recovery;
 mod tests;
 
 pub use banner::{print_banner, print_halt_banner};
+pub(crate) use dispatch::dispatch_emergency_choice;
 
 use crate::config::Config;
 use crate::error::{NmblError, format_chain};
@@ -80,10 +82,9 @@ use crate::sys::poller::LocalSender;
 use crate::terminal::TerminalAction;
 use crate::ui::app::App;
 use crate::ui::console::{Console, open_console};
-use crate::ui::emergency_actions::{retry_boot, surface_action_failure, verify_kexec_readiness};
 use crate::ui::{
-    EmergencyChoice, SessionInteraction, TuiPasswordSupplier, build_emergency_app, build_message,
-    default_items, resolve_emergency_timeout,
+    SessionInteraction, build_emergency_app, build_message, default_items,
+    resolve_emergency_timeout,
 };
 
 /// Print the operator-facing emergency banner and drive the
@@ -149,218 +150,6 @@ pub async fn drop_to_emergency(
         sender,
     )
     .await
-}
-
-/// Run one emergency-menu choice. Returns `Some(action)` when the choice
-/// is terminal (the caller should return it) or `None` when the sub-flow
-/// returned control to the menu (the caller should re-show it).
-///
-/// Shared by the local re-entrant picker ([`drop_to_emergency`]) and the
-/// remote-TUI per-session loop (`crate::ui::remote`) so both paths drive
-/// exactly the same dispatch — only the [`Console`] differs (the live
-/// boot console vs. the remote operator's pty).
-pub(crate) async fn dispatch_emergency_choice(
-    choice: EmergencyChoice,
-    console: &mut dyn Console,
-    app: &mut App<'static>,
-    error_count: &mut u32,
-    config: &Config,
-    session: &SessionInteraction,
-    sender: &LocalSender,
-) -> Option<TerminalAction> {
-    match choice {
-        EmergencyChoice::Reboot => {
-            eprintln!("[nmbl] operator (or timeout) chose reboot");
-            Some(TerminalAction::Reboot)
-        }
-        EmergencyChoice::RawShell => {
-            run_raw_shell_choice(console, app, error_count, config).await;
-            // Picker session done (shell exited, detached, or cancelled); re-show menu.
-            None
-        }
-        #[cfg(feature = "pretty-shell")]
-        EmergencyChoice::PrettyShell => {
-            run_pretty_shell_choice(console, app, error_count, config).await;
-            None
-        }
-        EmergencyChoice::RetryBoot => {
-            let mut supplier = TuiPasswordSupplier::new(config, session);
-            run_retry_boot_arm(config, console, app, error_count, &mut supplier, sender).await
-        }
-        EmergencyChoice::VerifyKexecReadiness => {
-            run_verify_kexec_arm(config, console, app, error_count).await
-        }
-    }
-}
-
-/// Handle the [`EmergencyChoice::RawShell`] picker arm: run the in-process
-/// console picker session and show a toast or error modal over the emergency
-/// menu so the operator knows what happened before re-entering the loop.
-async fn run_raw_shell_choice(
-    console: &mut dyn Console,
-    app: &mut App<'static>,
-    error_count: &mut u32,
-    config: &Config,
-) {
-    match crate::ui::console_picker::run_picker_session(console, config).await {
-        Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached { targets }) => {
-            // Fire-and-forget regime: tell the operator their shell(s) have
-            // been started elsewhere so they don't wonder why the menu
-            // re-appeared unchanged. Use the overlay variant so the
-            // emergency menu remains visible behind the press-any-key toast.
-            let body = format_detached_targets(&targets);
-            let _ = crate::ui::show_modal_error_over(
-                console,
-                app,
-                "Shell spawned",
-                &body,
-                std::time::Duration::from_secs(5),
-            )
-            .await;
-        }
-        Ok(_) => {}
-        Err(e) => {
-            let chain = format_chain(&e as &dyn std::error::Error);
-            nmbl_warn!("emergency-shell picker session failed: {chain}");
-            let _ = crate::ui::show_modal_error_over(
-                console,
-                app,
-                "Emergency shell failed",
-                &chain,
-                std::time::Duration::from_secs(10),
-            )
-            .await;
-            update_latest_error(app, error_count, "Emergency shell failed", &chain);
-        }
-    }
-}
-
-/// Handle the [`EmergencyChoice::PrettyShell`] arm: launch the alacritty-backed
-/// pty terminal and show an error modal if it fails to start.
-#[cfg(feature = "pretty-shell")]
-async fn run_pretty_shell_choice(
-    console: &mut dyn Console,
-    app: &mut App<'static>,
-    error_count: &mut u32,
-    config: &Config,
-) {
-    if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(console, config).await {
-        let chain = format_chain(&e as &dyn std::error::Error);
-        nmbl_warn!("pretty-shell session failed: {chain}");
-        let _ = crate::ui::show_modal_error_over(
-            console,
-            app,
-            "Pretty Shell failed to start",
-            &chain,
-            std::time::Duration::from_secs(10),
-        )
-        .await;
-        update_latest_error(app, error_count, "Pretty Shell failed to start", &chain);
-    }
-}
-
-/// Handle the [`EmergencyChoice::RetryBoot`] picker arm. Returns `Some(action)` if
-/// the retry succeeded (caller should return it), or `None` to continue the loop.
-async fn run_retry_boot_arm(
-    config: &Config,
-    console: &mut dyn Console,
-    app: &mut App<'static>,
-    error_count: &mut u32,
-    supplier: &mut TuiPasswordSupplier,
-    sender: &LocalSender,
-) -> Option<TerminalAction> {
-    match retry_boot(config, console, app, supplier, sender).await {
-        Ok(action) => Some(action),
-        Err(e) => {
-            let title = abort_aware_title(&e, "Retry boot failed");
-            nmbl_warn!(
-                "emergency retry-boot failed: {}",
-                format_chain(&e as &dyn std::error::Error)
-            );
-            surface_action_failure(console, app, title, &e).await;
-            update_latest_error(
-                app,
-                error_count,
-                title,
-                &format_chain(&e as &dyn std::error::Error),
-            );
-            None
-        }
-    }
-}
-
-/// Handle the [`EmergencyChoice::VerifyKexecReadiness`] picker arm. Returns
-/// `Some(action)` if kexec is ready (caller should return it), or `None` to continue.
-async fn run_verify_kexec_arm(
-    config: &Config,
-    console: &mut dyn Console,
-    app: &mut App<'static>,
-    error_count: &mut u32,
-) -> Option<TerminalAction> {
-    match verify_kexec_readiness(config, console, app).await {
-        Ok(Some(action)) => Some(action),
-        Ok(None) => None,
-        Err(e) => {
-            let title = abort_aware_title(&e, "Kexec readiness check failed");
-            nmbl_warn!(
-                "emergency verify-kexec-readiness failed: {}",
-                format_chain(&e as &dyn std::error::Error)
-            );
-            surface_action_failure(console, app, title, &e).await;
-            update_latest_error(
-                app,
-                error_count,
-                title,
-                &format_chain(&e as &dyn std::error::Error),
-            );
-            None
-        }
-    }
-}
-
-/// Update the persistent emergency-screen "error" box so it always
-/// reflects the *most recent* failure rather than latching the
-/// original boot error for the rest of the session. The transient
-/// modal that just flashed the failure auto-dismisses; without this
-/// the operator would be left staring at the first error again, with
-/// no trace of what actually went wrong (e.g. a failed Raw Shell).
-///
-/// `count` is bumped per call and rendered so repeated failures are
-/// visible at a glance; the freshest chain is shown in full underneath.
-fn update_latest_error(app: &mut App<'static>, count: &mut u32, title: &str, chain: &str) {
-    *count = count.saturating_add(1);
-    let message =
-        format!("Latest error (#{count}): {title}\n\n{chain}\n\nChoose what to do next.",);
-    app.set_emergency_message(message);
-}
-
-/// Render the "Shell spawned on …" body for the fire-and-forget
-/// success modal. Single target → `Shell spawned on /dev/X`; multiple
-/// → comma-separated. Keeps the message single-line so the modal stays
-/// readable on serial.
-fn format_detached_targets(targets: &[std::path::PathBuf]) -> String {
-    let joined = targets
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("Shell spawned on {joined}")
-}
-
-/// Pick the modal title shown when an emergency action returns an
-/// error. The operator-abort path uses a distinct "Aborted by operator"
-/// banner so the modal reads naturally ("you pressed Esc") instead of
-/// the generic action-failed banner that would otherwise apply.
-///
-/// `OperatorAborted` can surface from any emergency action that
-/// internally calls `wait_for` (Retry boot, Kexec readiness check on a
-/// future code path) — funneling the rename here means the call sites
-/// don't have to duplicate the `matches!` check.
-fn abort_aware_title(err: &NmblError, default: &'static str) -> &'static str {
-    match err {
-        NmblError::OperatorAborted { .. } => "Aborted by operator",
-        _ => default,
-    }
 }
 
 /// Open a fresh tty console (panic-recovery mode skips splash) and
