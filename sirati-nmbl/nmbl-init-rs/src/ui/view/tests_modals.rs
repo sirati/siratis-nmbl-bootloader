@@ -247,16 +247,20 @@ fn test_render_boot_status_spinner_advances_with_frame() {
 
 #[test]
 fn test_render_boot_status_shows_esc_to_abort_hint() {
-    // The "Esc to abort" hint must always be present on the
-    // BootStatus screen so the operator knows the wait is
-    // interruptible without having to read the docs.
+    // The wait hint must always be present on the BootStatus screen so
+    // the operator knows the wait is interruptible (Esc) AND that the
+    // boot log is reachable (Ctrl+L) without having to read the docs.
     let data = boot_status_data("phase 3b: waiting", &["mount /proc"], 0);
     let mut term = new_term(80, 24);
     term.draw(|f| render_boot_status(f, &data)).expect("draw");
     let text = buffer_text(&term);
     assert!(
-        text.contains("Esc to abort"),
-        "missing 'Esc to abort' hint in:\n{text}"
+        text.contains("Esc abort"),
+        "missing 'Esc abort' hint in:\n{text}"
+    );
+    assert!(
+        text.contains("Ctrl+L logs"),
+        "missing 'Ctrl+L logs' hint in:\n{text}"
     );
 }
 
@@ -282,14 +286,14 @@ fn test_render_boot_status_esc_hint_is_bottom_right_of_log_panel() {
         .get(hint_row_idx)
         .expect("hint row must exist in 24-row term");
     assert!(
-        hint_row.contains("Esc to abort"),
+        hint_row.contains("Esc abort"),
         "hint missing on expected row {hint_row_idx}: {hint_row:?}"
     );
     // Right alignment: the hint should sit near the right border,
-    // not the left. Specifically, the column where "Esc to abort"
-    // starts should be well past column 40 (mid-width on an 80-col
-    // terminal).
-    let hint_col = hint_row.find("Esc to abort").expect("hint substring");
+    // not the left. The hint string now leads with "Ctrl+L logs", so
+    // pin that the right-aligned block reaches the right edge — the
+    // trailing "Esc abort" must start past mid-width (col 40).
+    let hint_col = hint_row.find("Esc abort").expect("hint substring");
     assert!(
         hint_col > 40,
         "hint must be right-aligned (col {hint_col} should exceed 40): {hint_row:?}"

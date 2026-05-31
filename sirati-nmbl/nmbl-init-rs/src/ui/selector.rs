@@ -36,7 +36,7 @@ pub async fn run_selector(
 /// TUI event loop. Backend-agnostic: every render and key-poll goes
 /// through the [`Console`] trait. Hosts the countdown, the List/Editing
 /// state machine, and the timeout-defaults-to-active-profile rule.
-async fn run_selector_on_console(
+pub(crate) async fn run_selector_on_console(
     config: &Config,
     generations: &[Generation],
     console: &mut dyn Console,
@@ -79,31 +79,74 @@ async fn run_selector_on_console(
     //    rewriting the loop. Driven via `poll_event` so a host-reported
     //    `CSI 8;rows;cols t` resize redraws the picker against the new
     //    grid instead of stranding the old layout.
+    //
+    //    Input is *coalesced*: once the blocking poll surfaces an event we
+    //    keep draining every already-ready event with a zero timeout and
+    //    apply each to the App *before* a single redraw. A burst or a held
+    //    arrow key (the log viewer's worst case — holding Down through a
+    //    multi-thousand-line kernel log) thus collapses to ONE frame at the
+    //    final offset instead of one full-screen redraw + framebuffer flush
+    //    per keystroke. The `dirty` flag still skips the redraw entirely
+    //    when nothing changed state, so we never blit an unchanged frame.
+    //
+    //    On TOP of dirty: a 30 fps cap (`FRAME_INTERVAL`). A frame paints
+    //    only when `dirty` AND at least `FRAME_INTERVAL` has elapsed since
+    //    the last render, so a fast input burst can dirty the App many
+    //    times but repaints no more than 30×/s. When a change is pending
+    //    but the interval has not elapsed, the first poll's wait is bounded
+    //    to the time left until the next allowed render, so the loop wakes
+    //    by that deadline and the final state paints within ~33 ms — the
+    //    last frame after a burst is never dropped.
     let mut dirty = true;
+    // Seed so the very first pass renders immediately (interval already
+    // satisfied) instead of waiting out a frame interval before the
+    // initial paint.
+    let mut last_render = Instant::now()
+        .checked_sub(FRAME_INTERVAL)
+        .unwrap_or_else(Instant::now);
     loop {
-        if dirty {
+        let gate = render_gate(dirty, last_render, Instant::now());
+        if gate.render {
             console.render(&app)?;
+            last_render = Instant::now();
             dirty = false;
         }
-        match console.poll_event(POLL_SLICE).await? {
-            Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
-                dirty = true;
-            }
-            Some(crate::ui::console::ConsoleEvent::Key(key)) => {
-                if app.on_key(key) {
-                    break;
+        // Block for the first event, bounded by the frame-render deadline
+        // when a paint is pending, then drain the rest of the ready burst
+        // non-blockingly so they all land in one frame.
+        let mut timeout = gate.wait;
+        loop {
+            match console.poll_event(timeout).await? {
+                Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
+                    dirty = true;
                 }
-                dirty = true;
+                Some(crate::ui::console::ConsoleEvent::Key(key)) => {
+                    if app.on_key(key) {
+                        // A Decision (or screen pop) committed; stop
+                        // draining and let the outer loop notice.
+                        break;
+                    }
+                    dirty = true;
+                }
+                // No scrollback on the selector screen; ignore wheel
+                // notches. `UserHasInteracted` only matters during the
+                // countdown phase (already past here); in the event loop
+                // the real key that follows it does the work, so the
+                // notice is a no-op.
+                Some(
+                    crate::ui::console::ConsoleEvent::Scroll { .. }
+                    | crate::ui::console::ConsoleEvent::UserHasInteracted,
+                ) => {}
+                // No more events ready right now — break out and redraw
+                // once if anything changed.
+                None => break,
             }
-            // No scrollback on the selector screen; ignore wheel notches.
-            // `UserHasInteracted` only matters during the countdown phase
-            // (already past here); in the event loop the real key that
-            // follows it does the work, so the notice is a no-op.
-            Some(
-                crate::ui::console::ConsoleEvent::Scroll { .. }
-                | crate::ui::console::ConsoleEvent::UserHasInteracted,
-            )
-            | None => {}
+            if app.decision.is_some() {
+                break;
+            }
+            // Subsequent drains must not block: only fold in events that
+            // are already queued so we don't stall waiting for more input.
+            timeout = std::time::Duration::ZERO;
         }
         if app.decision.is_some() {
             break;
@@ -113,6 +156,58 @@ async fn run_selector_on_console(
     app.decision.ok_or_else(|| NmblError::Tui {
         source: std::io::Error::other("selector exited without decision"),
     })
+}
+
+/// Minimum wall-time between two consecutive screen renders: a 30 fps
+/// cap (~33.33 ms). Composed with the `dirty` flag so the event loop
+/// renders at most 30 times a second AND only when state changed.
+const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
+
+/// Decision of the frame-rate gate for one event-loop pass.
+struct RenderGate {
+    /// Whether a frame should be painted this pass.
+    render: bool,
+    /// Upper bound for the *first* `poll_event` wait this pass. When a
+    /// change is pending but the frame interval has not elapsed yet, this
+    /// shrinks below `POLL_SLICE` to the time left until the next allowed
+    /// render, so the loop wakes by that deadline and paints the pending
+    /// frame even if no further input arrives. Otherwise it is `POLL_SLICE`.
+    wait: Duration,
+}
+
+/// Compose the 30 fps cap with the `dirty` flag for a single loop pass.
+///
+/// `now` is passed in (rather than read from the clock here) so the gate
+/// is a pure function the tests drive against a controlled monotonic
+/// timeline without real sleeps. `last_render` is the [`Instant`] the
+/// previous frame was painted at.
+///
+/// * not dirty            ⇒ never render; full `POLL_SLICE` wait.
+/// * dirty, interval up   ⇒ render this pass; full `POLL_SLICE` wait.
+/// * dirty, interval left ⇒ don't render yet, but bound the wait to the
+///   remaining time so the deadline wakes us to paint the final frame.
+fn render_gate(dirty: bool, last_render: Instant, now: Instant) -> RenderGate {
+    if !dirty {
+        return RenderGate {
+            render: false,
+            wait: POLL_SLICE,
+        };
+    }
+    let elapsed = now.duration_since(last_render);
+    if elapsed >= FRAME_INTERVAL {
+        RenderGate {
+            render: true,
+            wait: POLL_SLICE,
+        }
+    } else {
+        // Wake by the next-render deadline so the pending change still
+        // paints once the interval passes, even with no new input.
+        let remaining = FRAME_INTERVAL - elapsed;
+        RenderGate {
+            render: false,
+            wait: POLL_SLICE.min(remaining),
+        }
+    }
 }
 
 /// Remaining whole seconds, rounded UP, for the countdown header.
@@ -193,7 +288,11 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{Decision, run_console_countdown, run_selector_on_console};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        Decision, FRAME_INTERVAL, render_gate, run_console_countdown, run_selector_on_console,
+    };
     use crate::config::Config;
     use crate::error::Result;
     use crate::generations::Generation;
@@ -309,6 +408,113 @@ mod tests {
         }
     }
 
+    /// Console double that counts `render` calls and replays a canned
+    /// burst of events. Every event is "already ready": `poll_event`
+    /// returns one per call regardless of the timeout (so a held-key
+    /// burst is fully queued), letting the loop's coalescing fold the
+    /// whole burst into a single redraw. Once drained it yields `None`.
+    struct RenderCountingConsole {
+        keys: VecDeque<KeyEvent>,
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl RenderCountingConsole {
+        fn new(keys: Vec<KeyEvent>) -> (Self, std::rc::Rc<std::cell::Cell<usize>>) {
+            let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+            (
+                Self {
+                    keys: keys.into(),
+                    renders: std::rc::Rc::clone(&renders),
+                },
+                renders,
+            )
+        }
+    }
+
+    impl Console for RenderCountingConsole {
+        fn render(&mut self, _app: &App<'_>) -> Result<()> {
+            self.renders.set(self.renders.get() + 1);
+            Ok(())
+        }
+        fn poll_event<'a>(
+            &'a mut self,
+            timeout: std::time::Duration,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>> {
+            Box::pin(async move { self.poll_event_blocking(timeout) })
+        }
+        fn poll_event_blocking(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<ConsoleEvent>> {
+            Ok(self.keys.pop_front().map(ConsoleEvent::Key))
+        }
+        fn size(&self) -> (u16, u16) {
+            (80, 24)
+        }
+        fn kind(&self) -> ConsoleKind {
+            ConsoleKind::Tty
+        }
+        fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
+            Ok(())
+        }
+        fn suspend(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn event_loop_coalesces_scroll_burst_into_few_redraws() {
+        // A held arrow key in the log viewer is the lag's worst case: the
+        // old loop drew + flushed one full frame per keystroke. The
+        // coalescing loop drains the whole ready burst before a single
+        // redraw, so M scroll events must collapse to far fewer than M
+        // renders. We drive: open the log viewer (Ctrl+L), a burst of
+        // Down presses, close it (Esc), then Enter to boot — all events
+        // pre-queued so they are "ready" together.
+        let cfg: Config = toml::from_str("").expect("default cfg");
+        let gens = vec![sel_gen(1)];
+        // Skip the countdown phase so we exercise the event loop directly.
+        let session = SessionInteraction::new();
+        session.set();
+
+        const BURST: usize = 200;
+        let mut script = Vec::with_capacity(BURST + 3);
+        script.push(ctrl(KeyCode::Char('l')));
+        for _ in 0..BURST {
+            script.push(press(KeyCode::Down));
+        }
+        script.push(press(KeyCode::Esc));
+        script.push(press(KeyCode::Enter));
+
+        let (mut console, renders) = RenderCountingConsole::new(script);
+        let decision = block(run_selector_on_console(
+            &cfg,
+            &gens,
+            &mut console,
+            0,
+            &session,
+        ))
+        .expect("decision");
+        assert!(matches!(decision, Decision::Boot { .. }));
+
+        // The whole pre-queued burst drains in one inner-loop pass, so the
+        // only redraw is the initial frame painted before the first poll.
+        // Far below the old one-redraw-per-keystroke cost (which would be
+        // > BURST renders).
+        let count = renders.get();
+        assert!(
+            count <= 2,
+            "coalescing must collapse a {BURST}-event burst to ≤2 redraws, got {count}"
+        );
+    }
+
     #[test]
     fn countdown_cancel_records_operator_presence() {
         // A keypress during the countdown is operator presence. The
@@ -334,5 +540,68 @@ mod tests {
             session.get(),
             "cancelling the countdown must latch operator presence"
         );
+    }
+
+    // The frame-rate gate is a pure function of (dirty, last_render, now),
+    // so these tests drive a controlled monotonic timeline (a base
+    // `Instant` plus deltas) and assert the gate decision directly — no
+    // real sleeps, fully deterministic.
+
+    #[test]
+    fn gate_renders_once_when_dirty_and_interval_elapsed() {
+        // dirty + interval elapsed ⇒ render this pass; full POLL_SLICE wait
+        // (the caller resets last_render and clears dirty on render).
+        let last = Instant::now();
+        let now = last + FRAME_INTERVAL;
+        let gate = render_gate(true, last, now);
+        assert!(gate.render, "interval has elapsed, must render");
+        assert_eq!(gate.wait, super::POLL_SLICE);
+    }
+
+    #[test]
+    fn gate_holds_render_and_bounds_wait_before_interval() {
+        // dirty + interval NOT elapsed ⇒ no render this pass, and the poll
+        // wait is bounded to the remaining time until the next allowed
+        // render (≤ the remaining interval, and ≤ POLL_SLICE).
+        let last = Instant::now();
+        let elapsed = FRAME_INTERVAL / 3;
+        let now = last + elapsed;
+        let remaining = FRAME_INTERVAL - elapsed;
+        let gate = render_gate(true, last, now);
+        assert!(!gate.render, "interval not elapsed yet, must not render");
+        assert!(
+            gate.wait <= remaining,
+            "wait {:?} must be bounded to remaining {:?}",
+            gate.wait,
+            remaining
+        );
+        assert!(gate.wait <= super::POLL_SLICE);
+    }
+
+    #[test]
+    fn gate_paints_pending_frame_once_interval_passes_without_input() {
+        // dirty + interval not elapsed, then time advances past the
+        // interval with NO new events ⇒ the pending frame renders. This is
+        // the deadline guarantee: the final state after a burst is never
+        // lost.
+        let last = Instant::now();
+        // First pass: too early, held.
+        let early = render_gate(true, last, last + FRAME_INTERVAL / 2);
+        assert!(!early.render);
+        // Time advances past the interval (the bounded wait woke us); still
+        // dirty, no new input ⇒ now it paints.
+        let late = render_gate(true, last, last + FRAME_INTERVAL + Duration::from_millis(1));
+        assert!(late.render, "pending frame must paint once interval passes");
+    }
+
+    #[test]
+    fn gate_never_renders_when_not_dirty() {
+        // not dirty ⇒ never render regardless of how much time elapsed,
+        // and the wait stays the full POLL_SLICE (no deadline to chase).
+        let last = Instant::now();
+        let way_past = last + FRAME_INTERVAL * 100;
+        let gate = render_gate(false, last, way_past);
+        assert!(!gate.render, "nothing changed, must never render");
+        assert_eq!(gate.wait, super::POLL_SLICE);
     }
 }

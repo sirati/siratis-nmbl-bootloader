@@ -23,6 +23,8 @@
 
 use std::time::Duration;
 
+use ratatui::widgets::Clear;
+
 use crate::activation::{KeyInjection, PasswordSupplier, run_all_activations};
 use crate::boot::kexec_into;
 use crate::config::Config;
@@ -38,6 +40,22 @@ use crate::ui::{
     BootReporter, ConfirmOutcome, Decision, run_selector, show_modal_confirm_over,
     show_modal_error_over,
 };
+
+/// Blank the whole console before handing off from the emergency menu
+/// to the selector.
+///
+/// The emergency menu paints a red `error` block top-left and a white
+/// selected-action line; the selector that follows only repaints the
+/// cells its own widgets touch. On the diff-rendering tty/serial
+/// backend that leaves the menu's stale cells showing through the new
+/// screen. The clean menu exits already reset the display — Raw/Pretty
+/// Shell suspend+resume the console (`terminal.clear()`), Ctrl+L's log
+/// viewer fills the frame — so this mirrors them with a full-area
+/// `Clear` (the same widget the modals use to punch a hole) right
+/// before the selector's first render.
+fn clear_console(console: &mut dyn Console) -> Result<()> {
+    console.draw_with(&mut |frame| frame.render_widget(Clear, frame.area()))
+}
 
 /// Re-run phases 3 → 5 from the emergency screen and return whatever
 /// [`TerminalAction`] the selector produces.
@@ -154,6 +172,10 @@ pub async fn verify_kexec_readiness(
             // In-runtime: build the genuine system-ops impl so the kexec
             // load + teardown route through the same seam as the main spine.
             let mut ops = RealSys::new(sender);
+            // Blank the boot-failed menu (and the just-dismissed confirm
+            // modal) before the selector's first render so neither bleeds
+            // through on the diff-rendering tty/serial backend.
+            clear_console(console)?;
             let decision = run_selector(config, &generations, console, &app.interaction).await?;
             Ok(Some(decision_to_action(
                 &mut ops,
@@ -181,6 +203,9 @@ async fn run_selector_and_dispatch<S: SysOps>(
         let mut reporter = BootReporter::overlay(console, app, "phase 4: scan generations (retry)");
         scan_generations(config, &mut reporter)?
     };
+    // Blank the boot-failed menu before the selector's first render so
+    // its red `error` block / selected-action line don't bleed through.
+    clear_console(console)?;
     let decision = run_selector(config, &generations, console, &app.interaction).await?;
     decision_to_action(ops, config, &generations, injections, decision)
 }
@@ -253,8 +278,126 @@ pub async fn surface_action_failure(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::pin::Pin;
+
+    use ratatui::Terminal;
+    use ratatui::backend::{Backend, TestBackend};
 
     use crate::generations::Generation;
+    use crate::ui::app::SessionInteraction;
+    use crate::ui::console::{ConsoleEvent, ConsoleKind};
+    use crate::ui::{build_emergency_app, default_items};
+
+    /// Minimal [`Console`] over a ratatui [`TestBackend`] so a test can
+    /// render a screen and then inspect the resulting cell buffer.
+    /// `render` and `draw_with` both go through `terminal.draw`, exactly
+    /// like the real tty/mock backends, so [`clear_console`] exercises
+    /// the same diff-render path that produced the bleed bug.
+    struct BufferConsole {
+        terminal: Terminal<TestBackend>,
+    }
+
+    impl BufferConsole {
+        fn new(w: u16, h: u16) -> Self {
+            Self {
+                terminal: Terminal::new(TestBackend::new(w, h)).expect("test terminal"),
+            }
+        }
+
+        /// True if every cell is the default blank: a single space with
+        /// no fg/bg colour and no modifiers. A residual emergency cell
+        /// (the red "boot failed" header, the bordered "error" block,
+        /// the highlighted action line) fails this.
+        fn is_blank(&self) -> bool {
+            let buf = self.terminal.backend().buffer();
+            buf.content().iter().all(|cell| {
+                cell.symbol() == " "
+                    && cell.fg == ratatui::style::Color::Reset
+                    && cell.bg == ratatui::style::Color::Reset
+                    && cell.modifier.is_empty()
+            })
+        }
+
+        fn dump(&self) -> String {
+            let buf = self.terminal.backend().buffer();
+            buf.content().iter().map(|c| c.symbol()).collect()
+        }
+    }
+
+    impl Console for BufferConsole {
+        fn render(&mut self, app: &App<'_>) -> Result<()> {
+            // TestBackend's draw is infallible; surface a clean unwrap.
+            self.terminal
+                .draw(|f| crate::ui::render_current_screen(f, app))
+                .expect("TestBackend render");
+            Ok(())
+        }
+        fn poll_event<'a>(
+            &'a mut self,
+            _timeout: Duration,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>> {
+            Box::pin(async move { Ok(None) })
+        }
+        fn poll_event_blocking(&mut self, _timeout: Duration) -> Result<Option<ConsoleEvent>> {
+            Ok(None)
+        }
+        fn size(&self) -> (u16, u16) {
+            match self.terminal.backend().size() {
+                Ok(s) => (s.width, s.height),
+                Err(_) => (0, 0),
+            }
+        }
+        fn kind(&self) -> ConsoleKind {
+            ConsoleKind::Tty
+        }
+        fn draw_with(&mut self, body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
+            self.terminal
+                .draw(|f| body(f))
+                .expect("TestBackend draw_with");
+            Ok(())
+        }
+        fn suspend(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The two emergency actions (retry boot, verify kexec readiness)
+    /// must blank the boot-failed menu before they render the selector,
+    /// or the menu's red header / bordered "error" block / highlighted
+    /// action line bleed through on the diff-rendering backend. Pin the
+    /// `clear_console` helper they both call: after it runs, no
+    /// emergency-screen cell survives.
+    #[test]
+    fn clear_console_blanks_residual_emergency_cells() {
+        let session = SessionInteraction::new();
+        let items = default_items();
+        let app = build_emergency_app("boot phase failed: disk offline", &items, &session);
+
+        let mut console = BufferConsole::new(80, 24);
+        // Paint the emergency screen, exactly what the operator sees
+        // behind the menu before picking retry / verify.
+        console.render(&app).expect("render emergency screen");
+        assert!(
+            !console.is_blank(),
+            "emergency screen must paint visible chrome before the clear"
+        );
+        assert!(
+            console.dump().contains("boot failed"),
+            "sanity: the red header is on screen pre-clear"
+        );
+
+        // The transition the two fixed actions perform before run_selector.
+        clear_console(&mut console).expect("clear_console");
+
+        assert!(
+            console.is_blank(),
+            "no emergency-screen cell may survive the clear:\n{}",
+            console.dump()
+        );
+    }
 
     fn fake_gen(number: u32) -> Generation {
         Generation {

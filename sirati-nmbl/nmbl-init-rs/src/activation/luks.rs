@@ -1,5 +1,7 @@
 //! LUKS-specific helpers: verifying-spinner runner and wrong-password modal.
 
+use std::time::Duration;
+
 use crate::config::{Activation, Config};
 use crate::error::Result;
 use crate::generations::Generation;
@@ -9,6 +11,11 @@ use crate::ui::app::{App, Screen};
 use crate::ui::console::Console;
 
 use super::helpers::wrap_runner_error;
+
+/// Non-blocking input slice polled on each verifying-spinner tick so a
+/// Ctrl+L / Esc lands within ~one frame without slowing the reap. Short
+/// enough that the `TICK_INTERVAL`-driven spinner cadence is unaffected.
+const VERIFY_INPUT_SLICE: Duration = Duration::from_millis(0);
 
 /// Resolved outcome of [`handle_wrong_password`]. Distinct from
 /// [`crate::ui::WrongPasswordOutcome`] (the modal-level reply) because
@@ -77,7 +84,19 @@ pub(super) async fn run_luks_with_spinner<S: ExecOps>(
     let _ = console.render(&app);
 
     let tick = |c: &mut dyn Console, a: &mut App<'_>| {
-        a.tick_passphrase_spinner();
+        // Service input WHILE cryptsetup verifies so Ctrl+L still opens
+        // the boot-log viewer (and Esc closes it) instead of the operator
+        // staring at a spinner they can't escape. We route through the
+        // shared `on_key` dispatch — the same one the selector uses — so
+        // Ctrl+L toggles `Screen::Log` over the verifying modal. The
+        // passphrase-spinner only advances while the log is NOT open so
+        // the operator can read it without the frame flickering back.
+        if let Ok(Some(key)) = c.poll_key(VERIFY_INPUT_SLICE) {
+            a.on_key(key);
+        }
+        if !matches!(a.screen, Screen::Log { .. }) {
+            a.tick_passphrase_spinner();
+        }
         let _ = c.render(a);
     };
 
@@ -106,10 +125,24 @@ pub(super) async fn run_luks_with_spinner<S: ExecOps>(
         .await
         .map_err(|source| wrap_runner_error(activation, source))?;
 
+    // If the operator opened the log viewer (Ctrl+L) during verification
+    // and never closed it, the App is parked on `Screen::Log` rather than
+    // the passphrase modal. Pop it back so `set_passphrase_verifying`
+    // (which is a no-op / debug-asserts off the passphrase screen) lands
+    // on the right screen and the next transition starts clean.
+    if matches!(app.screen, Screen::Log { .. })
+        && let Some(prev) = app.return_screen.take()
+    {
+        app.screen = *prev;
+    }
+
     // Done verifying — clear the overlay and repaint once so the next
     // screen transition (success → boot-status; wrong-pw → modal) starts
-    // from a clean slate.
-    app.set_passphrase_verifying(false);
+    // from a clean slate. Guard the setter: a degraded path could leave
+    // the App off the passphrase screen, and the setter debug-asserts.
+    if matches!(app.screen, Screen::Passphrase { .. }) {
+        app.set_passphrase_verifying(false);
+    }
     let _ = console.render(&app);
 
     Ok(outcome)

@@ -43,24 +43,4 @@ pub trait ProgressSink {
     /// concurrent work; it must never block on input. Render errors are
     /// swallowed for the same reason as [`ProgressSink::tick`].
     fn render_phase(&mut self, phase: &str);
-
-    /// Non-blocking async Esc-abort poll for the device wait.
-    ///
-    /// Awaits the backend's async `poll_event` for up to `timeout` and
-    /// returns `true` iff the operator pressed Esc within that window.
-    /// `devices::wait_for` races this against a guaranteed `POLL_INTERVAL`
-    /// floor sleep so a stuck wait aborts early on Esc while the floor —
-    /// not this future — pins the inter-poll cadence (a backend whose
-    /// `poll_event` ignores its timeout could otherwise busy-spin).
-    ///
-    /// Cancel-safe: the future only `.await`s the backend's own
-    /// cancel-safe `poll_event` and never consumes a byte it would then
-    /// drop, so a `tokio::select!` that drops it loses nothing — the next
-    /// iteration polls afresh. Non-Esc input is swallowed (the operator is
-    /// not expected to type during a device wait). The boxed return type
-    /// keeps [`ProgressSink`] object-safe.
-    fn poll_abort<'a>(
-        &'a mut self,
-        timeout: std::time::Duration,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + 'a>>;
 }
