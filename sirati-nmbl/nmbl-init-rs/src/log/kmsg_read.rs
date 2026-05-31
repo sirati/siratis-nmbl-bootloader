@@ -28,14 +28,73 @@ const MAX_RECORDS: usize = 100_000;
 /// Read and format the kernel ring buffer into display lines (oldest
 /// first), or a single explanatory line on failure.
 ///
+/// Called ONCE per viewer-open / Ctrl+K toggle — never per scroll or per
+/// render frame: the result is cached in `Screen::Log { lines }` and
+/// every subsequent scroll/redraw reads only that cached buffer. Draining
+/// and parsing the whole `/dev/kmsg` ring (thousands of records, `\xNN`
+/// unescaping) is O(buffer), so doing it per keystroke would make scroll
+/// laggy; the snapshot-once rule keeps it cheap.
+///
 /// Always returns at least one line so the viewer never renders an empty
 /// box with no explanation.
 #[must_use]
 pub fn snapshot_kernel() -> Vec<String> {
-    match read_dev_kmsg() {
+    match read_kmsg_raw() {
         Ok(raw) if raw.is_empty() => vec!["(kernel log is empty)".to_owned()],
         Ok(raw) => parse_kmsg(&raw),
         Err(e) => vec![format!("kernel log unavailable: {e}")],
+    }
+}
+
+/// Boxed fake raw-reader installed by [`set_raw_reader_for_test`].
+#[cfg(test)]
+type RawReaderFn = Box<dyn FnMut() -> std::io::Result<String>>;
+
+// Source of the raw `/dev/kmsg` byte stream. In production this always
+// opens and drains the real device; tests install a fake via
+// `set_raw_reader_for_test` so the snapshot-once contract can be asserted
+// without a real kernel ring buffer.
+#[cfg(test)]
+thread_local! {
+    static RAW_READER_OVERRIDE: std::cell::RefCell<Option<RawReaderFn>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Fetch the raw record stream, honouring a test override when one is
+/// installed. Production builds compile straight to [`read_dev_kmsg`].
+fn read_kmsg_raw() -> std::io::Result<String> {
+    #[cfg(test)]
+    {
+        let overridden =
+            RAW_READER_OVERRIDE.with(|cell| cell.borrow_mut().as_mut().map(|reader| reader()));
+        if let Some(result) = overridden {
+            return result;
+        }
+    }
+    read_dev_kmsg()
+}
+
+/// Install a fake raw-reader for the current thread, returning a guard
+/// that uninstalls it on drop. Each call to [`snapshot_kernel`] invokes
+/// the closure exactly once, so a counting closure proves the snapshot is
+/// taken once per open/toggle and NOT re-read on scroll or render.
+#[cfg(test)]
+pub(crate) fn set_raw_reader_for_test(
+    reader: impl FnMut() -> std::io::Result<String> + 'static,
+) -> RawReaderGuard {
+    RAW_READER_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(Box::new(reader)));
+    RawReaderGuard
+}
+
+/// Drops the thread-local raw-reader override installed by
+/// [`set_raw_reader_for_test`].
+#[cfg(test)]
+pub(crate) struct RawReaderGuard;
+
+#[cfg(test)]
+impl Drop for RawReaderGuard {
+    fn drop(&mut self) {
+        RAW_READER_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
     }
 }
 

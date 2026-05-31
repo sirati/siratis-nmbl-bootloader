@@ -230,6 +230,73 @@ fn ctrl_k_toggles_log_source_and_resets_scroll() {
 }
 
 #[test]
+fn kernel_snapshot_taken_once_not_per_scroll() {
+    // Regression: scrolling the kernel-log view must operate purely on
+    // the cached snapshot. Draining + parsing /dev/kmsg per keystroke is
+    // O(buffer) and made the kernel view laggy. Install a counting fake
+    // raw-reader, toggle to kernel mode (one read), fire a burst of
+    // scroll events, and assert the reader was invoked exactly once.
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let calls = Rc::new(Cell::new(0usize));
+    let calls_in_closure = Rc::clone(&calls);
+    let _guard = crate::log::set_raw_reader_for_test(move || {
+        calls_in_closure.set(calls_in_closure.get() + 1);
+        Ok("6,1,0,-;kernel line one\n6,2,1000000,-;kernel line two\n".to_owned())
+    });
+
+    let gens = vec![fake_gen(1, &[])];
+    let mut app = App::new(&gens);
+
+    // Open the viewer (NMBL log — does not touch the kernel reader).
+    app.on_key(ctrl(KeyCode::Char('l')));
+    assert_eq!(calls.get(), 0, "opening the NMBL log must not read kmsg");
+
+    // Ctrl+K snapshots the kernel ring buffer exactly once.
+    app.on_key(ctrl(KeyCode::Char('k')));
+    assert!(matches!(
+        app.screen,
+        Screen::Log {
+            source: LogSource::Kernel,
+            ..
+        }
+    ));
+    assert_eq!(calls.get(), 1, "Ctrl+K snapshots the kernel log once");
+
+    // A burst of scroll events must NOT re-invoke the reader.
+    for key in [
+        KeyCode::Down,
+        KeyCode::Down,
+        KeyCode::PageDown,
+        KeyCode::Up,
+        KeyCode::PageUp,
+        KeyCode::End,
+        KeyCode::Home,
+    ] {
+        app.on_key(press(key));
+    }
+    assert_eq!(
+        calls.get(),
+        1,
+        "scrolling the kernel log must reuse the cached snapshot, not re-read kmsg"
+    );
+
+    // The cached lines are the parsed snapshot, proving scroll reads the
+    // cache rather than an empty/placeholder buffer.
+    match &app.screen {
+        Screen::Log { lines, .. } => assert_eq!(
+            lines,
+            &vec![
+                "[    0.000000] kernel line one".to_owned(),
+                "[    1.000000] kernel line two".to_owned(),
+            ]
+        ),
+        _ => panic!("expected Screen::Log after Ctrl+K"),
+    }
+}
+
+#[test]
 fn ctrl_k_is_a_noop_outside_the_log_viewer() {
     let gens = vec![fake_gen(1, &[])];
     let mut app = App::new(&gens);
