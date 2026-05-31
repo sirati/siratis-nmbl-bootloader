@@ -189,35 +189,259 @@ fn ctrl_l_opens_log_and_esc_returns() {
 }
 
 #[test]
+fn ctrl_k_toggles_log_source_and_resets_scroll() {
+    let gens = vec![fake_gen(1, &[])];
+    let mut app = App::new(&gens);
+
+    // Open the viewer: defaults to NMBL's own log.
+    app.on_key(ctrl(KeyCode::Char('l')));
+    assert!(matches!(
+        app.screen,
+        Screen::Log {
+            source: LogSource::Nmbl,
+            ..
+        }
+    ));
+
+    // Scroll down so we can prove Ctrl+K resets the offset. Down also
+    // leaves follow-bottom mode.
+    app.on_key(press(KeyCode::Down));
+    assert!(
+        matches!(&app.screen, Screen::Log { offset, follow_bottom, .. }
+        if offset.get() == 1 && !follow_bottom.get())
+    );
+
+    // Ctrl+K flips to the kernel ring buffer and re-pins to the bottom
+    // (offset reset to 0, follow_bottom re-armed).
+    app.on_key(ctrl(KeyCode::Char('k')));
+    assert!(matches!(&app.screen,
+        Screen::Log {
+            source: LogSource::Kernel,
+            offset,
+            follow_bottom,
+            ..
+        } if offset.get() == 0 && follow_bottom.get()));
+
+    // Ctrl+K again flips back to NMBL's log.
+    app.on_key(ctrl(KeyCode::Char('k')));
+    assert!(matches!(
+        app.screen,
+        Screen::Log {
+            source: LogSource::Nmbl,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn kernel_snapshot_taken_once_not_per_scroll() {
+    // Regression: scrolling the kernel-log view must operate purely on
+    // the cached snapshot. Draining + parsing /dev/kmsg per keystroke is
+    // O(buffer) and made the kernel view laggy. Install a counting fake
+    // raw-reader, toggle to kernel mode (one read), fire a burst of
+    // scroll events, and assert the reader was invoked exactly once.
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let calls = Rc::new(Cell::new(0usize));
+    let calls_in_closure = Rc::clone(&calls);
+    let _guard = crate::log::set_raw_reader_for_test(move || {
+        calls_in_closure.set(calls_in_closure.get() + 1);
+        Ok("6,1,0,-;kernel line one\n6,2,1000000,-;kernel line two\n".to_owned())
+    });
+
+    let gens = vec![fake_gen(1, &[])];
+    let mut app = App::new(&gens);
+
+    // Open the viewer (NMBL log — does not touch the kernel reader).
+    app.on_key(ctrl(KeyCode::Char('l')));
+    assert_eq!(calls.get(), 0, "opening the NMBL log must not read kmsg");
+
+    // Ctrl+K snapshots the kernel ring buffer exactly once.
+    app.on_key(ctrl(KeyCode::Char('k')));
+    assert!(matches!(
+        app.screen,
+        Screen::Log {
+            source: LogSource::Kernel,
+            ..
+        }
+    ));
+    assert_eq!(calls.get(), 1, "Ctrl+K snapshots the kernel log once");
+
+    // A burst of scroll events must NOT re-invoke the reader.
+    for key in [
+        KeyCode::Down,
+        KeyCode::Down,
+        KeyCode::PageDown,
+        KeyCode::Up,
+        KeyCode::PageUp,
+        KeyCode::End,
+        KeyCode::Home,
+    ] {
+        app.on_key(press(key));
+    }
+    assert_eq!(
+        calls.get(),
+        1,
+        "scrolling the kernel log must reuse the cached snapshot, not re-read kmsg"
+    );
+
+    // The cached lines are the parsed snapshot, proving scroll reads the
+    // cache rather than an empty/placeholder buffer.
+    match &app.screen {
+        Screen::Log { lines, .. } => assert_eq!(
+            lines,
+            &vec![
+                "[    0.000000] kernel line one".to_owned(),
+                "[    1.000000] kernel line two".to_owned(),
+            ]
+        ),
+        _ => panic!("expected Screen::Log after Ctrl+K"),
+    }
+}
+
+#[test]
+fn ctrl_k_is_a_noop_outside_the_log_viewer() {
+    let gens = vec![fake_gen(1, &[])];
+    let mut app = App::new(&gens);
+    assert!(matches!(app.screen, Screen::List));
+    // Ctrl+K on the list screen must not open or change anything.
+    assert!(!app.on_key(ctrl(KeyCode::Char('k'))));
+    assert!(matches!(app.screen, Screen::List));
+}
+
+#[test]
+fn log_source_toggle_hint_text_per_mode() {
+    // The bottom-left footer hint advertises the OTHER source.
+    assert_eq!(LogSource::Nmbl.toggle_hint(), "Ctrl+K: kernel logs");
+    assert_eq!(LogSource::Kernel.toggle_hint(), "Ctrl+K: NMBL logs");
+    // And `toggled` flips between the two.
+    assert_eq!(LogSource::Nmbl.toggled(), LogSource::Kernel);
+    assert_eq!(LogSource::Kernel.toggled(), LogSource::Nmbl);
+}
+
+#[test]
 fn log_scroll_offset_moves_and_saturates() {
+    use std::cell::Cell;
     let gens = vec![fake_gen(1, &[])];
     let mut app = App::new(&gens);
     app.screen = Screen::Log {
         lines: vec!["a".into(), "b".into(), "c".into()],
-        offset: 0,
+        offset: Cell::new(0),
+        follow_bottom: Cell::new(false),
+        source: LogSource::Nmbl,
+    };
+
+    let off = |app: &App<'_>| match &app.screen {
+        Screen::Log { offset, .. } => offset.get(),
+        _ => panic!("expected Screen::Log"),
+    };
+    let following = |app: &App<'_>| match &app.screen {
+        Screen::Log { follow_bottom, .. } => follow_bottom.get(),
+        _ => panic!("expected Screen::Log"),
     };
 
     // Up at 0 saturates at 0.
     app.on_key(press(KeyCode::Up));
-    assert!(matches!(app.screen, Screen::Log { offset: 0, .. }));
+    assert_eq!(off(&app), 0);
     // Down advances by 1.
     app.on_key(press(KeyCode::Down));
-    assert!(matches!(app.screen, Screen::Log { offset: 1, .. }));
+    assert_eq!(off(&app), 1);
     // PageDown advances by a page.
     app.on_key(press(KeyCode::PageDown));
-    assert!(matches!(app.screen, Screen::Log { offset, .. } if offset == 1 + LOG_PAGE));
-    // End jumps to u16::MAX (renderer clamps for display).
+    assert_eq!(off(&app), 1 + LOG_PAGE);
+    // End re-arms follow-bottom (renderer resolves the concrete offset).
     app.on_key(press(KeyCode::End));
-    assert!(matches!(
-        app.screen,
-        Screen::Log {
-            offset: u16::MAX,
-            ..
-        }
-    ));
-    // Home returns to 0.
+    assert!(following(&app), "End re-pins to the bottom");
+    // Home jumps to 0 and leaves follow-bottom mode.
     app.on_key(press(KeyCode::Home));
-    assert!(matches!(app.screen, Screen::Log { offset: 0, .. }));
+    assert_eq!(off(&app), 0);
+    assert!(!following(&app), "Home is an explicit scroll, not follow");
+}
+
+#[test]
+fn log_opens_at_bottom_and_first_up_is_immediate() {
+    // Open-at-bottom: a >viewport buffer must show its LAST page after the
+    // first render, and the very first Up must move up by exactly one line
+    // (no dead presses). We drive the real renderer through a test backend
+    // so `render_log` resolves `follow_bottom` against a concrete viewport
+    // height and writes the clamped offset back.
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let gens = vec![fake_gen(1, &[])];
+    let mut app = App::new(&gens);
+
+    // 200 lines on a 24-row terminal: the body box (minus borders + footer)
+    // is well under 200 rows, so the buffer is scrollable.
+    let lines: Vec<String> = (0..200).map(|i| format!("line {i}")).collect();
+    app.on_key(ctrl(KeyCode::Char('l')));
+    if let Screen::Log { lines: l, .. } = &mut app.screen {
+        *l = lines;
+    } else {
+        panic!("Ctrl+L must open the log viewer");
+    }
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+
+    // First render resolves the bottom-most offset. With 200 lines and a
+    // ~21-row inner viewport the bottom offset is 200 - visible, i.e. large.
+    term.draw(|f| crate::ui::render_current_screen(f, &app))
+        .expect("first frame");
+    let bottom = match &app.screen {
+        Screen::Log {
+            offset,
+            follow_bottom,
+            ..
+        } => {
+            assert!(follow_bottom.get(), "still following the bottom on open");
+            offset.get()
+        }
+        _ => panic!("expected Screen::Log"),
+    };
+    assert!(
+        bottom > 0,
+        "a >viewport buffer must open scrolled to the bottom"
+    );
+
+    // First Up: moves up by exactly one line from the resolved bottom and
+    // leaves follow-bottom mode — no dead presses.
+    app.on_key(press(KeyCode::Up));
+    match &app.screen {
+        Screen::Log {
+            offset,
+            follow_bottom,
+            ..
+        } => {
+            assert!(!follow_bottom.get(), "first Up stops following the bottom");
+            assert_eq!(
+                offset.get(),
+                bottom - 1,
+                "first Up moves up exactly one line from the bottom"
+            );
+        }
+        _ => panic!("expected Screen::Log"),
+    }
+
+    // End re-pins to the bottom on the next frame.
+    app.on_key(press(KeyCode::End));
+    term.draw(|f| crate::ui::render_current_screen(f, &app))
+        .expect("second frame");
+    match &app.screen {
+        Screen::Log { offset, .. } => {
+            assert_eq!(offset.get(), bottom, "End jumps back to the bottom");
+        }
+        _ => panic!("expected Screen::Log"),
+    }
+
+    // Home jumps to the top.
+    app.on_key(press(KeyCode::Home));
+    term.draw(|f| crate::ui::render_current_screen(f, &app))
+        .expect("third frame");
+    match &app.screen {
+        Screen::Log { offset, .. } => assert_eq!(offset.get(), 0, "Home jumps to the top"),
+        _ => panic!("expected Screen::Log"),
+    }
 }
 
 #[test]

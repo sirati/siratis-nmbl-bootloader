@@ -59,6 +59,48 @@ impl SkipSelector {
 /// Page size (in rows) for [`Screen::Log`] PageUp/PageDown scrolling.
 pub(crate) const LOG_PAGE: u16 = 20;
 
+/// Which log buffer the [`Screen::Log`] viewer is currently showing.
+///
+/// Ctrl+K toggles between the two; each toggle re-reads the chosen buffer
+/// so the snapshot is fresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSource {
+    /// NMBL's own in-memory boot transcript ([`crate::log::snapshot_full`]).
+    Nmbl,
+    /// The kernel ring buffer / `dmesg` ([`crate::log::snapshot_kernel`]),
+    /// read on demand from `/dev/kmsg`.
+    Kernel,
+}
+
+impl LogSource {
+    /// Footer hint text for the *other* source — what Ctrl+K switches TO.
+    #[must_use]
+    pub fn toggle_hint(self) -> &'static str {
+        match self {
+            LogSource::Nmbl => "Ctrl+K: kernel logs",
+            LogSource::Kernel => "Ctrl+K: NMBL logs",
+        }
+    }
+
+    /// Read a fresh snapshot of this source (oldest line first).
+    #[must_use]
+    pub fn read_snapshot(self) -> Vec<String> {
+        match self {
+            LogSource::Nmbl => crate::log::snapshot_full(),
+            LogSource::Kernel => crate::log::snapshot_kernel(),
+        }
+    }
+
+    /// The source Ctrl+K toggles to from this one.
+    #[must_use]
+    pub fn toggled(self) -> Self {
+        match self {
+            LogSource::Nmbl => LogSource::Kernel,
+            LogSource::Kernel => LogSource::Nmbl,
+        }
+    }
+}
+
 /// Maximum number of entries retained in each [`Screen::KeyEcho`] ring
 /// buffer. Old entries are evicted from the front when full. ~20 keeps
 /// the panels readable on an 80×24 console with room for header/footer.
@@ -156,11 +198,27 @@ pub enum Screen<'a> {
     List,
     /// Full boot-transcript viewer, opened with Ctrl+L from any screen
     /// and popped back via Esc / Ctrl+L. `lines` is the snapshot
-    /// (oldest first) and `offset` is the scroll position; the renderer
-    /// clamps `offset` so over-scroll is harmless.
+    /// (oldest first) and `offset` is the scroll-from-top position.
+    ///
+    /// `offset` and `follow_bottom` are [`Cell`]s so the *renderer* can
+    /// write the CLAMPED offset back each frame: the renderer is the only
+    /// place that knows the viewport height (and therefore the true
+    /// bottom-most offset). After the first frame `offset` always holds a
+    /// concrete in-range value, so the very first Up keypress moves by one
+    /// line with no "dead presses" — without this write-back, opening at
+    /// the bottom (`follow_bottom = true`) would leave `offset` stale and
+    /// the operator would have to press Up thousands of times before the
+    /// raw offset dropped below the clamp.
+    ///
+    /// `follow_bottom` starts `true` on open / Ctrl+K so the viewer shows
+    /// the newest lines (like `less +G`); the first explicit up-scroll
+    /// clears it (End re-arms it). `source` records which buffer is shown
+    /// (NMBL vs kernel); Ctrl+K toggles it and re-reads.
     Log {
         lines: Vec<String>,
-        offset: u16,
+        offset: Cell<u16>,
+        follow_bottom: Cell<bool>,
+        source: LogSource,
     },
     Editing {
         /// Index into the generations slice.
