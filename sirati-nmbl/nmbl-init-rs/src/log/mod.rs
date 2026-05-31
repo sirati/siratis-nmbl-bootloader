@@ -1,5 +1,6 @@
 mod byte_ring;
 mod kmsg;
+mod kmsg_read;
 mod ring;
 mod tui_flag;
 mod verbosity;
@@ -17,6 +18,7 @@ pub const NMBL_LOG_PATH: &str = "/nmbl-log/nmbl.log";
 
 pub use byte_ring::{flush_to, snapshot_full};
 pub use kmsg::emit_kmsg;
+pub use kmsg_read::snapshot_kernel;
 pub use ring::{push_ring, snapshot};
 pub use tui_flag::{clear_tui_active, set_tui_active, tui_active};
 pub use verbosity::{Verbosity, current, init};

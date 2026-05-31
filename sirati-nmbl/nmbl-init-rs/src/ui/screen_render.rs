@@ -106,7 +106,11 @@ fn render_modal_overlay(frame: &mut ratatui::Frame<'_>, modal: &ModalKind, scrol
 fn render_screen_body(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
     match &app.screen {
         Screen::List => render_list(frame, &list_data(app)),
-        Screen::Log { lines, offset } => render_log(frame, frame.area(), lines, *offset),
+        Screen::Log {
+            lines,
+            offset,
+            source,
+        } => render_log(frame, frame.area(), lines, *offset, *source),
         Screen::Editing {
             generation_index,
             line,
