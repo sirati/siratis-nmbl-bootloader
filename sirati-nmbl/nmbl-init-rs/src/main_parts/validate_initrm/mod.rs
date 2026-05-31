@@ -19,6 +19,7 @@
 mod report;
 mod scenarios;
 mod scripted_console;
+mod scripted_supplier;
 
 use std::path::Path;
 

@@ -78,7 +78,6 @@ pub async fn run_all_activations<S: SysOps>(
     config: &Config,
     reporter: &mut BootReporter<'_, '_>,
     mut password_supplier: Option<&mut dyn PasswordSupplier>,
-    sender: &crate::sys::poller::LocalSender,
 ) -> Result<Vec<KeyInjection>> {
     let mut injections: Vec<KeyInjection> = Vec::new();
     if config.activations.is_empty() {
@@ -117,7 +116,6 @@ pub async fn run_all_activations<S: SysOps>(
             activation,
             &mut *reporter.console,
             supplier_ref,
-            sender,
         )
         .await?;
 
@@ -203,7 +201,6 @@ async fn run_one_activation<S: SysOps>(
     activation: &Activation,
     console: &mut dyn Console,
     mut supplier: Option<&mut dyn PasswordSupplier>,
-    sender: &crate::sys::poller::LocalSender,
 ) -> Result<Option<Zeroizing<Vec<u8>>>> {
     // 1-indexed attempt counter for the wrong-password modal title
     // ("Wrong password (attempt N)"). Resets per activation so a
@@ -233,7 +230,7 @@ async fn run_one_activation<S: SysOps>(
         // pressing Enter and the unlock result. Other activation
         // kinds (LVM, mdraid, …) keep the simpler blocking `run`.
         let outcome = if activation.kind == ActivationKind::LuksPassword {
-            run_luks_with_spinner(activation, stdin_slice, console, sender).await?
+            run_luks_with_spinner(activation, stdin_slice, console, ops).await?
         } else {
             ops.run(&activation.binary, &activation.argv, stdin_slice)
                 .await

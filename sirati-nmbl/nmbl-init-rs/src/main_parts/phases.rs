@@ -7,7 +7,7 @@ use nmbl_init::error::{NmblError, Result};
 use nmbl_init::modules::{load_early_modules, load_explicit_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
 use nmbl_init::sys::ops::{FsOps, ModuleOps, SysOps};
-use nmbl_init::ui::{BootReporter, SessionInteraction, SkipSelector, TuiPasswordSupplier};
+use nmbl_init::ui::BootReporter;
 use nmbl_init::{nmbl_info, nmbl_warn};
 
 /// Phase 1: mount /proc, /sys, /dev. Lives at the top of `main` so the
@@ -48,9 +48,7 @@ pub(super) async fn run_phases_post_console<S: SysOps>(
     ops: &mut S,
     config: &Config,
     console: &mut dyn nmbl_init::ui::console::Console,
-    session: &SessionInteraction,
-    skip_selector: &SkipSelector,
-    sender: &nmbl_init::sys::poller::LocalSender,
+    supplier: &mut dyn nmbl_init::activation::PasswordSupplier,
 ) -> Result<Vec<KeyInjection>> {
     let mut reporter = BootReporter::new(console, "phase 2b: loading kernel modules");
     // Paint the first frame so the operator sees a populated screen
@@ -83,9 +81,7 @@ pub(super) async fn run_phases_post_console<S: SysOps>(
     }
 
     nmbl_info!("phase 3: storage activations");
-    let mut supplier = TuiPasswordSupplier::new(config, session, skip_selector);
-    let injections =
-        run_all_activations(ops, config, &mut reporter, Some(&mut supplier), sender).await?;
+    let injections = run_all_activations(ops, config, &mut reporter, Some(supplier)).await?;
 
     nmbl_info!("phase 3b: mount system filesystems");
     mount_system_filesystems(ops, config, &mut reporter).await?;
