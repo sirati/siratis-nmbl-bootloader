@@ -132,6 +132,12 @@ impl Console for LatchingConsole<'_> {
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Option<ConsoleEvent>>> + 'a>> {
         Box::pin(async move {
+            // One input-poll cycle of the event loop. Bump the global
+            // diagnostic tick here — the single convergence point every
+            // interactive loop polls through — so the top-right spinner
+            // advances iff the loop keeps iterating, and freezes the
+            // instant a synchronous op blocks the loop.
+            crate::ui::event_tick::tick();
             if let Some(ev) = self.take_pending() {
                 return Ok(Some(ev));
             }
@@ -141,6 +147,9 @@ impl Console for LatchingConsole<'_> {
     }
 
     fn poll_event_blocking(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>> {
+        // One input-poll cycle (early-boot reporter / blocking path):
+        // bump the same diagnostic tick the async path drives.
+        crate::ui::event_tick::tick();
         if let Some(ev) = self.take_pending() {
             return Ok(Some(ev));
         }
