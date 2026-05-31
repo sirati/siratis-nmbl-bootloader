@@ -19,10 +19,11 @@ fn fs_entry(device: &str, mountpoint: &str, is_root: bool) -> FilesystemEntry {
     }
 }
 
-/// Counting ProgressSink for tests. Records every `render_phase` call
-/// and the most recent phase string so we can assert both the cadence
-/// (~N renders per second of wait, driven by `tokio::time::sleep`) and
-/// the format of the status line.
+/// Counting ProgressSink for tests. Records every `tick` call and the
+/// most recent phase string so we can assert both the cadence (~N ticks
+/// per second of wait, floored by `tokio::time::sleep`) and the format
+/// of the status line. `wait_for` now drives `tick` (not `render_phase`)
+/// each iteration so the wait is interruptible by Ctrl+L / Esc.
 struct CountingSink {
     ticks: u32,
     last_phase: Option<String>,
@@ -38,9 +39,9 @@ impl CountingSink {
 }
 
 impl ProgressSink for CountingSink {
-    fn tick(&mut self, _phase: &str) -> TickOutcome {
-        // The async `wait_for` no longer calls `tick` (no blocking input
-        // poll during a device wait); it renders via `render_phase`.
+    fn tick(&mut self, phase: &str) -> TickOutcome {
+        self.ticks = self.ticks.saturating_add(1);
+        self.last_phase = Some(phase.to_string());
         TickOutcome::Continue
     }
 
@@ -48,6 +49,18 @@ impl ProgressSink for CountingSink {
         self.ticks = self.ticks.saturating_add(1);
         self.last_phase = Some(phase.to_string());
     }
+}
+
+/// A ProgressSink whose `tick` always reports `Aborted` — models the
+/// operator pressing Esc with no log overlay open. Lets us prove
+/// `wait_for` surfaces `OperatorAborted` instead of waiting out the
+/// whole device-timeout budget.
+struct AbortingSink;
+impl ProgressSink for AbortingSink {
+    fn tick(&mut self, _phase: &str) -> TickOutcome {
+        TickOutcome::Aborted
+    }
+    fn render_phase(&mut self, _phase: &str) {}
 }
 
 /// Build a single-thread `LocalRuntime` to drive the async `wait_for`
@@ -125,6 +138,37 @@ fn wait_for_ticks_progress_sink_during_wait() {
         "expected at most 15 renders during a 500 ms wait (defensive upper bound), got {}",
         sink.ticks
     );
+}
+
+#[test]
+fn wait_for_aborts_on_esc_instead_of_waiting_out_the_budget() {
+    // The reported hang: a device that will never appear (yanked boot
+    // USB) must NOT trap the operator. With a sink that reports Aborted
+    // (Esc, no overlay) wait_for must return OperatorAborted promptly,
+    // naming the device, rather than burning the full 30 s timeout.
+    let missing = Path::new("/nonexistent/nmbl-devices-abort-test");
+    let mut sink = AbortingSink;
+    let start = Instant::now();
+    let err = block(wait_for(
+        missing,
+        Duration::from_secs(30),
+        "phase 3b: waiting for",
+        Some(&mut sink),
+    ))
+    .expect_err("Esc abort must surface an error, not Ok");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "abort must return promptly, not wait out the 30 s budget"
+    );
+    match err {
+        NmblError::OperatorAborted { context } => {
+            assert!(
+                context.contains("nmbl-devices-abort-test"),
+                "abort context must name the device: {context:?}"
+            );
+        }
+        other => panic!("expected OperatorAborted, got {other:?}"),
+    }
 }
 
 #[test]

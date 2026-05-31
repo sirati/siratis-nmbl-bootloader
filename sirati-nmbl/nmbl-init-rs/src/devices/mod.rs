@@ -17,7 +17,7 @@ use crate::error::{NmblError, Result};
 use crate::nmbl_info;
 use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
 use crate::sys::poller::LocalSender;
-use crate::ui::{BootReporter, ProgressSink};
+use crate::ui::{BootReporter, ProgressSink, TickOutcome};
 
 /// Sleep granularity between polls. Matches the 100 ms cadence of the
 /// shell loop this module replaces.
@@ -41,9 +41,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Async so the inter-poll cadence comes from `tokio::time::sleep`
 /// rather than a blocking `thread::sleep` — the single-threaded runtime
 /// keeps serving the concurrent remote-attach server and the local
-/// spinner while we wait. The status line is render-only (no blocking
-/// input poll): the operator is not expected to type during a device
-/// wait, so this loop never blocks on `poll_key`.
+/// spinner while we wait.
+///
+/// The wait is also INTERRUPTIBLE: each iteration the progress sink's
+/// `tick` is driven (which renders, then polls input), so the operator
+/// can press Ctrl+L to read the boot log or Esc to abort even while a
+/// device that will never appear (e.g. a yanked boot USB) is polled.
+/// An Esc with no log overlay open returns
+/// [`NmblError::OperatorAborted`]; the cadence is FLOORED by racing the
+/// tick against a `tokio::time::sleep(POLL_INTERVAL)` so a backend whose
+/// input poll ignores its timeout can't turn the wait into a busy loop.
+/// With `progress = None` (tests, headless contexts) the loop is the
+/// plain sleep-cadence poll with no input servicing.
 pub async fn wait_for(
     device: &Path,
     timeout: Duration,
@@ -67,14 +76,31 @@ pub async fn wait_for(
             });
         }
 
-        // Render-only status update; the runtime, not a blocking
-        // `poll_key`, provides the cadence below.
+        // Render + poll for input (Ctrl+L log viewer, Esc abort) via the
+        // sink's `tick`, then sleep the REMAINDER of the `POLL_INTERVAL`
+        // floor. On a real backend `tick` blocks up to its own short
+        // input-poll slice (≈ the floor) so the extra sleep is tiny; on a
+        // sink whose `tick` returns instantly (a backend ignoring its
+        // poll timeout, or a test sink) the floor sleep is what keeps the
+        // loop from busy-spinning. Headless contexts (`progress = None`)
+        // just sleep the floor.
+        let iter_start = Instant::now();
         if let Some(sink) = progress.as_deref_mut() {
-            let elapsed = start.elapsed();
-            let phase = format_wait_phase(operation, &device.display(), elapsed, timeout);
-            sink.render_phase(&phase);
+            let phase = format_wait_phase(operation, &device.display(), start.elapsed(), timeout);
+            if sink.tick(&phase) == TickOutcome::Aborted {
+                return Err(NmblError::OperatorAborted {
+                    context: format!("{operation} {}", device.display()),
+                });
+            }
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        // Sleep only the time left to hit the floor (saturating at zero so
+        // a `tick` that already consumed the whole slice doesn't add a
+        // second full interval). This bounds the per-iteration cadence at
+        // POLL_INTERVAL regardless of how the backend honours its timeout.
+        let floor_remaining = POLL_INTERVAL.saturating_sub(iter_start.elapsed());
+        if !floor_remaining.is_zero() {
+            tokio::time::sleep(floor_remaining).await;
+        }
     }
 }
 

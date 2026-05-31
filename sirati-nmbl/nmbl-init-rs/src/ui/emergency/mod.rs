@@ -49,6 +49,8 @@ use crate::ui::console::Console;
 mod builders;
 pub(crate) mod loop_driver;
 
+#[cfg(test)]
+pub(crate) use builders::likely_cause;
 pub(crate) use builders::{build_emergency_app, build_message, default_items};
 
 /// Default countdown to auto-reboot when the operator is not present.
