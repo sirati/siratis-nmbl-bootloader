@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::generations::Generation;
-use crate::ui::app::{BootStatusData, SPINNER_FRAMES, SPINNER_GLYPHS};
+use crate::ui::app::{BootStatusData, LogSource, SPINNER_FRAMES, SPINNER_GLYPHS};
 
 use super::{
     EditScreenData, EmergencyScreenData, KeyEchoScreenData, ListScreenData, caret_line,
@@ -251,14 +251,25 @@ pub fn render_boot_status(frame: &mut Frame<'_>, data: &BootStatusData<'_>) {
 /// scroll position from the top; it is clamped here to
 /// `total - visible_rows` so an over-scroll (e.g. `End` setting
 /// `u16::MAX`) lands on the last full page rather than off the end.
-/// A bordered "boot log" block fills `area` above a single dim footer
-/// hint row.
-pub fn render_log(frame: &mut Frame<'_>, area: Rect, lines: &[String], offset: u16) {
+/// A bordered title block fills `area` above a footer row carrying a
+/// left-aligned Ctrl+K hint (toggle to the other log source) and a
+/// right-aligned scroll/close hint.
+pub fn render_log(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: &[String],
+    offset: u16,
+    source: LogSource,
+) {
     // Reserve the bottom row for the footer hint; the rest is the box.
     let [body, footer] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas::<2>(area);
 
-    let block = Block::bordered().title("boot log");
+    let title = match source {
+        LogSource::Nmbl => "boot log",
+        LogSource::Kernel => "kernel log (dmesg)",
+    };
+    let block = Block::bordered().title(title);
     let inner = block.inner(body);
     let visible = inner.height;
     let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
@@ -279,6 +290,15 @@ pub fn render_log(frame: &mut Frame<'_>, area: Rect, lines: &[String], offset: u
         .wrap(Wrap { trim: false });
     frame.render_widget(para, body);
 
+    // Bottom-left: Ctrl+K toggles to the other log source.
+    let kernel_hint = Paragraph::new(Span::styled(
+        source.toggle_hint(),
+        Style::default().add_modifier(Modifier::DIM),
+    ))
+    .alignment(Alignment::Left);
+    frame.render_widget(kernel_hint, footer);
+
+    // Bottom-right: scroll + close keys.
     let hint = Paragraph::new(Span::styled(
         "\u{2191}/\u{2193} PgUp/PgDn  Esc/Ctrl+L close",
         Style::default().add_modifier(Modifier::DIM),

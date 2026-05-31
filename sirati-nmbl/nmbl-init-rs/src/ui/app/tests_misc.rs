@@ -189,12 +189,74 @@ fn ctrl_l_opens_log_and_esc_returns() {
 }
 
 #[test]
+fn ctrl_k_toggles_log_source_and_resets_scroll() {
+    let gens = vec![fake_gen(1, &[])];
+    let mut app = App::new(&gens);
+
+    // Open the viewer: defaults to NMBL's own log.
+    app.on_key(ctrl(KeyCode::Char('l')));
+    assert!(matches!(
+        app.screen,
+        Screen::Log {
+            source: LogSource::Nmbl,
+            ..
+        }
+    ));
+
+    // Scroll down so we can prove Ctrl+K resets the offset.
+    app.on_key(press(KeyCode::Down));
+    assert!(matches!(app.screen, Screen::Log { offset: 1, .. }));
+
+    // Ctrl+K flips to the kernel ring buffer and resets scroll to 0.
+    app.on_key(ctrl(KeyCode::Char('k')));
+    assert!(matches!(
+        app.screen,
+        Screen::Log {
+            source: LogSource::Kernel,
+            offset: 0,
+            ..
+        }
+    ));
+
+    // Ctrl+K again flips back to NMBL's log.
+    app.on_key(ctrl(KeyCode::Char('k')));
+    assert!(matches!(
+        app.screen,
+        Screen::Log {
+            source: LogSource::Nmbl,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn ctrl_k_is_a_noop_outside_the_log_viewer() {
+    let gens = vec![fake_gen(1, &[])];
+    let mut app = App::new(&gens);
+    assert!(matches!(app.screen, Screen::List));
+    // Ctrl+K on the list screen must not open or change anything.
+    assert!(!app.on_key(ctrl(KeyCode::Char('k'))));
+    assert!(matches!(app.screen, Screen::List));
+}
+
+#[test]
+fn log_source_toggle_hint_text_per_mode() {
+    // The bottom-left footer hint advertises the OTHER source.
+    assert_eq!(LogSource::Nmbl.toggle_hint(), "Ctrl+K: kernel logs");
+    assert_eq!(LogSource::Kernel.toggle_hint(), "Ctrl+K: NMBL logs");
+    // And `toggled` flips between the two.
+    assert_eq!(LogSource::Nmbl.toggled(), LogSource::Kernel);
+    assert_eq!(LogSource::Kernel.toggled(), LogSource::Nmbl);
+}
+
+#[test]
 fn log_scroll_offset_moves_and_saturates() {
     let gens = vec![fake_gen(1, &[])];
     let mut app = App::new(&gens);
     app.screen = Screen::Log {
         lines: vec!["a".into(), "b".into(), "c".into()],
         offset: 0,
+        source: LogSource::Nmbl,
     };
 
     // Up at 0 saturates at 0.

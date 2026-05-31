@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use super::{App, Decision, EmergencyChoice, LOG_PAGE, Screen};
+use super::{App, Decision, EmergencyChoice, LOG_PAGE, LogSource, Screen};
 
 impl<'a> App<'a> {
     /// Reduce a crossterm KeyEvent into a state mutation. Returns
@@ -41,14 +41,34 @@ impl<'a> App<'a> {
                             self.screen = *prev;
                         }
                     } else {
-                        // Stash the current screen and open the log viewer.
+                        // Stash the current screen and open the log viewer,
+                        // defaulting to NMBL's own boot transcript.
                         self.return_screen = Some(Box::new(std::mem::replace(
                             &mut self.screen,
                             Screen::Log {
-                                lines: crate::log::snapshot_full(),
+                                lines: LogSource::Nmbl.read_snapshot(),
                                 offset: 0,
+                                source: LogSource::Nmbl,
                             },
                         )));
+                    }
+                    return false;
+                }
+                KeyCode::Char('k') => {
+                    // Only meaningful inside the log viewer: flip between
+                    // NMBL's own log and the kernel ring buffer, re-reading
+                    // the newly-selected buffer so it is fresh. The scroll
+                    // resets to the top of the new content. A no-op on every
+                    // other screen.
+                    if let Screen::Log {
+                        lines,
+                        offset,
+                        source,
+                    } = &mut self.screen
+                    {
+                        *source = source.toggled();
+                        *lines = source.read_snapshot();
+                        *offset = 0;
                     }
                     return false;
                 }
