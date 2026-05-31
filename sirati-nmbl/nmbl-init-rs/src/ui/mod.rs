@@ -35,6 +35,7 @@ pub mod console_relay;
 pub mod editline;
 pub mod emergency;
 pub mod emergency_actions;
+pub(crate) mod event_tick;
 pub mod key_echo;
 pub mod modal_confirm;
 pub mod modal_error;
