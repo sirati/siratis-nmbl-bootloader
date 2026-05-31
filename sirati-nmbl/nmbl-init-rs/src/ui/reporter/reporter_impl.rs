@@ -1,14 +1,12 @@
 use std::borrow::Cow;
-use std::future::Future;
-use std::pin::Pin;
 use std::time::Duration;
 
 use crossterm::event::KeyCode;
 
 use crate::error::Result;
 use crate::log;
-use crate::ui::app::{App, ModalKind};
-use crate::ui::console::{Console, ConsoleEvent};
+use crate::ui::app::{App, ModalKind, Screen};
+use crate::ui::console::Console;
 
 use super::types::{ProgressSink, TickOutcome};
 
@@ -55,6 +53,18 @@ pub(super) enum ReporterApp<'a> {
 
 impl ReporterApp<'_> {
     pub(super) fn as_ref(&self) -> &App<'_> {
+        match self {
+            ReporterApp::Owned(a) => a,
+            ReporterApp::Overlay(a) => a,
+        }
+    }
+
+    /// Mutable view onto the driven App so the wait-loop tick can route
+    /// operator keystrokes through the shared [`App::on_key`] dispatch
+    /// (the same one the selector / emergency loops use). This is what
+    /// makes Ctrl+L open the log viewer — and Esc close it — DURING a
+    /// device / activation wait, not just on an interactive screen.
+    pub(super) fn as_mut(&mut self) -> &mut App<'static> {
         match self {
             ReporterApp::Owned(a) => a,
             ReporterApp::Overlay(a) => a,
@@ -243,21 +253,33 @@ impl ProgressSink for BootReporter<'_, '_> {
     /// underlying wait itself fails.
     ///
     /// Returns [`TickOutcome::Aborted`] when the operator presses Esc
-    /// on the boot-status screen — the callers (the `activation`
-    /// `run_with_tick` reap loop and the LUKS passphrase-modal spinner)
-    /// surface this as
+    /// on the boot-status screen — the callers (`devices::wait_for`, the
+    /// activation source-device wait, the `run_with_tick` reap loop, and
+    /// the LUKS passphrase-modal spinner) surface this as
     /// [`crate::error::NmblError::OperatorAborted`] so the emergency
-    /// menu can re-appear with the operator's explicit "abort"
-    /// context. `devices::wait_for` no longer calls `tick`; it renders
-    /// via [`ProgressSink::render_phase`] and has no Esc-abort.
+    /// menu can re-appear with the operator's explicit "abort" context.
+    ///
+    /// Every keystroke is routed through the shared [`App::on_key`]
+    /// dispatch FIRST, so Ctrl+L opens the boot-log viewer (and Esc
+    /// closes it) mid-wait — the operator is never trapped on a frozen
+    /// spinner while a device that will never appear is polled. Only an
+    /// Esc pressed with NO log overlay open counts as an abort; an Esc
+    /// that merely closes the log overlay keeps the wait running.
     fn tick(&mut self, phase: &str) -> TickOutcome {
         let snap = log::snapshot(LOG_SNAPSHOT_LINES);
-        write_phase(
-            &mut self.app,
-            Cow::<'static, str>::Owned(phase.to_string()),
-            Some(snap),
-            true,
-        );
+        // While the log viewer is open over a wait, keep its snapshot
+        // fresh and DON'T disturb the operator's phase/spinner: paint the
+        // log instead. The phase string still advances behind the overlay
+        // so closing it (Esc) reveals the up-to-date status.
+        let log_open = matches!(self.app.as_ref().screen, Screen::Log { .. });
+        if !log_open {
+            write_phase(
+                &mut self.app,
+                Cow::<'static, str>::Owned(phase.to_string()),
+                Some(snap),
+                true,
+            );
+        }
         let _ = self.console.render(self.app.as_ref());
 
         // Poll for a single key with a short timeout so the wait stays
@@ -265,10 +287,11 @@ impl ProgressSink for BootReporter<'_, '_> {
         // POLL_INTERVAL in `devices::wait_for`. A failed poll (transient
         // DRM / tty error) is treated as "no key" — same swallowing
         // policy as the render above.
-        match self.console.poll_key(TICK_POLL_SLICE) {
-            Ok(Some(key)) if key.code == KeyCode::Esc => TickOutcome::Aborted,
-            _ => TickOutcome::Continue,
-        }
+        let key = match self.console.poll_key(TICK_POLL_SLICE) {
+            Ok(Some(key)) => key,
+            _ => return TickOutcome::Continue,
+        };
+        decide_tick(self.app.as_mut(), key)
     }
 
     fn render_phase(&mut self, phase: &str) {
@@ -281,16 +304,39 @@ impl ProgressSink for BootReporter<'_, '_> {
         );
         let _ = self.console.render(self.app.as_ref());
     }
+}
 
-    fn poll_abort<'a>(&'a mut self, timeout: Duration) -> Pin<Box<dyn Future<Output = bool> + 'a>> {
-        Box::pin(async move {
-            // Await the backend's own cancel-safe async poll. A failed
-            // poll (transient DRM / tty error) is treated as "no key" —
-            // the same swallowing policy as `render_phase`/`tick`.
-            matches!(
-                self.console.poll_event(timeout).await,
-                Ok(Some(ConsoleEvent::Key(k))) if k.code == KeyCode::Esc
-            )
-        })
+/// Route one wait-loop keystroke through the shared [`App::on_key`]
+/// dispatch and decide whether the wait should abort.
+///
+/// This is the bridge that makes the global ESC / Ctrl+L hierarchy work
+/// DURING a device / activation wait (not only on interactive screens):
+///
+/// - **Ctrl+L** (any wait): `on_key` stashes the boot-status screen and
+///   opens [`Screen::Log`]; the wait keeps running and the next tick
+///   paints the live log. Returns [`TickOutcome::Continue`].
+/// - **Esc while the log overlay is open**: `on_key` pops back to the
+///   boot-status screen. The wait resumes; NOT an abort
+///   ([`TickOutcome::Continue`]).
+/// - **Esc with no overlay**: there is nothing to back out of, so the
+///   only useful action is to abort the wait
+///   ([`TickOutcome::Aborted`]) — the caller surfaces
+///   [`crate::error::NmblError::OperatorAborted`] and the emergency
+///   screen appears.
+/// - Any other key (scroll keys inside the log, etc.) is handled by
+///   `on_key` and the wait continues.
+fn decide_tick(app: &mut App<'static>, key: crossterm::event::KeyEvent) -> TickOutcome {
+    let log_open_before = matches!(app.screen, Screen::Log { .. });
+    let is_esc = key.code == KeyCode::Esc
+        && !key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL);
+    app.on_key(key);
+    // Esc aborts ONLY when it didn't just close a log overlay. If the log
+    // was open before this key, the Esc was consumed by closing it.
+    if is_esc && !log_open_before {
+        TickOutcome::Aborted
+    } else {
+        TickOutcome::Continue
     }
 }

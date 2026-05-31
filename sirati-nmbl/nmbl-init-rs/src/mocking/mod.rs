@@ -20,6 +20,10 @@
 //!   (the same code path the LUKS activation flow uses). Stderr surfaces
 //!   the entered string with single quotes so a test harness can scrape
 //!   it; Esc-cancel surfaces "cancelled".
+//! - `log-viewer [lines]` — pre-fills NMBL's boot transcript with `lines`
+//!   (default 4000) synthetic long lines and runs the real generation
+//!   selector so the Ctrl+L / Ctrl+K log viewer can be scrolled by hand.
+//!   Repro vehicle for the scroll-lag + open-at-bottom fixes.
 //! - `resize [r1 c1 r2 c2]` — fires two synthetic
 //!   [`ConsoleEvent::Resize`] events on the mock console at the
 //!   supplied sizes (defaults 40x100, 20x60), repainting between each,
@@ -50,8 +54,8 @@ use crate::sys::tty::{enter_raw, restore_termios, save_termios};
 
 use self::console::MockConsole;
 use self::scenarios::{
-    run_boot_status, run_emergency, run_modal_buttons, run_modal_confirm, run_modal_error,
-    run_passphrase, run_resize, run_wrong_password,
+    run_boot_status, run_emergency, run_log_viewer, run_modal_buttons, run_modal_confirm,
+    run_modal_error, run_passphrase, run_resize, run_wrong_password,
 };
 
 /// Parsed `--debug-tui -- <scenario> [args...]` invocation.
@@ -113,6 +117,7 @@ pub fn run(args: DebugTuiArgs) -> Result<()> {
             "boot-status" => run_boot_status(&mut console, &args.args).await,
             "passphrase" => run_passphrase(&mut console, &args.args).await,
             "resize" => run_resize(&mut console, &args.args).await,
+            "log-viewer" => run_log_viewer(&mut console, &args.args).await,
             "emergency" => run_emergency(&mut console, &args.args, &sender).await,
             other => Err(NmblError::Io {
                 source: std::io::Error::other(format!("unknown --debug-tui scenario {other:?}")),
