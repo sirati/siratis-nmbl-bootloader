@@ -119,7 +119,37 @@ pub(crate) async fn passphrase_prompt_on_console(
         // Drive `poll_event` so host-reported `CSI 8;rows;cols t`
         // resizes redraw the modal at the new dimensions instead of
         // smearing the old layout until the next keypress.
-        match console.poll_event(POLL_SLICE).await? {
+        //
+        // Floor the idle cadence with a guaranteed `POLL_SLICE` sleep
+        // (mirroring `devices::wait_for`): a real tty's `poll_event`
+        // honours the timeout so this floor is a no-op there, but a
+        // console whose `poll_event` returns instantly (e.g.
+        // `NoopConsole`, which ignores the timeout) would otherwise
+        // busy-spin this loop at 100% CPU and starve the single-threaded
+        // runtime. Race the floor against `poll_event`; on an actionable
+        // event we take it immediately, and on no event we honour the
+        // rest of the floor before looping. `floor` is pinned OUTSIDE
+        // the select and only `&mut`-borrowed, so an early `return` never
+        // drops it; `poll_event` is cancel-safe.
+        let mut floor = std::pin::pin!(tokio::time::sleep(POLL_SLICE));
+        let event = tokio::select! {
+            event = console.poll_event(POLL_SLICE) => {
+                let event = event?;
+                // poll_event resolved before the floor elapsed (an
+                // instant-returning console); honour the rest of the
+                // floor so the loop never spins faster than the cadence.
+                if event.is_none() {
+                    floor.await;
+                }
+                event
+            }
+            () = &mut floor => {
+                // Floor elapsed before poll_event produced anything;
+                // loop and re-render (caps-lock / resize repaint).
+                None
+            }
+        };
+        match event {
             Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
                 dirty = true;
             }
