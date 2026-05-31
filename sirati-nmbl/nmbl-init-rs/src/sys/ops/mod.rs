@@ -143,6 +143,20 @@ pub trait ExecOps {
         argv: &[String],
         stdin_data: Option<&[u8]>,
     ) -> Result<ProcessOutcome>;
+    /// Tick-aware variant of [`run`](ExecOps::run): while the child runs,
+    /// `tick` is invoked every reap slice so a UI spinner keeps animating
+    /// during a slow unlock (e.g. Argon2id LUKS). Routes the LUKS
+    /// activation's spinner-reaping exec through the same seam every other
+    /// activation uses, so the dry-run can presence-check the binary
+    /// without forking it (and without ticking). See
+    /// [`crate::sys::activation::run_with_tick`].
+    async fn run_with_tick(
+        &mut self,
+        binary: &Path,
+        argv: &[String],
+        stdin_data: Option<&[u8]>,
+        tick: &mut dyn FnMut(),
+    ) -> Result<ProcessOutcome>;
     /// Fork+exec `binary` and capture stdout — see
     /// [`crate::sys::activation::run_capture`].
     async fn run_capture(

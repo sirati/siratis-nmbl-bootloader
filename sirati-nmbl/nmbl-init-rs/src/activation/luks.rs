@@ -3,8 +3,8 @@
 use crate::config::{Activation, Config};
 use crate::error::Result;
 use crate::generations::Generation;
-use crate::sys::activation::{ProcessOutcome, run_with_tick};
-use crate::sys::poller::LocalSender;
+use crate::sys::activation::ProcessOutcome;
+use crate::sys::ops::ExecOps;
 use crate::ui::app::{App, Screen};
 use crate::ui::console::Console;
 
@@ -37,11 +37,11 @@ pub(super) enum WrongPasswordHandled {
 /// overlaid. We do NOT share state with the supplier's App (which was
 /// consumed inside `collect_stdin`) — a fresh App is cheaper than
 /// threading a mutable reference through the supplier trait.
-pub(super) async fn run_luks_with_spinner(
+pub(super) async fn run_luks_with_spinner<S: ExecOps>(
     activation: &Activation,
     stdin_slice: Option<&[u8]>,
     console: &mut dyn Console,
-    sender: &LocalSender,
+    ops: &mut S,
 ) -> Result<ProcessOutcome> {
     let label = activation
         .prompt_label
@@ -92,15 +92,19 @@ pub(super) async fn run_luks_with_spinner(
     // closure captures `&mut app` and `&mut *console` directly.)
     let mut cb = || tick(console, &mut app);
 
-    let outcome = run_with_tick(
-        &activation.binary,
-        &activation.argv,
-        stdin_slice,
-        Some(&mut cb as &mut dyn FnMut()),
-        sender,
-    )
-    .await
-    .map_err(|source| wrap_runner_error(activation, source))?;
+    // Route the spinner-reaping exec through `ops` so the dry-run
+    // presence-checks `cryptsetup` instead of forking it. `RealSys`
+    // forwards to `sys::activation::run_with_tick`, preserving the
+    // genuine spinner; `DryRunSys` records a finding and never forks.
+    let outcome = ops
+        .run_with_tick(
+            &activation.binary,
+            &activation.argv,
+            stdin_slice,
+            &mut cb as &mut dyn FnMut(),
+        )
+        .await
+        .map_err(|source| wrap_runner_error(activation, source))?;
 
     // Done verifying — clear the overlay and repaint once so the next
     // screen transition (success → boot-status; wrong-pw → modal) starts
