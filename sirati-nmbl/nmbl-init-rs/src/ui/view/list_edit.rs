@@ -165,7 +165,7 @@ pub fn render_emergency(frame: &mut Frame<'_>, data: &EmergencyScreenData<'_>) {
     render_footer(
         frame,
         footer,
-        "up/down select  Enter confirm  r reboot  s shell",
+        "up/down select  Enter confirm  r reboot  s shell  Ctrl+L logs",
     );
 }
 
@@ -227,7 +227,7 @@ pub fn render_boot_status(frame: &mut Frame<'_>, data: &BootStatusData<'_>) {
         let hint_row = inner.y.saturating_add(inner.height.saturating_sub(1));
         let hint_rect = Rect::new(inner.x, hint_row, inner.width, 1);
         let hint = Paragraph::new(Span::styled(
-            "Esc to abort",
+            "Ctrl+L logs  Esc abort",
             Style::default().add_modifier(Modifier::DIM),
         ))
         .alignment(Alignment::Right);

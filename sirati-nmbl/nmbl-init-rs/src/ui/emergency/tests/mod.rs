@@ -130,6 +130,119 @@ fn build_message_includes_error_chain_lines() {
 }
 
 #[test]
+fn build_message_prepends_likely_cause_for_device_timeout() {
+    // The reported failure mode: yanked boot device → DeviceTimeout.
+    // The error screen must lead with a plain-language "Likely cause"
+    // line naming the unplug/seating problem, then still carry the raw
+    // chain (device path + the timeout text) below it.
+    use crate::error::NmblError;
+    use std::path::PathBuf;
+    let err = NmblError::DeviceTimeout {
+        device: PathBuf::from("/dev/disk/by-uuid/abc-123"),
+        timeout_ms: 30_000,
+    };
+    let msg = build_message(&err);
+    assert!(
+        msg.contains("Likely cause:"),
+        "DeviceTimeout must produce a likely-cause hint: {msg}"
+    );
+    assert!(
+        msg.contains("unplugged") || msg.contains("not seated"),
+        "hint must name the unplug/seating cause: {msg}"
+    );
+    // The raw chain (device path) must still be present below the hint
+    // so the operator keeps the actionable detail.
+    assert!(
+        msg.contains("/dev/disk/by-uuid/abc-123"),
+        "the threaded-through device path must remain in the message: {msg}"
+    );
+    // Hint comes first, raw chain after.
+    let hint_pos = msg.find("Likely cause:").expect("hint present");
+    let chain_pos = msg.find("Boot failed").expect("chain present");
+    assert!(
+        hint_pos < chain_pos,
+        "hint must precede the raw chain: {msg}"
+    );
+}
+
+#[test]
+fn likely_cause_unwraps_wrapped_device_timeout() {
+    // DeviceTimeout nested under an Activation wrapper (the real shape
+    // when a LUKS-produced dm node never appears) must still be matched
+    // by walking the source() chain.
+    use crate::error::NmblError;
+    use std::path::PathBuf;
+    let wrapped = NmblError::Activation {
+        kind: "luks-password".to_string(),
+        source: Box::new(NmblError::DeviceTimeout {
+            device: PathBuf::from("/dev/mapper/cryptroot"),
+            timeout_ms: 15_000,
+        }),
+    };
+    assert!(
+        super::likely_cause(&wrapped).is_some(),
+        "a DeviceTimeout wrapped in Activation must still yield a hint"
+    );
+}
+
+#[test]
+fn emergency_screen_footer_advertises_ctrl_l_logs() {
+    // The error screen must tell the operator the log viewer exists —
+    // a "Ctrl+L" hint in the footer is the recoverability affordance
+    // the report asked for. Render to a TestBackend and grep the frame.
+    use crate::ui::app::{EmergencyChoice, EmergencyItem};
+    use crate::ui::view::{EmergencyScreenData, render_emergency};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let items = vec![EmergencyItem {
+        label: "Reboot",
+        choice: EmergencyChoice::Reboot,
+    }];
+    let data = EmergencyScreenData {
+        message: "Likely cause: the boot device may have been unplugged.\n\nBoot failed.",
+        items: &items,
+        selected_index: 0,
+        countdown_remaining_secs: None,
+    };
+    let mut term = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+    term.draw(|f| render_emergency(f, &data)).expect("draw");
+    let buf = term.backend().buffer();
+    let text: String = (0..buf.area.height)
+        .flat_map(|y| {
+            (0..buf.area.width).filter_map(move |x| buf.cell((x, y)).map(|c| c.symbol().to_owned()))
+        })
+        .collect();
+    assert!(
+        text.contains("Ctrl+L"),
+        "emergency footer must advertise the Ctrl+L log hotkey:\n{text}"
+    );
+    assert!(
+        text.contains("Likely cause"),
+        "the threaded-through likely-cause line must render:\n{text}"
+    );
+}
+
+#[test]
+fn likely_cause_none_for_unrecognised_error() {
+    // An error with no specific operator-actionable pattern must NOT
+    // fabricate a hint — the raw chain stands alone.
+    use crate::error::NmblError;
+    let err = NmblError::Tui {
+        source: std::io::Error::other("some render glitch"),
+    };
+    assert!(
+        super::likely_cause(&err).is_none(),
+        "unrecognised errors must not produce a misleading hint"
+    );
+    let msg = build_message(&err);
+    assert!(
+        !msg.contains("Likely cause:"),
+        "no hint line when the cause is unknown: {msg}"
+    );
+}
+
+#[test]
 fn resolve_emergency_timeout_uses_default_when_absent() {
     let config = crate::config::Config::recovery_default();
     assert_eq!(
