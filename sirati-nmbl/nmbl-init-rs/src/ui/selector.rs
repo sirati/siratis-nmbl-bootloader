@@ -36,7 +36,7 @@ pub async fn run_selector(
 /// TUI event loop. Backend-agnostic: every render and key-poll goes
 /// through the [`Console`] trait. Hosts the countdown, the List/Editing
 /// state machine, and the timeout-defaults-to-active-profile rule.
-async fn run_selector_on_console(
+pub(crate) async fn run_selector_on_console(
     config: &Config,
     generations: &[Generation],
     console: &mut dyn Console,
@@ -79,31 +79,56 @@ async fn run_selector_on_console(
     //    rewriting the loop. Driven via `poll_event` so a host-reported
     //    `CSI 8;rows;cols t` resize redraws the picker against the new
     //    grid instead of stranding the old layout.
+    //
+    //    Input is *coalesced*: once the blocking poll surfaces an event we
+    //    keep draining every already-ready event with a zero timeout and
+    //    apply each to the App *before* a single redraw. A burst or a held
+    //    arrow key (the log viewer's worst case — holding Down through a
+    //    multi-thousand-line kernel log) thus collapses to ONE frame at the
+    //    final offset instead of one full-screen redraw + framebuffer flush
+    //    per keystroke. The `dirty` flag still skips the redraw entirely
+    //    when nothing changed state, so we never blit an unchanged frame.
     let mut dirty = true;
     loop {
         if dirty {
             console.render(&app)?;
             dirty = false;
         }
-        match console.poll_event(POLL_SLICE).await? {
-            Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
-                dirty = true;
-            }
-            Some(crate::ui::console::ConsoleEvent::Key(key)) => {
-                if app.on_key(key) {
-                    break;
+        // Block for the first event, then drain the rest of the ready
+        // burst non-blockingly so they all land in one frame.
+        let mut timeout = POLL_SLICE;
+        loop {
+            match console.poll_event(timeout).await? {
+                Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
+                    dirty = true;
                 }
-                dirty = true;
+                Some(crate::ui::console::ConsoleEvent::Key(key)) => {
+                    if app.on_key(key) {
+                        // A Decision (or screen pop) committed; stop
+                        // draining and let the outer loop notice.
+                        break;
+                    }
+                    dirty = true;
+                }
+                // No scrollback on the selector screen; ignore wheel
+                // notches. `UserHasInteracted` only matters during the
+                // countdown phase (already past here); in the event loop
+                // the real key that follows it does the work, so the
+                // notice is a no-op.
+                Some(
+                    crate::ui::console::ConsoleEvent::Scroll { .. }
+                    | crate::ui::console::ConsoleEvent::UserHasInteracted,
+                ) => {}
+                // No more events ready right now — break out and redraw
+                // once if anything changed.
+                None => break,
             }
-            // No scrollback on the selector screen; ignore wheel notches.
-            // `UserHasInteracted` only matters during the countdown phase
-            // (already past here); in the event loop the real key that
-            // follows it does the work, so the notice is a no-op.
-            Some(
-                crate::ui::console::ConsoleEvent::Scroll { .. }
-                | crate::ui::console::ConsoleEvent::UserHasInteracted,
-            )
-            | None => {}
+            if app.decision.is_some() {
+                break;
+            }
+            // Subsequent drains must not block: only fold in events that
+            // are already queued so we don't stall waiting for more input.
+            timeout = std::time::Duration::ZERO;
         }
         if app.decision.is_some() {
             break;
@@ -307,6 +332,113 @@ mod tests {
             }
             other => panic!("expected explicit Boot decision, got {other:?}"),
         }
+    }
+
+    /// Console double that counts `render` calls and replays a canned
+    /// burst of events. Every event is "already ready": `poll_event`
+    /// returns one per call regardless of the timeout (so a held-key
+    /// burst is fully queued), letting the loop's coalescing fold the
+    /// whole burst into a single redraw. Once drained it yields `None`.
+    struct RenderCountingConsole {
+        keys: VecDeque<KeyEvent>,
+        renders: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl RenderCountingConsole {
+        fn new(keys: Vec<KeyEvent>) -> (Self, std::rc::Rc<std::cell::Cell<usize>>) {
+            let renders = std::rc::Rc::new(std::cell::Cell::new(0));
+            (
+                Self {
+                    keys: keys.into(),
+                    renders: std::rc::Rc::clone(&renders),
+                },
+                renders,
+            )
+        }
+    }
+
+    impl Console for RenderCountingConsole {
+        fn render(&mut self, _app: &App<'_>) -> Result<()> {
+            self.renders.set(self.renders.get() + 1);
+            Ok(())
+        }
+        fn poll_event<'a>(
+            &'a mut self,
+            timeout: std::time::Duration,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Option<ConsoleEvent>>> + 'a>> {
+            Box::pin(async move { self.poll_event_blocking(timeout) })
+        }
+        fn poll_event_blocking(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> Result<Option<ConsoleEvent>> {
+            Ok(self.keys.pop_front().map(ConsoleEvent::Key))
+        }
+        fn size(&self) -> (u16, u16) {
+            (80, 24)
+        }
+        fn kind(&self) -> ConsoleKind {
+            ConsoleKind::Tty
+        }
+        fn draw_with(&mut self, _body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
+            Ok(())
+        }
+        fn suspend(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn event_loop_coalesces_scroll_burst_into_few_redraws() {
+        // A held arrow key in the log viewer is the lag's worst case: the
+        // old loop drew + flushed one full frame per keystroke. The
+        // coalescing loop drains the whole ready burst before a single
+        // redraw, so M scroll events must collapse to far fewer than M
+        // renders. We drive: open the log viewer (Ctrl+L), a burst of
+        // Down presses, close it (Esc), then Enter to boot — all events
+        // pre-queued so they are "ready" together.
+        let cfg: Config = toml::from_str("").expect("default cfg");
+        let gens = vec![sel_gen(1)];
+        // Skip the countdown phase so we exercise the event loop directly.
+        let session = SessionInteraction::new();
+        session.set();
+
+        const BURST: usize = 200;
+        let mut script = Vec::with_capacity(BURST + 3);
+        script.push(ctrl(KeyCode::Char('l')));
+        for _ in 0..BURST {
+            script.push(press(KeyCode::Down));
+        }
+        script.push(press(KeyCode::Esc));
+        script.push(press(KeyCode::Enter));
+
+        let (mut console, renders) = RenderCountingConsole::new(script);
+        let decision = block(run_selector_on_console(
+            &cfg,
+            &gens,
+            &mut console,
+            0,
+            &session,
+        ))
+        .expect("decision");
+        assert!(matches!(decision, Decision::Boot { .. }));
+
+        // The whole pre-queued burst drains in one inner-loop pass, so the
+        // only redraw is the initial frame painted before the first poll.
+        // Far below the old one-redraw-per-keystroke cost (which would be
+        // > BURST renders).
+        let count = renders.get();
+        assert!(
+            count <= 2,
+            "coalescing must collapse a {BURST}-event burst to ≤2 redraws, got {count}"
+        );
     }
 
     #[test]

@@ -47,7 +47,12 @@ impl<'a> App<'a> {
                             &mut self.screen,
                             Screen::Log {
                                 lines: LogSource::Nmbl.read_snapshot(),
-                                offset: 0,
+                                // Open pinned to the bottom (newest lines),
+                                // like `dmesg` / `less +G`. The renderer
+                                // resolves `follow_bottom` to a concrete
+                                // clamped offset on the first frame.
+                                offset: std::cell::Cell::new(0),
+                                follow_bottom: std::cell::Cell::new(true),
                                 source: LogSource::Nmbl,
                             },
                         )));
@@ -63,12 +68,17 @@ impl<'a> App<'a> {
                     if let Screen::Log {
                         lines,
                         offset,
+                        follow_bottom,
                         source,
                     } = &mut self.screen
                     {
                         *source = source.toggled();
                         *lines = source.read_snapshot();
-                        *offset = 0;
+                        // Re-pin to the bottom of the freshly-read buffer so
+                        // the newest lines of the toggled-to source are
+                        // visible, matching the open-at-bottom behaviour.
+                        offset.set(0);
+                        follow_bottom.set(true);
                     }
                     return false;
                 }
@@ -89,22 +99,52 @@ impl<'a> App<'a> {
         }
 
         match &mut self.screen {
-            Screen::Log { offset, .. } => {
+            Screen::Log {
+                offset,
+                follow_bottom,
+                ..
+            } => {
                 // Esc closes the viewer (Ctrl+L is handled above). Other
-                // keys scroll; the renderer clamps the offset so
-                // over-scroll here is harmless. No Decision is produced.
+                // keys scroll; the renderer wrote back a concrete, clamped
+                // offset on the last frame, so an up-scroll from the bottom
+                // moves by exactly one line (no dead presses) and any
+                // over-scroll the renderer clamps again next frame. No
+                // Decision is produced.
+                let cur = offset.get();
                 match key.code {
                     KeyCode::Esc => {
                         if let Some(prev) = self.return_screen.take() {
                             self.screen = *prev;
                         }
                     }
-                    KeyCode::Up => *offset = offset.saturating_sub(1),
-                    KeyCode::Down => *offset = offset.saturating_add(1),
-                    KeyCode::PageUp => *offset = offset.saturating_sub(LOG_PAGE),
-                    KeyCode::PageDown => *offset = offset.saturating_add(LOG_PAGE),
-                    KeyCode::Home => *offset = 0,
-                    KeyCode::End => *offset = u16::MAX,
+                    // Any explicit up-scroll leaves "follow the bottom"
+                    // mode so the view stops auto-pinning to the newest
+                    // line and honours the chosen offset.
+                    KeyCode::Up => {
+                        follow_bottom.set(false);
+                        offset.set(cur.saturating_sub(1));
+                    }
+                    KeyCode::PageUp => {
+                        follow_bottom.set(false);
+                        offset.set(cur.saturating_sub(LOG_PAGE));
+                    }
+                    KeyCode::Home => {
+                        follow_bottom.set(false);
+                        offset.set(0);
+                    }
+                    // Down/PageDown also drop follow mode and step the
+                    // offset; the renderer clamps to the last full page.
+                    KeyCode::Down => {
+                        follow_bottom.set(false);
+                        offset.set(cur.saturating_add(1));
+                    }
+                    KeyCode::PageDown => {
+                        follow_bottom.set(false);
+                        offset.set(cur.saturating_add(LOG_PAGE));
+                    }
+                    // End re-pins to the bottom; the renderer resolves the
+                    // concrete offset against the live viewport height.
+                    KeyCode::End => follow_bottom.set(true),
                     _ => {}
                 }
                 false

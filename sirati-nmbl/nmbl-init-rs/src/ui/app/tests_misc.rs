@@ -203,20 +203,24 @@ fn ctrl_k_toggles_log_source_and_resets_scroll() {
         }
     ));
 
-    // Scroll down so we can prove Ctrl+K resets the offset.
+    // Scroll down so we can prove Ctrl+K resets the offset. Down also
+    // leaves follow-bottom mode.
     app.on_key(press(KeyCode::Down));
-    assert!(matches!(app.screen, Screen::Log { offset: 1, .. }));
+    assert!(
+        matches!(&app.screen, Screen::Log { offset, follow_bottom, .. }
+        if offset.get() == 1 && !follow_bottom.get())
+    );
 
-    // Ctrl+K flips to the kernel ring buffer and resets scroll to 0.
+    // Ctrl+K flips to the kernel ring buffer and re-pins to the bottom
+    // (offset reset to 0, follow_bottom re-armed).
     app.on_key(ctrl(KeyCode::Char('k')));
-    assert!(matches!(
-        app.screen,
+    assert!(matches!(&app.screen,
         Screen::Log {
             source: LogSource::Kernel,
-            offset: 0,
+            offset,
+            follow_bottom,
             ..
-        }
-    ));
+        } if offset.get() == 0 && follow_bottom.get()));
 
     // Ctrl+K again flips back to NMBL's log.
     app.on_key(ctrl(KeyCode::Char('k')));
@@ -318,35 +322,126 @@ fn log_source_toggle_hint_text_per_mode() {
 
 #[test]
 fn log_scroll_offset_moves_and_saturates() {
+    use std::cell::Cell;
     let gens = vec![fake_gen(1, &[])];
     let mut app = App::new(&gens);
     app.screen = Screen::Log {
         lines: vec!["a".into(), "b".into(), "c".into()],
-        offset: 0,
+        offset: Cell::new(0),
+        follow_bottom: Cell::new(false),
         source: LogSource::Nmbl,
+    };
+
+    let off = |app: &App<'_>| match &app.screen {
+        Screen::Log { offset, .. } => offset.get(),
+        _ => panic!("expected Screen::Log"),
+    };
+    let following = |app: &App<'_>| match &app.screen {
+        Screen::Log { follow_bottom, .. } => follow_bottom.get(),
+        _ => panic!("expected Screen::Log"),
     };
 
     // Up at 0 saturates at 0.
     app.on_key(press(KeyCode::Up));
-    assert!(matches!(app.screen, Screen::Log { offset: 0, .. }));
+    assert_eq!(off(&app), 0);
     // Down advances by 1.
     app.on_key(press(KeyCode::Down));
-    assert!(matches!(app.screen, Screen::Log { offset: 1, .. }));
+    assert_eq!(off(&app), 1);
     // PageDown advances by a page.
     app.on_key(press(KeyCode::PageDown));
-    assert!(matches!(app.screen, Screen::Log { offset, .. } if offset == 1 + LOG_PAGE));
-    // End jumps to u16::MAX (renderer clamps for display).
+    assert_eq!(off(&app), 1 + LOG_PAGE);
+    // End re-arms follow-bottom (renderer resolves the concrete offset).
     app.on_key(press(KeyCode::End));
-    assert!(matches!(
-        app.screen,
-        Screen::Log {
-            offset: u16::MAX,
-            ..
-        }
-    ));
-    // Home returns to 0.
+    assert!(following(&app), "End re-pins to the bottom");
+    // Home jumps to 0 and leaves follow-bottom mode.
     app.on_key(press(KeyCode::Home));
-    assert!(matches!(app.screen, Screen::Log { offset: 0, .. }));
+    assert_eq!(off(&app), 0);
+    assert!(!following(&app), "Home is an explicit scroll, not follow");
+}
+
+#[test]
+fn log_opens_at_bottom_and_first_up_is_immediate() {
+    // Open-at-bottom: a >viewport buffer must show its LAST page after the
+    // first render, and the very first Up must move up by exactly one line
+    // (no dead presses). We drive the real renderer through a test backend
+    // so `render_log` resolves `follow_bottom` against a concrete viewport
+    // height and writes the clamped offset back.
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let gens = vec![fake_gen(1, &[])];
+    let mut app = App::new(&gens);
+
+    // 200 lines on a 24-row terminal: the body box (minus borders + footer)
+    // is well under 200 rows, so the buffer is scrollable.
+    let lines: Vec<String> = (0..200).map(|i| format!("line {i}")).collect();
+    app.on_key(ctrl(KeyCode::Char('l')));
+    if let Screen::Log { lines: l, .. } = &mut app.screen {
+        *l = lines;
+    } else {
+        panic!("Ctrl+L must open the log viewer");
+    }
+
+    let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+
+    // First render resolves the bottom-most offset. With 200 lines and a
+    // ~21-row inner viewport the bottom offset is 200 - visible, i.e. large.
+    term.draw(|f| crate::ui::render_current_screen(f, &app))
+        .expect("first frame");
+    let bottom = match &app.screen {
+        Screen::Log {
+            offset,
+            follow_bottom,
+            ..
+        } => {
+            assert!(follow_bottom.get(), "still following the bottom on open");
+            offset.get()
+        }
+        _ => panic!("expected Screen::Log"),
+    };
+    assert!(
+        bottom > 0,
+        "a >viewport buffer must open scrolled to the bottom"
+    );
+
+    // First Up: moves up by exactly one line from the resolved bottom and
+    // leaves follow-bottom mode — no dead presses.
+    app.on_key(press(KeyCode::Up));
+    match &app.screen {
+        Screen::Log {
+            offset,
+            follow_bottom,
+            ..
+        } => {
+            assert!(!follow_bottom.get(), "first Up stops following the bottom");
+            assert_eq!(
+                offset.get(),
+                bottom - 1,
+                "first Up moves up exactly one line from the bottom"
+            );
+        }
+        _ => panic!("expected Screen::Log"),
+    }
+
+    // End re-pins to the bottom on the next frame.
+    app.on_key(press(KeyCode::End));
+    term.draw(|f| crate::ui::render_current_screen(f, &app))
+        .expect("second frame");
+    match &app.screen {
+        Screen::Log { offset, .. } => {
+            assert_eq!(offset.get(), bottom, "End jumps back to the bottom");
+        }
+        _ => panic!("expected Screen::Log"),
+    }
+
+    // Home jumps to the top.
+    app.on_key(press(KeyCode::Home));
+    term.draw(|f| crate::ui::render_current_screen(f, &app))
+        .expect("third frame");
+    match &app.screen {
+        Screen::Log { offset, .. } => assert_eq!(offset.get(), 0, "Home jumps to the top"),
+        _ => panic!("expected Screen::Log"),
+    }
 }
 
 #[test]

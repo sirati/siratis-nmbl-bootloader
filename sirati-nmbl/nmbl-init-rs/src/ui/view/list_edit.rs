@@ -247,18 +247,32 @@ pub fn render_boot_status(frame: &mut Frame<'_>, data: &BootStatusData<'_>) {
 
 /// Render the full boot-transcript log viewer ([`crate::ui::app::Screen::Log`]).
 ///
-/// `lines` is the snapshot (oldest first) and `offset` is the operator's
-/// scroll position from the top; it is clamped here to
-/// `total - visible_rows` so an over-scroll (e.g. `End` setting
-/// `u16::MAX`) lands on the last full page rather than off the end.
+/// `lines` is the snapshot (oldest first). `offset` is the operator's
+/// scroll-from-top position and `follow_bottom` requests pinning to the
+/// newest lines (open / End / Ctrl+K). Both are [`Cell`]s so this
+/// renderer — the only place that knows the viewport height — writes the
+/// resolved, CLAMPED offset back each frame:
+///
+/// * when `follow_bottom` is set, the offset is pinned to the bottom-most
+///   full page (`total - visible_rows`);
+/// * otherwise the raw offset is clamped into `0..=max_off`.
+///
+/// Writing the clamped value back is what makes scrolling up from the
+/// bottom immediate: after the first frame `offset` holds the true
+/// bottom offset, so the next Up keypress moves one line rather than
+/// burning thousands of dead presses against a stale raw `u16`.
+///
 /// A bordered title block fills `area` above a footer row carrying a
 /// left-aligned Ctrl+K hint (toggle to the other log source) and a
 /// right-aligned scroll/close hint.
+///
+/// [`Cell`]: std::cell::Cell
 pub fn render_log(
     frame: &mut Frame<'_>,
     area: Rect,
     lines: &[String],
-    offset: u16,
+    offset: &std::cell::Cell<u16>,
+    follow_bottom: &std::cell::Cell<bool>,
     source: LogSource,
 ) {
     // Reserve the bottom row for the footer hint; the rest is the box.
@@ -274,7 +288,14 @@ pub fn render_log(
     let visible = inner.height;
     let total = u16::try_from(lines.len()).unwrap_or(u16::MAX);
     let max_off = total.saturating_sub(visible);
-    let clamped = offset.min(max_off);
+    let clamped = if follow_bottom.get() {
+        max_off
+    } else {
+        offset.get().min(max_off)
+    };
+    // Write the resolved offset back so the key handler scrolls from a
+    // concrete, in-range position next frame (immediate first Up).
+    offset.set(clamped);
 
     let start = clamped as usize;
     let end = start.saturating_add(visible as usize).min(lines.len());
