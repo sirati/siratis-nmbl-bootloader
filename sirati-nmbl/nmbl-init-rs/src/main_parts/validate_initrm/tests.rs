@@ -87,6 +87,69 @@ fn present_shell_binary_is_not_reported() {
     fs::remove_dir_all(&root).ok();
 }
 
+/// A config carrying one `luks-password` activation whose backing
+/// `cryptsetup` lives at `binary`. The dry-run drives the genuine
+/// activation control flow — including the passphrase prompt — so this is
+/// the regression fixture for the infinite-spin bug: before the fix the
+/// NormalBoot scenario hot-spun forever on the NoopConsole passphrase
+/// prompt and this test would hang.
+fn config_with_luks(binary: &str) -> Config {
+    let mut c = config_with_shell("/bin/sh");
+    let activation: nmbl_init::config::Activation = toml::from_str(&format!(
+        r#"
+            kind = "luks-password"
+            binary = "{binary}"
+            argv = ["luksOpen", "/dev/sda1", "cryptroot", "--key-file=-"]
+            produces_devices = ["/dev/mapper/cryptroot"]
+            description = "unlock root"
+        "#
+    ))
+    .expect("parse luks activation");
+    c.activations.push(activation);
+    c
+}
+
+#[test]
+fn luks_activation_dry_run_terminates_and_reports_cryptsetup() {
+    // THE regression: an empty closure (no /bin/cryptsetup) must make the
+    // dry-run TERMINATE and surface cryptsetup as a missing file — it must
+    // NOT busy-spin on the NoopConsole passphrase prompt.
+    let root = temp_closure("luks-missing-cryptsetup", |_d| {});
+    let config = config_with_luks("/bin/cryptsetup");
+
+    let report = validate_initrm(&config, None, &root);
+    assert!(
+        !report.is_clean(),
+        "missing cryptsetup must surface a finding"
+    );
+    let rendered = report.render();
+    assert!(
+        rendered.contains("/bin/cryptsetup"),
+        "report should name the absent cryptsetup binary:\n{rendered}"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn luks_activation_dry_run_with_cryptsetup_present_does_not_report_it() {
+    // Stage /bin/cryptsetup so the run_with_tick presence-check is
+    // satisfied; the dry-run must still terminate and not fork it.
+    let root = temp_closure("luks-present-cryptsetup", |d| {
+        fs::create_dir_all(d.join("bin")).expect("mkdir bin");
+        fs::write(d.join("bin/cryptsetup"), b"#!/bin/sh\n").expect("write cryptsetup");
+        fs::write(d.join("bin/sh"), b"#!/bin/sh\n").expect("write sh");
+    });
+    let config = config_with_luks("/bin/cryptsetup");
+
+    let report = validate_initrm(&config, None, &root);
+    let rendered = report.render();
+    assert!(
+        !rendered.contains("/bin/cryptsetup"),
+        "present cryptsetup must not be reported as missing:\n{rendered}"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn uki_missing_file_is_reported_as_parse_error() {
     // A `--uki` pointing at a nonexistent file must surface a UKI finding
