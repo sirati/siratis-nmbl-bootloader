@@ -29,6 +29,36 @@ fn build_active_console_is_pre_checked_with_extras() {
     assert!(!state.selected[2]);
 }
 
+/// The kernel-console row must label what `/dev/console` ACTUALLY
+/// resolves to at runtime (the resolver's output), not a config guess.
+/// When that device is the framebuffer VT the splash paints on
+/// (`/dev/tty1`) the label is the plain `-> ` form with no caveat.
+#[test]
+fn build_console_label_shows_resolved_device_when_it_is_the_screen() {
+    let cfg = Config::recovery_default();
+    let state =
+        PickerState::build_with(&cfg, || Ok(PathBuf::from("/dev/tty1")), no_enum).expect("build");
+    assert_eq!(state.candidates[0].target, PathBuf::from("/dev/tty1"));
+    assert_eq!(state.candidates[0].label, "/dev/console (-> /dev/tty1)");
+}
+
+/// When `/dev/console` resolves to a device that is NOT the live splash
+/// VT (e.g. cmdline pins `console=ttyS0` but the box booted headless off
+/// a USB stick), the row must say so — the operator was previously told
+/// "ttyS0" with no hint it isn't the screen in front of them. This is the
+/// console-label half of the shell-spawn-nohang fix.
+#[test]
+fn build_console_label_flags_resolved_device_that_is_not_the_screen() {
+    let cfg = Config::recovery_default();
+    let state =
+        PickerState::build_with(&cfg, || Ok(PathBuf::from("/dev/ttyS0")), no_enum).expect("build");
+    assert_eq!(state.candidates[0].target, PathBuf::from("/dev/ttyS0"));
+    assert_eq!(
+        state.candidates[0].label,
+        "/dev/console (-> /dev/ttyS0, NOT the live screen)"
+    );
+}
+
 #[test]
 fn build_merges_enumerated_set_after_kernel_console() {
     let cfg = Config::recovery_default();

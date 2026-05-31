@@ -54,6 +54,114 @@ use phases::run_phase_1;
 
 const BOOTSTRAP_CONFIG_PATH: &str = "/etc/nmbl/bootstrap.toml";
 
+/// Earliest startup, before any work that can fail. Two jobs, in order:
+///
+/// 1. **As PID 1, mount `/dev` (devtmpfs) then `/proc` immediately and
+///    blockingly.** The initramfs ships an empty `/dev` with no static
+///    `/dev/console`, so until devtmpfs is mounted PID 1 has no console
+///    and any early panic message is invisible; and the panic hook's
+///    `execve("/proc/self/exe")` recovery needs `/proc`. Mounting these
+///    up front (rather than in Phase 1, which only runs after config
+///    load) makes the earliest failure observable and recoverable.
+///    Best-effort: a mount that returns `EBUSY` (re-exec already has it
+///    mounted) is fine, and any other error must not itself abort —
+///    Phase 1 re-mounts idempotently with full reporting later.
+///
+/// 2. **Install the panic hook right away**, against the default report
+///    dir, so a panic in `parse_args` / `Config::load` (which run before
+///    the config-driven `install_panic_hook` below) still routes through
+///    the `execve`-into-recovery path instead of unwinding past `main`
+///    or aborting. `install_panic_hook` is idempotent/replace-semantics,
+///    so the later call with the operator's real report dir just updates
+///    the target directory.
+fn early_init() {
+    // Only PID 1 is responsible for the pseudo-filesystems; a non-PID-1
+    // invocation (installer, systemd unit, rescue client) must not touch
+    // the host's mounts.
+    if nix::unistd::getpid().as_raw() == 1 {
+        // /dev first so /dev/console exists for output, then /proc for
+        // the panic hook's self-re-exec. EBUSY = already mounted (re-exec
+        // path) is success; any other error is swallowed so early_init
+        // itself can never be the thing that kills PID 1 — Phase 1 will
+        // retry with diagnostics.
+        for (target, fstype, options) in [
+            ("/dev", "devtmpfs", "mode=755,nosuid"),
+            ("/proc", "proc", "nosuid,noexec,nodev"),
+            ("/sys", "sysfs", "nosuid,noexec,nodev"),
+        ] {
+            let path = Path::new(target);
+            let _ = std::fs::create_dir_all(path);
+            match nmbl_init::sys::mount::mount_fs(None, path, fstype, options) {
+                Ok(()) => {}
+                Err(NmblError::Mount {
+                    source: nix::errno::Errno::EBUSY,
+                    ..
+                }) => {}
+                Err(_) => { /* swallow: Phase 1 re-mounts with reporting */ }
+            }
+        }
+
+        // Now that devtmpfs is mounted, wire stdin/stdout/stderr to
+        // `/dev/console`. This is the load-bearing part. The initramfs
+        // ships an empty `/dev`, so the kernel hands PID 1 **no
+        // `/dev/console`** at exec time and fd 0/1/2 are left invalid;
+        // the first `open()` then reuses fd 0/1/2 for unrelated files,
+        // so any later code that assumes those descriptors are the
+        // console (logging, the panic hook, the boot reporter, the
+        // emergency console grab) operates on the wrong fds.
+        //
+        // This was the real-hardware boot failure: on a Lenovo where the
+        // boot aborted in early startup, PID 1 fell through musl
+        // `abort()`'s final `hlt`, which the kernel reports as a #GP
+        // "Attempted to kill init". A control image that mounts these
+        // filesystems and reopens the console **before** the real init
+        // runs (then execs it as PID 1) boots cleanly, whereas mounting
+        // `/dev` alone (no console reopen) still aborts — so the console
+        // reopen here is the operative fix, not the mounts by themselves.
+        wire_console_stdio();
+    }
+
+    // Hook installed before parse_args / Config::load so their panics are
+    // caught. Uses the panic module's default report dir; re-installed
+    // with the operator's configured dir once the config is loaded.
+    install_panic_hook(Path::new(nmbl_init::panic::DEFAULT_PANIC_REPORT_DIR));
+}
+
+/// Open `/dev/console` and `dup2` it onto fd 0/1/2 so the process has a
+/// valid, connected stdin/stdout/stderr. PID 1 booted from an initramfs
+/// with an empty `/dev` starts with those descriptors invalid; this
+/// repairs them so logging, the panic hook's `eprintln!`, and the boot
+/// reporter all have somewhere to write. Best-effort: every step is
+/// swallowed so a missing/odd console can never make `early_init` itself
+/// the thing that kills PID 1.
+fn wire_console_stdio() {
+    use std::os::fd::IntoRawFd;
+
+    // RDWR so stdin reads (operator key presses on the console) work too.
+    let Ok(console) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/console")
+    else {
+        return;
+    };
+    // Take the raw fd out of the `File` so its `Drop` can't close a
+    // descriptor we are about to alias onto 0/1/2 (the open may itself
+    // have landed on fd 0 when stdio was unallocated).
+    let cfd = console.into_raw_fd();
+    for target in 0..=2 {
+        if cfd != target {
+            // dup2 onto the canonical stdio fds; ignore errors (best-effort).
+            let _ = nix::unistd::dup2(cfd, target);
+        }
+    }
+    // Close the source fd only if it isn't one of the stdio fds we just
+    // populated; otherwise it stays open as the live console.
+    if cfd > 2 {
+        let _ = nix::unistd::close(cfd);
+    }
+}
+
 // Tmpfs path the byte-ring is flushed to right before every terminal
 // action — defined once in `log::NMBL_LOG_PATH`. The parent dir is
 // `mkdir -p`'d on every call; EEXIST is benign, anything else means
@@ -204,6 +312,12 @@ fn run_inner(
 /// [`execute_terminal_action`] (which diverges) or returns
 /// `ExitCode::SUCCESS` after a normal `Ok(())` outcome.
 fn main() -> ExitCode {
+    // Before anything that can fail: as PID 1 mount /dev + /proc, and
+    // install the panic hook. See [`early_init`]. Compiled-in for every
+    // build; the mocking/debug-tui path below is non-PID-1 so it only
+    // gets the (idempotent) hook install, not the mounts.
+    early_init();
+
     // `--debug-tui -- <scenario> [args...]` entrypoint (feature `mocking`).
     // Runs a single modal flow on the current terminal and exits.
     // Compiled out of release builds so the production initramfs cannot

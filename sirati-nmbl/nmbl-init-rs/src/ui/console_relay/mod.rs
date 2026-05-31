@@ -33,7 +33,7 @@ mod modal;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{Mode, OFlags, fcntl_setfl, open};
+use rustix::fs::{Mode, OFlags, open};
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
@@ -72,9 +72,16 @@ const RELAY_BUF: usize = 4096;
 /// target doesn't abort the whole relay. The remaining selected
 /// targets continue to work.
 fn open_target_nonblocking(path: &Path) -> Option<OwnedFd> {
+    // O_NONBLOCK MUST be on the open(2) itself, not set afterwards: a tty
+    // line without CLOCAL blocks the bare open() until carrier (DCD) is
+    // asserted, so a carrier-less serial target would wedge the whole
+    // single-threaded relay before we ever reach fcntl. Opening
+    // non-blocking returns immediately regardless of carrier; the relay
+    // loop already polls before every read, so non-blocking stays the
+    // desired steady state anyway.
     let fd = match open(
         path,
-        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+        OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     ) {
         Ok(f) => f,
@@ -86,15 +93,6 @@ fn open_target_nonblocking(path: &Path) -> Option<OwnedFd> {
             return None;
         }
     };
-    if let Err(e) = fcntl_setfl(&fd, OFlags::NONBLOCK) {
-        nmbl_warn!(
-            "console_relay: F_SETFL O_NONBLOCK on {} failed: {e}",
-            path.display()
-        );
-        // Even without non-blocking the relay can usually still cope
-        // because we poll before reading — drop down to blocking mode
-        // rather than killing the target outright.
-    }
     Some(fd)
 }
 

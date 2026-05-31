@@ -27,7 +27,7 @@ use nix::unistd::execve;
 /// before main installs the hook with the configured directory). `/run`
 /// is tmpfs — created in phase 1 — so a re-exec for panic recovery has
 /// somewhere to write even when the system filesystem isn't mounted.
-const DEFAULT_PANIC_REPORT_DIR: &str = "/run";
+pub const DEFAULT_PANIC_REPORT_DIR: &str = "/run";
 
 /// Process-wide override for the panic report directory. Populated by
 /// [`install_panic_hook`] from the runtime config so the panic hook —
