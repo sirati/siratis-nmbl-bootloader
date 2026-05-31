@@ -88,15 +88,33 @@ pub(crate) async fn run_selector_on_console(
     //    final offset instead of one full-screen redraw + framebuffer flush
     //    per keystroke. The `dirty` flag still skips the redraw entirely
     //    when nothing changed state, so we never blit an unchanged frame.
+    //
+    //    On TOP of dirty: a 30 fps cap (`FRAME_INTERVAL`). A frame paints
+    //    only when `dirty` AND at least `FRAME_INTERVAL` has elapsed since
+    //    the last render, so a fast input burst can dirty the App many
+    //    times but repaints no more than 30×/s. When a change is pending
+    //    but the interval has not elapsed, the first poll's wait is bounded
+    //    to the time left until the next allowed render, so the loop wakes
+    //    by that deadline and the final state paints within ~33 ms — the
+    //    last frame after a burst is never dropped.
     let mut dirty = true;
+    // Seed so the very first pass renders immediately (interval already
+    // satisfied) instead of waiting out a frame interval before the
+    // initial paint.
+    let mut last_render = Instant::now()
+        .checked_sub(FRAME_INTERVAL)
+        .unwrap_or_else(Instant::now);
     loop {
-        if dirty {
+        let gate = render_gate(dirty, last_render, Instant::now());
+        if gate.render {
             console.render(&app)?;
+            last_render = Instant::now();
             dirty = false;
         }
-        // Block for the first event, then drain the rest of the ready
-        // burst non-blockingly so they all land in one frame.
-        let mut timeout = POLL_SLICE;
+        // Block for the first event, bounded by the frame-render deadline
+        // when a paint is pending, then drain the rest of the ready burst
+        // non-blockingly so they all land in one frame.
+        let mut timeout = gate.wait;
         loop {
             match console.poll_event(timeout).await? {
                 Some(crate::ui::console::ConsoleEvent::Resize { .. }) => {
@@ -138,6 +156,58 @@ pub(crate) async fn run_selector_on_console(
     app.decision.ok_or_else(|| NmblError::Tui {
         source: std::io::Error::other("selector exited without decision"),
     })
+}
+
+/// Minimum wall-time between two consecutive screen renders: a 30 fps
+/// cap (~33.33 ms). Composed with the `dirty` flag so the event loop
+/// renders at most 30 times a second AND only when state changed.
+const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
+
+/// Decision of the frame-rate gate for one event-loop pass.
+struct RenderGate {
+    /// Whether a frame should be painted this pass.
+    render: bool,
+    /// Upper bound for the *first* `poll_event` wait this pass. When a
+    /// change is pending but the frame interval has not elapsed yet, this
+    /// shrinks below `POLL_SLICE` to the time left until the next allowed
+    /// render, so the loop wakes by that deadline and paints the pending
+    /// frame even if no further input arrives. Otherwise it is `POLL_SLICE`.
+    wait: Duration,
+}
+
+/// Compose the 30 fps cap with the `dirty` flag for a single loop pass.
+///
+/// `now` is passed in (rather than read from the clock here) so the gate
+/// is a pure function the tests drive against a controlled monotonic
+/// timeline without real sleeps. `last_render` is the [`Instant`] the
+/// previous frame was painted at.
+///
+/// * not dirty            ⇒ never render; full `POLL_SLICE` wait.
+/// * dirty, interval up   ⇒ render this pass; full `POLL_SLICE` wait.
+/// * dirty, interval left ⇒ don't render yet, but bound the wait to the
+///   remaining time so the deadline wakes us to paint the final frame.
+fn render_gate(dirty: bool, last_render: Instant, now: Instant) -> RenderGate {
+    if !dirty {
+        return RenderGate {
+            render: false,
+            wait: POLL_SLICE,
+        };
+    }
+    let elapsed = now.duration_since(last_render);
+    if elapsed >= FRAME_INTERVAL {
+        RenderGate {
+            render: true,
+            wait: POLL_SLICE,
+        }
+    } else {
+        // Wake by the next-render deadline so the pending change still
+        // paints once the interval passes, even with no new input.
+        let remaining = FRAME_INTERVAL - elapsed;
+        RenderGate {
+            render: false,
+            wait: POLL_SLICE.min(remaining),
+        }
+    }
 }
 
 /// Remaining whole seconds, rounded UP, for the countdown header.
@@ -218,7 +288,11 @@ mod tests {
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{Decision, run_console_countdown, run_selector_on_console};
+    use std::time::{Duration, Instant};
+
+    use super::{
+        Decision, FRAME_INTERVAL, render_gate, run_console_countdown, run_selector_on_console,
+    };
     use crate::config::Config;
     use crate::error::Result;
     use crate::generations::Generation;
@@ -466,5 +540,68 @@ mod tests {
             session.get(),
             "cancelling the countdown must latch operator presence"
         );
+    }
+
+    // The frame-rate gate is a pure function of (dirty, last_render, now),
+    // so these tests drive a controlled monotonic timeline (a base
+    // `Instant` plus deltas) and assert the gate decision directly — no
+    // real sleeps, fully deterministic.
+
+    #[test]
+    fn gate_renders_once_when_dirty_and_interval_elapsed() {
+        // dirty + interval elapsed ⇒ render this pass; full POLL_SLICE wait
+        // (the caller resets last_render and clears dirty on render).
+        let last = Instant::now();
+        let now = last + FRAME_INTERVAL;
+        let gate = render_gate(true, last, now);
+        assert!(gate.render, "interval has elapsed, must render");
+        assert_eq!(gate.wait, super::POLL_SLICE);
+    }
+
+    #[test]
+    fn gate_holds_render_and_bounds_wait_before_interval() {
+        // dirty + interval NOT elapsed ⇒ no render this pass, and the poll
+        // wait is bounded to the remaining time until the next allowed
+        // render (≤ the remaining interval, and ≤ POLL_SLICE).
+        let last = Instant::now();
+        let elapsed = FRAME_INTERVAL / 3;
+        let now = last + elapsed;
+        let remaining = FRAME_INTERVAL - elapsed;
+        let gate = render_gate(true, last, now);
+        assert!(!gate.render, "interval not elapsed yet, must not render");
+        assert!(
+            gate.wait <= remaining,
+            "wait {:?} must be bounded to remaining {:?}",
+            gate.wait,
+            remaining
+        );
+        assert!(gate.wait <= super::POLL_SLICE);
+    }
+
+    #[test]
+    fn gate_paints_pending_frame_once_interval_passes_without_input() {
+        // dirty + interval not elapsed, then time advances past the
+        // interval with NO new events ⇒ the pending frame renders. This is
+        // the deadline guarantee: the final state after a burst is never
+        // lost.
+        let last = Instant::now();
+        // First pass: too early, held.
+        let early = render_gate(true, last, last + FRAME_INTERVAL / 2);
+        assert!(!early.render);
+        // Time advances past the interval (the bounded wait woke us); still
+        // dirty, no new input ⇒ now it paints.
+        let late = render_gate(true, last, last + FRAME_INTERVAL + Duration::from_millis(1));
+        assert!(late.render, "pending frame must paint once interval passes");
+    }
+
+    #[test]
+    fn gate_never_renders_when_not_dirty() {
+        // not dirty ⇒ never render regardless of how much time elapsed,
+        // and the wait stays the full POLL_SLICE (no deadline to chase).
+        let last = Instant::now();
+        let way_past = last + FRAME_INTERVAL * 100;
+        let gate = render_gate(false, last, way_past);
+        assert!(!gate.render, "nothing changed, must never render");
+        assert_eq!(gate.wait, super::POLL_SLICE);
     }
 }
