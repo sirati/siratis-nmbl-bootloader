@@ -207,6 +207,72 @@ fn reporter_keypress_during_log_window_latches_presence() {
 }
 
 #[test]
+fn progress_sink_tick_ctrl_l_opens_log_viewer_mid_wait() {
+    // The hang fix: Ctrl+L must reach the global dispatch DURING a
+    // device/activation wait, opening the boot-log viewer instead of the
+    // operator being trapped on a spinner. tick stays Continue (the wait
+    // keeps running behind the overlay) and the App is now on Screen::Log.
+    let mut console = MockConsole::with_keys(vec![Some(KeyEvent::new(
+        KeyCode::Char('l'),
+        KeyModifiers::CONTROL,
+    ))]);
+    let mut reporter = BootReporter::new(&mut console, "phase 3b: waiting");
+    let outcome = ProgressSink::tick(&mut reporter, "phase 3b: waiting for /dev/sda1");
+    assert_eq!(
+        outcome,
+        TickOutcome::Continue,
+        "Ctrl+L must not abort the wait — it opens the log viewer"
+    );
+    assert!(
+        matches!(reporter.app().screen, Screen::Log { .. }),
+        "Ctrl+L during a wait must switch the App onto the log viewer"
+    );
+}
+
+#[test]
+fn progress_sink_tick_esc_closes_log_overlay_without_aborting() {
+    // ESC hierarchy: with the log viewer open, Esc must CLOSE it and
+    // resume the wait (Continue) rather than abort. Only an Esc with no
+    // overlay aborts. Script Ctrl+L then Esc across two ticks.
+    let mut console = MockConsole::with_keys(vec![
+        Some(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+        Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    ]);
+    let mut reporter = BootReporter::new(&mut console, "phase 3b: waiting");
+    let open = ProgressSink::tick(&mut reporter, "p");
+    assert_eq!(open, TickOutcome::Continue);
+    assert!(
+        matches!(reporter.app().screen, Screen::Log { .. }),
+        "log viewer must be open after Ctrl+L"
+    );
+    let close = ProgressSink::tick(&mut reporter, "p");
+    assert_eq!(
+        close,
+        TickOutcome::Continue,
+        "Esc that closes the log overlay must NOT abort the wait"
+    );
+    assert!(
+        matches!(reporter.app().screen, Screen::BootStatus(_)),
+        "Esc must pop the log viewer back to the boot-status wait screen"
+    );
+}
+
+#[test]
+fn progress_sink_tick_esc_aborts_when_no_overlay_then_continues_when_log_open() {
+    // Full hierarchy in one test: idle Esc aborts; but after opening the
+    // log, Esc only closes it. (Two independent reporters because the
+    // first aborts.)
+    let mut c1 =
+        MockConsole::with_keys(vec![Some(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))]);
+    let mut r1 = BootReporter::new(&mut c1, "waiting");
+    assert_eq!(
+        ProgressSink::tick(&mut r1, "p"),
+        TickOutcome::Aborted,
+        "idle Esc (no overlay) must abort"
+    );
+}
+
+#[test]
 fn progress_sink_tick_ignores_non_esc_keys() {
     // Stray keypresses (Enter, letters, …) should not abort the
     // wait — only Esc carries the operator-abort semantics.
