@@ -284,6 +284,25 @@ impl ExecOps for DryRunSys {
         Ok(self.scenario.scripted_outcome(ExecRole::Activation))
     }
 
+    async fn run_with_tick(
+        &mut self,
+        binary: &Path,
+        _argv: &[String],
+        _stdin_data: Option<&[u8]>,
+        _tick: &mut dyn FnMut(),
+    ) -> Result<ProcessOutcome> {
+        // Presence-check only: NEVER fork (so the LUKS `cryptsetup` exec is
+        // not run in the sandbox) and NEVER tick (no live console). The
+        // outcome is the same activation-role script `run` uses, so the
+        // boot routes identically under each scenario.
+        self.require_binary(
+            "run_with_tick",
+            binary,
+            "activation/exec binary not in initrd",
+        );
+        Ok(self.scenario.scripted_outcome(ExecRole::Activation))
+    }
+
     async fn run_capture(
         &mut self,
         binary: &Path,

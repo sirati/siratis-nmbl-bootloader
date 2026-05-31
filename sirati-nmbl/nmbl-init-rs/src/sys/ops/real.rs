@@ -158,6 +158,17 @@ impl ExecOps for RealSys<'_> {
         crate::sys::activation::run(binary, argv, stdin_data, self.sender()).await
     }
 
+    async fn run_with_tick(
+        &mut self,
+        binary: &Path,
+        argv: &[String],
+        stdin_data: Option<&[u8]>,
+        tick: &mut dyn FnMut(),
+    ) -> Result<ProcessOutcome> {
+        crate::sys::activation::run_with_tick(binary, argv, stdin_data, Some(tick), self.sender())
+            .await
+    }
+
     async fn run_capture(
         &mut self,
         binary: &Path,
