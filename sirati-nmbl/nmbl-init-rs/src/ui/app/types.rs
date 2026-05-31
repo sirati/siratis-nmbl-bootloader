@@ -198,12 +198,26 @@ pub enum Screen<'a> {
     List,
     /// Full boot-transcript viewer, opened with Ctrl+L from any screen
     /// and popped back via Esc / Ctrl+L. `lines` is the snapshot
-    /// (oldest first) and `offset` is the scroll position; the renderer
-    /// clamps `offset` so over-scroll is harmless. `source` records which
-    /// buffer is shown (NMBL vs kernel); Ctrl+K toggles it and re-reads.
+    /// (oldest first) and `offset` is the scroll-from-top position.
+    ///
+    /// `offset` and `follow_bottom` are [`Cell`]s so the *renderer* can
+    /// write the CLAMPED offset back each frame: the renderer is the only
+    /// place that knows the viewport height (and therefore the true
+    /// bottom-most offset). After the first frame `offset` always holds a
+    /// concrete in-range value, so the very first Up keypress moves by one
+    /// line with no "dead presses" — without this write-back, opening at
+    /// the bottom (`follow_bottom = true`) would leave `offset` stale and
+    /// the operator would have to press Up thousands of times before the
+    /// raw offset dropped below the clamp.
+    ///
+    /// `follow_bottom` starts `true` on open / Ctrl+K so the viewer shows
+    /// the newest lines (like `less +G`); the first explicit up-scroll
+    /// clears it (End re-arms it). `source` records which buffer is shown
+    /// (NMBL vs kernel); Ctrl+K toggles it and re-reads.
     Log {
         lines: Vec<String>,
-        offset: u16,
+        offset: Cell<u16>,
+        follow_bottom: Cell<bool>,
         source: LogSource,
     },
     Editing {

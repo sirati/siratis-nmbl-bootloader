@@ -109,8 +109,9 @@ fn render_screen_body(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
         Screen::Log {
             lines,
             offset,
+            follow_bottom,
             source,
-        } => render_log(frame, frame.area(), lines, *offset, *source),
+        } => render_log(frame, frame.area(), lines, offset, follow_bottom, *source),
         Screen::Editing {
             generation_index,
             line,

@@ -254,6 +254,51 @@ pub(super) async fn run_emergency(
     Ok(())
 }
 
+/// Drive the real generation selector so the in-TUI log viewer (Ctrl+L /
+/// Ctrl+K) can be exercised by hand under tmux. Pre-fills NMBL's own boot
+/// transcript with `<lines>` long synthetic lines (default 4000) so the
+/// viewer has a multi-page buffer to scroll: this is the repro vehicle
+/// for the scroll-lag fix (hold Down / PageDown and confirm the redraw is
+/// smooth) and for open-at-bottom (the viewer must open on the newest
+/// line). Ctrl+K toggles to the live kernel ring buffer.
+///
+/// `--debug-tui log-viewer [lines]`. Press Enter on the menu to exit.
+pub(super) async fn run_log_viewer(console: &mut MockConsole, args: &[String]) -> Result<()> {
+    let lines: usize = args
+        .first()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4000usize);
+    for i in 0..lines {
+        crate::nmbl_info!(
+            "synthetic boot-log line {i:05} — lorem ipsum dolor sit amet, \
+             consectetur adipiscing elit, sed do eiusmod tempor incididunt"
+        );
+    }
+    let config = Config::recovery_default();
+    let gens = [demo_generation()];
+    // A pre-set session latch skips the auto-boot countdown so the harness
+    // sits in the event loop waiting for Ctrl+L straight away.
+    let session = SessionInteraction::new();
+    session.set();
+    let decision =
+        crate::ui::selector::run_selector_on_console(&config, &gens, console, 0, &session).await;
+    eprintln!("[mocking] log-viewer decision={decision:?}");
+    Ok(())
+}
+
+/// A throwaway [`Generation`] so the selector has one row to render.
+fn demo_generation() -> crate::generations::Generation {
+    crate::generations::Generation {
+        number: 1,
+        profile_link: std::path::PathBuf::from("/nix/var/nix/profiles/system-1-link"),
+        kernel: std::path::PathBuf::from("/run/current-system/kernel"),
+        initrd: std::path::PathBuf::from("/run/current-system/initrd"),
+        init_path: std::path::PathBuf::from("/run/current-system/init"),
+        kernel_params: vec!["init=/sbin/init".to_owned()],
+        label: "NixOS (mocking harness)".to_owned(),
+    }
+}
+
 pub(super) fn arg_or_default(args: &[String], idx: usize, default: &str) -> String {
     args.get(idx)
         .cloned()
