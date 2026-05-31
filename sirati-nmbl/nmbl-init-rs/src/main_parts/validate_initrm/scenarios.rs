@@ -47,6 +47,7 @@ use nmbl_init::ui::{SessionInteraction, SkipSelector};
 use super::super::dispatch::select_and_act;
 use super::super::phases::run_phases_post_console;
 use super::scripted_console::ScriptedConsole;
+use super::scripted_supplier::ScriptedPasswordSupplier;
 
 use crossterm::event::KeyCode;
 
@@ -67,21 +68,17 @@ const DRYRUN_SHELL_ROWS: u16 = 24;
 pub(super) fn run_normal_boot(config: &Config, closure_root: &std::path::Path) -> Vec<MissingFile> {
     let closure = ClosureView::new(closure_root.to_path_buf());
     let mut dryrun = DryRunSys::new(closure, DryRunScenario::NormalBoot);
-    let result = block_on_tui_with_poller(|sender| async move {
+    let result = block_on_tui_with_poller(|_sender| async move {
         let session = SessionInteraction::new();
         let skip_selector = SkipSelector::new();
         // Headless: take the default-boot decision path, no keypress.
         skip_selector.set(true);
         let mut console = NoopConsole::new();
-        if let Ok(injections) = run_phases_post_console(
-            &mut dryrun,
-            config,
-            &mut console,
-            &session,
-            &skip_selector,
-            &sender,
-        )
-        .await
+        // Headless supplier: returns a placeholder passphrase instantly,
+        // never driving the NoopConsole's timeout-ignoring poll loop.
+        let mut supplier = ScriptedPasswordSupplier;
+        if let Ok(injections) =
+            run_phases_post_console(&mut dryrun, config, &mut console, &mut supplier).await
         {
             // SWALLOW the TerminalAction — never execute it.
             let _ = select_and_act(
@@ -114,17 +111,9 @@ pub(super) fn run_error_screen(
     let mut dryrun = DryRunSys::new(closure, DryRunScenario::ErrorToErrorScreen);
     let result = block_on_tui_with_poller(|sender| async move {
         let session = SessionInteraction::new();
-        let skip_selector = SkipSelector::new();
         let mut noop = NoopConsole::new();
-        let outcome = run_phases_post_console(
-            &mut dryrun,
-            config,
-            &mut noop,
-            &session,
-            &skip_selector,
-            &sender,
-        )
-        .await;
+        let mut supplier = ScriptedPasswordSupplier;
+        let outcome = run_phases_post_console(&mut dryrun, config, &mut noop, &mut supplier).await;
         // The scenario scripts an activation failure, so we expect Err;
         // either way, route to the emergency screen to exercise it.
         let err = outcome.err().unwrap_or_else(|| NmblError::Io {

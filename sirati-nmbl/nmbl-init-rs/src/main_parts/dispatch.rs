@@ -13,7 +13,9 @@ use nmbl_init::terminal::{TerminalAction, redirect_stdio_for_execve};
 use nmbl_init::ui::console::{Console, LatchingConsole};
 #[cfg(not(feature = "stateful"))]
 use nmbl_init::ui::run_selector;
-use nmbl_init::ui::{BootReporter, Decision, SessionInteraction, SkipSelector};
+use nmbl_init::ui::{
+    BootReporter, Decision, SessionInteraction, SkipSelector, TuiPasswordSupplier,
+};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
 
 use super::phases::run_phases_post_console;
@@ -296,27 +298,29 @@ pub(super) async fn run_tui_session<S: nmbl_init::sys::ops::SysOps>(
     // dispatch reads it. Default `false` (= show the selector) means a
     // boot with no passphrase prompt is completely unaffected.
     let skip_selector = SkipSelector::new();
+    // Genuine passphrase supplier: pops the live ratatui modal on the
+    // boot console. Built here (not inside `run_phases_post_console`) so
+    // the dry-run path can substitute a scripted supplier that never
+    // touches the console — see `validate_initrm::scenarios`.
+    let mut supplier = TuiPasswordSupplier::new(config, session, &skip_selector);
     // Phases 2b/3/3b run here too: their syscalls (modules, cryptsetup,
     // mount) are plain synchronous calls inside this async fn, and the
     // passphrase prompt / wrong-password modal `.await` the same
     // console — no nested runtime anywhere.
-    let outcome =
-        match run_phases_post_console(ops, config, &mut *console, session, &skip_selector, sender)
+    let outcome = match run_phases_post_console(ops, config, &mut *console, &mut supplier).await {
+        Ok(injections) => {
+            select_and_act(
+                ops,
+                config,
+                &mut *console,
+                &injections,
+                session,
+                &skip_selector,
+            )
             .await
-        {
-            Ok(injections) => {
-                select_and_act(
-                    ops,
-                    config,
-                    &mut *console,
-                    &injections,
-                    session,
-                    &skip_selector,
-                )
-                .await
-            }
-            Err(err) => Err(err),
-        };
+        }
+        Err(err) => Err(err),
+    };
     match outcome {
         Ok(action) => {
             // `console` falls out of scope on return, running

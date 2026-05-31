@@ -85,7 +85,7 @@ pub async fn retry_boot(
     let injections = {
         let mut reporter =
             BootReporter::overlay(console, app, "phase 3: storage activations (retry)");
-        run_all_activations(&mut ops, config, &mut reporter, Some(supplier), sender).await?
+        run_all_activations(&mut ops, config, &mut reporter, Some(supplier)).await?
     };
 
     // Phase 3b: mount system filesystems.
