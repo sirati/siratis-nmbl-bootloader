@@ -141,9 +141,11 @@ in
               - systemd: systemd-boot (UEFI only, formerly gummiboot)
               - efi-stub: UEFI direct boot. NMBL's kernel + initrd are
                 combined into a single UKI (Unified Kernel Image) PE and
-                installed as EFI/BOOT/BOOTX64.EFI on the ESP. No GRUB or
-                systemd-boot binary is written — the ESP holds ONLY NMBL.
-                UEFI only.
+                installed on the ESP — by default at the fallback path
+                EFI/BOOT/BOOTX64.EFI (no GRUB/systemd-boot binary written).
+                Set loader_extra_args.efiStubInstallPath to an own path
+                (e.g. EFI/nmbl/nmbl.efi) to install alongside an existing
+                bootloader without overwriting its fallback binary. UEFI only.
               - null: No loader (used for qemu_kernel_invoke mode)
 
               Defaults to "grub" for bios/uefi modes, null for qemu_kernel_invoke.
@@ -180,6 +182,32 @@ in
                       This installs to the fallback path (EFI/BOOT/BOOTX64.EFI) which
                       firmware looks for when no NVRAM entries exist.
                       Only applies to UEFI boot mode with GRUB.
+                    '';
+                  };
+
+                  efiStubInstallPath = lib.mkOption {
+                    type = lib.types.str;
+                    default = "EFI/BOOT/BOOTX64.EFI";
+                    example = "EFI/nmbl/nmbl.efi";
+                    description = lib.mdDoc ''
+                      ESP-relative path the efi-stub UKI is installed to
+                      (loader = "efi-stub").
+
+                      Defaults to the UEFI removable/fallback path
+                      EFI/BOOT/BOOTX64.EFI, which firmware auto-boots with no
+                      NVRAM entry — the right choice for a dedicated NMBL disk
+                      or a manually-uploaded image (e.g. stardust, live-usb).
+
+                      Set to an own path such as EFI/nmbl/nmbl.efi to install
+                      ALONGSIDE an existing bootloader (e.g. GRUB) without
+                      overwriting its fallback binary. An own path is not
+                      auto-booted by firmware, so NMBL registers a UEFI NVRAM
+                      boot entry ("NMBL", placed first in BootOrder) pointing at
+                      it — this requires canTouchEfiVariables = true; otherwise
+                      the file is written and a warning tells you to add the
+                      boot entry by hand. GRUB's own NVRAM entry is left intact.
+
+                      Only applies to loader = "efi-stub".
                     '';
                   };
 
