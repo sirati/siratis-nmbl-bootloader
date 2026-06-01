@@ -101,12 +101,21 @@ let
     else
       [ ];
 
-  # loop + squashfs are required for the external-rescue disk path: NMBL
-  # calls LOOP_CTL_GET_FREE on /dev/loop-control (needs the loop driver)
-  # and then mounts the .sfs as squashfs. Both modules must be in the
-  # initramfs so they can be insmod'd on demand before allocate_loop_device.
+  # loop + squashfs + overlay are required by NMBL ITSELF for the
+  # external-rescue disk path: NMBL calls LOOP_CTL_GET_FREE on
+  # /dev/loop-control (loop), mounts the .sfs as squashfs (squashfs), then
+  # stacks a live-CD writable `/rescue` overlay (overlay) over the
+  # read-only squashfs lower with a tmpfs upper — all BEFORE switch_root,
+  # in NMBL's own kernel (the rescue /init runs too late to supply
+  # overlay). They are NOT eagerly loaded on every boot (absent from
+  # options.nix `explicitKernelModules`); the Rust dispatch loads them ON
+  # DEMAND right before the loop-mount + overlay dance. But their .ko must
+  # still SHIP in the initramfs so on-demand load can find them, so they
+  # flow into the staged closure here (via `extraExplicitModules` ->
+  # `allKernelModules` -> `modulesClosure`) without entering NMBL's runtime
+  # eager-load list.
   rescueDiskModules =
-    if cfg.rescue.mode == "external" then [ "loop" "squashfs" ] else [ ];
+    if cfg.rescue.mode == "external" then [ "loop" "squashfs" "overlay" ] else [ ];
 
   # af_packet is required by the DHCP client (socket(AF_PACKET, SOCK_DGRAM,
   # ETH_P_IP)). Without this module the raw-socket DHCP exchange fails with
@@ -115,24 +124,70 @@ let
   rescuePacketModule =
     if cfg.rescue.network && cfg.rescue.mode == "external" then [ "af_packet" ] else [ ];
 
-  # overlay + ext4 back the full recovery system's writable overlays, the NIC
-  # drivers let its /init bring up DHCP after switch_root, and af_packet backs
-  # dhcpcd's AF_PACKET/BPF socket for the DHCPv4 exchange. The .ko files
-  # must be STAGED into the NMBL initramfs module tree (via makeModulesClosure
-  # below) so finit_module can find them; naming them in the runtime explicit
-  # list (options.nix) is not enough on its own. The full-system path is
-  # independent of cfg.rescue.network (which gates NMBL's own in-initramfs DHCP
-  # fetch), so its NIC drivers must be staged here rather than relying on
-  # rescueNicModules above. ext4's deps (mbcache, jbd2) are pulled into the
-  # closure automatically. Gated on the full-system external rescue so the
-  # default build's module set is unchanged.
+  # Modules the FULL RECOVERY SYSTEM needs after switch_root: its NIC
+  # drivers (for dhcpcd), overlay + ext4 (the writable-overlay scratch),
+  # and af_packet (dhcpcd's AF_PACKET/BPF socket). These are NOT loaded
+  # into NMBL's own kernel/initramfs — NMBL does not need them. Instead
+  # they are built into a SEPARATE module closure against NMBL's exact
+  # kernel (`rescueModuleClosure` below) and shipped inside the rescue
+  # squashfs, where the rescue `/init` modprobes them itself after
+  # switch_root (the running kernel is still NMBL's, so `uname -r`
+  # matches the staged tree). ext4's deps (mbcache, jbd2) and each NIC
+  # driver's transport deps are pulled into the closure automatically.
   rescueFullSystemModules =
     if cfg.rescue.fullSystem.enable && cfg.rescue.mode == "external" then
-      cfg.rescue.nicDrivers ++ detectedNicModules ++ [ "overlay" "ext4" "af_packet" ]
+      lib.unique (
+        lib.filter (m: !(lib.elem m cfg.blacklistedKernelModules)) (
+          cfg.rescue.nicDrivers ++ detectedNicModules ++ [ "overlay" "ext4" "af_packet" ]
+        )
+      )
     else
       [ ];
 
-  # Import kernel modules management module
+  # The kernel's module tree, for both NMBL's own closure and the rescue
+  # closure. Same derivation as kernelModulesManager.bootloaderModulesTree.
+  rescueModulesTree = pkgs.aggregateModules [
+    (lib.getOutput "modules" cfg.kernelPackage)
+  ];
+
+  # makeModulesClosure expects `firmware` to be a SINGLE store path it can
+  # `cd` into (it reads `$firmware/lib/firmware/<blob>`), not a list. The
+  # `boot.nmbl.rescue.fullSystem.firmware` option is a plain
+  # `listOf package` (no NixOS-style `apply`), so join it into one
+  # buildEnv exposing `/lib/firmware` — exactly as NixOS's
+  # `hardware.firmware` option does internally. An empty list still yields
+  # a valid (empty) `/lib/firmware`, so the closure builds cleanly when no
+  # firmware is configured (e.g. the VM test, where no driver needs blobs).
+  rescueFirmwareEnv = pkgs.buildEnv {
+    name = "nmbl-rescue-firmware";
+    paths = cfg.rescue.fullSystem.firmware;
+    pathsToLink = [ "/lib/firmware" ];
+    ignoreCollisions = true;
+  };
+
+  # Module closure for the rescue squashfs, built against NMBL's exact
+  # kernel so `uname -r` after switch_root matches `/lib/modules/<kver>`.
+  # `firmware` pulls in only the blobs the staged modules reference
+  # (makeModulesClosure extracts per-module firmware requests), so passing
+  # a big package like linux-firmware stays scoped. `allowMissing` keeps
+  # the build green if a named driver is built into the kernel. Only built
+  # when there are rescue modules to stage.
+  rescueModuleClosure =
+    if rescueFullSystemModules != [ ] then
+      pkgs.makeModulesClosure {
+        rootModules = rescueFullSystemModules;
+        kernel = rescueModulesTree;
+        firmware = rescueFirmwareEnv;
+        allowMissing = true;
+      }
+    else
+      null;
+
+  # Import kernel modules management module. The rescue full-system
+  # modules are deliberately NOT in extraExplicitModules: NMBL must not
+  # load or stage them (see rescueModuleClosure above). Only NMBL's own
+  # needs (loop/squashfs for the loop-mount, and the network-rescue NIC
+  # set when rescue.network is on) flow in here.
   kernelModulesManager = import ./modules/kernel-modules.nix {
     inherit
       lib
@@ -141,7 +196,7 @@ let
       cfg
       ;
     extraExplicitModules = lib.unique (
-      rescueNicModules ++ rescueDiskModules ++ rescuePacketModule ++ rescueFullSystemModules
+      rescueNicModules ++ rescueDiskModules ++ rescuePacketModule
     );
   };
 
@@ -188,10 +243,19 @@ let
     contents = cfg.rescue.squashfsContents;
     fullSystem = {
       inherit (cfg.rescue.fullSystem) enable packages sshdPort rootAuthorizedKeys;
-      # NIC drivers the recovery /init modprobes. NMBL preloads the same
-      # set into its kernel before switch_root (options.nix), so modprobe
-      # is a no-op fallback; passing them keeps the script self-describing.
+      # NIC drivers the recovery /init modprobes ITSELF after switch_root.
+      # NMBL no longer preloads them — the .ko + firmware ship in the
+      # squashfs (moduleClosure below), and the running kernel is still
+      # NMBL's, so `uname -r` matches the staged tree.
       nicDrivers = lib.unique (cfg.rescue.nicDrivers ++ detectedNicModules);
+      # Filesystem / packet modules the recovery /init loads before the
+      # overlay + network setup. Loaded from the staged tree, not NMBL's.
+      coreModules = [ "overlay" "ext4" "af_packet" ];
+      # The makeModulesClosure result (its /lib/modules + /lib/firmware are
+      # staged into the squashfs root). null when there is nothing to load
+      # (fullSystem disabled or non-external), in which case rescue-sfs.nix
+      # skips the modprobe + staging.
+      moduleClosure = rescueModuleClosure;
     };
   };
 

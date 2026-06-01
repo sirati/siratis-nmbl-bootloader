@@ -580,53 +580,57 @@ in
           cfg.kernelModules
           ++ config.boot.initrd.kernelModules
           ++ fsDerivedKernelModules
-          ++ lib.optionals (cfg.rescue.mode == "external") [
-            # loop is needed by allocate_loop_device (LOOP_CTL_GET_FREE on
-            # /dev/loop-control). squashfs is the filesystem type for the
-            # rescue blob. Both must be loaded before rescue dispatch runs.
-            "loop"
-            "squashfs"
-          ]
           ++ lib.optionals (cfg.rescue.network && cfg.rescue.mode == "external") (
             cfg.rescue.nicDrivers ++ nicDetectedKernelModules
             # af_packet is the kernel module that enables AF_PACKET sockets.
             # The DHCP client in rescue/net.rs opens socket(AF_PACKET, SOCK_DGRAM,
             # ETH_P_IP) to send/receive raw DHCP frames; without this module the
             # call fails with EAFNOSUPPORT before any packet leaves the NIC.
+            # NOTE: this is NMBL's OWN in-initramfs DHCP path (gated on
+            # rescue.network), distinct from the full recovery system, which
+            # ships + loads af_packet itself from the squashfs (see below).
             ++ [ "af_packet" ]
           )
-          # The full recovery system runs its own dhcpcd + sshd after
-          # switch_root, so the NIC drivers must be loaded into NMBL's
-          # kernel before handoff (the squashfs has no kmod-loadable
-          # modules of its own for NMBL's kernel). modprobe inside /init
-          # is then a no-op. Independent of rescue.network, which gates
-          # NMBL's own in-initramfs DHCP/HTTP fetch path.
+          # NOTE: `loop` + `squashfs` are NOT eagerly loaded here merely
+          # because external rescue is configured. NMBL needs them only to
+          # loop-mount the rescue blob, which happens at most once per boot
+          # (and usually never), so the Rust rescue dispatch loads them ON
+          # DEMAND right before `LOOP_CTL_GET_FREE` / the squashfs mount (see
+          # `rescue::disk::ensure_loop_squashfs_modules`). Their .ko still
+          # ship in the initramfs (config.nix `rescueDiskModules` →
+          # `extraExplicitModules` keeps them in the staged closure). They
+          # appear in THIS eager list only if the NORMAL boot path needs them
+          # independently — e.g. a root on squashfs surfaces `squashfs` via
+          # `fsDerivedKernelModules`, or the operator lists `loop` in
+          # `boot.initrd.kernelModules`.
           #
-          # overlay + ext4 back the full recovery system's writable
-          # overlays: its /init formats an ext4 image on a loop device and
-          # layers a writable overlay over the read-only squashfs store,
-          # /etc and /var. NMBL has no udev to auto-load filesystem drivers
-          # on mount(2), so both must be loaded into NMBL's kernel before
-          # switch_root or the overlay/ext4 mounts fail with "unknown
-          # filesystem type". ext4's deps (mbcache, jbd2) are pulled in
-          # automatically by the loader's modules.dep resolution.
-          # af_packet backs dhcpcd's AF_PACKET/BPF socket for the DHCPv4
-          # exchange the recovery /init runs after switch_root; without it
-          # dhcp_openbpf fails with EAFNOSUPPORT and no IPv4 lease is acquired.
-          ++ lib.optionals (cfg.rescue.fullSystem.enable && cfg.rescue.mode == "external") (
-            cfg.rescue.nicDrivers ++ nicDetectedKernelModules ++ [ "overlay" "ext4" "af_packet" ]
-          )
+          # NOTE: the full recovery system (rescue.fullSystem) deliberately
+          # does NOT append its NIC drivers / overlay / ext4 / af_packet
+          # here. Those modules are built into the rescue SQUASHFS against
+          # NMBL's exact kernel (see lib/config.nix `rescueModuleClosure`)
+          # and the rescue `/init` modprobes them ITSELF after switch_root
+          # (the running kernel is still NMBL's, so `uname -r` matches the
+          # staged module tree). Loading them into NMBL's own initramfs is
+          # wrong: NMBL does not need them, and firmware-dependent drivers
+          # (esp. wifi) would fail because NMBL's initramfs has no
+          # /lib/firmware.
         )
       );
       defaultText = lib.literalMD ''
         union of `boot.nmbl.kernelModules`, `boot.initrd.kernelModules`,
         and filesystem driver modules derived from
         `config.fileSystems.*.fsType` (e.g. `ext4`, `vfat`, `btrfs`),
-        plus `boot.nmbl.rescue.nicDrivers` and any NIC modules detected
-        from hardware-configuration when
+        plus `boot.nmbl.rescue.nicDrivers`, any NIC modules detected from
+        hardware-configuration, and `af_packet` when
         `boot.nmbl.rescue.network = true` and
         `boot.nmbl.rescue.mode = "external"`, with
-        `boot.nmbl.blacklistedKernelModules` removed.
+        `boot.nmbl.blacklistedKernelModules` removed. `loop` + `squashfs`
+        are NOT added here for rescue — the Rust dispatch loads them on
+        demand before the loop-mount; they appear only if the normal boot
+        path needs them (e.g. root on squashfs via `fsType`). The full
+        recovery system (`boot.nmbl.rescue.fullSystem`) does NOT add
+        modules here either: its drivers ship in the rescue squashfs and
+        are loaded by the rescue `/init` after switch_root.
       '';
       description = lib.mdDoc ''
         Kernel modules the NMBL /init will load explicitly at startup
@@ -1052,6 +1056,31 @@ in
             into the image's `/nix/store` and registered in the nix DB so
             `nix-shell -p` and `nix run` work offline against what is
             present (and online against substituters once DHCP is up).
+          '';
+        };
+
+        firmware = lib.mkOption {
+          type = lib.types.listOf lib.types.package;
+          default = [ ];
+          example = lib.literalExpression "[ pkgs.linux-firmware ]";
+          description = lib.mdDoc ''
+            Firmware packages whose blobs the rescue module closure may
+            pull in. `pkgs.makeModulesClosure` extracts only the firmware
+            files the rescue modules actually reference (via each module's
+            embedded firmware request list), so passing a large package
+            like `pkgs.linux-firmware` stays scoped — only the blobs the
+            staged drivers need land in the squashfs `/lib/firmware`.
+
+            This is what makes firmware-dependent drivers (notably wifi:
+            iwlwifi, ath*, brcmfmac, rtw*, mt76) usable from the rescue
+            console: the rescue `/init` modprobes the driver AFTER
+            switch_root with `/lib/firmware` present in the squashfs root,
+            so the kernel's firmware request succeeds — unlike loading it
+            into NMBL's firmware-less initramfs, where the request fails
+            and the module can never be reloaded.
+
+            Only consulted when `rescue.fullSystem.enable = true` and
+            `rescue.mode = "external"`.
           '';
         };
 
