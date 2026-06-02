@@ -417,3 +417,71 @@ success_target = "multi-user.target"
 "#;
     toml::from_str::<Config>(toml).expect_err("missing max_recovery_attempts must reject");
 }
+
+#[test]
+fn tpm_section_absent_uses_defaults() {
+    // Configs predating the [tpm] knob must parse and observe the
+    // permissive default posture (no measure, no require) and the
+    // single-sourced lock PCR.
+    let cfg: Config = toml::from_str("[general]\ntimeout_ms = 3000\n").expect("config must parse");
+    assert!(!cfg.tpm.measure);
+    assert!(!cfg.tpm.require_tpm);
+    assert_eq!(cfg.tpm.pcr_index, crate::security_consts::LOCK_PCR);
+    assert_eq!(cfg.tpm.device, PathBuf::from("/dev/tpmrm0"));
+    assert!(cfg.tpm.sealed_secrets.is_empty());
+}
+
+#[test]
+fn tpm_section_round_trips_all_fields() {
+    let toml = r#"
+[tpm]
+measure     = true
+pcr_index   = 7
+require_tpm = true
+device      = "/dev/tpm0"
+
+[[tpm.sealed_secrets]]
+name        = "luks-key"
+sealed_path = "nmbl/luks.sealed"
+unseal_to   = "/run/nmbl/luks.key"
+"#;
+    let cfg: Config = toml::from_str(toml).expect("[tpm] must parse");
+    assert!(cfg.tpm.measure);
+    assert!(cfg.tpm.require_tpm);
+    assert_eq!(cfg.tpm.pcr_index, 7);
+    assert_eq!(cfg.tpm.device, PathBuf::from("/dev/tpm0"));
+    assert_eq!(cfg.tpm.sealed_secrets.len(), 1);
+    let s = cfg
+        .tpm
+        .sealed_secrets
+        .first()
+        .expect("one sealed secret was parsed");
+    assert_eq!(s.name, "luks-key");
+    assert_eq!(s.sealed_path, PathBuf::from("nmbl/luks.sealed"));
+    assert_eq!(s.unseal_to, PathBuf::from("/run/nmbl/luks.key"));
+}
+
+#[test]
+fn tpm_section_rejects_unknown_field() {
+    let toml = r#"
+[tpm]
+measure = true
+mystery = "boom"
+"#;
+    let err = toml::from_str::<Config>(toml).expect_err("unknown field in [tpm] must be rejected");
+    assert!(err.to_string().contains("mystery"), "{err}");
+}
+
+#[test]
+fn tpm_sealed_secret_rejects_unknown_field() {
+    let toml = r#"
+[[tpm.sealed_secrets]]
+name        = "k"
+sealed_path = "a"
+unseal_to   = "b"
+mystery     = "boom"
+"#;
+    let err = toml::from_str::<Config>(toml)
+        .expect_err("unknown field in [[tpm.sealed_secrets]] must be rejected");
+    assert!(err.to_string().contains("mystery"), "{err}");
+}

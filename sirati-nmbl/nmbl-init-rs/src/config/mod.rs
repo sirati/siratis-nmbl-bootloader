@@ -12,6 +12,7 @@ mod paths;
 mod rescue_cfg;
 mod splash;
 mod stateful_cfg;
+mod tpm;
 mod tui;
 
 #[cfg(test)]
@@ -32,6 +33,7 @@ pub use entries::{Activation, ActivationKind, FilesystemEntry};
 pub use general::{General, KernelModules};
 pub use paths::Paths;
 pub use rescue_cfg::{EmergencyShellConfig, RescueConfig};
+pub use tpm::{SealedSecret, TpmConfig};
 pub use tui::Tui;
 
 #[cfg(feature = "image-splash")]
@@ -98,6 +100,12 @@ pub struct Config {
     /// secure-boot table (FIX-05) so an unverified image is never honoured.
     #[serde(default)]
     pub driver_images: DriverImagesConfig,
+
+    /// `[tpm]` measured-boot config (#7). ALWAYS compiled (FIX-09): the
+    /// knobs live in the base schema regardless of the `secure-boot`
+    /// feature, so a `[tpm]` table parses on every build.
+    #[serde(default)]
+    pub tpm: TpmConfig,
 
     /// Populated by Phase 0.5 with the runtime mountpoint of the boot
     /// partition. `None` in legacy embedded-config mode. Never parsed
@@ -268,6 +276,7 @@ impl Config {
             // reaching recovery never relaxes the security posture.
             // ──────────────────────────────────────────────────────────────────
             driver_images: DriverImagesConfig::default(),
+            tpm: TpmConfig::default(),
             runtime_boot_mountpoint: None,
             #[cfg(feature = "stateful")]
             runtime_state_mountpoint: None,
