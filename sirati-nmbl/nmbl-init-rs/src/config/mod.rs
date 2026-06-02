@@ -5,6 +5,7 @@ use serde::Deserialize;
 use crate::error::{NmblError, Result};
 
 pub(crate) mod bootstrap;
+mod driver_image;
 mod entries;
 mod general;
 mod paths;
@@ -26,6 +27,7 @@ pub use bootstrap::{
     BootstrapBootFs, BootstrapConfig, BootstrapKernelModules, BootstrapRescue, BootstrapSection,
     BootstrapStateMount, resolve_full_config_path,
 };
+pub use driver_image::{DriverImageSpec, DriverImagesConfig};
 pub use entries::{Activation, ActivationKind, FilesystemEntry};
 pub use general::{General, KernelModules};
 pub use paths::Paths;
@@ -90,6 +92,13 @@ pub struct Config {
     //   #9  staged  : #[cfg(feature="staged-boot")] pub staged: Option<StagedConfig>,
     //   #10 secureB : #[cfg(feature="secure-boot")] pub secure_boot: SecureBootConfig,
     // ─────────────────────────────────────────────────────────────────────────
+    /// `[driver_images]` group (#8): verified out-of-tree driver squashfs
+    /// blobs NMBL loop-mounts and `finit_module`s before kexec. Always
+    /// compiled; the Nix side rejects `enable = true` without an active
+    /// secure-boot table (FIX-05) so an unverified image is never honoured.
+    #[serde(default)]
+    pub driver_images: DriverImagesConfig,
+
     /// Populated by Phase 0.5 with the runtime mountpoint of the boot
     /// partition. `None` in legacy embedded-config mode. Never parsed
     /// from TOML — `#[serde(skip)]` keeps it out of the wire schema and
@@ -258,6 +267,7 @@ impl Config {
             // struct field. recovery_default must stay strict-shape (FIX-53):
             // reaching recovery never relaxes the security posture.
             // ──────────────────────────────────────────────────────────────────
+            driver_images: DriverImagesConfig::default(),
             runtime_boot_mountpoint: None,
             #[cfg(feature = "stateful")]
             runtime_state_mountpoint: None,

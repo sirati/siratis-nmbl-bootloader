@@ -213,6 +213,25 @@ let
       max_recovery_attempts = cfg.stateful.maxRecoveryAttempts;
       success_target = cfg.stateful.successTarget;
     };
+  }
+  # Driver-image group (#8): verified out-of-tree driver squashfs blobs.
+  # Emitted only when enabled so non-driver builds keep the existing wire
+  # shape (the Rust `DriverImagesConfig` serde default is the empty,
+  # disabled config). The per-image `firmware` packages are a BUILD-TIME
+  # input baked into the squashfs — they are NOT part of the runtime struct,
+  # so they are deliberately not emitted here (`deny_unknown_fields` would
+  # otherwise reject them). The image table mirrors the `filesystems` /
+  # `activations` array-of-tables precedent (Rust field `images`).
+  // lib.optionalAttrs cfg.driverImages.enable {
+    driver_images = {
+      enable = true;
+      images = map (img: {
+        path = img.path;
+        sig_path = img.sigPath;
+        modules = img.modules;
+        blacklist = img.blacklist;
+      }) (lib.attrValues cfg.driverImages.images);
+    };
   };
 
   rawToml = tomlFormat.generate "nmbl-config.toml" tomlValue;
