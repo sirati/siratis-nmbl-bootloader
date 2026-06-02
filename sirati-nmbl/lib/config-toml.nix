@@ -180,6 +180,27 @@ let
     emergency_shell = {
       extra_consoles = cfg.emergencyShell.extraConsoles;
     };
+
+    # `[tpm]` measured-boot table consumed by the Rust `TpmConfig`
+    # struct (#7). ALWAYS emitted (FIX-09): the struct is compiled into
+    # every build regardless of the `secure-boot` Cargo feature, so the
+    # table is part of the base wire shape. `requireTpm` is derived in
+    # tpm.nix (true when measuring / secure boot is on — FIX-28).
+    # `sealed_secrets` is omitted when empty so the common-case wire
+    # shape stays minimal and the Rust serde default (`[]`) applies.
+    tpm = {
+      measure = cfg.tpm.measure;
+      pcr_index = cfg.tpm.pcrIndex;
+      require_tpm = cfg.tpm.requireTpm;
+      device = toString cfg.tpm.device;
+    }
+    // lib.optionalAttrs (cfg.tpm.sealedSecrets != [ ]) {
+      sealed_secrets = map (s: {
+        name = s.name;
+        sealed_path = s.sealedPath;
+        unseal_to = toString s.unsealTo;
+      }) cfg.tpm.sealedSecrets;
+    };
   }
   # Splash rendering. Emitted only when the graphical splash is enabled
   # so the validator (`deny_unknown_fields`) accepts the TOML on builds
