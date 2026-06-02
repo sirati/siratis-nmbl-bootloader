@@ -8,7 +8,7 @@ use crate::generations::{Generation, active_generation_index};
 use crate::ui::POLL_SLICE;
 use crate::ui::app::{App, Decision, SessionInteraction};
 use crate::ui::console::Console;
-use crate::ui::timeout::TimeoutOutcome;
+use crate::ui::countdown::{CountdownAction, CountdownOutcome, CountdownScreen};
 
 /// Run the boot-selection TUI on the provided [`Console`] and return
 /// the operator's decision.
@@ -59,13 +59,13 @@ pub(crate) async fn run_selector_on_console(
     // screen applies before arming its auto-reboot timer.
     let outcome = if app.interaction.get() {
         app.countdown_remaining_secs = None;
-        TimeoutOutcome::Cancelled
+        CountdownOutcome::Cancelled
     } else {
         run_console_countdown(console, &mut app, countdown).await?
     };
     app.countdown_remaining_secs = None;
 
-    if matches!(outcome, TimeoutOutcome::Expired) && app.decision.is_none() {
+    if matches!(outcome, CountdownOutcome::Expired) && app.decision.is_none() {
         // Countdown reached zero without input — boot the same entry
         // the list was highlighting (the active profile).
         return Ok(Decision::Boot {
@@ -210,69 +210,46 @@ fn render_gate(dirty: bool, last_render: Instant, now: Instant) -> RenderGate {
     }
 }
 
-/// Remaining whole seconds, rounded UP, for the countdown header.
-/// A non-zero sub-second remainder still reads as at least "1s" so a
-/// sub-second `timeout_ms` never displays a misleading "0s".
-fn ceil_secs(d: Duration) -> u64 {
-    let secs = d.as_secs();
-    if d.subsec_nanos() > 0 {
-        secs.saturating_add(1)
-    } else {
-        secs
-    }
-}
-
 /// Countdown driver that polls the [`Console`] for keys instead of
 /// stdin, so cancel-on-keypress works on both the splash framebuffer
 /// (input via `/dev/tty1`) and the raw-mode tty.
+///
+/// Thin adapter over the shared [`CountdownScreen`] widget: the widget
+/// owns the deadline, the (rounded-up) tick cadence, and the render
+/// callback, while THIS function supplies the selector's input policy via
+/// the classifier. Today's policy is "cancel on the central layer's
+/// one-shot `UserHasInteracted` — the single source of operator presence
+/// — and ignore everything else", reproduced byte-for-byte below. The
+/// wrapper already set the shared latch when it emitted that notice, so a
+/// later screen this session sees the boot as attended without the
+/// selector touching the latch itself. A `Resize` only repaints (the
+/// selector loop redraws at the new geometry) and a raw `Key` arrives
+/// *after* the notice, so neither cancels here.
 async fn run_console_countdown(
     console: &mut dyn Console,
     app: &mut App<'_>,
     duration: Duration,
-) -> Result<TimeoutOutcome> {
-    let start = Instant::now();
-    let deadline = start.checked_add(duration).unwrap_or(start);
-
-    // Round the displayed remaining time UP so a sub-second budget
-    // (e.g. a 500 ms `timeout_ms`) shows "1s" rather than a misleading
-    // "0s". Whole-second budgets are unaffected.
-    let initial = ceil_secs(duration);
-    app.countdown_remaining_secs = Some(initial);
-    console.render(app)?;
-    let mut last_reported = initial;
-
-    loop {
-        let now = Instant::now();
-        let Some(remaining) = deadline.checked_duration_since(now) else {
-            return Ok(TimeoutOutcome::Expired);
-        };
-
-        let slice = remaining.min(POLL_SLICE);
-        // Cancel the countdown on the central layer's one-shot
-        // `UserHasInteracted` — the single source of "operator is
-        // present". The wrapper already set the shared latch when it
-        // emitted this, so a later screen this session sees the boot as
-        // attended without the selector touching the latch itself. A
-        // `Resize` only repaints (the selector loop below redraws at the
-        // new geometry) and a raw `Key` is delivered *after* the notice,
-        // so neither needs to cancel here.
-        if let Some(crate::ui::console::ConsoleEvent::UserHasInteracted) =
-            console.poll_event(slice).await?
-        {
-            return Ok(TimeoutOutcome::Cancelled);
+) -> Result<CountdownOutcome> {
+    // The render callback paints the selector header with the remaining
+    // seconds — exactly the old per-tick body. The widget hands back its
+    // own `console`, so the closure renders through THAT borrow and only
+    // captures `app`; the classifier captures nothing, keeping the two
+    // closures' borrows disjoint.
+    let render = |console: &mut dyn Console, secs: u64| -> Result<()> {
+        app.countdown_remaining_secs = Some(secs);
+        console.render(app)
+    };
+    // The selector's classifier: cancel ONLY on the presence notice.
+    let classify = |event| {
+        if matches!(event, crate::ui::console::ConsoleEvent::UserHasInteracted) {
+            CountdownAction::Cancel
+        } else {
+            CountdownAction::Continue
         }
-
-        let now = Instant::now();
-        let Some(remaining) = deadline.checked_duration_since(now) else {
-            return Ok(TimeoutOutcome::Expired);
-        };
-        let secs = ceil_secs(remaining);
-        if secs != last_reported {
-            app.countdown_remaining_secs = Some(secs);
-            console.render(app)?;
-            last_reported = secs;
-        }
-    }
+    };
+    CountdownScreen::new(duration)
+        .run(console, classify, render)
+        .await
 }
 
 #[cfg(test)]
@@ -298,7 +275,7 @@ mod tests {
     use crate::generations::Generation;
     use crate::ui::app::{App, SessionInteraction};
     use crate::ui::console::{Console, ConsoleEvent, ConsoleKind, LatchingConsole};
-    use crate::ui::timeout::TimeoutOutcome;
+    use crate::ui::countdown::CountdownOutcome;
 
     /// Console double that replays canned key events; once drained it
     /// yields `None` so the countdown loop relies on its own deadline.
@@ -535,7 +512,7 @@ mod tests {
             std::time::Duration::from_secs(60),
         ))
         .expect("countdown polls the console");
-        assert_eq!(outcome, TimeoutOutcome::Cancelled);
+        assert_eq!(outcome, CountdownOutcome::Cancelled);
         assert!(
             session.get(),
             "cancelling the countdown must latch operator presence"
