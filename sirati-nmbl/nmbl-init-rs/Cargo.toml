@@ -80,6 +80,22 @@ mocking = []
 # default build never compiles it. The tokio runtime + async migration
 # is the new base and is NOT gated.
 remote-tui = ["dep:futures-util"]
+# Opt-in secure/staged-boot (R-6 / FIX-16). Pulls the pure-Rust ML-DSA
+# signature verifier (`fips204`), the TPM 2.0 marshaler (`tpm2-protocol`),
+# and SHA-2 (`sha2`, shared with `network-rescue`). NO `dep:zeroize`:
+# zeroize is a non-optional dep, so listing it here would be a cargo error
+# (FIX-30); the host signer's `Zeroizing` lives in nmbl-host-tools instead.
+# When OFF the `src/sig` and `src/tpm/measure` trees are `#[cfg]`d out and
+# none of these optional deps compile, so the default build is byte-for-byte
+# identical to a feature-free build (FIX-6 / FIX-23). `fips204` is pinned
+# with explicit ML-DSA features (NOT default-features-and-hope) so the
+# pre-hash `Ph::SHA512` path and ML-DSA-65/87 are guaranteed present
+# (FIX-50). `staged-boot` depends on `secure-boot`.
+secure-boot = ["dep:fips204", "dep:tpm2-protocol", "dep:sha2"]
+# Opt-in staged boot (a signed config fragment + drivers on a verified
+# priority volume). Structurally implies `secure-boot`: there is no staged
+# path without signature verification (R-3 / R-6).
+staged-boot = ["secure-boot"]
 
 [dependencies]
 nix = { version = "0.29", default-features = false, features = ["mount", "fs", "process", "term", "user", "signal", "reboot", "feature"] }
@@ -150,10 +166,22 @@ alacritty_terminal = { version = "0.26", optional = true, default-features = fal
 oklab = { version = "1.1.2", optional = true, default-features = true }
 # Phase D rescue-fallback (optional; gated behind `network-rescue`).
 # dhcproto provides the DHCPv4 wire codec used by `src/net/dhcp.rs`
-# (D.2). sha2 provides SHA-256 used by `src/net/http.rs` (D.3) to
-# verify the rescue blob against the operator-pinned digest.
+# (D.2). sha2 provides SHA-256/512: pulled by BOTH `network-rescue`
+# (rescue-blob digest in `src/net/http.rs`) AND `secure-boot` (the
+# pre-hash digest for ML-DSA verify + the relock-poison hash). It stays
+# `optional`, so the default build is byte-identical (FIX-6 / FIX-23).
 dhcproto = { version = "0.13", optional = true, default-features = false }
 sha2     = { version = "0.10", optional = true, default-features = false }
+# Secure/staged-boot (optional; gated behind `secure-boot`). fips204 is
+# the pure-Rust FIPS-204 (ML-DSA) verifier; `default-features = false`
+# drops its `default-rng` (we verify, never sign, so no getrandom is
+# forced) and we EXPLICITLY enable `ml-dsa-65` + `ml-dsa-87` so the
+# `AlgId::{MlDsa65,MlDsa87}` code paths and the pre-hash `Ph::SHA512`
+# entry are guaranteed compiled in (FIX-50). tpm2-protocol is the
+# pure-Rust TPM 2.0 marshaler/unmarshaler (`default-features = false`);
+# neither pulls a `*-sys`/`cc`/`openssl-sys` crate (FIX-43).
+fips204       = { version = "0.4.6", optional = true, default-features = false, features = ["ml-dsa-65", "ml-dsa-87"] }
+tpm2-protocol = { version = "0.18", optional = true, default-features = false }
 # Single 4-byte read for the DHCPv4 XID. We avoid pulling in a full RNG
 # crate (`rand`); `getrandom::fill` reads straight from `getrandom(2)`.
 getrandom = { version = "0.3", optional = true, default-features = false }
