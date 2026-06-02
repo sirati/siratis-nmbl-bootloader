@@ -155,19 +155,11 @@ pub(super) fn mount_overlay_for_child(
     Ok(Path::new(RESCUE_MOUNT))
 }
 
-/// Lowercase hex encoder for SHA-256 digests. Avoids pulling in the
-/// `hex` crate for a 64-byte string.
-pub(super) fn hex_lower(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let hi = TABLE.get(usize::from(b >> 4)).copied().unwrap_or(b'?');
-        let lo = TABLE.get(usize::from(b & 0x0f)).copied().unwrap_or(b'?');
-        out.push(hi as char);
-        out.push(lo as char);
-    }
-    out
-}
+/// Re-export shim: `hex_lower` was lifted to the ungated `util::hex` module
+/// (FIX-23 / master-plan §B.1) so the network-rescue and secure-boot paths
+/// share one encoder. Kept here so `download::hex_lower` stays resolvable for
+/// the in-module call above and the `rescue::net::mod` test caller.
+pub(super) use crate::util::hex::hex_lower;
 
 /// Compute the lowercase-hex SHA-256 of `bytes`. Exposed so unit
 /// tests can pin the hasher behaviour against a known vector without

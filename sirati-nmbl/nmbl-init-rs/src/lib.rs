@@ -31,4 +31,7 @@ pub mod state;
 pub mod sys;
 pub mod terminal;
 pub mod ui;
+/// Small shared primitives. `util::hex` is ungated; `util::hash` is gated
+/// `any(network-rescue, secure-boot)` (it `use`s the optional `sha2` dep).
+pub mod util;
 pub mod validate;
