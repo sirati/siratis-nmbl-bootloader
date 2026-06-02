@@ -11,7 +11,9 @@ mod modules_state;
 mod source_wait;
 mod stdin;
 
-pub(crate) use exit_codes::{exit_code_error, is_activation_success, kind_label, wrap_runner_error};
+pub(crate) use exit_codes::{
+    exit_code_error, is_activation_success, kind_label, wrap_runner_error,
+};
 pub(crate) use modules_state::{check_required_modules, loaded_modules};
 pub(crate) use source_wait::wait_for_source_device;
 pub(crate) use stdin::collect_stdin;
