@@ -19,6 +19,11 @@ pub mod rescue;
 /// Always compiled so the Nix↔Rust round-trip test runs in every build.
 pub mod security_consts;
 pub mod shell;
+/// Signature-verification subsystem (secure/staged-boot). F1 skeleton: a
+/// no-op scaffold proving the `secure-boot` feature's deps link; the real
+/// verify pipeline lands in F2.
+#[cfg(feature = "secure-boot")]
+pub mod sig;
 #[cfg(feature = "image-splash")]
 pub mod splash;
 #[cfg(feature = "stateful")]
