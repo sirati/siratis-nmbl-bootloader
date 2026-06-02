@@ -40,6 +40,7 @@ let
   # is "any security table enabled ⇒ `secure-boot` ∈ nmblFeatures".
   securityConsts = import ./security-consts.nix { inherit lib; };
   secureBootActive = securityConsts.mkSecureBootActive config;
+  stagedBootActive = securityConsts.mkStagedBootActive config;
 
   # Cargo features to enable in the /init binary. Gated on splash and
   # rescue options so feature-free builds (default) stay byte-identical
@@ -55,7 +56,13 @@ let
     # `secure-boot` feature into the built /init. `secureBootActive` is
     # `false` in the skeleton (the options don't exist yet), so the
     # default build is unchanged.
-    ++ lib.optional secureBootActive "secure-boot";
+    ++ lib.optional secureBootActive "secure-boot"
+    # Staged boot (#9): `boot.nmbl.staged.enable` pulls the `staged-boot`
+    # Cargo feature (which implies `secure-boot`). The SAME boolean gates
+    # the `[staged]`/`[bootstrap.staged]` emit in the toml helpers, so the
+    # built binary always carries the cfg that parses what Nix emits
+    # (FIX-40). `false` in the skeleton, so the default build is unchanged.
+    ++ lib.optional stagedBootActive "staged-boot";
 
   # Resolved /init binary used by the initramfs builder. Identity-equal
   # to the prebuilt `nmblInit` / `nmblInitSplash` in the single-feature

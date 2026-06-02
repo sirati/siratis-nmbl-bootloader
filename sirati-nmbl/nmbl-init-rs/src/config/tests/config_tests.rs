@@ -485,3 +485,81 @@ mystery     = "boom"
         .expect_err("unknown field in [[tpm.sealed_secrets]] must be rejected");
     assert!(err.to_string().contains("mystery"), "{err}");
 }
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn staged_section_absent_decodes_to_none() {
+    // Configs that predate the staged knob (and staged-feature builds
+    // whose Nix config did not enable staging) must still parse and
+    // produce `staged = None` — the staged path engages only on opt-in.
+    let toml = "[general]\ntimeout_ms = 3000\n";
+    let cfg: Config = toml::from_str(toml).expect("config must parse");
+    assert!(cfg.staged.is_none());
+}
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn staged_section_present_parses_required_fields() {
+    let toml = r#"
+[staged]
+enable   = true
+image    = "nmbl-staged.img"
+fragment = "nmbl/fragment.toml"
+sig      = "nmbl/fragment.toml.sig"
+"#;
+    let cfg: Config = toml::from_str(toml).expect("[staged] must parse");
+    let s = cfg.staged.expect("staged should be Some");
+    assert!(s.enable);
+    assert_eq!(s.image, PathBuf::from("nmbl-staged.img"));
+    assert_eq!(s.fragment, PathBuf::from("nmbl/fragment.toml"));
+    assert_eq!(s.sig, PathBuf::from("nmbl/fragment.toml.sig"));
+}
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn staged_section_rejects_unknown_field() {
+    let toml = r#"
+[staged]
+image    = "nmbl-staged.img"
+fragment = "nmbl/fragment.toml"
+sig      = "nmbl/fragment.toml.sig"
+mystery  = "boom"
+"#;
+    let err =
+        toml::from_str::<Config>(toml).expect_err("unknown field in [staged] must be rejected");
+    assert!(err.to_string().contains("mystery"), "{err}");
+}
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn staged_section_requires_image_fragment_and_sig() {
+    // `image`/`fragment`/`sig` have no serde default — a partial table is
+    // a hard parse error, not a silent fill-in.
+    let toml = "[staged]\nenable = true\n";
+    toml::from_str::<Config>(toml).expect_err("missing required staged fields must reject");
+}
+
+// F1 NEGATIVE: the staged slice built WITHOUT secure-boot. A binary
+// compiled without `staged-boot` (so without `secure-boot`) `#[cfg]`s the
+// `staged` field off `Config`, so a `[staged]` table is an UNKNOWN table
+// that `deny_unknown_fields` must reject. This guards FIX-40: a feature-
+// free binary can never silently ignore a staged table the Nix side would
+// only emit for a staged build.
+#[cfg(not(feature = "staged-boot"))]
+#[test]
+fn staged_section_rejected_without_secure_boot_feature() {
+    let toml = r#"
+[staged]
+enable   = true
+image    = "nmbl-staged.img"
+fragment = "nmbl/fragment.toml"
+sig      = "nmbl/fragment.toml.sig"
+"#;
+    let err = toml::from_str::<Config>(toml)
+        .expect_err("a non-staged-boot binary must reject the [staged] table");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("staged") || msg.contains("unknown"),
+        "rejection should mention the unknown staged table, got: {msg}",
+    );
+}

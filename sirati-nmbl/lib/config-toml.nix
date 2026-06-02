@@ -55,6 +55,12 @@ let
 
   tomlFormat = pkgs.formats.toml { };
 
+  # Single source of the staged-boot emit/feature gate (FIX-40): the SAME
+  # boolean drives the `staged-boot` Cargo feature in lib/signing-build.nix
+  # and the `[staged]` emit below, so a feature-free binary never receives
+  # a `[staged]` table it cannot parse.
+  stagedBootActive = (import ./security-consts.nix { inherit lib; }).mkStagedBootActive config;
+
   # Absolute path the emergency shell forks at runtime (NMBL PID 1, in the
   # initramfs). Mirrors the Rust `paths.shell` / preflight_shell check.
   shellPath = toString cfg.paths.shell;
@@ -286,6 +292,20 @@ let
         # install-time-impure and NEVER reach config.toml.
         enable = cfg.signing.uki.enable;
       };
+    };
+  }
+  # Staged-boot pointer set. Emitted ONLY when staged boot is active so a
+  # build WITHOUT the `staged-boot` feature (whose binary `#[cfg]`s the
+  # `[staged]` field out) never sees a table its `deny_unknown_fields`
+  # parser would reject (FIX-40). The gate is the SAME `stagedBootActive`
+  # boolean that pulls the Cargo feature in. No `has_config_fragment` key
+  # (FIX-56) — the Rust side checks fragment existence at runtime.
+  // lib.optionalAttrs stagedBootActive {
+    staged = {
+      enable = cfg.staged.enable;
+      image = cfg.staged.image;
+      fragment = cfg.staged.fragment;
+      sig = cfg.staged.sig;
     };
   };
 

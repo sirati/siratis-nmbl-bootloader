@@ -95,7 +95,30 @@ let
       ];
     in
     lib.foldl' (a: b: a || b) false activeTerms;
+
+  # ──────────────────────── stagedBootActive ──────────────────────────
+  #
+  # The ONE emit/feature gate for the staged-boot slice (#9). True exactly
+  # when the operator enabled `boot.nmbl.staged.enable`. Consumed by:
+  #   * the `nmblFeatures` derive (lib/signing-build.nix) — to OR in the
+  #     `staged-boot` Cargo feature, and
+  #   * BOTH staged emit gates (lib/config-toml.nix `[staged]` and
+  #     lib/bootstrap-toml.nix `[bootstrap.staged]`),
+  # so the Nix tables are emitted under the SAME boolean as the Rust
+  # `#[cfg(feature = "staged-boot")]` — a feature-free binary never sees a
+  # table it cannot parse (FIX-40).
+  #
+  # `staged-boot` structurally implies `secure-boot`, so a true value here
+  # also makes `secureBootActive` true at the Cargo level via the feature
+  # graph; the `staged.enable ⇒ secureBoot.enable` operator-config rule is
+  # enforced as a `--validate-config` assertion in the staged module
+  # (FIX-26), not here.
+  #
+  # The `or false` fallback keeps this evaluable in the #5p skeleton before
+  # the staged module lands its `boot.nmbl.staged.enable` option (FIX-57
+  # scaffolding for the same window as `mkSecureBootActive`).
+  mkStagedBootActive = config: (config.boot.nmbl.staged.enable or false);
 in
 {
-  inherit defaults mkSecureBootActive;
+  inherit defaults mkSecureBootActive mkStagedBootActive;
 }

@@ -13,6 +13,8 @@ mod rescue_cfg;
 #[cfg(feature = "secure-boot")]
 mod signing;
 mod splash;
+#[cfg(feature = "staged-boot")]
+mod staged;
 mod stateful_cfg;
 mod tpm;
 mod tui;
@@ -26,6 +28,8 @@ mod tui;
 )]
 mod tests;
 
+#[cfg(feature = "staged-boot")]
+pub use bootstrap::BootstrapStaged;
 pub use bootstrap::{
     BootstrapBootFs, BootstrapConfig, BootstrapKernelModules, BootstrapRescue, BootstrapSection,
     BootstrapStateMount, resolve_full_config_path,
@@ -43,6 +47,9 @@ pub use signing::{SigningConfig, UkiSigningConfig};
 
 #[cfg(feature = "image-splash")]
 pub use splash::{Splash, SplashBackgroundLocation};
+
+#[cfg(feature = "staged-boot")]
+pub use staged::StagedConfig;
 
 #[cfg(feature = "stateful")]
 pub use stateful_cfg::StatefulConfig;
@@ -119,6 +126,16 @@ pub struct Config {
     #[cfg(feature = "secure-boot")]
     #[serde(default)]
     pub signing: SigningConfig,
+
+    /// Top-level `[staged]` table naming the priority-volume image plus
+    /// the signed config fragment + signature paths within it. Absent in
+    /// non-staged builds and in staged builds whose Nix config did not
+    /// enable `boot.nmbl.staged.enable`; the Nix emit gate is the same
+    /// `staged-boot` boolean as this `#[cfg]` (FIX-40), so a build without
+    /// the feature never receives a `[staged]` table it cannot parse.
+    #[cfg(feature = "staged-boot")]
+    #[serde(default)]
+    pub staged: Option<StagedConfig>,
 
     /// Populated by Phase 0.5 with the runtime mountpoint of the boot
     /// partition. `None` in legacy embedded-config mode. Never parsed
@@ -295,6 +312,10 @@ impl Config {
             // the cap/seal posture (FIX-53/FIX-04).
             #[cfg(feature = "secure-boot")]
             signing: SigningConfig::default(),
+            // Recovery never self-mounts a staged fragment: `None` keeps
+            // the loader on the verified base config only (FIX-53).
+            #[cfg(feature = "staged-boot")]
+            staged: None,
             runtime_boot_mountpoint: None,
             #[cfg(feature = "stateful")]
             runtime_state_mountpoint: None,
