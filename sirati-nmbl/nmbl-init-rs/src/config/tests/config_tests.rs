@@ -563,3 +563,138 @@ sig      = "nmbl/fragment.toml.sig"
         "rejection should mention the unknown staged table, got: {msg}",
     );
 }
+
+#[cfg(feature = "secure-boot")]
+#[test]
+fn secure_boot_section_absent_uses_defaults() {
+    // Configs predating the [secure_boot] knob must parse and observe the
+    // disabled, audit-neutral default posture plus the single-sourced
+    // refuse countdown and sentinel path.
+    let cfg: Config = toml::from_str("[general]\ntimeout_ms = 3000\n").expect("config must parse");
+    assert!(!cfg.secure_boot.enable);
+    assert!(!cfg.secure_boot.enforce);
+    assert!(cfg.secure_boot.priority_volume.is_none());
+    assert!(cfg.secure_boot.allowed_key_ids.is_empty());
+    assert_eq!(
+        cfg.secure_boot.refuse_countdown_seconds,
+        crate::security_consts::REFUSE_COUNTDOWN_SECONDS
+    );
+    assert_eq!(
+        cfg.secure_boot.sentinel_path,
+        PathBuf::from(crate::security_consts::SENTINEL_PATH)
+    );
+}
+
+#[cfg(feature = "secure-boot")]
+#[test]
+fn secure_boot_section_round_trips_all_fields() {
+    let toml = r#"
+[secure_boot]
+enable                    = true
+signed_file_path          = "nmbl/priority.signed"
+allowed_key_ids           = ["abcd", "ef01"]
+sentinel_path             = "/boot/nmbl/rescue"
+enforce                   = true
+require_tpm               = true
+refuse_countdown_seconds  = 45
+allow_audit_mode_insecure = false
+
+[secure_boot.priority_volume]
+device      = "/dev/mapper/cryptpriority"
+mountpoint  = "/mnt/nmbl-priority"
+fstype      = "ext4"
+options     = "ro,nosuid,nodev,noexec"
+inside_luks = true
+"#;
+    let cfg: Config = toml::from_str(toml).expect("[secure_boot] must parse");
+    let sb = &cfg.secure_boot;
+    assert!(sb.enable);
+    assert!(sb.enforce);
+    assert!(sb.require_tpm);
+    assert_eq!(sb.refuse_countdown_seconds, 45);
+    assert_eq!(sb.signed_file_path, PathBuf::from("nmbl/priority.signed"));
+    assert_eq!(
+        sb.allowed_key_ids,
+        vec!["abcd".to_owned(), "ef01".to_owned()]
+    );
+    assert_eq!(sb.sentinel_path, PathBuf::from("/boot/nmbl/rescue"));
+    let pv = sb
+        .priority_volume
+        .as_ref()
+        .expect("priority_volume should be Some");
+    assert_eq!(pv.device, PathBuf::from("/dev/mapper/cryptpriority"));
+    assert_eq!(pv.mountpoint, PathBuf::from("/mnt/nmbl-priority"));
+    assert_eq!(pv.fstype, "ext4");
+    assert_eq!(pv.options, "ro,nosuid,nodev,noexec");
+    assert!(pv.inside_luks);
+}
+
+#[cfg(feature = "secure-boot")]
+#[test]
+fn secure_boot_priority_volume_options_default() {
+    // `options` has a serde default — an omitted key fills the hardened
+    // read-only set rather than erroring.
+    let toml = r#"
+[secure_boot.priority_volume]
+device     = "/dev/sda2"
+mountpoint = "/mnt/p"
+fstype     = "ext4"
+"#;
+    let cfg: Config = toml::from_str(toml).expect("[secure_boot.priority_volume] must parse");
+    let pv = cfg
+        .secure_boot
+        .priority_volume
+        .as_ref()
+        .expect("priority_volume should be Some");
+    assert_eq!(pv.options, "ro,nosuid,nodev,noexec");
+    assert!(!pv.inside_luks);
+}
+
+#[cfg(feature = "secure-boot")]
+#[test]
+fn secure_boot_section_rejects_unknown_field() {
+    let toml = r#"
+[secure_boot]
+enable  = true
+mystery = "boom"
+"#;
+    let err = toml::from_str::<Config>(toml)
+        .expect_err("unknown field in [secure_boot] must be rejected");
+    assert!(err.to_string().contains("mystery"), "{err}");
+}
+
+#[cfg(feature = "secure-boot")]
+#[test]
+fn secure_boot_priority_volume_rejects_unknown_field() {
+    let toml = r#"
+[secure_boot.priority_volume]
+device     = "/dev/sda2"
+mountpoint = "/mnt/p"
+fstype     = "ext4"
+mystery    = "boom"
+"#;
+    let err = toml::from_str::<Config>(toml)
+        .expect_err("unknown field in [secure_boot.priority_volume] must be rejected");
+    assert!(err.to_string().contains("mystery"), "{err}");
+}
+
+// F1 NEGATIVE: a binary built WITHOUT secure-boot `#[cfg]`s the
+// `secure_boot` field off `Config`, so a `[secure_boot]` table is an
+// UNKNOWN table `deny_unknown_fields` must reject — a feature-free binary
+// never silently accepts a secure-boot table the Nix side only emits for a
+// secure-boot build (FIX-16).
+#[cfg(not(feature = "secure-boot"))]
+#[test]
+fn secure_boot_section_rejected_without_secure_boot_feature() {
+    let toml = r#"
+[secure_boot]
+enable = true
+"#;
+    let err = toml::from_str::<Config>(toml)
+        .expect_err("a non-secure-boot binary must reject the [secure_boot] table");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("secure_boot") || msg.contains("unknown"),
+        "rejection should mention the unknown secure_boot table, got: {msg}",
+    );
+}

@@ -11,6 +11,8 @@ mod general;
 mod paths;
 mod rescue_cfg;
 #[cfg(feature = "secure-boot")]
+mod secure_boot;
+#[cfg(feature = "secure-boot")]
 mod signing;
 mod splash;
 #[cfg(feature = "staged-boot")]
@@ -41,6 +43,9 @@ pub use paths::Paths;
 pub use rescue_cfg::{EmergencyShellConfig, RescueConfig};
 pub use tpm::{SealedSecret, TpmConfig};
 pub use tui::Tui;
+
+#[cfg(feature = "secure-boot")]
+pub use secure_boot::{PriorityVolume, SecureBootConfig};
 
 #[cfg(feature = "secure-boot")]
 pub use signing::{SigningConfig, UkiSigningConfig};
@@ -126,6 +131,16 @@ pub struct Config {
     #[cfg(feature = "secure-boot")]
     #[serde(default)]
     pub signing: SigningConfig,
+
+    /// `[secure_boot]` table (#10) — the top-level secure-boot policy:
+    /// the ONE [`PriorityVolume`] concept (R-3), the refuse-screen
+    /// countdown, the rescue sentinel, and the enforcement/TPM posture.
+    /// Secure-boot builds only; the Nix emit gate is `secureBootActive`
+    /// (FIX-16), so a feature-free binary never receives a `[secure_boot]`
+    /// table its `deny_unknown_fields` parser would reject.
+    #[cfg(feature = "secure-boot")]
+    #[serde(default)]
+    pub secure_boot: SecureBootConfig,
 
     /// Top-level `[staged]` table naming the priority-volume image plus
     /// the signed config fragment + signature paths within it. Absent in
@@ -312,6 +327,12 @@ impl Config {
             // the cap/seal posture (FIX-53/FIX-04).
             #[cfg(feature = "secure-boot")]
             signing: SigningConfig::default(),
+            // secure_boot: default is disabled/audit-neutral — reaching
+            // recovery never relaxes the cap/seal posture (FIX-53). The
+            // priority gate is skipped (`enable = false`) but the sentinel
+            // path and countdown stay at their single-sourced defaults.
+            #[cfg(feature = "secure-boot")]
+            secure_boot: SecureBootConfig::default(),
             // Recovery never self-mounts a staged fragment: `None` keeps
             // the loader on the verified base config only (FIX-53).
             #[cfg(feature = "staged-boot")]

@@ -294,6 +294,37 @@ let
       };
     };
   }
+  # Secure-boot policy (#10): the ONE priority-volume concept (R-3) plus
+  # the refuse countdown, sentinel and enforcement posture. Emitted ONLY
+  # when the `secure-boot` feature is compiled in (`secureBootActive`,
+  # FIX-16) so a non-security build's TOML never carries a `[secure_boot]`
+  # table the Rust struct (`#[cfg(feature="secure-boot")]`,
+  # `deny_unknown_fields`) wouldn't accept. The `[secure_boot.priority_volume]`
+  # sub-table is itself emitted only when a device is configured, matching
+  # the Rust `Option<PriorityVolume>` (absent ⇒ `None`). `allowed_key_ids`
+  # are full key fingerprints the gate narrows to (R-3/FIX-08).
+  // lib.optionalAttrs secureBootActive {
+    secure_boot =
+      {
+        enable = cfg.secureBoot.enable;
+        signed_file_path = cfg.secureBoot.signedFilePath;
+        allowed_key_ids = cfg.secureBoot.allowedKeyIds;
+        sentinel_path = cfg.secureBoot.sentinelPath;
+        enforce = cfg.secureBoot.enforce;
+        require_tpm = cfg.secureBoot.requireTpm;
+        refuse_countdown_seconds = cfg.secureBoot.refuseCountdownSeconds;
+        allow_audit_mode_insecure = cfg.secureBoot.allowAuditModeInsecure;
+      }
+      // lib.optionalAttrs (cfg.secureBoot.priorityVolume.device != null) {
+        priority_volume = {
+          device = cfg.secureBoot.priorityVolume.device;
+          mountpoint = cfg.secureBoot.priorityVolume.mountpoint;
+          fstype = cfg.secureBoot.priorityVolume.fstype;
+          options = cfg.secureBoot.priorityVolume.options;
+          inside_luks = cfg.secureBoot.priorityVolume.insideLuks;
+        };
+      };
+  }
   # Staged-boot pointer set. Emitted ONLY when staged boot is active so a
   # build WITHOUT the `staged-boot` feature (whose binary `#[cfg]`s the
   # `[staged]` field out) never sees a table its `deny_unknown_fields`
