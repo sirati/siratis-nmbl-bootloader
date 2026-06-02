@@ -88,12 +88,18 @@ pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'stati
         });
     }
 
-    // loop + squashfs are auto-added to the explicit module list for
-    // `rescue.mode == external` (see `rescueDiskModules` in
-    // lib/config.nix) and loaded in phase 2b on the normal boot path, or
-    // by the force_on_boot branch in `main::run_inner` before this runs.
-    // `allocate_loop_device` additionally mknods `/dev/loop-control` if
-    // devtmpfs didn't, so no on-demand insmod is needed here.
+    // loop + squashfs are NO LONGER eagerly loaded on every boot (they
+    // were dropped from NMBL's runtime explicit-load list in
+    // lib/options.nix). NMBL needs them only to loop-mount this blob, so
+    // we load them ON DEMAND right here — the single choke point every
+    // rescue entry path (interactive emergency + force_on_boot) funnels
+    // through before touching /dev/loop-control. Their .ko still ship in
+    // the initramfs (lib/config.nix `rescueDiskModules` keeps them in the
+    // staged closure), so this load resolves. Best-effort: if the normal
+    // boot path already loaded them (e.g. root on squashfs) this is a
+    // cheap no-op; on failure we log and proceed so `allocate_loop_device`
+    // surfaces the real error with its own `loop-alloc` stage.
+    ensure_loop_squashfs_modules(config);
 
     let index = allocate_loop_device().map_err(|source| NmblError::Rescue {
         stage: "loop-alloc",
@@ -123,6 +129,47 @@ pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'stati
     mount_overlay_root(&loop_dev)?;
 
     Ok(Path::new(RESCUE_MOUNT))
+}
+
+/// Modules NMBL ITSELF needs to stage the writable rescue root before
+/// switch_root: `loop` for `LOOP_CTL_GET_FREE` on `/dev/loop-control`,
+/// `squashfs` for the read-only lower mount, and `overlay` for the
+/// live-CD `/rescue` overlay ([`mount_overlay_root`]) layered over that
+/// lower with a tmpfs upper. All three are loaded into NMBL's running
+/// kernel here — the rescue `/init` runs only AFTER switch_root, far too
+/// late to provide the `overlay` this dispatch already depends on.
+const RESCUE_DISK_MODULES: [&str; 3] = ["loop", "squashfs", "overlay"];
+
+/// Load `loop` + `squashfs` + `overlay` on demand, immediately before the
+/// loop-mount + overlay dance.
+///
+/// These are deliberately absent from NMBL's eager boot-time module list
+/// (lib/options.nix) — NMBL needs them only on a rescue dispatch, at most
+/// once per boot, so loading them on every boot just to support a rescue
+/// that usually never fires would be wasteful. Their `.ko` still ship in
+/// the initramfs (lib/config.nix `rescueDiskModules`), so this resolves.
+/// Idempotent: if the normal boot path already loaded them (e.g. a
+/// squashfs root), the inner loader reports `AlreadyLoaded` and this is a
+/// no-op; likewise the rescue `/init`'s own later `modprobe overlay`
+/// becomes a no-op once this has run.
+///
+/// Best-effort by design — any error is logged, not propagated: if the
+/// modules are genuinely missing, the subsequent `allocate_loop_device`,
+/// squashfs `mount`, or `overlay` `mount` fails with a far more
+/// actionable, stage-tagged [`NmblError::Rescue`] than a premature bail
+/// here would give.
+fn ensure_loop_squashfs_modules(config: &Config) {
+    let modules: Vec<String> = RESCUE_DISK_MODULES.iter().map(|m| m.to_string()).collect();
+    if let Err(err) = crate::modules::load_modules(
+        &config.kernel_modules.modules_dir,
+        &modules,
+        &config.kernel_modules.blacklist,
+    ) {
+        eprintln!(
+            "[nmbl] external rescue: on-demand load of loop+squashfs failed \
+             ({err}); continuing — the loop-mount will surface the real error"
+        );
+    }
 }
 
 /// Build the writable rescue root as a live-CD-style overlay: a

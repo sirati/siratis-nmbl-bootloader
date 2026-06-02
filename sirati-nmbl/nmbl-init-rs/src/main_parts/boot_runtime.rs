@@ -24,10 +24,12 @@ use super::phases::mount_state_twin;
 use super::phases::{run_bootstrap_phase, run_phase_2a};
 use super::{cmdline_has_key_echo_flag, should_force_external_rescue};
 
-/// Force-external-rescue sub-flow. Loads the explicit module set
-/// (carries the auto-added `loop`/`squashfs`/nicDrivers for
-/// `rescue.mode == external`) then calls `rescue::dispatch`. Extracted
-/// from `run_inner` to keep that fn under 100 lines.
+/// Force-external-rescue sub-flow. Loads the explicit module set (which
+/// carries the network-rescue NIC/`af_packet` set when `rescue.network`
+/// is on — NOT `loop`/`squashfs`, which `rescue::dispatch` →
+/// `prepare_disk_rescue` now loads on demand), then calls
+/// `rescue::dispatch`. Extracted from `run_inner` to keep that fn under
+/// 100 lines.
 ///
 /// `config` is taken by value so `Err` can carry it back to
 /// `open_console_and_drop_to_emergency` without cloning when
@@ -38,18 +40,16 @@ pub(crate) fn run_force_rescue(
     noop: &mut NoopConsole,
 ) -> std::result::Result<TerminalAction, Box<(NmblError, Config)>> {
     nmbl_info!("force_on_boot: entering external rescue");
-    // The rescue-required kernel modules (`loop`, `squashfs`, the
-    // rescue `nicDrivers` and `af_packet`) are auto-added to
-    // `config.kernel_modules.explicit` for `rescue.mode == external`
-    // (see lib/config.nix `rescueDiskModules`/`rescueNicModules`),
-    // which is normally loaded in phase 2b. The force path
-    // short-circuits before phase 2b, so without loading them here
-    // `allocate_loop_device` would fail with ENOENT on
-    // `/dev/loop-control` (the `loop` module was never inserted, so
-    // devtmpfs never created the node) and `/init`'s DHCP would have
-    // no NIC driver after switch_root. Load the explicit set now —
-    // before `rescue::dispatch` — using the pre-console NoopConsole
-    // reporter exactly as phase 2a does.
+    // The network-rescue NIC drivers + `af_packet` are added to
+    // `config.kernel_modules.explicit` for `rescue.network &&
+    // rescue.mode == external` (see lib/config.nix `rescueNicModules`/
+    // `rescuePacketModule`), normally loaded in phase 2b. The force path
+    // short-circuits before phase 2b, so load the explicit set now so
+    // NMBL's own in-initramfs DHCP path has its NIC driver. `loop` +
+    // `squashfs` are NOT in this list anymore: `rescue::dispatch` →
+    // `prepare_disk_rescue` loads them on demand right before the
+    // loop-mount, so this path no longer has to. Load via the pre-console
+    // NoopConsole reporter exactly as phase 2a does.
     {
         // Pre-runtime: no poller yet, so module loading (sync `ModuleOps`)
         // goes through a sender-less `RealSys`.
