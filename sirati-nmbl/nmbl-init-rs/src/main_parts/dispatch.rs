@@ -239,7 +239,7 @@ pub(super) fn halt_final(reason: &str) -> ! {
 /// later phase can `spawn_local` the same shape per connection. It is
 /// `block_on`'d once for the local console here.
 pub(super) async fn run_tui_session(
-    config: &Config,
+    config: &mut Config,
     console: Box<dyn Console>,
     session: &SessionInteraction,
     sender: &nmbl_init::sys::poller::LocalSender,
@@ -264,14 +264,20 @@ pub(super) async fn run_tui_session(
     // mount) are plain synchronous calls inside this async fn, and the
     // passphrase prompt / wrong-password modal `.await` the same
     // console — no nested runtime anywhere.
-    let outcome =
-        match run_phases_post_console(config, &mut *console, session, &skip_selector, sender).await
-        {
-            Ok(injections) => {
-                select_and_act(config, &mut *console, &injections, session, &skip_selector).await
-            }
-            Err(err) => Err(err),
-        };
+    let outcome = match run_phases_post_console(
+        &mut *config,
+        &mut *console,
+        session,
+        &skip_selector,
+        sender,
+    )
+    .await
+    {
+        Ok(injections) => {
+            select_and_act(config, &mut *console, &injections, session, &skip_selector).await
+        }
+        Err(err) => Err(err),
+    };
     match outcome {
         Ok(action) => {
             // `console` falls out of scope on return, running

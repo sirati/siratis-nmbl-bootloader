@@ -188,7 +188,10 @@ pub(crate) async fn run_boot_inside_runtime(
     }
     let session = SessionInteraction::new();
     BootOutcome::Done(Box::new(Ok(run_tui_session(
-        &config, console, &session, &sender,
+        &mut config,
+        console,
+        &session,
+        &sender,
     )
     .await)))
 }
