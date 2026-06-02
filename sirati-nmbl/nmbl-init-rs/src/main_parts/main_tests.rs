@@ -44,28 +44,34 @@ fn external_mode_without_force_does_not_trigger() {
 
 #[test]
 fn force_path_loads_explicit_set_before_dispatch() {
-    // Contract for the ordering fix: the force_on_boot branch must
-    // run the EXPLICIT module set (which carries the auto-added
-    // `loop`/`squashfs`/nicDrivers for mode==external) before
-    // `rescue::dispatch`. We can't drive `run_inner` (it is PID-1
-    // flow), but we can lock in that the explicit list — not the
-    // early list — is the one a forced external rescue depends on,
-    // and that the loader is a no-op when that list is empty (so the
-    // pre-dispatch call never spuriously fails a forced boot on a
-    // platform with built-in loop/squashfs).
+    // Contract for the force_on_boot branch: it runs the EXPLICIT module
+    // set before `rescue::dispatch` so NMBL's own in-initramfs DHCP path
+    // (the network-rescue NIC set, added when `rescue.network` is on) is
+    // live before handoff. `loop`/`squashfs` are NO LONGER carried by the
+    // explicit list — `rescue::dispatch` → `prepare_disk_rescue` loads
+    // them on demand right before the loop-mount — so the force path does
+    // not depend on them being in `explicit`. We can't drive `run_inner`
+    // (PID-1 flow), but we can lock in that the explicit list (not the
+    // early list) is the one the force path loads, and that the loader is
+    // a no-op on an empty set (so a forced boot is never spuriously
+    // blocked).
     let mut cfg = Config::recovery_default();
     cfg.rescue.force_on_boot = true;
     cfg.rescue.mode = RescueMode::External;
-    cfg.kernel_modules.explicit = vec![
-        "loop".to_owned(),
-        "squashfs".to_owned(),
-        "virtio_net".to_owned(),
-    ];
+    cfg.kernel_modules.explicit = vec!["virtio_net".to_owned(), "af_packet".to_owned()];
     assert!(should_force_external_rescue(&cfg));
-    // The force path loads `config.kernel_modules.explicit`; confirm
-    // the rescue-critical names live there and not in `early`.
-    assert!(cfg.kernel_modules.explicit.iter().any(|m| m == "loop"));
-    assert!(cfg.kernel_modules.explicit.iter().any(|m| m == "squashfs"));
+    // The force path loads `config.kernel_modules.explicit`; the
+    // network-rescue NIC set lives there (not in `early`), while
+    // loop/squashfs are intentionally absent (loaded on demand at
+    // dispatch instead).
+    assert!(
+        cfg.kernel_modules
+            .explicit
+            .iter()
+            .any(|m| m == "virtio_net")
+    );
+    assert!(!cfg.kernel_modules.explicit.iter().any(|m| m == "loop"));
+    assert!(!cfg.kernel_modules.explicit.iter().any(|m| m == "squashfs"));
     assert!(cfg.kernel_modules.early.is_empty());
 
     // Empty explicit list -> loader short-circuits Ok (no modules

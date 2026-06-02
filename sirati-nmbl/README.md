@@ -1,11 +1,26 @@
-# NMBL — NixOS Minimal BootLoader
+# sirati's NMBL — no more boot loader
 
-Linux as a bootloader. NMBL boots a tiny pinned Linux kernel plus a
-minimal initramfs, lets the operator pick a NixOS generation, and
-`kexec`s straight into it. The bootloader never copies kernels or
-initrds onto a boot partition — it reads them in place from the
-target system's `/nix/var/nix/profiles/system-N-link/`, which is the
-whole point of NMBL.
+**Using Linux as a bootloader.** A conventional bootloader (GRUB,
+systemd-boot) is a second, lesser operating system: it reimplements
+filesystem drivers, a disk/partition stack, and a scripting language,
+all just to locate a kernel and hand off to it. But Linux already
+ships every driver for the filesystem it runs on — so the most capable
+thing to boot Linux with is Linux itself.
+
+NMBL boots a tiny pinned Linux kernel plus a minimal initramfs, lets
+the operator pick a NixOS generation, and `kexec`s straight into it.
+Because a *real* kernel mounts the *real* root with the *real* driver,
+two long-standing bootloader restrictions simply disappear:
+
+- **No restriction on where the system lives.** Any storage stack
+  Linux can mount is bootable — LVM, LUKS, mdraid, ZFS, btrfs
+  subvolumes, network block devices — with no bootloader-side driver
+  to reimplement or keep up to date.
+- **No copying the kernel and initrd onto a boot partition.** NMBL
+  reads them in place from the target system's
+  `/nix/var/nix/profiles/system-N-link/`, so the boot partition never
+  has to be kept in sync with every NixOS generation. That is the
+  whole point of NMBL.
 
 The userspace in that initramfs is a single static Rust binary,
 `nmbl-init`, that runs as PID 1.
@@ -152,7 +167,7 @@ in `lib/options.nix` and `lib/modules/activation.nix`.
     bootstrapper = {
       partition_table = "gpt";
       bootMode = "uefi";          # "bios" | "uefi" | "qemu_kernel_invoke"
-      loader = "grub";            # "grub" | "systemd" | null
+      loader = "grub";            # "grub" | "systemd" | "efi-stub" | null
     };
 
     timeoutSeconds = 3;           # countdown before auto-boot
@@ -182,6 +197,38 @@ Notable points:
   `keyfile` (bundled into the initramfs), or `password` (entered in
   the TUI passphrase modal).
 - `verbose` defaults to inheriting `boot.initrd.verbose`.
+
+### efi-stub direct boot
+
+With `loader = "efi-stub"` (UEFI only) NMBL's kernel + initrd are
+combined into a single UKI (Unified Kernel Image) PE and written to
+the ESP — no GRUB or systemd-boot binary at all. By default it lands
+at the firmware removable/fallback path `EFI/BOOT/BOOTX64.EFI`, which
+firmware auto-boots with no NVRAM entry: ideal for a dedicated NMBL
+disk or a manually-uploaded image.
+
+To install **alongside an existing bootloader** (e.g. GRUB) without
+overwriting its fallback binary, point the UKI at its own path:
+
+```nix
+{
+  boot.nmbl.bootstrapper = {
+    bootMode = "uefi";
+    loader   = "efi-stub";
+    loader_extra_args = {
+      efiStubInstallPath  = "EFI/nmbl/nmbl.efi";  # own path, not BOOTX64
+      canTouchEfiVariables = true;                # register the NVRAM entry
+    };
+  };
+}
+```
+
+An own path is not auto-booted by firmware, so NMBL registers a UEFI
+NVRAM boot entry (`NMBL`, placed first in BootOrder) pointing at it,
+leaving the existing bootloader's entry intact as a fallback. The
+NVRAM write requires `canTouchEfiVariables = true`; with it `false`
+the file is written and a warning tells you to add the boot entry by
+hand.
 
 ## External configuration
 
@@ -363,7 +410,7 @@ Working:
 - Storage activation: LVM (`vgchange -ay`), mdraid (`mdadm --assemble --scan`), LUKS via TPM / keyfile / passphrase, ZFS (`zpool import -N`).
 - `kexec_file_load(2)` handover into the selected generation.
 - Panic hook with `--errored` recovery re-exec.
-- Bootstrapper installation via GRUB or systemd-boot on GPT for BIOS or UEFI, plus QEMU `-kernel` direct invocation.
+- Bootstrapper installation via GRUB or systemd-boot on GPT for BIOS or UEFI, the `efi-stub` direct-boot UKI (fallback path or an own path alongside another bootloader), plus QEMU `-kernel` direct invocation.
 - **External configuration** on the boot partition
   (`boot.nmbl.configLocation = "external"`): tiny bootstrap.toml
   embedded in the initramfs, full config.toml staged on /boot and

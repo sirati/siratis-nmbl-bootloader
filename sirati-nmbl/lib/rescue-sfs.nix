@@ -37,6 +37,8 @@
     sshdPort = 22222;
     rootAuthorizedKeys = [ ];
     nicDrivers = [ ];
+    coreModules = [ ];
+    moduleClosure = null;
   },
 }:
 
@@ -124,11 +126,23 @@ let
   cryptsetup = pkgs.cryptsetup;
   cacert = pkgs.cacert;
 
-  # NIC drivers the /init modprobes (a no-op if NMBL already loaded them
-  # into its kernel before switch_root, which it does — see options.nix).
-  nicModprobes = lib.concatMapStringsSep "\n"
-    (m: "  modprobe ${m} 2>/dev/null || true")
-    fullSystem.nicDrivers;
+  # All kernel modules the rescue /init loads ITSELF after switch_root.
+  # Core fs/packet modules first (overlay + ext4 back the writable
+  # scratch, af_packet backs dhcpcd's BPF socket), then the NIC drivers.
+  # NMBL no longer preloads any of these — their .ko (+ firmware) ship in
+  # the squashfs at /lib/modules/<uname -r> and /lib/firmware, staged from
+  # `fullSystem.moduleClosure`. The running kernel after switch_root is
+  # still NMBL's, so `uname -r` matches the staged module-tree version and
+  # plain `modprobe` (absolute kmod path — PATH is not set up yet) resolves
+  # them via the modules.dep we depmod at build time. Firmware-dependent
+  # NIC drivers (wifi: iwlwifi, ath*, brcmfmac, …) work here BECAUSE
+  # /lib/firmware is present in the squashfs root and firmware_class's
+  # search path is pointed at it just before these modprobes run — unlike
+  # loading the driver into NMBL's firmware-less initramfs.
+  rescueModprobeList = fullSystem.coreModules ++ fullSystem.nicDrivers;
+  rescueModprobes = lib.concatMapStringsSep "\n"
+    (m: "    ${kmod}/bin/modprobe ${m} > /dev/console 2>&1 || log \"WARNING: modprobe ${m} failed\"")
+    rescueModprobeList;
 
   # The rescue /init: PID 1 after switch_root. A bash script, baked into
   # the image at /init. References tools by absolute store path so it
@@ -173,6 +187,29 @@ let
     ${utilLinux}/bin/mount -t tmpfs    tmpfs    /run     2>/dev/null || true
     ${utilLinux}/bin/mount -t tmpfs    tmpfs    /tmp     2>/dev/null || true
 
+    # --- kernel modules (loaded by THE RESCUE, not NMBL) ---
+    # NMBL no longer preloads the rescue's drivers; it only loads loop +
+    # squashfs (on demand) so it can loop-mount this blob. Everything the
+    # recovery system needs — overlay + ext4 (the writable scratch),
+    # af_packet (dhcpcd's BPF socket) and the NIC drivers — is shipped in
+    # this squashfs at /lib/modules/$(uname -r) and modprobe'd HERE. Done
+    # before the ext4 scratch / overlays / networking below, which depend
+    # on these modules. /sys is mounted above, so firmware_class exists.
+    #
+    # Point the kernel's firmware loader at the squashfs /lib/firmware
+    # FIRST, so a NIC driver that requests firmware at modprobe time (wifi)
+    # finds its blob. Best-effort: the sysfs knob is absent if
+    # CONFIG_FW_LOADER_USER_HELPER is off, but the in-kernel loader also
+    # searches /lib/firmware by default, so the override is belt-and-braces.
+    log "pointing firmware loader at /lib/firmware"
+    if [ -w /sys/module/firmware_class/parameters/path ]; then
+      ${coreutils}/bin/printf '%s' /lib/firmware \
+        > /sys/module/firmware_class/parameters/path 2>/dev/null \
+        || log "WARNING: could not set firmware_class search path"
+    fi
+    log "loading rescue kernel modules (overlay, ext4, af_packet, NIC drivers)"
+${rescueModprobes}
+
     # --- ext4 scratch backing the overlay upper/work dirs ---
     # The squashfs root (/, /nix, /etc, /var) is read-only, so the scratch
     # mountpoint and the overlay upper/work dirs cannot live there. The overlay
@@ -195,8 +232,8 @@ let
     # SAFETY: only ever mkfs/mount the device whose serial is EXACTLY
     # NMBLSCRATCH. The recovery-target disks (the btrfs RAID nvme0/nvme1) MUST
     # NEVER be formatted. If no NMBLSCRATCH device is found, we do NOT guess —
-    # we fall back to path (2). The ext4 + overlay kernel modules are loaded
-    # into NMBL's kernel before switch_root (see options.nix / config.nix);
+    # we fall back to path (2). The ext4 + overlay kernel modules were
+    # modprobe'd by THIS /init above (shipped in the squashfs, not by NMBL);
     # every step degrades to a WARNING rather than aborting.
     ${coreutils}/bin/mkdir -p /run/scratch \
       || log "WARNING: mkdir /run/scratch failed"
@@ -368,10 +405,6 @@ let
       -o lowerdir=/root,upperdir=/run/scratch/ovl/root/u,workdir=/run/scratch/ovl/root/w \
       /root \
       || log "WARNING: overlay over /root failed; /root stays read-only"
-
-    # --- kernel modules (no-op if NMBL preloaded them) ---
-    log "loading NIC drivers"
-${nicModprobes}
 
     # --- networking ---
     # nixpkgs builds dhcpcd with --disable-privsep --dbdir=/var/lib/dhcpcd,
@@ -626,6 +659,26 @@ ${nicModprobes}
   authorizedKeys = pkgs.writeText "authorized_keys"
     (lib.concatStringsSep "\n" fullSystem.rootAuthorizedKeys + "\n");
 
+  # Downstream-supplied recovery packages (e.g. wpa_supplicant, iw added
+  # by a laptop config). Their bin/sbin dirs are shimmed onto PATH below,
+  # alongside the hardcoded core tools, so any binary the operator added
+  # via `rescue.fullSystem.packages` is usable from the rescue shell and
+  # over ssh without the caller having to also touch this file. The store
+  # paths are emitted as a space-separated list the build loop iterates.
+  fullSystemPackagePaths =
+    lib.concatMapStringsSep " " (p: "${p}") fullSystem.packages;
+
+  # The rescue module closure built against NMBL's exact kernel (its
+  # /lib/modules/<kver> already has a depmod'd modules.dep, and its
+  # /lib/firmware holds only the blobs those modules reference). Staged
+  # into the squashfs root so the rescue /init can modprobe them after
+  # switch_root. May be null (fullSystem disabled / no modules), in which
+  # case the staging block is a no-op. makeModulesClosure with
+  # allowMissing and zero resolved modules emits an EMPTY out (no lib/),
+  # so the build-time `cp` is guarded by an existence test regardless.
+  moduleClosurePath =
+    if fullSystem.moduleClosure != null then "${fullSystem.moduleClosure}" else "";
+
   fullSquashfs = pkgs.runCommand "nmbl-rescue.sfs"
     {
       nativeBuildInputs = [ pkgs.squashfsTools pkgs.nix ];
@@ -649,6 +702,31 @@ ${nicModprobes}
       export NIX_STATE_DIR=$PWD/root/nix/var/nix
       export NIX_STORE_DIR=/nix/store
       nix-store --load-db < ${closure}/registration
+
+      # --- rescue kernel modules + firmware ---
+      # Stage the module closure (built against NMBL's exact kernel) into
+      # the squashfs root so the rescue /init can modprobe its own drivers
+      # after switch_root: /lib/modules/<kver> carries the .ko + the
+      # depmod'd modules.dep (makeModulesClosure runs depmod), and
+      # /lib/firmware carries only the blobs those drivers reference. The
+      # running kernel after switch_root is still NMBL's, so $(uname -r)
+      # matches <kver> and plain modprobe resolves them. cp -aL so the
+      # closure's symlinks are dereferenced into the self-contained blob.
+      mc=${lib.escapeShellArg moduleClosurePath}
+      if [ -n "$mc" ] && [ -d "$mc/lib/modules" ]; then
+        echo "staging rescue kernel modules from $mc/lib/modules"
+        mkdir -p root/lib
+        cp -aL "$mc/lib/modules" root/lib/modules
+        if [ -d "$mc/lib/firmware" ]; then
+          echo "staging rescue firmware from $mc/lib/firmware"
+          cp -aL "$mc/lib/firmware" root/lib/firmware
+        else
+          echo "no rescue firmware in closure (no module requested any)"
+        fi
+        chmod -R u+w root/lib
+      else
+        echo "no rescue module closure to stage (fullSystem off or all built-in)"
+      fi
 
       # --- baked config files ---
       cp ${nixConf}        root/etc/nix/nix.conf
@@ -706,6 +784,25 @@ ${nicModprobes}
       for d in ${openssh}/sbin ${kmod}/sbin ${utilLinux}/sbin ${e2fsprogs}/sbin; do
         [ -d "$d" ] || continue
         for tool in "$d"/*; do
+          name=$(basename "$tool")
+          [ -e "root/sbin/$name" ] || ln -s "$tool" "root/sbin/$name"
+        done
+      done
+
+      # Generalised shims for any downstream `rescue.fullSystem.packages`
+      # (wpa_supplicant, iw, …): link every binary in each package's bin/
+      # and sbin/ onto PATH so it resolves from the rescue shell and over
+      # ssh. Idempotent ([ -e ] guard) so a package overlapping the
+      # hardcoded core set above does not clobber existing links; only the
+      # last component name matters for PATH resolution.
+      for pkgpath in ${fullSystemPackagePaths}; do
+        for tool in "$pkgpath"/bin/*; do
+          [ -e "$tool" ] || continue
+          name=$(basename "$tool")
+          [ -e "root/bin/$name" ] || ln -s "$tool" "root/bin/$name"
+        done
+        for tool in "$pkgpath"/sbin/*; do
+          [ -e "$tool" ] || continue
           name=$(basename "$tool")
           [ -e "root/sbin/$name" ] || ln -s "$tool" "root/sbin/$name"
         done
