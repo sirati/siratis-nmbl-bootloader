@@ -39,13 +39,21 @@ modules = ["zfs"]
     assert!(cfg.driver_images.enable);
     assert_eq!(cfg.driver_images.images.len(), 2);
 
-    let nvidia = &cfg.driver_images.images[0];
+    let nvidia = cfg
+        .driver_images
+        .images
+        .first()
+        .expect("first driver image parsed");
     assert_eq!(nvidia.path, PathBuf::from("nmbl/driver-nvidia.sfs"));
     assert_eq!(nvidia.sig_path, PathBuf::from("nmbl/driver-nvidia.sfs.sig"));
     assert_eq!(nvidia.modules, vec!["nvidia", "nvidia_modeset"]);
     assert_eq!(nvidia.blacklist, vec!["nouveau"]);
 
-    let zfs = &cfg.driver_images.images[1];
+    let zfs = cfg
+        .driver_images
+        .images
+        .get(1)
+        .expect("second driver image parsed");
     assert_eq!(zfs.path, PathBuf::from("nmbl/driver-zfs.sfs"));
     assert_eq!(zfs.modules, vec!["zfs"]);
     // Absent blacklist defaults to empty (serde default).
