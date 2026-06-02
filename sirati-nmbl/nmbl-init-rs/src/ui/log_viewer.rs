@@ -105,7 +105,10 @@ impl LogViewer {
             return LogViewerOutcome::Ignored;
         }
 
-        if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        if key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+        {
             match key.code {
                 // Ctrl+L closes the viewer (it is the open/close toggle on
                 // the selector); a standalone host treats it as close too.

@@ -245,18 +245,20 @@ mod tests {
         // says so.
         let mut console = ScriptedConsole::new(vec![key(KeyCode::Char('x'))]);
         let saw = Cell::new(None);
-        let outcome = block(CountdownScreen::new(std::time::Duration::from_secs(60)).run(
-            &mut console,
-            |event| {
-                if let ConsoleEvent::Key(k) = event {
-                    saw.set(Some(k.code));
-                    CountdownAction::Cancel
-                } else {
-                    CountdownAction::Continue
-                }
-            },
-            |_console, _secs| Ok(()),
-        ))
+        let outcome = block(
+            CountdownScreen::new(std::time::Duration::from_secs(60)).run(
+                &mut console,
+                |event| {
+                    if let ConsoleEvent::Key(k) = event {
+                        saw.set(Some(k.code));
+                        CountdownAction::Cancel
+                    } else {
+                        CountdownAction::Continue
+                    }
+                },
+                |_console, _secs| Ok(()),
+            ),
+        )
         .expect("countdown runs");
         assert_eq!(outcome, CountdownOutcome::Cancelled);
         assert_eq!(saw.get(), Some(KeyCode::Char('x')));
@@ -268,11 +270,13 @@ mod tests {
         // budget expire even though an event was delivered — i.e. an
         // ignored key does NOT cancel.
         let mut console = ScriptedConsole::new(vec![key(KeyCode::Char('z'))]);
-        let outcome = block(CountdownScreen::new(std::time::Duration::from_millis(1)).run(
-            &mut console,
-            |_event| CountdownAction::Continue,
-            |_console, _secs| Ok(()),
-        ))
+        let outcome = block(
+            CountdownScreen::new(std::time::Duration::from_millis(1)).run(
+                &mut console,
+                |_event| CountdownAction::Continue,
+                |_console, _secs| Ok(()),
+            ),
+        )
         .expect("countdown runs");
         assert_eq!(outcome, CountdownOutcome::Expired);
     }
@@ -283,16 +287,18 @@ mod tests {
         // rounded UP so a 1500 ms countdown opens reading "2s".
         let mut console = ScriptedConsole::new(vec![key(KeyCode::Char('q'))]);
         let first = Cell::new(None);
-        let _ = block(CountdownScreen::new(std::time::Duration::from_millis(1_500)).run(
-            &mut console,
-            |_event| CountdownAction::Cancel,
-            |_console, secs| {
-                if first.get().is_none() {
-                    first.set(Some(secs));
-                }
-                Ok(())
-            },
-        ))
+        let _ = block(
+            CountdownScreen::new(std::time::Duration::from_millis(1_500)).run(
+                &mut console,
+                |_event| CountdownAction::Cancel,
+                |_console, secs| {
+                    if first.get().is_none() {
+                        first.set(Some(secs));
+                    }
+                    Ok(())
+                },
+            ),
+        )
         .expect("countdown runs");
         assert_eq!(first.get(), Some(2));
     }

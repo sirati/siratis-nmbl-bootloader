@@ -264,20 +264,15 @@ pub(super) async fn run_tui_session(
     // mount) are plain synchronous calls inside this async fn, and the
     // passphrase prompt / wrong-password modal `.await` the same
     // console — no nested runtime anywhere.
-    let outcome = match run_phases_post_console(
-        &mut *config,
-        &mut *console,
-        session,
-        &skip_selector,
-        sender,
-    )
-    .await
-    {
-        Ok(injections) => {
-            select_and_act(config, &mut *console, &injections, session, &skip_selector).await
-        }
-        Err(err) => Err(err),
-    };
+    let outcome =
+        match run_phases_post_console(&mut *config, &mut *console, session, &skip_selector, sender)
+            .await
+        {
+            Ok(injections) => {
+                select_and_act(config, &mut *console, &injections, session, &skip_selector).await
+            }
+            Err(err) => Err(err),
+        };
     match outcome {
         Ok(action) => {
             // `console` falls out of scope on return, running
