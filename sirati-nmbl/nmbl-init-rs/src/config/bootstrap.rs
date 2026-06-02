@@ -41,6 +41,18 @@ pub struct BootstrapSection {
     /// extra mount entirely.
     #[serde(default)]
     pub state: Option<BootstrapStateMount>,
+
+    /// Optional staged-boot pointer set embedded in the bootstrap stage.
+    /// Names the priority volume that carries the signed config fragment
+    /// + drivers so the pre-stage can mount and verify it before reading
+    /// the full per-generation config. Gated behind `staged-boot` (which
+    /// implies `secure-boot`): without the verifier there is no staged
+    /// path, so the field — and the table that fills it — only exist in
+    /// staged-boot builds, keeping the wire schema of a feature-free build
+    /// byte-for-byte unchanged (FIX-40).
+    #[cfg(feature = "staged-boot")]
+    #[serde(default)]
+    pub staged: Option<BootstrapStaged>,
 }
 
 /// Boot-filesystem descriptor used by the bootstrap stage. Shape mirrors
@@ -67,6 +79,32 @@ pub struct BootstrapBootFs {
 #[serde(deny_unknown_fields)]
 pub struct BootstrapStateMount {
     pub mountpoint: PathBuf,
+}
+
+/// `[bootstrap.staged]` — the staged-boot pointer set carried in the
+/// frozen bootstrap stage. Names where the priority volume holding the
+/// signed config fragment + drivers is mounted, plus the volume-relative
+/// paths to the fragment and its detached signature. The pre-stage mounts
+/// [`Self::mountpoint`] and verifies the fragment under it before reading
+/// the full config (R-3 / R-6).
+///
+/// Gated behind `staged-boot` so a feature-free initramfs neither parses
+/// nor emits this table (FIX-40). Carries NO `has_config_fragment` flag
+/// (FIX-56): fragment presence is a runtime file-existence check.
+#[cfg(feature = "staged-boot")]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BootstrapStaged {
+    /// Initramfs mountpoint where the bootstrap stage binds the verified
+    /// priority volume.
+    pub mountpoint: PathBuf,
+
+    /// Signed config fragment, relative to [`Self::mountpoint`].
+    pub fragment: PathBuf,
+
+    /// Detached ML-DSA signature over [`Self::fragment`], relative to
+    /// [`Self::mountpoint`].
+    pub sig: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]

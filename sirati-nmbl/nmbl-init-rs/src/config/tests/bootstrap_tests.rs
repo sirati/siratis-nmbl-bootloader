@@ -315,6 +315,8 @@ fn bootstrap_validate_rejects_url_without_sha() {
                 default_sha256: String::new(),
             },
             state: None,
+            #[cfg(feature = "staged-boot")]
+            staged: None,
         },
     };
     let err = cfg.validate().expect_err("url without sha must reject");
@@ -344,6 +346,8 @@ fn bootstrap_validate_rejects_sha_without_url() {
                 default_sha256: "deadbeef".to_string(),
             },
             state: None,
+            #[cfg(feature = "staged-boot")]
+            staged: None,
         },
     };
     cfg.validate().expect_err("sha without url must reject");
@@ -396,10 +400,108 @@ fn bootstrap_validate_accepts_both_empty_and_both_set() {
                 default_sha256: sha.to_string(),
             },
             state: None,
+            #[cfg(feature = "staged-boot")]
+            staged: None,
         },
     };
     mk("", "").validate().expect("both empty must pass");
     mk("https://example.invalid/r.cpio", "deadbeef")
         .validate()
         .expect("both set must pass");
+}
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn bootstrap_staged_section_absent_decodes_to_none() {
+    let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+"#;
+    let cfg: BootstrapConfig = toml::from_str(toml).expect("staged must be optional");
+    assert!(cfg.bootstrap.staged.is_none());
+}
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn bootstrap_staged_section_present_parses_fields() {
+    let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+
+[bootstrap.staged]
+mountpoint = "/mnt/staged"
+fragment   = "nmbl/fragment.toml"
+sig        = "nmbl/fragment.toml.sig"
+"#;
+    let cfg: BootstrapConfig = toml::from_str(toml).expect("staged must parse");
+    let staged = cfg.bootstrap.staged.expect("staged should be Some");
+    assert_eq!(staged.mountpoint, PathBuf::from("/mnt/staged"));
+    assert_eq!(staged.fragment, PathBuf::from("nmbl/fragment.toml"));
+    assert_eq!(staged.sig, PathBuf::from("nmbl/fragment.toml.sig"));
+}
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn bootstrap_staged_rejects_unknown_field() {
+    let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+
+[bootstrap.staged]
+mountpoint = "/mnt/staged"
+fragment   = "nmbl/fragment.toml"
+sig        = "nmbl/fragment.toml.sig"
+extra      = "x"
+"#;
+    let err = toml::from_str::<BootstrapConfig>(toml)
+        .expect_err("unknown field in [bootstrap.staged] must be rejected");
+    assert!(err.to_string().contains("extra"), "{err}");
+}
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn bootstrap_staged_rejects_missing_required_field() {
+    let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+
+[bootstrap.staged]
+mountpoint = "/mnt/staged"
+"#;
+    toml::from_str::<BootstrapConfig>(toml)
+        .expect_err("missing bootstrap.staged.fragment/sig must reject");
+}
+
+// F1 NEGATIVE: a binary built WITHOUT `staged-boot` `#[cfg]`s the `staged`
+// field off `BootstrapSection`, so a `[bootstrap.staged]` table is unknown
+// and `deny_unknown_fields` must reject it (FIX-40).
+#[cfg(not(feature = "staged-boot"))]
+#[test]
+fn bootstrap_staged_section_rejected_without_secure_boot_feature() {
+    let toml = r#"
+[bootstrap.boot_fs]
+device     = "/dev/sda1"
+fstype     = "vfat"
+mountpoint = "/mnt/boot"
+
+[bootstrap.staged]
+mountpoint = "/mnt/staged"
+fragment   = "nmbl/fragment.toml"
+sig        = "nmbl/fragment.toml.sig"
+"#;
+    let err = toml::from_str::<BootstrapConfig>(toml)
+        .expect_err("a non-staged-boot binary must reject [bootstrap.staged]");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("staged") || msg.contains("unknown"),
+        "rejection should mention the unknown staged table, got: {msg}",
+    );
 }
