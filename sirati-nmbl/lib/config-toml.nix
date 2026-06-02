@@ -41,6 +41,18 @@
 let
   cfg = config.boot.nmbl;
 
+  # Single source of the `secureBootActive` IMPLICATION boolean (FIX-16),
+  # shared with `lib/signing-build.nix`'s `nmblFeatures` derive. The binding
+  # contract is "any per-table security emit-gate ⇒ `secure-boot` ∈
+  # nmblFeatures". `secureBootActive` is exactly the condition under which
+  # the `secure-boot` Cargo feature is compiled into /init, so gating the
+  # security tables on it makes the TOML emit track the Rust
+  # `#[cfg(feature="secure-boot")]` struct fields precisely: a `[signing]`
+  # table is emitted iff the struct that parses it (with `deny_unknown_fields`)
+  # exists in the binary.
+  securityConsts = import ./security-consts.nix { inherit lib; };
+  secureBootActive = securityConsts.mkSecureBootActive config;
+
   tomlFormat = pkgs.formats.toml { };
 
   # Absolute path the emergency shell forks at runtime (NMBL PID 1, in the
@@ -252,6 +264,28 @@ let
         modules = img.modules;
         blacklist = img.blacklist;
       }) (lib.attrValues cfg.driverImages.images);
+    };
+  }
+  # Signature-enforcement POLICY (#6). Emitted only when the `secure-boot`
+  # feature is compiled in (`secureBootActive`, FIX-16), so a non-security
+  # build's TOML never carries a `[signing]` table the Rust struct
+  # (`#[cfg(feature="secure-boot")]`, `deny_unknown_fields`) wouldn't accept.
+  #
+  # POLICY ONLY — `publicKeys` are NEVER emitted (R-5/FIX-04). They are the
+  # trust anchor and are `include_bytes!`-baked into the binary, not read
+  # from this writable-boot artifact. We emit `enable`/`enforce`/`algorithm`/
+  # `sig_path_suffix` and the `[signing.uki]` policy sub-table only.
+  // lib.optionalAttrs secureBootActive {
+    signing = {
+      enable = cfg.signing.enable;
+      enforce = cfg.signing.enforce;
+      algorithm = cfg.signing.algorithm;
+      sig_path_suffix = cfg.signing.sigPathSuffix;
+      uki = {
+        # Install-time UKI signing policy only. keyFile/certFile are
+        # install-time-impure and NEVER reach config.toml.
+        enable = cfg.signing.uki.enable;
+      };
     };
   };
 

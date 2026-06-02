@@ -10,6 +10,8 @@ mod entries;
 mod general;
 mod paths;
 mod rescue_cfg;
+#[cfg(feature = "secure-boot")]
+mod signing;
 mod splash;
 mod stateful_cfg;
 mod tpm;
@@ -35,6 +37,9 @@ pub use paths::Paths;
 pub use rescue_cfg::{EmergencyShellConfig, RescueConfig};
 pub use tpm::{SealedSecret, TpmConfig};
 pub use tui::Tui;
+
+#[cfg(feature = "secure-boot")]
+pub use signing::{SigningConfig, UkiSigningConfig};
 
 #[cfg(feature = "image-splash")]
 pub use splash::{Splash, SplashBackgroundLocation};
@@ -106,6 +111,14 @@ pub struct Config {
     /// feature, so a `[tpm]` table parses on every build.
     #[serde(default)]
     pub tpm: TpmConfig,
+
+    /// `[signing]` table — signature-enforcement POLICY (secure-boot
+    /// builds only). Carries enforcement posture only; the trust-anchor
+    /// public keys are baked into the binary, never parsed from TOML
+    /// (R-5/FIX-04). See [`SigningConfig`].
+    #[cfg(feature = "secure-boot")]
+    #[serde(default)]
+    pub signing: SigningConfig,
 
     /// Populated by Phase 0.5 with the runtime mountpoint of the boot
     /// partition. `None` in legacy embedded-config mode. Never parsed
@@ -277,6 +290,11 @@ impl Config {
             // ──────────────────────────────────────────────────────────────────
             driver_images: DriverImagesConfig::default(),
             tpm: TpmConfig::default(),
+            // signing: enforce stays false in recovery (audit-neutral); the
+            // baked keys are unaffected, and reaching recovery never relaxes
+            // the cap/seal posture (FIX-53/FIX-04).
+            #[cfg(feature = "secure-boot")]
+            signing: SigningConfig::default(),
             runtime_boot_mountpoint: None,
             #[cfg(feature = "stateful")]
             runtime_state_mountpoint: None,
