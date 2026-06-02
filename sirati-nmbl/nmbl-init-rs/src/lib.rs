@@ -15,6 +15,9 @@ pub mod mount;
 pub mod net;
 pub mod panic;
 pub mod rescue;
+/// Single-source security defaults mirrored by `lib/security-consts.nix`.
+/// Always compiled so the Nix↔Rust round-trip test runs in every build.
+pub mod security_consts;
 pub mod shell;
 #[cfg(feature = "image-splash")]
 pub mod splash;

@@ -78,6 +78,18 @@ pub struct Config {
     #[serde(default)]
     pub stateful: Option<StatefulConfig>,
 
+    // ───────────────────── secure/staged-boot config anchor ─────────────────
+    // INSERTION ANCHOR (FIX-60): the F1 security slices add their config
+    // tables here, each a `#[serde(default)] pub <name>: <Cfg>,` line gated
+    // as applicable. Inserting at this marker keeps the parallel slices from
+    // colliding on the struct-field list. Add the matching default in
+    // `recovery_default()` at its twin anchor.
+    //   #6  signing : #[cfg(feature="secure-boot")] pub signing: SigningConfig,
+    //   #7  tpm     : pub tpm: TpmConfig,            (always-compiled — FIX-09)
+    //   #8  driver  : pub driver_images: DriverImageConfig,
+    //   #9  staged  : #[cfg(feature="staged-boot")] pub staged: Option<StagedConfig>,
+    //   #10 secureB : #[cfg(feature="secure-boot")] pub secure_boot: SecureBootConfig,
+    // ─────────────────────────────────────────────────────────────────────────
     /// Populated by Phase 0.5 with the runtime mountpoint of the boot
     /// partition. `None` in legacy embedded-config mode. Never parsed
     /// from TOML — `#[serde(skip)]` keeps it out of the wire schema and
@@ -239,6 +251,13 @@ impl Config {
             emergency_shell: EmergencyShellConfig::default(),
             #[cfg(feature = "stateful")]
             stateful: None,
+            // ───────────── secure/staged-boot recovery_default anchor ─────────
+            // INSERTION ANCHOR (FIX-60): twin of the struct-field anchor. Each
+            // F1 security slice adds its field default here (e.g.
+            // `signing: SigningConfig::default(),`), gated to match its
+            // struct field. recovery_default must stay strict-shape (FIX-53):
+            // reaching recovery never relaxes the security posture.
+            // ──────────────────────────────────────────────────────────────────
             runtime_boot_mountpoint: None,
             #[cfg(feature = "stateful")]
             runtime_state_mountpoint: None,
