@@ -22,29 +22,22 @@ let
   cfg = config.boot.nmbl;
   bootstrapper = cfg.bootstrapper;
 
-  # Cargo features to enable in the /init binary. Gated on splash and
-  # rescue options so feature-free builds (default) stay byte-identical
-  # to today's binary. When only `image-splash` is requested we prefer
-  # the prebuilt `nmblInitSplash` to keep the existing CI cache hot;
-  # when only `network-rescue` is requested we use `mkNmblInit`. When
-  # both are requested we build a combined binary via `mkNmblInit`.
-  nmblFeatures =
-    lib.optional cfg.splash.enable "image-splash"
-    ++ lib.optional cfg.rescue.network "network-rescue"
-    ++ lib.optional cfg.stateful.enable "stateful";
-
-  # Resolved /init binary used by the initramfs builder. Identity-equal
-  # to the prebuilt `nmblInit` / `nmblInitSplash` in the single-feature
-  # cases so Nix's store-path dedup keeps the existing CI cache hot.
-  selectedNmblInit =
-    if nmblFeatures == [ ] then
+  # UKI build wiring + /init binary selection, extracted into
+  # ./signing-build.nix. Produces the SAME `system.build.nmblUki` /
+  # `system.build.nmblInit` derivations as before — `selectedNmblInit`
+  # is the resolved /init binary, `nmblUki` the EFI-stub PE.
+  signingBuild = import ./signing-build.nix {
+    inherit
+      pkgs
+      lib
+      config
+      cfg
       nmblInit
-    else if nmblFeatures == [ "image-splash" ] then
       nmblInitSplash
-    else if nmblFeatures == [ "stateful" ] then
-      mkNmblInit { features = [ "stateful" ]; }
-    else
-      mkNmblInit { features = nmblFeatures; };
+      mkNmblInit
+      ;
+  };
+  selectedNmblInit = signingBuild.selectedNmblInit;
 
   # Activation options are contributed by ./modules/activation.nix. Read
   # defensively so this file still evaluates if that module hasn't been
@@ -498,30 +491,7 @@ in
     # systemd-stub reliably passes the embedded `.initrd` section, so no
     # on-disk initrd is needed. Always evaluable (cheap when unreferenced);
     # only built when the efi-stub install path consumes it.
-    system.build.nmblUki =
-      let
-        kernel = config.system.build.nmblKernel;
-        initrd = config.system.build.nmblInitramfs;
-        cmdline = lib.concatStringsSep " " (
-          cfg.kernelParams ++ lib.optional (cfg.serialConsole != null) "console=${cfg.serialConsole}"
-        );
-      in
-      pkgs.runCommand "nmbl-uki.efi"
-        {
-          nativeBuildInputs = [ pkgs.systemdUkify ];
-        }
-        ''
-          # ukify defaults to reading /usr/lib/os-release for the .osrel
-          # section, which does not exist in the Nix sandbox. Pass an
-          # explicit minimal os-release so the build is hermetic.
-          printf 'NAME=NMBL\nID=nmbl\nPRETTY_NAME="NMBL Bootloader"\n' > os-release
-          ukify build \
-            --linux=${kernel}/bzImage \
-            --initrd=${initrd}/initrd \
-            --cmdline=${lib.escapeShellArg cmdline} \
-            --os-release=@os-release \
-            --output=$out
-        '';
+    system.build.nmblUki = signingBuild.nmblUki;
 
     # Expose the actually-selected /init binary for downstream tooling
     # (debug scripts, manual nix builds). Mirrors nmblKernel/nmblInitramfs.
