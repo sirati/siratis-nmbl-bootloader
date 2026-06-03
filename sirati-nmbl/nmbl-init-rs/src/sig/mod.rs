@@ -36,6 +36,8 @@ pub mod sidecar;
 #[cfg(feature = "secure-boot")]
 pub mod baked_keys;
 #[cfg(feature = "secure-boot")]
+pub mod gate;
+#[cfg(feature = "secure-boot")]
 pub mod keys;
 // The per-generation sidecar locator (#18). Gated like the verify path it
 // feeds: locating sidecars only matters when signatures are checked. Uses the
@@ -60,7 +62,9 @@ pub use sidecar::{SidecarError, SigSidecar};
 #[cfg(feature = "secure-boot")]
 pub use keys::{BakedKey, FullFp, VerifyingKeyEnum, fp, parse_baked_keys, resolve_allowed_keys};
 
-// The per-generation sidecar locator (#18).
+// The per-generation sidecar locator (#18) and the boot-flow policy gate (#19).
+#[cfg(feature = "secure-boot")]
+pub use gate::{PolicyDecision, apply_policy, ensure_generation_signed_gated};
 #[cfg(feature = "secure-boot")]
 pub use scan::{GenBlob, SidecarResolution, generation_sig_dir, resolve_sig_sidecar};
 
