@@ -1,11 +1,35 @@
 //! Pre-kexec handoff staging: build the cmdline, stage the NMBL log
 //! transcript into the next kernel's initramfs, assemble the cpio
-//! fragment, and (in F4) verify the generation + measure it into PCR-11
-//! before loading the image via `kexec_file_load(2)`. Split out of
-//! `boot/mod.rs` so the verify/measure insertion points live next to the
-//! staging they gate. Load MUST happen before any unmount —
+//! fragment, and — the security keystone (#20) — VERIFY the generation's
+//! signature, leave the PCR-11 MEASURE seam (#27, Wave-3), then LOAD the
+//! image via `kexec_file_load(2)`. Split out of `boot/mod.rs` so the
+//! verify/measure insertion points live next to the staging they gate.
+//! Load MUST happen before any unmount —
 //! [`sys::kexec::load_with_extra_initrd_cpio`] reads kernel+initrd from
 //! the still-mounted `/mnt/system`.
+//!
+//! ## verify → [measure seam] → load (FIX-02 / FIX-13 / FIX-14)
+//!
+//! [`verify_measure_then_load`] performs three steps in a FIXED order:
+//!
+//! 1. **VERIFY** the generation's kernel+initrd signatures BEFORE anything
+//!    is loaded. The verify runs over PINNED file descriptors — each blob
+//!    is opened ONCE inside [`crate::sig::verify::ensure_generation_signed`]
+//!    and streamed through SHA-512 from that one fd, never re-opened by
+//!    path for hashing (FIX-02). An enforce-mode failure is surfaced as
+//!    [`NmblError::PolicyRefused`], which the `run_tui_session` Err arm maps
+//!    to the [`RebootIntoRescue`] terminus — there is NO bypass and NO
+//!    allow-unsigned path (R-1 / FIX-04). Audit mode (`signing.enable &&
+//!    !enforce`) warns and proceeds, handled entirely inside the gate.
+//! 2. **MEASURE seam** (`// #27 measure seam:`): the clearly-marked,
+//!    well-structured insertion point for the Wave-3 PCR-11 extend
+//!    (`tpm::measure::extend_handoff`). It sits AFTER verify and BEFORE load
+//!    (FIX-14) and carries the byte-identical [`Handoff`] (the exact cmdline
+//!    that will be loaded) so the value measured equals the value loaded.
+//!    The extend itself is NOT implemented here (#27 owns it).
+//! 3. **LOAD** the verified image with the SAME cmdline buffer that the
+//!    measure seam saw (FIX-14): the `cmdline` passed to `kexec_file_load(2)`
+//!    is byte-for-byte the `Handoff::cmdline` the seam carried.
 
 use std::path::Path;
 
@@ -106,29 +130,113 @@ fn stage_log_for_kexec() -> Vec<u8> {
     }
 }
 
-/// Build the cmdline, stage the log + key injections into the next
-/// kernel's initramfs, then verify + measure the generation and load it
-/// via `kexec_file_load(2)`. Returns the final cmdline so the caller can
-/// log it before tearing the mounts down. The cutover syscall stays in
-/// the dispatcher — this only fills the kexec image slot.
+/// The byte-exact handoff inputs that bind verify, measure, and load.
+///
+/// Built AFTER the signature gate passes and carried THROUGH the `// #27
+/// measure seam:` into the load. Holding the `cmdline` in one owned value
+/// that both the (future) PCR-11 extend and the `kexec_file_load(2)` call
+/// read from guarantees the cmdline measured is byte-identical to the
+/// cmdline loaded (FIX-14): there is exactly one `String`, never two
+/// independently-rebuilt copies that could drift.
+struct Handoff {
+    /// The final, NUL-free kernel cmdline — the SAME buffer the measure
+    /// seam will hash and the load will pass to `kexec_file_load(2)`.
+    cmdline: String,
+}
+
+/// VERIFY the generation's signature before anything is loaded (#20 step a).
+///
+/// Runs the audit-vs-enforce gate [`crate::sig::ensure_generation_signed_gated`]
+/// over the generation. That gate streams each blob through SHA-512 over a
+/// SINGLE pinned fd (FIX-02 — opened once inside the verify pipeline, never
+/// re-opened by path for hashing) and applies the operator's `[signing]`
+/// posture:
+///
+/// * **Proceed** — verification passed, OR audit mode (`signing.enable &&
+///   !enforce`) downgraded a failure to a warning. The boot continues.
+/// * **Refuse(cause)** — enforce mode rejected a bad/missing signature. We
+///   wrap `cause` in [`NmblError::PolicyRefused`] so the `run_tui_session`
+///   Err arm routes it to `policy::run_refuse_screen` →
+///   [`RebootIntoRescue`] (R-1). There is NO bypass and NO allow-unsigned
+///   branch here (FIX-04): the only relaxation is the gate's own audit mode.
+///
+/// When the `secure-boot` feature is off there are no signatures to check,
+/// so this is a no-op `Ok(())` — the feature being absent is the operator
+/// declining signature enforcement, decided at build time, not a runtime
+/// bypass of an enabled policy.
+///
+/// [`RebootIntoRescue`]: crate::terminal::TerminalAction::RebootIntoRescue
+#[cfg_attr(
+    not(feature = "secure-boot"),
+    expect(
+        clippy::unnecessary_wraps,
+        unused_variables,
+        reason = "no-op verify when secure-boot is disabled at build time"
+    )
+)]
+fn verify_generation_signature(config: &Config, generation: &Generation) -> Result<()> {
+    #[cfg(feature = "secure-boot")]
+    {
+        use crate::error::NmblError;
+        use crate::sig::{PolicyDecision, ensure_generation_signed_gated};
+
+        match ensure_generation_signed_gated(config, generation) {
+            PolicyDecision::Proceed => Ok(()),
+            // Enforce-mode refusal: hand the cause to the shared refuse
+            // terminus via PolicyRefused. The `run_tui_session` Err arm
+            // (FIX-35) maps this to the non-interactive refuse countdown +
+            // RebootIntoRescue — NEVER the shell-offering emergency menu.
+            PolicyDecision::Refuse(cause) => Err(NmblError::PolicyRefused {
+                cause: Box::new(cause),
+            }),
+        }
+    }
+    #[cfg(not(feature = "secure-boot"))]
+    {
+        Ok(())
+    }
+}
+
+/// Build the cmdline, VERIFY the generation, leave the PCR-11 measure
+/// seam (#27), then LOAD the image via `kexec_file_load(2)` — in that
+/// FIXED order over the staged inputs. Returns the final cmdline so the
+/// caller can log it before tearing the mounts down. The cutover syscall
+/// stays in the dispatcher — this only fills the kexec image slot.
+///
+/// Verify happens FIRST, before the image is staged into the kexec slot:
+/// an enforce-mode signature failure returns [`NmblError::PolicyRefused`]
+/// and nothing is loaded (R-1 / FIX-04). The cmdline that the measure seam
+/// sees and the cmdline handed to `kexec_file_load(2)` are the SAME owned
+/// [`Handoff::cmdline`] buffer (FIX-14).
 ///
 /// When `key_injections` is non-empty, an in-memory cpio fragment
 /// containing those files is appended to the system initrd via
 /// `memfd_create(2)` before `kexec_file_load(2)` — the typed
 /// passphrases never touch disk.
+///
+/// [`NmblError::PolicyRefused`]: crate::error::NmblError::PolicyRefused
 pub(crate) fn verify_measure_then_load(
     config: &Config,
     generation: &Generation,
     cmdline_override: Option<&str>,
     key_injections: &[KeyInjection],
 ) -> Result<String> {
-    let cmdline = build_cmdline(generation, cmdline_override, &config.paths.system_root);
+    let handoff = Handoff {
+        cmdline: build_cmdline(generation, cmdline_override, &config.paths.system_root),
+    };
     nmbl_info!(
         "kexec: loading generation {} (kernel={}, initrd={})",
         generation.number,
         generation.kernel.display(),
         generation.initrd.display()
     );
+
+    // (a) VERIFY the generation's kernel+initrd signatures over pinned
+    // fds, BEFORE the image is staged into the kexec slot (FIX-02). An
+    // enforce-mode failure short-circuits here with PolicyRefused — no
+    // load, no bypass (R-1/FIX-04). Audit mode warns inside the gate and
+    // returns Ok so the boot proceeds.
+    verify_generation_signature(config, generation)?;
 
     // Stage the NMBL log transcript into the next kernel's initramfs.
     // The byte ring lives in RAM and the current tmpfs at NMBL_LOG_PATH
@@ -167,8 +275,19 @@ pub(crate) fn verify_measure_then_load(
         );
     }
 
-    // F4 (FIX-02): verify generation over a single pinned fd HERE
-    // F4 (FIX-12/27): measure into PCR-11 HERE
+    // #27 measure seam: (b) extend PCR-11 with the verified generation
+    // HERE — AFTER verify, BEFORE load (FIX-14). Wave-3's
+    // `tpm::measure::extend_handoff(config, generation, driver_images,
+    // &handoff.cmdline)` slots in at this point: it hashes the SAME kernel
+    // over a pinned fd and binds `handoff.cmdline` (the byte-exact buffer
+    // the load below consumes) into the measurement, so the value measured
+    // equals the value loaded. The extend is NOT implemented here (#20
+    // owns only verify+load); this seam reserves its exact position and the
+    // byte-identical cmdline it must measure.
+    let Handoff { cmdline } = handoff;
+
+    // (c) LOAD the verified image with the SAME cmdline the seam carried
+    // (FIX-14): `&cmdline` here is the identical buffer measured above.
     sys::kexec::load_with_extra_initrd_cpio(
         &generation.kernel,
         &generation.initrd,
@@ -186,99 +305,5 @@ pub(crate) fn verify_measure_then_load(
     clippy::indexing_slicing,
     reason = "tests are allowed to assert with panics"
 )]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    fn gen_for(params: &[&str]) -> Generation {
-        Generation {
-            number: 42,
-            profile_link: PathBuf::from("/mnt/system/nix/var/nix/profiles/system-42-link"),
-            toplevel: PathBuf::from("/mnt/system/nix/store/abc123-nixos-system-42"),
-            kernel: PathBuf::from("/mnt/system/boot/vmlinuz"),
-            initrd: PathBuf::from("/mnt/system/boot/initrd"),
-            init_path: PathBuf::from("/mnt/system/nix/var/nix/profiles/system-42-link/init"),
-            kernel_params: params.iter().map(|s| (*s).to_string()).collect(),
-            label: String::new(),
-        }
-    }
-
-    fn root() -> PathBuf {
-        PathBuf::from("/mnt/system")
-    }
-
-    #[test]
-    fn build_cmdline_override_used_verbatim() {
-        let g = gen_for(&["root=/dev/sda1", "quiet"]);
-        let s = "init=/sbin/init debug";
-        assert_eq!(build_cmdline(&g, Some(s), &root()), s);
-    }
-
-    #[test]
-    fn build_cmdline_no_override_joins_params_and_appends_init() {
-        let g = gen_for(&["root=/dev/sda1", "ro", "quiet"]);
-        assert_eq!(
-            build_cmdline(&g, None, &root()),
-            "root=/dev/sda1 ro quiet init=/nix/var/nix/profiles/system-42-link/init",
-        );
-    }
-
-    #[test]
-    fn build_cmdline_empty_override_yields_empty() {
-        let g = gen_for(&["root=/dev/sda1"]);
-        assert_eq!(build_cmdline(&g, Some(""), &root()), "");
-    }
-
-    #[test]
-    fn injects_init_when_missing() {
-        let mut g = gen_for(&["root=fstab"]);
-        g.init_path = PathBuf::from("/mnt/system/nix/store/abc/init");
-        let out = build_cmdline(&g, None, &root());
-        assert!(
-            out.ends_with(" init=/nix/store/abc/init"),
-            "unexpected cmdline: {out}",
-        );
-    }
-
-    #[test]
-    fn respects_existing_init_in_params() {
-        let mut g = gen_for(&["init=/explicit"]);
-        g.init_path = PathBuf::from("/mnt/system/nix/store/xyz/init");
-        assert_eq!(build_cmdline(&g, None, &root()), "init=/explicit");
-    }
-
-    #[test]
-    fn override_passes_through() {
-        let mut g = gen_for(&["root=fstab"]);
-        g.init_path = PathBuf::from("/mnt/system/nix/store/xyz/init");
-        assert_eq!(build_cmdline(&g, Some("foo bar"), &root()), "foo bar");
-    }
-
-    #[test]
-    fn init_outside_system_root_warns_but_uses_raw() {
-        let mut g = gen_for(&["root=fstab"]);
-        g.init_path = PathBuf::from("/elsewhere/init");
-        let out = build_cmdline(&g, None, &root());
-        assert!(
-            out.ends_with(" init=/elsewhere/init"),
-            "unexpected cmdline: {out}",
-        );
-    }
-
-    #[test]
-    fn empty_params_still_inject_init() {
-        let mut g = gen_for(&[]);
-        g.init_path = PathBuf::from("/mnt/system/nix/store/abc/init");
-        assert_eq!(build_cmdline(&g, None, &root()), "init=/nix/store/abc/init");
-    }
-
-    #[test]
-    fn init_token_matched_only_at_token_start() {
-        // A param ending in "init=" must NOT short-circuit injection — the
-        // check looks at whole whitespace tokens, not substrings.
-        let mut g = gen_for(&["weird_suffix_init=foo"]);
-        g.init_path = PathBuf::from("/mnt/system/nix/store/abc/init");
-        let out = build_cmdline(&g, None, &root());
-        assert!(out.contains(" init=/nix/store/abc/init"), "got: {out}");
-    }
-}
+#[path = "handoff_tests.rs"]
+mod tests;
