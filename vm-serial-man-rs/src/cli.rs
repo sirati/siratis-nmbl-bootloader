@@ -154,6 +154,16 @@ pub struct ManagerConfig {
     #[arg(long, default_value = "tis")]
     pub tpm_kind: TpmKindArg,
 
+    /// Persist the swtpm state across this manager's lifetime: do not wipe the
+    /// `--tpm` state dir on start, nor remove it on stop. Used to carry a
+    /// TPM-sealed secret from a first (enroll) run into a second (unseal) run
+    /// of the SAME state dir for a measured-boot seal/unseal roundtrip. A fresh
+    /// QEMU power-on still issues `TPM2_Startup(CLEAR)`, so PCRs reset and the
+    /// boot re-extends the same deterministic event sequence. No effect without
+    /// `--tpm`. The caller owns deleting the state dir when the roundtrip ends.
+    #[arg(long, requires = "tpm")]
+    pub tpm_persist: bool,
+
     /// Secure-Boot OVMF code firmware (read-only pflash). Setting both this and
     /// `--sb-vars` enables a Secure-Boot-enforcing machine (`smm=on`),
     /// overriding the boot-mode's own UEFI firmware.

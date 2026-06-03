@@ -7,6 +7,7 @@ use tokio::net::UnixStream;
 use tracing::{debug, trace, warn};
 
 use crate::protocol::{CommandResponse, CommandType, FindRequest};
+use crate::stdout_safe::{write_stdout_line, write_stdout_newline};
 
 use super::utils::find_socket;
 
@@ -57,11 +58,11 @@ pub async fn find_in_history(
     let mut match_count = 0;
     let mut total_matches = 0;
 
-    println!("=== Searching for pattern: {} ===", pattern);
+    write_stdout_line(&format!("=== Searching for pattern: {} ===", pattern));
     if before > 0 || after > 0 {
-        println!("Context: {} before, {} after", before, after);
+        write_stdout_line(&format!("Context: {} before, {} after", before, after));
     }
-    println!();
+    write_stdout_newline();
 
     loop {
         line.clear();
@@ -91,31 +92,39 @@ pub async fn find_in_history(
             CommandResponse::TotalMatches(total) => {
                 total_matches = total;
                 if let Some(n) = first_n {
-                    println!("Displaying first {} of {} matches", n.min(total), total);
+                    write_stdout_line(&format!(
+                        "Displaying first {} of {} matches",
+                        n.min(total),
+                        total
+                    ));
                 } else if let Some(n) = last_n {
-                    println!("Displaying last {} of {} matches", n.min(total), total);
+                    write_stdout_line(&format!(
+                        "Displaying last {} of {} matches",
+                        n.min(total),
+                        total
+                    ));
                 } else {
-                    println!("Found {} matches", total);
+                    write_stdout_line(&format!("Found {} matches", total));
                 }
-                println!();
+                write_stdout_newline();
             }
             CommandResponse::FindMatch(line_num, context) => {
                 match_count += 1;
-                println!("--- Match #{} (line {}) ---", match_count, line_num + 1);
+                write_stdout_line(&format!("--- Match #{} (line {}) ---", match_count, line_num + 1));
                 for ctx_line in context {
-                    println!("{}", ctx_line);
+                    write_stdout_line(&ctx_line);
                 }
-                println!();
+                write_stdout_newline();
             }
             CommandResponse::Complete => {
-                println!("=== Search Complete ===");
+                write_stdout_line("=== Search Complete ===");
                 if total_matches > 0 && match_count < total_matches {
-                    println!(
+                    write_stdout_line(&format!(
                         "Displayed {} of {} total matches",
                         match_count, total_matches
-                    );
+                    ));
                 } else {
-                    println!("Displayed {} matches", match_count);
+                    write_stdout_line(&format!("Displayed {} matches", match_count));
                 }
                 break;
             }
