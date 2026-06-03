@@ -21,6 +21,7 @@ use crate::error::NmblError;
 use crate::sig::alg::{AlgId, HashId};
 use crate::sig::wire::{self, Header};
 use crate::sig::{BakedKey, DOMAIN_PRIORITY_FILE, fp};
+use crate::sys::ops::RealSys;
 
 /// A deterministic ML-DSA-65 signer that mints real priority-file sidecars the
 /// gate's verify core accepts. Mirrors the host `nmbl-sign` triple: pre-hash the
@@ -101,8 +102,10 @@ fn attested_volume_exposes_its_mountpoint() {
     // A non-owned mount (PrePlainBoot reuse) drops without unmounting.
     let cfg = Config::recovery_default();
     let vol = priority_vol(PathBuf::from("/dev/none"), false);
-    let attested = super::mount_priority_volume(GatePhase::PrePlainBoot, &with_boot_mp(cfg), &vol)
-        .expect("pre-plain-boot reuses the boot FS, no mount");
+    let mut fs = RealSys::sync_only();
+    let attested =
+        super::mount_priority_volume(&mut fs, GatePhase::PrePlainBoot, &with_boot_mp(cfg), &vol)
+            .expect("pre-plain-boot reuses the boot FS, no mount");
     assert_eq!(
         attested.mountpoint(),
         std::path::Path::new("/run/boot-test")
@@ -137,7 +140,8 @@ fn a_missing_priority_file_under_enforce_defers_a_refuse() {
     // A non-inside-LUKS volume so the PrePlainBoot phase applies.
     cfg.secure_boot.priority_volume = Some(priority_vol(PathBuf::from("/dev/none"), false));
 
-    let err = run_priority_gate_at(GatePhase::PrePlainBoot, &cfg).unwrap_err();
+    let mut fs = RealSys::sync_only();
+    let err = run_priority_gate_at(&mut fs, GatePhase::PrePlainBoot, &cfg).unwrap_err();
     assert!(
         matches!(err, NmblError::PolicyRefused { .. }),
         "a missing priority file must DEFER a PolicyRefused, not refuse inline"
@@ -235,8 +239,9 @@ fn a_cross_domain_signature_is_rejected() {
 #[test]
 fn disabled_secure_boot_skips_the_gate() {
     let cfg = Config::recovery_default(); // secure_boot.enable = false
+    let mut fs = RealSys::sync_only();
     assert!(
-        run_priority_gate_at(GatePhase::PrePlainBoot, &cfg)
+        run_priority_gate_at(&mut fs, GatePhase::PrePlainBoot, &cfg)
             .unwrap()
             .is_none(),
         "an off posture skips the gate entirely"
@@ -249,8 +254,9 @@ fn the_phase_only_runs_for_its_own_volume_kind() {
     // versa) — each hook owns one phase (FIX-34).
     let mut cfg = enforcing_cfg(&[]);
     cfg.secure_boot.priority_volume = Some(priority_vol(PathBuf::from("/dev/none"), true));
+    let mut fs = RealSys::sync_only();
     assert!(
-        run_priority_gate_at(GatePhase::PrePlainBoot, &cfg)
+        run_priority_gate_at(&mut fs, GatePhase::PrePlainBoot, &cfg)
             .unwrap()
             .is_none(),
         "the pre-plain-boot phase skips an inside-LUKS volume"
@@ -269,7 +275,8 @@ fn audit_mode_proceeds_past_a_missing_file() {
     cfg.secure_boot.signed_file_path = PathBuf::from("nmbl/priority.bin");
     cfg.secure_boot.priority_volume = Some(priority_vol(PathBuf::from("/dev/none"), false));
 
-    let attested = run_priority_gate_at(GatePhase::PrePlainBoot, &cfg)
+    let mut fs = RealSys::sync_only();
+    let attested = run_priority_gate_at(&mut fs, GatePhase::PrePlainBoot, &cfg)
         .expect("audit mode must not refuse")
         .expect("audit mode proceeds with a witness");
     drop(attested);
