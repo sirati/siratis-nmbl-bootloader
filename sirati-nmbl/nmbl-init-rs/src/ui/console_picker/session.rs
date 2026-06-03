@@ -52,8 +52,9 @@ pub async fn run_picker_session(
     // `sealed` is the unforgeable proof that `policy::seal_secrets` ran
     // (lock PCR capped, TPM-unsealed mappers closed) BEFORE this fork/exec
     // waist. Holding it by value here is what makes "no shell without a
-    // seal" a compile-time guarantee (re-audit C-1).
-    let _sealed = sealed;
+    // seal" a compile-time guarantee (re-audit C-1); we thread it down
+    // into both the overlap relay and the fire-and-forget spawn so the
+    // real `spawn_shell`/`spawn_shell_on_tty` waists demand it by type.
     let mut state = PickerState::build(config)?;
     if state.candidates.is_empty() {
         return Ok(PickerSessionOutcome::Cancelled);
@@ -70,15 +71,16 @@ pub async fn run_picker_session(
         config,
         targets,
         &display_target,
-        |console, config, targets, display_target| {
+        move |console, config, targets, display_target| {
             Box::pin(crate::ui::console_relay::run_relay(
+                sealed,
                 console,
                 config,
                 targets,
                 display_target,
             ))
         },
-        fire_and_forget_spawn,
+        move |config, targets| fire_and_forget_spawn(sealed, config, targets),
     )
     .await
 }
@@ -152,10 +154,16 @@ pub(super) fn display_target_for(console: &dyn Console) -> PathBuf {
 /// Errors are logged but never propagated — the picker's caller still
 /// surfaces a success modal so the operator knows the spawn was
 /// attempted.
-fn fire_and_forget_spawn(config: &Config, targets: &[PathBuf]) -> Result<()> {
+fn fire_and_forget_spawn(
+    sealed: crate::policy::Sealed,
+    config: &Config,
+    targets: &[PathBuf],
+) -> Result<()> {
     for t in targets {
-        // seal-exempt: reached only via `run_picker_session`, which requires the `Sealed` witness; the seal (cap + close-mappers) already ran at the session entry before any shell forks here.
-        match crate::sys::pty::spawn_shell_on_tty(&config.paths.shell, t) {
+        // The `sealed` witness (threaded from `run_picker_session`) is
+        // required by type, so this fire-and-forget fork cannot happen
+        // before the seal capped the PCR + closed every mapper.
+        match crate::sys::pty::spawn_shell_on_tty(sealed, &config.paths.shell, t) {
             Ok(_) => {}
             Err(e) => {
                 nmbl_warn!(
