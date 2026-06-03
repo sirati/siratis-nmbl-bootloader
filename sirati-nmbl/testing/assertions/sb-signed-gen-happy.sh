@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Secure-boot scenario: signed generation happy path (#57 / matrix id #4a).
+# Secure-boot scenario: signed generation happy path.
 #
 # A correctly-signed generation must verify, measure, and kexec into the
 # system. The generation's kernel + initrd were signed at install time with
@@ -7,23 +7,41 @@
 # the pre-kexec verify guard (verify_measure_then_load) passes and NMBL boots
 # the system normally — NO refuse, NO reboot-into-rescue.
 #
+# The cryptroot must OPEN before NMBL reaches generation verify+kexec (storage
+# activation runs first). This scenario boots the passphrase-unlock twin of the
+# config — the SAME install-signed generation, only the LUKS unlock differs —
+# and types the fixed install passphrase so the boot reaches the verify+measure
+# +kexec we want to prove. The tpm-unlock config is exercised by the roundtrip.
+#
 # Flow:
-#   1. Launch the test-secure-boot runner (swtpm "tis" + SB-OVMF, smm=on),
+#   1. Launch the passphrase-unlock runner (swtpm "tis" + SB-OVMF, smm=on),
 #      whose disk carries /boot/nmbl/sigs/<gen-id>/{kernel,initrd}.sig.
-#   2. Assert NMBL did NOT refuse: no refuse-countdown / reboot-into-rescue /
+#   2. Type the install LUKS passphrase so cryptroot opens.
+#   3. Assert NMBL did NOT refuse: no refuse-countdown / reboot-into-rescue /
 #      signature-failure marker appears.
-#   3. Assert the system reaches the post-kexec root shell (verify passed, the
+#   4. Assert the system reaches the post-kexec root shell (verify passed, the
 #      generation was kexec'd).
-#   4. Tear the VM down and clean up everything THIS script started.
+#   5. Tear the VM down and clean up everything THIS script started.
 #
 # Exit 0 on success, 1 on any failure.
 #
 # Required on PATH: vm-serial-man, the runner ($NMBL_RUNNER or
-# `run-test-secure-boot`), screen, coreutils, gnugrep, qemu, OVMFFull, swtpm.
+# `run-test-secure-boot-enroll`), screen, coreutils, gnugrep, qemu, OVMFFull,
+# swtpm.
 
 set -uo pipefail
 
-CONFIG_NAME="test-secure-boot"
+# The passphrase-unlock twin's config name (hostname + screen session +
+# qcow2). The runner is the enroll runner, set via NMBL_RUNNER by the flake.
+CONFIG_NAME="test-secure-boot-enroll"
+
+# The fixed install LUKS passphrase (disko-luks-password.nix). NMBL stage-0's
+# luks-password activation shows an answerable modal; typing this opens
+# cryptroot so the boot can reach generation verify+kexec.
+LUKS_PASSPHRASE="${NMBL_LUKS_PASSPHRASE:-test}"
+# The luks-password passphrase modal NMBL renders when the cryptroot needs the
+# operator's passphrase. Seeing it means "type the passphrase", not a failure.
+PASSWORD_PROMPT_RE='Enter LUKS passphrase|passphrase for cryptroot'
 
 # A REFUSAL (any form) on the happy path is a HARD FAIL: the signed generation
 # should verify. Covers the refuse countdown, the policy-refused terminus, and
@@ -73,6 +91,22 @@ if ! "$RUNNER"; then
   exit 1
 fi
 
+# Answer NMBL stage-0's LUKS passphrase modal so cryptroot opens and the boot
+# can proceed to generation verify+measure+kexec. The modal may take a moment
+# to render after the runner returns; feed the passphrase as soon as it shows
+# (and once more on first appearance below in case it rendered late).
+echo "=== feeding the LUKS passphrase so cryptroot opens ===" >&2
+for _ in $(seq 1 24); do
+  if seen_in_history "$PASSWORD_PROMPT_RE"; then
+    send_cmd "$LUKS_PASSPHRASE"
+    break
+  fi
+  if seen_in_history "kexec|root@${CONFIG_NAME}"; then
+    break
+  fi
+  sleep 5
+done
+
 # Wait for the booted root shell. If a refusal appears at any point it is an
 # immediate failure (checked after, via history) — the signed generation must
 # verify and boot.
@@ -86,6 +120,11 @@ for _ in $(seq 1 "$((SHELL_TIMEOUT / 5))"); do
   if seen_in_history "root@${CONFIG_NAME}"; then
     booted=true
     break
+  fi
+  # Re-feed the passphrase if the modal is still up (slow/late render) and we
+  # have not yet kexec'd into the generation.
+  if seen_in_history "$PASSWORD_PROMPT_RE" && ! seen_in_history "kexec|root@${CONFIG_NAME}"; then
+    send_cmd "$LUKS_PASSPHRASE"
   fi
   sleep 5
 done
