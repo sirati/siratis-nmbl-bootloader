@@ -4,6 +4,8 @@
 
 use anyhow::Result;
 
+use crate::stdout_safe::write_stdout_line;
+
 use super::utils::is_process_running;
 
 /// Show status of running VM managers
@@ -11,7 +13,7 @@ use super::utils::is_process_running;
 /// Scans /tmp for VM manager sockets and displays their status,
 /// including whether the associated process is still running
 pub async fn show_status() -> Result<()> {
-    println!("Scanning for VM managers...");
+    write_stdout_line("Scanning for VM managers...");
 
     let tmp_dir = std::path::Path::new("/tmp");
     let mut entries = tokio::fs::read_dir(tmp_dir).await?;
@@ -23,7 +25,7 @@ pub async fn show_status() -> Result<()> {
             if let Some(name_str) = name.to_str() {
                 if name_str.starts_with("vm-serial-man-") && name_str.ends_with(".sock") {
                     found = true;
-                    println!("Found VM manager socket: {}", path.display());
+                    write_stdout_line(&format!("Found VM manager socket: {}", path.display()));
 
                     // Try to extract PID from socket name
                     if let Some(pid_str) = name_str
@@ -33,9 +35,11 @@ pub async fn show_status() -> Result<()> {
                         if let Ok(pid) = pid_str.parse::<u32>() {
                             // Check if process is running
                             if is_process_running(pid) {
-                                println!("  Status: Running (PID: {})", pid);
+                                write_stdout_line(&format!("  Status: Running (PID: {})", pid));
                             } else {
-                                println!("  Status: Socket exists but process not running (stale socket)");
+                                write_stdout_line(
+                                    "  Status: Socket exists but process not running (stale socket)",
+                                );
                             }
                         }
                     }
@@ -45,7 +49,7 @@ pub async fn show_status() -> Result<()> {
     }
 
     if !found {
-        println!("No VM managers found");
+        write_stdout_line("No VM managers found");
     }
 
     Ok(())

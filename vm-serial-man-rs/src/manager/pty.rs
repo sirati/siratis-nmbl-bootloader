@@ -3,7 +3,6 @@
 //! This module manages reading from and writing to the QEMU serial via Unix socket
 
 use anyhow::{Context, Result};
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -28,28 +27,8 @@ const IDLE_FLUSH: Duration = Duration::from_millis(750);
 /// Read chunk size for the incremental serial reader.
 const READ_CHUNK: usize = 4096;
 
-/// Mirror one serial line to the manager's stdout without ever panicking.
-///
-/// `println!` aborts the whole process on any write error — in particular a
-/// `BrokenPipe` (EPIPE) when the downstream reader (the `screen` session's pty
-/// / a closed log pipe) has gone away. That used to kill the manager mid-run
-/// and truncate scenarios. We write directly and SWALLOW `BrokenPipe`: the
-/// daemon must keep buffering and broadcasting serial output even with no one
-/// reading stdout. Other I/O errors are logged once, not fatal.
-fn echo_line_to_stdout(line: &str) {
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    match lock.write_all(line.as_bytes()).and_then(|()| lock.write_all(b"\n")) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
-            // Downstream stdout closed; keep running headless.
-            trace!("stdout broken pipe, dropping console echo");
-        }
-        Err(e) => warn!("error echoing serial line to stdout: {e}"),
-    }
-}
-
 use crate::buffer::OutputBuffer;
+use crate::stdout_safe::write_stdout_line;
 
 /// Serial I/O handler using Unix socket
 pub struct SerialHandler {
@@ -142,7 +121,7 @@ impl SerialHandler {
                     trace!("Serial output: {}", trimmed);
                     // Mirror to stdout for console visibility, but never panic
                     // if the downstream pipe is gone (EPIPE).
-                    echo_line_to_stdout(&trimmed);
+                    write_stdout_line(&trimmed);
                     buffer.lock().await.push(trimmed.clone());
                     let _ = output_tx.send(trimmed);
                 }

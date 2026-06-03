@@ -11,6 +11,7 @@ mod client;
 mod log;
 mod manager;
 mod protocol;
+mod stdout_safe;
 
 use clap::Parser;
 use cli::{BootModeArgs, Cli, Commands, DisplayArg, ManagerConfig, TpmKindArg};

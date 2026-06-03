@@ -9,6 +9,7 @@ use tokio::net::UnixStream;
 use tracing::{debug, trace, warn};
 
 use crate::protocol::{CommandRequest, CommandResponse, CommandType, LinesRequest, TailRequest};
+use crate::stdout_safe::{write_stdout_line, write_stdout_newline};
 
 use super::utils::find_socket;
 
@@ -91,27 +92,27 @@ pub async fn send_command(
                         info.start_line, end_line, info.total_lines, age_str
                     )
                 };
-                println!("{}", header);
+                write_stdout_line(&header);
 
                 if info.lines.is_empty() {
-                    println!("(no recent output)");
+                    write_stdout_line("(no recent output)");
                 } else {
                     for line in info.lines {
-                        println!("{}", line);
+                        write_stdout_line(&line);
                     }
                 }
-                println!();
+                write_stdout_newline();
             }
             CommandResponse::CommandInjected(cmd) => {
-                println!("=== Injecting command: {} ===", cmd);
-                println!();
+                write_stdout_line(&format!("=== Injecting command: {} ===", cmd));
+                write_stdout_newline();
             }
             CommandResponse::OutputLine(output) => {
-                println!("{}", output);
+                write_stdout_line(&output);
             }
             CommandResponse::Complete => {
-                println!();
-                println!("=== Command Complete ===");
+                write_stdout_newline();
+                write_stdout_line("=== Command Complete ===");
                 trace!(
                     "Received Complete response, total responses: {}",
                     response_count
@@ -124,7 +125,7 @@ pub async fn send_command(
                 break;
             }
             CommandResponse::Stopped => {
-                println!("VM manager stopped");
+                write_stdout_line("VM manager stopped");
                 debug!("Received Stopped response");
                 break;
             }
@@ -205,7 +206,7 @@ pub async fn stop_manager(socket: Option<PathBuf>) -> Result<()> {
 
     match response {
         CommandResponse::Stopped => {
-            println!("VM manager stopped successfully");
+            write_stdout_line("VM manager stopped successfully");
             Ok(())
         }
         CommandResponse::Error(err) => {
@@ -263,16 +264,16 @@ pub async fn get_lines(start: usize, end: usize, socket: Option<PathBuf>) -> Res
     match response {
         CommandResponse::Lines(lines) => {
             if lines.is_empty() {
-                println!("No lines found in range {}-{}", start, end);
+                write_stdout_line(&format!("No lines found in range {}-{}", start, end));
             } else {
-                println!(
+                write_stdout_line(&format!(
                     "=== Lines {}-{} (showing {} lines) ===",
                     start,
                     end,
                     lines.len()
-                );
+                ));
                 for (i, line) in lines.iter().enumerate() {
-                    println!("[{}] {}", start + i, line);
+                    write_stdout_line(&format!("[{}] {}", start + i, line));
                 }
             }
             Ok(())
@@ -332,15 +333,15 @@ pub async fn get_tail(lines: usize, socket: Option<PathBuf>) -> Result<()> {
     match response {
         CommandResponse::Tail(tail_lines) => {
             if tail_lines.is_empty() {
-                println!("No lines in buffer");
+                write_stdout_line("No lines in buffer");
             } else {
-                println!(
+                write_stdout_line(&format!(
                     "=== Last {} lines (showing {} lines) ===",
                     lines,
                     tail_lines.len()
-                );
+                ));
                 for line in tail_lines.iter() {
-                    println!("{}", line);
+                    write_stdout_line(line);
                 }
             }
             Ok(())
