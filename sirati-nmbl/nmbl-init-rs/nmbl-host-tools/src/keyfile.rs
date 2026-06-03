@@ -18,6 +18,9 @@
 //! can never bake at the wrong width.
 
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use nmbl_init::sig::AlgId;
@@ -62,12 +65,29 @@ pub fn write_public(path: &Path, alg: AlgId, pubkey: &[u8]) -> Result<()> {
 /// secret bytes arrive in [`Zeroizing`] and the assembled buffer is also
 /// zeroized on drop, so the private material is wiped from this process's memory
 /// after the write.
+///
+/// The file is created `0o600` from the start (via `OpenOptionsExt::mode`), so
+/// the secret never exists with world-readable permissions even for an instant
+/// — a chmod-after-write would leave that window open. An existing file is
+/// truncated and rewritten; `mode` only applies on creation, so on a re-keygen
+/// we re-assert `0o600` explicitly to repair a file that was created insecurely.
 pub fn write_private(path: &Path, alg: AlgId, sk: &Zeroizing<Vec<u8>>) -> Result<()> {
     let mut buf = Zeroizing::new(Vec::with_capacity(PRIV_KEY_OFF + sk.len()));
     buf.extend_from_slice(&PRIV_MAGIC);
     buf.push(alg_tag(alg));
     buf.extend_from_slice(sk);
-    fs::write(path, buf.as_slice())
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| SignError::io(format!("create private key {}", path.display()), e))?;
+    // `mode` is a no-op when the file already existed; re-assert 0600 so a
+    // re-keygen over an insecure file still ends locked down.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| SignError::io(format!("chmod private key {}", path.display()), e))?;
+    f.write_all(buf.as_slice())
         .map_err(|e| SignError::io(format!("write private key {}", path.display()), e))
 }
 
@@ -128,6 +148,33 @@ mod tests {
         let loaded = read_private(&path).unwrap();
         assert_eq!(loaded.alg, AlgId::MlDsa87);
         assert_eq!(loaded.sk.as_slice(), sk.as_slice());
+    }
+
+    #[test]
+    fn private_is_written_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sk.key");
+        let sk = Zeroizing::new(vec![0xCD; 64]);
+        write_private(&path, AlgId::MlDsa87, &sk).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "private key must be 0600, got {mode:o}"
+        );
+    }
+
+    #[test]
+    fn private_rekeygen_stays_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sk.key");
+        // Pre-create a world-readable file to mimic an insecure prior keygen.
+        fs::write(&path, b"stale").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let sk = Zeroizing::new(vec![0xCD; 64]);
+        write_private(&path, AlgId::MlDsa87, &sk).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "re-keygen must end 0600, got {mode:o}");
     }
 
     #[test]
