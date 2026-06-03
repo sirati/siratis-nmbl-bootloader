@@ -376,31 +376,34 @@
             rc=0
             for f in $(find src -name '*.rs'); do
               awk -v file="$f" '
-                # Ring buffer of the last WINDOW source lines so the
-                # witness (a `Sealed` param in the fn signature, a
-                # `seal_secrets` call, or a `// seal-exempt:` note) is
-                # found even when it sits several lines above the fork.
-                BEGIN { WINDOW = 80 }
-                {
-                  buf[NR % WINDOW] = $0
+                # The witness must live in the SAME function body as the
+                # fork: a `Sealed`/`seal_secrets` token in a doc-comment or
+                # in an unrelated function 17 lines up must NOT satisfy a
+                # spawn site. We reset the witness flag at every `fn`
+                # definition, set it only on NON-comment witness lines
+                # (`// seal-exempt:` is the one comment that counts), and
+                # require it at each real spawn waist.
+                function is_comment(line) {
+                  return (line ~ /^[[:space:]]*\/\//)
+                }
+                # A new function definition starts a fresh body: anything
+                # the previous fn proved no longer applies.
+                /\<fn[[:space:]]+[A-Za-z_]/ { witness = 0 }
+                # Record a witness ONLY from real code: a `Sealed` param /
+                # binding or a `seal_secrets` call on a non-comment line.
+                # An explicit `// seal-exempt:` justification is the single
+                # comment form that also counts.
+                (!is_comment($0) && ($0 ~ /seal_secrets/ || $0 ~ /Sealed/)) \
+                  || ($0 ~ /seal-exempt:/) {
+                  witness = 1
                 }
                 # A shell-fork waist: the two PTY shell-spawn primitives.
                 # Skip comment lines (doc-comments that merely mention the
                 # primitive) and their own definitions (`fn spawn_shell`).
                 ($0 ~ /\<spawn_shell(_on_tty)?\(/) \
-                  && $0 !~ /^[[:space:]]*\/\// \
+                  && !is_comment($0) \
                   && $0 !~ /\<fn[[:space:]]+spawn_shell/ {
-                  ok = 0
-                  for (i = 0; i < WINDOW; i++) {
-                    j = (NR - i) % WINDOW
-                    line = buf[j]
-                    if (line ~ /seal-exempt:/ || line ~ /seal_secrets/ \
-                        || line ~ /Sealed/) {
-                      ok = 1
-                      break
-                    }
-                  }
-                  if (!ok) {
+                  if (!witness) {
                     printf "%s:%d:%s\n", file, FNR, $0
                     bad = 1
                   }
@@ -409,7 +412,7 @@
               ' "$f" || rc=1
             done
             if [ "$rc" -ne 0 ]; then
-              echo "ERROR: every shell-fork (spawn_shell / spawn_shell_on_tty) must be preceded by the Sealed witness from policy::seal_secrets (cap PCR + close TPM-unsealed mappers) or carry a '// seal-exempt: <why>' justification"
+              echo "ERROR: every shell-fork (spawn_shell / spawn_shell_on_tty) must be preceded — within its enclosing function — by the Sealed witness from policy::seal_secrets (cap PCR + close TPM-unsealed mappers) or carry a '// seal-exempt: <why>' justification"
               exit 1
             fi
             touch $out
