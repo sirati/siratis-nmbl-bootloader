@@ -27,6 +27,11 @@ pub mod commands;
 #[cfg(feature = "secure-boot")]
 pub mod measure;
 pub mod presence;
+/// Runtime Secure-Boot state awareness (FIX-11): read the `SecureBoot` efivar
+/// + PCR-7 and warn/refuse at the start of the measured path when the firmware
+/// is not enforcing. Always-compiled (std/rustix reads, no new dep); the
+/// enforce decision is invoked from the secure-boot-gated measure path.
+pub mod sbstate;
 pub mod transport;
 
 #[cfg(test)]
@@ -34,6 +39,7 @@ mod tests;
 
 pub use commands::{cap_lock_pcr, cap_pcr, cap_pcr_outcome, pcr_extend, pcr_read};
 pub use presence::tpm_present;
+pub use sbstate::{SB_STATE_PCR, SbAction, SbEfiState, enforce_secure_boot_state};
 pub use transport::TpmDevice;
 
 /// The PCR the measured-boot path caps to poison TPM-sealed secrets on a
