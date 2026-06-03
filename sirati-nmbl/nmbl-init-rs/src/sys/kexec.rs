@@ -178,23 +178,25 @@ pub fn load_with_extra_initrd_cpio(
     cmdline: &str,
     flags: u32,
 ) -> Result<()> {
-    // Non-secure-boot path: no verified fd to pin, so the kernel is opened by
-    // path inside `load_with_initrd_fd`.
-    load_cpio_core(kernel, None, initrd, extra_cpio, cmdline, flags)
+    // Non-secure-boot path: no verified fds to pin, so the kernel AND the
+    // initrd are opened by path (no pinned initrd source fd).
+    load_cpio_core(kernel, None, initrd, None, extra_cpio, cmdline, flags)
 }
 
 /// Like [`load_with_extra_initrd_cpio`], but loads the PINNED, already-verified
-/// kernel fd directly (FIX-02 / MED-1) instead of re-opening the kernel by
-/// path. `kernel_fd` is the fd the signature verifier opened, hashed, and
-/// verified; `kernel_path` is carried only for error context. The initrd is
-/// still read from `initrd` (its pristine bytes were verified by digest and
-/// measured), combined with `extra_cpio` in a memfd, and that memfd is the
-/// initrd fd handed to `kexec_file_load(2)` — so the kernel the new image runs
-/// is byte-identical to the one that was verified and measured.
+/// kernel + initrd fds directly (FIX-02 / MED-1 / LOW-A) instead of re-opening
+/// either by path. `kernel_fd` is the fd the signature verifier opened, hashed,
+/// and verified; `initrd_src_fd` is the verifier's pinned initrd fd — the
+/// initrd bytes spliced with `extra_cpio` into the kexec memfd are read from
+/// THAT fd (seek-to-0 then read-to-end), never re-read from `initrd` (the path
+/// is carried only for error context). So both the kernel the new image runs
+/// AND the pristine initrd it unpacks are byte-identical to the ones that were
+/// verified and measured.
 pub fn load_with_kernel_fd_and_extra_initrd_cpio(
     kernel_path: &Path,
     kernel_fd: BorrowedFd<'_>,
     initrd: &Path,
+    initrd_src_fd: BorrowedFd<'_>,
     extra_cpio: &[u8],
     cmdline: &str,
     flags: u32,
@@ -203,29 +205,71 @@ pub fn load_with_kernel_fd_and_extra_initrd_cpio(
         kernel_path,
         Some(kernel_fd),
         initrd,
+        Some(initrd_src_fd),
         extra_cpio,
         cmdline,
         flags,
     )
 }
 
-/// Shared body of the cpio-injecting load: read the initrd, append the cpio
+/// Read the WHOLE pristine initrd into memory for the cpio splice.
+///
+/// LOW-A: when `initrd_src_fd` is `Some` (the secure-boot path), the bytes are
+/// read from THAT verifier-pinned fd — seek-to-0 first so a previously-hashed fd
+/// is read from its start, then read to EOF — never re-read from `initrd` by
+/// path. The bytes spliced into the kexec memfd are then byte-identical to the
+/// ones verified + measured. When `None` (non-secure-boot), fall back to reading
+/// the path. `kernel`/`initrd` are carried only for error context.
+fn read_initrd_bytes(
+    kernel: &Path,
+    initrd: &Path,
+    initrd_src_fd: Option<BorrowedFd<'_>>,
+) -> Result<Vec<u8>> {
+    let kexec_err = |e: rustix::io::Errno| NmblError::KexecLoad {
+        kernel: kernel.to_path_buf(),
+        initrd: Some(initrd.to_path_buf()),
+        source: nix::Error::from_raw(e.raw_os_error()),
+    };
+    match initrd_src_fd {
+        Some(fd) => {
+            // Seek the pinned fd to 0 (the verify hashed it, leaving it at EOF)
+            // and read the whole image from it (LOW-A — no path re-read).
+            rustix::fs::seek(fd, rustix::fs::SeekFrom::Start(0)).map_err(kexec_err)?;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                let n = rustix::io::read(fd, &mut chunk).map_err(kexec_err)?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
+            }
+            Ok(buf)
+        }
+        None => std::fs::read(initrd).map_err(|e| NmblError::KexecLoad {
+            kernel: kernel.to_path_buf(),
+            initrd: Some(initrd.to_path_buf()),
+            source: nix::Error::from_raw(e.raw_os_error().unwrap_or(libc::EIO)),
+        }),
+    }
+}
+
+/// Shared body of the cpio-injecting load: read the initrd bytes (from the
+/// pinned `initrd_src_fd` when supplied — LOW-A — else by path), append the cpio
 /// fragment into a memfd, and hand it (plus the kernel fd / path) to
 /// [`load_with_initrd_fd`]. `kernel_fd` is `Some` for the verified secure-boot
-/// path (pin the verified fd — FIX-02) and `None` otherwise (open by path).
+/// path (pin the verified fd — FIX-02) and `None` otherwise (open by path);
+/// `initrd_src_fd` follows the same secure-boot/non-secure-boot split.
 fn load_cpio_core(
     kernel: &Path,
     kernel_fd: Option<BorrowedFd<'_>>,
     initrd: &Path,
+    initrd_src_fd: Option<BorrowedFd<'_>>,
     extra_cpio: &[u8],
     cmdline: &str,
     flags: u32,
 ) -> Result<()> {
-    let mut combined: Vec<u8> = std::fs::read(initrd).map_err(|e| NmblError::KexecLoad {
-        kernel: kernel.to_path_buf(),
-        initrd: Some(initrd.to_path_buf()),
-        source: nix::Error::from_raw(e.raw_os_error().unwrap_or(libc::EIO)),
-    })?;
+    let mut combined: Vec<u8> = read_initrd_bytes(kernel, initrd, initrd_src_fd)?;
     // 4-byte align before the next concatenated archive — Linux's
     // initrd unpacker accepts NUL padding between archives.
     while !combined.len().is_multiple_of(4) {
@@ -312,6 +356,54 @@ mod tests {
             build_cmdline_cstring("", kernel, None).expect("empty cmdline must succeed");
         assert_eq!(len, 1, "len must be 1 (the NUL)");
         assert_eq!(buf.as_slice(), b"\0");
+    }
+
+    /// LOW-A initrd fd-pin: when an initrd SOURCE fd is supplied, the initrd
+    /// bytes the cpio splice reads come from THAT fd, and the initrd PATH is
+    /// NEVER re-read. Proof: a BOGUS, nonexistent initrd path plus a pinned
+    /// source fd returns the fd's bytes (not ENOENT). The SAME bogus path
+    /// WITHOUT a fd fails with ENOENT — the path read happened. The contrast is
+    /// the assertion: the verified initrd fd is the splice source, so there is
+    /// no path re-read between verify and load.
+    #[test]
+    fn supplied_initrd_fd_is_the_splice_source_not_the_path() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::fd::AsFd;
+
+        let kernel = Path::new("/boot/vmlinuz-test");
+        let bogus_initrd = Path::new("/nonexistent/nmbl/kexec/initrd/does/not/exist");
+
+        // A real, open initrd fd standing in for the verifier's pinned one.
+        // Seek it to EOF first to prove read_initrd_bytes seeks back to 0
+        // (mirroring a post-verify fd left at EOF by the hash).
+        let mut ifile = tempfile::NamedTempFile::new().expect("initrd tempfile");
+        let body = b"pristine-verified-initrd-bytes";
+        ifile.write_all(body).expect("write initrd");
+        ifile.as_file().sync_all().expect("sync");
+        ifile.seek(SeekFrom::End(0)).expect("seek to EOF");
+
+        // With the pinned fd: the bytes come from the fd, NOT the bogus path.
+        let bytes = read_initrd_bytes(kernel, bogus_initrd, Some(ifile.as_file().as_fd()))
+            .expect("pinned-fd read must succeed even with a bogus path");
+        assert_eq!(
+            bytes.as_slice(),
+            body,
+            "the splice source must be the pinned fd's bytes, read from offset 0",
+        );
+
+        // Control: NO fd ⇒ the bogus path IS read ⇒ a KexecLoad error (ENOENT).
+        let err = read_initrd_bytes(kernel, bogus_initrd, None)
+            .expect_err("without a fd the bogus path must be read and fail");
+        match err {
+            NmblError::KexecLoad { source, .. } => {
+                assert_eq!(
+                    source,
+                    nix::Error::ENOENT,
+                    "without a pinned fd the initrd path is read (ENOENT on a bogus path)",
+                );
+            }
+            other => panic!("expected KexecLoad ENOENT, got {other:?}"),
+        }
     }
 
     /// FIX-02 / MED-1 fd-pin: when a kernel fd IS supplied, the kernel PATH is
