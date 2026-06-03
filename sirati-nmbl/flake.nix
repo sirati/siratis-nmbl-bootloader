@@ -264,10 +264,11 @@
       };
 
       # INSECURE TEST-ONLY signing keypair glue (#56). Exposes the committed
-      # fixed ML-DSA-87 keypair to the test harness, `signTestArtifact` to sign
-      # test artifacts with it, and `assertAbsentFromClosure` — the build check
-      # that the test PRIVATE key never enters a PRODUCTION NMBL closure.
-      testKeys = import ./testing/keys.nix { inherit pkgs lib nmblSign; };
+      # PUBLIC ML-DSA-87 key (the baked trust anchor) and `assertAbsentFromClosure`
+      # — the build check that a signing PRIVATE key never enters a NMBL closure.
+      # No private-key-importing signer: test artifacts are signed at INSTALL
+      # RUNTIME (lib/install-{signing,gen-signing}.nix), never in a derivation.
+      testKeys = import ./testing/keys.nix { inherit pkgs lib; };
 
       # The PRODUCTION-closure absence guard (#56 / FIX-61): the insecure-test
       # private key must NOT appear in a production NMBL initramfs closure.
@@ -318,132 +319,70 @@
       # measured/signed chain under the swtpm "tis" + SB-OVMF (smm=on) seam;
       # each scenario is its own `.#test-secure-boot-<scenario>` app the #57
       # runner executes. BUILT here; #57 runs the VMs.
+      #
+      # SIGNING MODEL (HARD principle): a signing PRIVATE key must NEVER be a Nix
+      # derivation input. The test disk is therefore SIGNED AT INSTALL RUNTIME by
+      # NMBL's normal install-time path-based signing — NOT by a build-time
+      # derivation that store-imports the keys. The `test-secure-boot` config
+      # already declares `signing.uki.{keyFile,certFile}` and `generationKeyFile`
+      # as on-disk PATHs (`/run/nmbl-test-keys/…`); the `sb-install-*` orchestrator
+      # (testing/sb-install.nix) runs nixos-anywhere, stages the committed test
+      # keys at those paths in the rescue installer, and `installBootLoader`
+      # `sbsign`s the UKI + writes the ML-DSA generation sidecars in place. The
+      # booted disk is signed by the real install-time code and NO key is in any
+      # derivation closure.
       secureBootConfig = testing.mkTestConfigurations."test-secure-boot";
 
-      # The disko disk-image build installs NMBL with signing DEFERRED (the
-      # impure keys are unreadable inside the sealed build VM — see
-      # boot.nmbl.signing.deferInstallSigning). We finish the install HERE, on
-      # the host, where the committed INSECURE-TEST keys are available: sign
-      # every generation's kernel/initrd (ML-DSA, the baked trust anchor's
-      # private half) and `sbsign` the NMBL UKI with the test `db` key, then
-      # write the artifacts onto the disk's (unencrypted) ESP. This is the
-      # RUNTIME-install equivalent for a config the scenarios boot as a
-      # prebuilt disk; the store-imported keys are fine here because this is a
-      # TEST disk, NOT a production NMBL closure (the prod closure-leak guard
-      # `insecure-test-key-absent` still holds for production configs).
-      secureBootSignedDisk =
-        let
-          unsignedDisk = secureBootConfig.config.system.build.vmDiskImage;
-          toplevel = secureBootConfig.config.system.build.toplevel;
-          uki = secureBootConfig.config.system.build.nmblUki;
-          mlDsaKey = testKeys.privateKey;
-          sbKey = ./testing/keys/insecure-test-sb-db.key;
-          sbCert = ./testing/keys/insecure-test-sb-db.crt;
-          sigSuffix = secureBootConfig.config.boot.nmbl.signing.sigPathSuffix;
-        in
-        pkgs.runCommand "test-secure-boot-signed-disk-image"
-          {
-            nativeBuildInputs = [
-              pkgs.qemu-utils
-              pkgs.libguestfs-with-appliance
-              pkgs.sbsigntool
-              pkgs.coreutils
-            ] ++ lib.optional (nmblSign != null) nmblSign;
-          }
-          ''
-            mkdir -p "$out" stage/sigs
-            # Writable copy of the deferred (unsigned) image.
-            qemu-img convert -f qcow2 -O qcow2 \
-              ${unsignedDisk}/nixos.qcow2 "$out/nixos.qcow2"
-            chmod u+w "$out/nixos.qcow2"
+      # Install variant of the real config: same config, but with the disko
+      # build's `deferInstallSigning = mkDefault true` OVERRIDDEN to false so the
+      # install-time signing ACTUALLY RUNS during the nixos-anywhere install
+      # (where the staged key paths exist). Used only for its diskoScript +
+      # toplevel store-paths — nixos-anywhere installs THIS and signs in place.
+      secureBootInstallConfig = testing.mkTestVM (
+        testing.configs."test-secure-boot" // {
+          extraModules =
+            (testing.configs."test-secure-boot".extraModules or [ ])
+            ++ [ { boot.nmbl.signing.deferInstallSigning = lib.mkForce false; } ];
+        }
+      );
 
-            # gen-id = file_name(canonicalize(toplevel)) — the SAME content-
-            # addressed store basename nmbl-init computes at boot (gen_id.rs /
-            # `nmbl-init --print-gen-id`), so the signer and the runtime
-            # verifier agree on the sidecar directory.
-            gen_id="$(basename "$(readlink -f ${toplevel})")"
-            echo "Signing generation $gen_id for the NMBL boot guard (host-side)..."
+      # Runtime-install orchestrators (no signing key ever enters a derivation).
+      sbInstall = import ./testing/sb-install.nix {
+        inherit nixpkgs system nixos-anywhere;
+        rescueArtifacts = (rescueVmTestFlake.outputs {
+          self = rescueVmTestFlake;
+          inherit nixpkgs;
+        }).packages.${system};
+      };
 
-            # Per-generation ML-DSA sidecars, per-role domains, exactly where
-            # src/sig/scan.rs::resolve_sig_sidecar looks:
-            #   /nmbl/sigs/<gen-id>/{kernel,initrd}<sigPathSuffix>
-            mkdir -p "stage/sigs/$gen_id"
-            ${if nmblSign == null then ''
-              echo "ERROR: nmbl-sign signer unavailable; cannot sign the test disk." >&2
-              exit 1
-            '' else ''
-              nmbl-sign sign --key ${mlDsaKey} --domain gen-kernel \
-                --out "stage/sigs/$gen_id/kernel${sigSuffix}" ${toplevel}/kernel
-              nmbl-sign sign --key ${mlDsaKey} --domain gen-initrd \
-                --out "stage/sigs/$gen_id/initrd${sigSuffix}" ${toplevel}/initrd
-            ''}
+      secureBootInstaller = sbInstall.mkSbInstaller {
+        name = "test-secure-boot";
+        config = secureBootInstallConfig;
+        port = "22201";
+      };
 
-            # sbsign the NMBL UKI with the INSECURE-TEST db key so the
-            # enforcing SB firmware (whose db we enrolled this cert into)
-            # launches it (audit F1).
-            echo "Signing the NMBL UKI for Secure Boot (sbsign, host-side)..."
-            sbsign --key ${sbKey} --cert ${sbCert} \
-              --output stage/BOOTX64.EFI ${uki}
-            sbverify --cert ${sbCert} stage/BOOTX64.EFI
-
-            # Write the signed UKI + sidecars onto the (unencrypted) ESP
-            # (disk-main-ESP = partition 2 in the disko layout).
-            echo "Writing signed artifacts onto the ESP..."
-            export LIBGUESTFS_BACKEND=direct
-            guestfish --rw -a "$out/nixos.qcow2" <<EOF
-            run
-            mount /dev/sda2 /
-            mkdir-p /EFI/BOOT
-            upload stage/BOOTX64.EFI /EFI/BOOT/BOOTX64.EFI
-            mkdir-p /nmbl/sigs/$gen_id
-            upload stage/sigs/$gen_id/kernel${sigSuffix} /nmbl/sigs/$gen_id/kernel${sigSuffix}
-            upload stage/sigs/$gen_id/initrd${sigSuffix} /nmbl/sigs/$gen_id/initrd${sigSuffix}
-            umount /
-            EOF
-            echo "✓ test-secure-boot disk signed: UKI sbsign'd, generation $gen_id ML-DSA sidecars staged."
-          '';
-
-      # The real (tpm-unlock) config's host-signed NMBL UKI, as a standalone
-      # PE. The TPM-roundtrip needs it to power-cycle the SAME disk (with the
-      # token the enroll phase sealed onto vda3) into the tpm-unlock NMBL stage:
-      # the enroll twin and the real config differ ONLY in their embedded NMBL
-      # initrd (password vs token unlock), and for an efi-stub loader that
-      # config lives inside the UKI. Swapping just `/EFI/BOOT/BOOTX64.EFI` on the
-      # shared disk therefore switches phase 2 to tpm-unlock while keeping the
-      # enrolled LUKS2 token on vda3 intact.
-      secureBootSignedUki =
-        let
-          uki = secureBootConfig.config.system.build.nmblUki;
-          sbKey = ./testing/keys/insecure-test-sb-db.key;
-          sbCert = ./testing/keys/insecure-test-sb-db.crt;
-        in
-        pkgs.runCommand "test-secure-boot-signed-uki"
-          {
-            nativeBuildInputs = [ pkgs.sbsigntool pkgs.coreutils ];
-          }
-          ''
-            mkdir -p "$out"
-            sbsign --key ${sbKey} --cert ${sbCert} \
-              --output "$out/BOOTX64.EFI" ${uki}
-            sbverify --cert ${sbCert} "$out/BOOTX64.EFI"
-          '';
-
-      # The config the scenarios boot/tamper: identical to secureBootConfig but
-      # with vmDiskImage pointing at the HOST-SIGNED disk, so the runner copies
-      # the signed qcow2 and the bad-sig scenario tampers a signed image.
-      secureBootSignedConfig = secureBootConfig // {
-        config = secureBootConfig.config // {
-          system = secureBootConfig.config.system // {
-            build = secureBootConfig.config.system.build // {
-              vmDiskImage = secureBootSignedDisk;
-            };
-          };
-        };
+      # CLOSURE GUARD: the install artifact (everything nixos-anywhere ships and
+      # then signs in place) must reference NEITHER signing private key. Mirrors
+      # `insecure-test-key-absent`, but for the SECURE-BOOT TEST install path and
+      # for BOTH the ML-DSA generation key and the SB `db` private key. We assert
+      # against a combined closure of the diskoScript + toplevel (the two
+      # --store-paths the installer hands nixos-anywhere). Because the disk is
+      # signed at INSTALL RUNTIME from a staged PATH, the keys must be absent.
+      secureBootNoPrivateKey = testKeys.assertAbsentFromClosure {
+        name = "test-secure-boot-no-private-key";
+        # The two --store-paths the installer hands nixos-anywhere — together they
+        # are everything that ships and is then signed in place at install time.
+        rootPaths = [
+          secureBootInstallConfig.config.system.build.diskoScript
+          secureBootInstallConfig.config.system.build.toplevel
+        ];
+        # ALSO assert the Secure-Boot `db` private key (not just the ML-DSA one).
+        extraKeyPaths = [ ./testing/keys/insecure-test-sb-db.key ];
       };
 
       secureBootRunner = testRunners.mkRunner {
         name = "test-secure-boot";
-        config = secureBootSignedConfig;
+        config = secureBootConfig;
         inherit vmSerialMan;
         tpm = "tis";
         secureBoot = true;
@@ -502,85 +441,51 @@
               }
             ];
           };
+          enrollModules =
+            (testing.configs."test-secure-boot".extraModules or [ ]) ++ [ enrollOverride ];
         in
         testing.mkTestVM (baseCfg // {
           name = "test-secure-boot-enroll";
-          extraModules = (baseCfg.extraModules or [ ]) ++ [ enrollOverride ];
+          extraModules = enrollModules;
         });
 
-      # Host-sign the enroll twin's disk the same way the real config's disk is
-      # signed (UKI sbsign + per-generation ML-DSA sidecars on the ESP), so the
-      # enforcing firmware launches its UKI and NMBL's verify guard passes.
-      secureBootEnrollSignedDisk =
-        let
-          unsignedDisk = secureBootEnrollConfig.config.system.build.vmDiskImage;
-          toplevel = secureBootEnrollConfig.config.system.build.toplevel;
-          uki = secureBootEnrollConfig.config.system.build.nmblUki;
-          mlDsaKey = testKeys.privateKey;
-          sbKey = ./testing/keys/insecure-test-sb-db.key;
-          sbCert = ./testing/keys/insecure-test-sb-db.crt;
-          sigSuffix = secureBootEnrollConfig.config.boot.nmbl.signing.sigPathSuffix;
-        in
-        pkgs.runCommand "test-secure-boot-enroll-signed-disk-image"
-          {
-            nativeBuildInputs = [
-              pkgs.qemu-utils
-              pkgs.libguestfs-with-appliance
-              pkgs.sbsigntool
-              pkgs.coreutils
-            ] ++ lib.optional (nmblSign != null) nmblSign;
-          }
-          ''
-            mkdir -p "$out" stage/sigs
-            qemu-img convert -f qcow2 -O qcow2 \
-              ${unsignedDisk}/nixos.qcow2 "$out/nixos.qcow2"
-            chmod u+w "$out/nixos.qcow2"
+      # Install variant of the enroll twin (deferInstallSigning forced off so the
+      # nixos-anywhere install signs its UKI + sidecars in place — same path-based
+      # install-time signing as the real config, no key in any derivation).
+      secureBootEnrollInstallConfig = testing.mkTestVM (
+        testing.configs."test-secure-boot" // {
+          name = "test-secure-boot-enroll";
+          extraModules =
+            (testing.configs."test-secure-boot".extraModules or [ ])
+            ++ [
+              (
+                { lib, ... }:
+                {
+                  boot.nmbl.activation.luks = lib.mkForce [
+                    {
+                      name = "cryptroot";
+                      device = "/dev/vda3";
+                      unlock = "password";
+                      promptLabel = "Enter LUKS passphrase for cryptroot (enroll phase)";
+                      passToStage1 = "/etc/nmbl-luks/cryptroot";
+                    }
+                  ];
+                  boot.nmbl.signing.deferInstallSigning = lib.mkForce false;
+                }
+              )
+            ];
+        }
+      );
 
-            gen_id="$(basename "$(readlink -f ${toplevel})")"
-            echo "Signing enroll-twin generation $gen_id (host-side)..."
-            mkdir -p "stage/sigs/$gen_id"
-            ${if nmblSign == null then ''
-              echo "ERROR: nmbl-sign signer unavailable; cannot sign the enroll disk." >&2
-              exit 1
-            '' else ''
-              nmbl-sign sign --key ${mlDsaKey} --domain gen-kernel \
-                --out "stage/sigs/$gen_id/kernel${sigSuffix}" ${toplevel}/kernel
-              nmbl-sign sign --key ${mlDsaKey} --domain gen-initrd \
-                --out "stage/sigs/$gen_id/initrd${sigSuffix}" ${toplevel}/initrd
-            ''}
-
-            echo "sbsign'ing the enroll-twin UKI for Secure Boot..."
-            sbsign --key ${sbKey} --cert ${sbCert} \
-              --output stage/BOOTX64.EFI ${uki}
-            sbverify --cert ${sbCert} stage/BOOTX64.EFI
-
-            export LIBGUESTFS_BACKEND=direct
-            guestfish --rw -a "$out/nixos.qcow2" <<EOF
-            run
-            mount /dev/sda2 /
-            mkdir-p /EFI/BOOT
-            upload stage/BOOTX64.EFI /EFI/BOOT/BOOTX64.EFI
-            mkdir-p /nmbl/sigs/$gen_id
-            upload stage/sigs/$gen_id/kernel${sigSuffix} /nmbl/sigs/$gen_id/kernel${sigSuffix}
-            upload stage/sigs/$gen_id/initrd${sigSuffix} /nmbl/sigs/$gen_id/initrd${sigSuffix}
-            umount /
-            EOF
-            echo "✓ enroll-twin disk signed."
-          '';
-
-      secureBootEnrollSignedConfig = secureBootEnrollConfig // {
-        config = secureBootEnrollConfig.config // {
-          system = secureBootEnrollConfig.config.system // {
-            build = secureBootEnrollConfig.config.system.build // {
-              vmDiskImage = secureBootEnrollSignedDisk;
-            };
-          };
-        };
+      secureBootEnrollInstaller = sbInstall.mkSbInstaller {
+        name = "test-secure-boot-enroll";
+        config = secureBootEnrollInstallConfig;
+        port = "22202";
       };
 
       secureBootEnrollRunner = testRunners.mkRunner {
         name = "test-secure-boot-enroll";
-        config = secureBootEnrollSignedConfig;
+        config = secureBootEnrollConfig;
         inherit vmSerialMan;
         tpm = "tis";
         secureBoot = true;
@@ -601,8 +506,14 @@
         pkgs.swtpm
       ];
 
-      # Build one scenario check app from its assertion script. `extraEnv` lets
-      # the bad-sig scenario export the pristine disk path it tampers.
+      # Build one scenario check app from its assertion script.
+      #
+      # SIGNED-AT-INSTALL-RUNTIME: each scenario first runs the `sb-install-*`
+      # orchestrator (nixos-anywhere), which produces the SIGNED disk under
+      # `$INSTALL_WORK/disk1.qcow2`. The disk is signed by NMBL's install-time
+      # path-based code — no signing key is ever a derivation input. We then
+      # export `NMBL_DISK_IMAGE` so the scenario runner (mkRunner) boots THAT
+      # signed disk. `extraEnv` lets the bad-sig scenario point at the same disk.
       mkSbScenarioCheck =
         {
           scenario,
@@ -612,30 +523,86 @@
         }:
         pkgs.writeShellApplication {
           name = "test-secure-boot-${scenario}";
-          runtimeInputs = sbScenarioInputs ++ extraInputs;
+          runtimeInputs = sbScenarioInputs ++ extraInputs ++ [ pkgs.qemu-utils ];
           text = ''
             export NMBL_RUNNER=${secureBootRunner}
+
+            # Produce the install-runtime-SIGNED disk unless the caller already
+            # staged one (NMBL_SB_SIGNED_DISK). The orchestrator reads the test
+            # signing keys from a runtime PATH and signs the UKI + sidecars in
+            # place during the nixos-anywhere install.
+            INSTALL_WORK="''${NMBL_SB_INSTALL_WORK:-$PWD/.sb-install-work}"
+            if [ -z "''${NMBL_SB_SIGNED_DISK:-}" ]; then
+              mkdir -p "$INSTALL_WORK"
+              echo "=== signing the test disk at install runtime (nixos-anywhere) ==="
+              ${secureBootInstaller}/bin/sb-install-test-secure-boot \
+                --work-dir "$INSTALL_WORK/real"
+              NMBL_SB_SIGNED_DISK="$INSTALL_WORK/real/disk1.qcow2"
+            fi
+            export NMBL_DISK_IMAGE="$NMBL_SB_SIGNED_DISK"
+            export NMBL_SB_DISK="$NMBL_SB_SIGNED_DISK"
+
             ${extraEnv}
             assertions=${./testing/assertions}
-            timeout "''${NMBL_WALL_TIMEOUT:-900}" \
+            timeout "''${NMBL_WALL_TIMEOUT:-1800}" \
               bash "$assertions/${script}"
           '';
         };
 
-      checkSbTpmRoundtrip = mkSbScenarioCheck {
-        scenario = "tpm-roundtrip";
-        script = "sb-tpm-roundtrip.sh";
+      checkSbTpmRoundtrip = pkgs.writeShellApplication {
+        name = "test-secure-boot-tpm-roundtrip";
+        runtimeInputs = sbScenarioInputs ++ [ pkgs.libguestfs-with-appliance pkgs.qemu-utils ];
         # The roundtrip drives TWO runners against one persisted swtpm: the
         # passphrase-unlock enroll twin (phase 1, seals the token onto vda3) and
         # the real tpm-unlock config (phase 2, auto-unseals after the
-        # power-cycle). The two phases share ONE disk (the enrolled qcow2);
+        # power-cycle). Both disks are SIGNED AT INSTALL RUNTIME by the
+        # orchestrators. The two phases share ONE disk (the enrolled qcow2);
         # before phase 2 the script swaps that disk's ESP UKI for the real
-        # tpm-unlock UKI (NMBL_SB_TPM_UKI) so the token on vda3 stays intact
+        # tpm-unlock config's installed-and-signed UKI (NMBL_SB_TPM_UKI,
+        # extracted from the real disk's ESP) so the token on vda3 stays intact
         # while the NMBL stage switches to token unlock — needs libguestfs.
-        extraInputs = [ pkgs.libguestfs-with-appliance ];
-        extraEnv = ''
+        text = ''
+          export NMBL_RUNNER=${secureBootRunner}
           export NMBL_ENROLL_RUNNER=${secureBootEnrollRunner}
-          export NMBL_SB_TPM_UKI=${secureBootSignedUki}/BOOTX64.EFI
+          export LIBGUESTFS_BACKEND=direct
+
+          INSTALL_WORK="''${NMBL_SB_INSTALL_WORK:-$PWD/.sb-install-work}"
+          mkdir -p "$INSTALL_WORK"
+
+          # Phase 1 boots the ENROLL twin (passphrase cryptroot) so it can reach
+          # the system and run nmbl-tpm-enroll. Install + sign that disk at
+          # runtime; the enroll runner boots it via NMBL_DISK_IMAGE.
+          if [ -z "''${NMBL_SB_ENROLL_DISK:-}" ]; then
+            echo "=== install+sign the ENROLL-twin disk at runtime (nixos-anywhere) ==="
+            ${secureBootEnrollInstaller}/bin/sb-install-test-secure-boot-enroll \
+              --work-dir "$INSTALL_WORK/enroll"
+            NMBL_SB_ENROLL_DISK="$INSTALL_WORK/enroll/disk1.qcow2"
+          fi
+          export NMBL_DISK_IMAGE="$NMBL_SB_ENROLL_DISK"
+
+          # The real (tpm-unlock) config: install + sign at runtime so the script
+          # can swap its INSTALL-SIGNED UKI onto the shared disk's ESP for phase 2
+          # (the token on vda3 stays intact). We only need its signed UKI, which
+          # we extract from the installed disk's ESP — no host-side sbsign drv.
+          if [ -z "''${NMBL_SB_SIGNED_DISK:-}" ]; then
+            echo "=== install+sign the tpm-unlock disk at runtime (for its UKI) ==="
+            ${secureBootInstaller}/bin/sb-install-test-secure-boot \
+              --work-dir "$INSTALL_WORK/real"
+            NMBL_SB_SIGNED_DISK="$INSTALL_WORK/real/disk1.qcow2"
+          fi
+          NMBL_SB_TPM_UKI="$INSTALL_WORK/real-tpm-uki/BOOTX64.EFI"
+          mkdir -p "$INSTALL_WORK/real-tpm-uki"
+          guestfish --ro -a "$NMBL_SB_SIGNED_DISK" <<GF
+          run
+          mount /dev/sda2 /
+          download /EFI/BOOT/BOOTX64.EFI $INSTALL_WORK/real-tpm-uki/BOOTX64.EFI
+          umount /
+          GF
+          export NMBL_SB_TPM_UKI
+
+          assertions=${./testing/assertions}
+          timeout "''${NMBL_WALL_TIMEOUT:-3000}" \
+            bash "$assertions/sb-tpm-roundtrip.sh"
         '';
       };
       checkSbSignedGenHappy = mkSbScenarioCheck {
@@ -646,11 +613,9 @@
         scenario = "bad-sig-refused";
         script = "sb-bad-sig-refused.sh";
         # The bad-sig scenario tampers a pristine disk copy (removes a sidecar
-        # off the FAT32 boot partition), so it needs libguestfs + the disk path.
+        # off the FAT32 boot partition), so it needs libguestfs. NMBL_SB_DISK is
+        # set to the install-runtime-signed disk by mkSbScenarioCheck above.
         extraInputs = [ pkgs.libguestfs-with-appliance ];
-        extraEnv = ''
-          export NMBL_SB_DISK=${secureBootSignedConfig.config.system.build.vmDiskImage}/nixos.qcow2
-        '';
       };
     in
     {
@@ -699,26 +664,28 @@
         # The unsigned-UKI Secure-Boot smoke-test disk (#55): a GPT/ESP image
         # whose BOOTX64.EFI is an UNSIGNED UKI, for the SB-refusal harness.
         sb-unsigned-uki-disk = sbSmoke.unsignedUkiDisk;
-        # The fully-signed test-secure-boot disk the chain scenarios boot: the
-        # disko image (NMBL installed, signing deferred) with the UKI sbsign'd
-        # and the generation ML-DSA sidecars written onto the ESP host-side.
-        # `nix build .#test-secure-boot-disk`.
-        test-secure-boot-disk = secureBootSignedDisk;
-        # The TPM-roundtrip ENROLL twin's signed disk: same generation as
-        # test-secure-boot but with a passphrase cryptroot so phase 1 of the
-        # roundtrip can boot into the system and run nmbl-tpm-enroll.
-        # `nix build .#test-secure-boot-enroll-disk`.
-        test-secure-boot-enroll-disk = secureBootEnrollSignedDisk;
-        # The real (tpm-unlock) config's host-signed NMBL UKI, swapped onto the
-        # shared disk's ESP for the roundtrip's phase 2.
-        # `nix build .#test-secure-boot-signed-uki`.
-        test-secure-boot-signed-uki = secureBootSignedUki;
+        # The runtime SB-install orchestrators (#57 F6b). Each installs the
+        # test-secure-boot NMBL config via nixos-anywhere and signs the UKI +
+        # generation sidecars AT INSTALL RUNTIME from the staged key paths — no
+        # signing key ever enters a derivation. The booted disk lands in the
+        # orchestrator's work dir. `nix build .#sb-install-test-secure-boot`.
+        sb-install-test-secure-boot = secureBootInstaller;
+        sb-install-test-secure-boot-enroll = secureBootEnrollInstaller;
+        # CLOSURE GUARD (#57 F6b): the secure-boot test INSTALL artifact's closure
+        # (diskoScript + toplevel — everything nixos-anywhere ships) must contain
+        # NEITHER the ML-DSA generation key NOR the SB `db` private key. Proves
+        # the install signs from a runtime PATH, never a derivation input.
+        # `nix build .#test-secure-boot-no-private-key`.
+        test-secure-boot-no-private-key = secureBootNoPrivateKey;
       };
 
       # Build-only validation gates surfaced for CI / `nix flake check`-style
-      # consumption: the insecure-test-key prod-absence guard (#56).
+      # consumption: the insecure-test-key prod-absence guard (#56) and the
+      # secure-boot-install private-key-absence guard (#57 F6b — the signed test
+      # disk is signed at install runtime, so no signing key is in its closure).
       checks.${system} = {
         insecure-test-key-absent = insecureKeyAbsentFromProd;
+        test-secure-boot-no-private-key = secureBootNoPrivateKey;
       };
 
       # Test configurations
@@ -771,6 +738,19 @@
           type = "app";
           program = "${checkSbBadSigRefused}/bin/test-secure-boot-bad-sig-refused";
         };
+        # Standalone runtime SB-install orchestrators (#57 F6b). Run one to
+        # produce the install-runtime-SIGNED disk on its own (the scenario apps
+        # run it automatically, but #57 can pre-stage it). The disk is signed by
+        # NMBL's install-time path-based code — no signing key in any derivation.
+        # `nix run .#sb-install-test-secure-boot -- --ssh-key <key> [--keys-dir <dir>]`.
+        sb-install-test-secure-boot = {
+          type = "app";
+          program = "${secureBootInstaller}/bin/sb-install-test-secure-boot";
+        };
+        sb-install-test-secure-boot-enroll = {
+          type = "app";
+          program = "${secureBootEnrollInstaller}/bin/sb-install-test-secure-boot-enroll";
+        };
       } // nixosAnywhereTestApps // testMatrix.apps // nixosAnywhereInstallAliases;
 
       # Reusable library: external flakes (the LUKS install orchestrator,
@@ -786,8 +766,10 @@
       # (e.g. as a release artefact) rather than `nix run` it.
       legacyPackages.${system} = {
         inherit testArtefact tmuxSerial;
-        # INSECURE TEST-ONLY signing keypair glue (#56): `signTestArtifact`,
-        # `assertAbsentFromClosure`, `bakedPublicKey`, and the raw key paths.
+        # INSECURE TEST-ONLY signing keypair glue (#56): the baked PUBLIC key and
+        # `assertAbsentFromClosure` (the build check that a signing PRIVATE key is
+        # never a derivation input). No private-key-importing signer — test
+        # artifacts are signed at INSTALL RUNTIME, never in a derivation.
         inherit testKeys;
         # The Secure-Boot unsigned-UKI smoke harness (#55): the runner, the
         # unsigned UKI, and the ESP disk image.

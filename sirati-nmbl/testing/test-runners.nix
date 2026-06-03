@@ -261,9 +261,21 @@ let
           ''
       }
       if [ ! -f "${diskName}" ]; then
-        echo "Copying VM disk image from Nix store..."
-        echo "Source: ${vmDiskImage}"
-        cp "${vmDiskImage}/nixos.qcow2" "${diskName}"
+        # NMBL_DISK_IMAGE overrides the disk source with a RUNTIME path (a qcow2
+        # produced at install time, e.g. by the secure-boot nixos-anywhere
+        # installer). This is how the secure-boot scenarios boot a disk SIGNED
+        # at install runtime instead of a build-time `vmDiskImage` store path —
+        # the signing key is never an input to a derivation. Falls back to the
+        # config's `vmDiskImage` (the normal non-secure-boot path) when unset.
+        if [ -n "''${NMBL_DISK_IMAGE:-}" ]; then
+          echo "Copying VM disk image from runtime path..."
+          echo "Source: ''${NMBL_DISK_IMAGE}"
+          cp "''${NMBL_DISK_IMAGE}" "${diskName}"
+        else
+          echo "Copying VM disk image from Nix store..."
+          echo "Source: ${vmDiskImage}"
+          cp "${vmDiskImage}/nixos.qcow2" "${diskName}"
+        fi
         chmod 644 "${diskName}"
         echo "✓ Disk image copied successfully"
       else
