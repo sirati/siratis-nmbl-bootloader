@@ -45,10 +45,13 @@ let
           # build VM whose only filesystem is the Nix store, so the
           # install-time-impure signing keys (generationKeyFile / uki.*) are
           # unreadable there and `nmbl-sign`/`sbsign` would kill the build.
-          # Defer in-installer signing for the image build (runtime POLICY is
-          # untouched — the baked anchor + config.toml still ENFORCE); the
-          # boot partition is signed host-side afterwards (see flake.nix's
-          # secure-boot disk wrapper).
+          # Defer in-installer signing for the BUILD-TIME disko image (a pure
+          # "ship unsigned, sign nothing in the sealed builder" toggle that
+          # imports NO key) — runtime POLICY is untouched (the baked anchor +
+          # config.toml still ENFORCE). It is `mkDefault` so the secure-boot
+          # RUNTIME install variant can `mkForce` it off (flake.nix
+          # `secureBootInstallConfig`), where the keys ARE staged at their paths
+          # and NMBL's install-time path-based signing signs the disk in place.
           ++ lib.optional (diskoModule != null) { boot.nmbl.signing.deferInstallSigning = lib.mkDefault true; }
           ++ extraModules
           ++ [
