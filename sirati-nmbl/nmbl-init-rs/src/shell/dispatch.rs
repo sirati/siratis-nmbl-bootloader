@@ -40,14 +40,28 @@ pub(crate) async fn dispatch_emergency_choice(
             Some(TerminalAction::Reboot)
         }
         EmergencyChoice::RawShell => {
-            run_raw_shell_choice(console, app, error_count, config).await;
-            // Picker session done (shell exited, detached, or cancelled); re-show menu.
-            None
+            // SEAL BEFORE SPAWN (G3): cap the lock PCR + close every
+            // TPM-unsealed mapper, then hand the spawn helper the
+            // unforgeable witness. On a seal failure there is no `Sealed`,
+            // so we cannot — and must not — open a shell: divert to refuse.
+            match crate::policy::seal_secrets(config.tpm.require_tpm, sender).await {
+                Ok(sealed) => {
+                    run_raw_shell_choice(sealed, console, app, error_count, config).await;
+                    // Picker session done (shell exited, detached, or cancelled); re-show menu.
+                    None
+                }
+                Err(e) => Some(refuse_on_seal_failure(e)),
+            }
         }
         #[cfg(feature = "pretty-shell")]
         EmergencyChoice::PrettyShell => {
-            run_pretty_shell_choice(console, app, error_count, config).await;
-            None
+            match crate::policy::seal_secrets(config.tpm.require_tpm, sender).await {
+                Ok(sealed) => {
+                    run_pretty_shell_choice(sealed, console, app, error_count, config).await;
+                    None
+                }
+                Err(e) => Some(refuse_on_seal_failure(e)),
+            }
         }
         EmergencyChoice::RetryBoot => {
             // Rescue retry always shows the selector (the operator
@@ -65,16 +79,40 @@ pub(crate) async fn dispatch_emergency_choice(
     }
 }
 
+/// Divert to a NON-INTERACTIVE terminal action when the seal fails
+/// (FIX-27): a present-but-uncappable TPM, a `requireTpm` box with no
+/// TPM, or a mapper that will not close. NEVER offer a shell.
+///
+/// SEAM: once `policy/relock.rs` lands (F4c), this becomes
+/// `policy::refuse_unsigned(config, cause) -> TerminalAction::RebootIntoRescue`,
+/// whose constructor itself takes/produces a `Sealed` so the refuse
+/// countdown is reachable only after a successful seal. Until then we
+/// fail closed with a halt banner carrying the seal-failure chain — no
+/// shell, no interactive context.
+pub(crate) fn refuse_on_seal_failure(err: crate::policy::SealFailed) -> TerminalAction {
+    nmbl_warn!(
+        "seal-on-rescue failed; refusing to open a shell: {}",
+        format_chain(err.cause() as &dyn std::error::Error)
+    );
+    TerminalAction::HaltWithBanner {
+        cause: err.into_cause(),
+    }
+}
+
 /// Handle the [`EmergencyChoice::RawShell`] picker arm: run the in-process
 /// console picker session and show a toast or error modal over the emergency
 /// menu so the operator knows what happened before re-entering the loop.
+///
+/// Takes the `Sealed` witness by value: a shell cannot be reached on this
+/// arm without proof that [`crate::policy::seal_secrets`] ran (G3).
 async fn run_raw_shell_choice(
+    sealed: crate::policy::Sealed,
     console: &mut dyn Console,
     app: &mut App<'static>,
     error_count: &mut u32,
     config: &Config,
 ) {
-    match crate::ui::console_picker::run_picker_session(console, config).await {
+    match crate::ui::console_picker::run_picker_session(sealed, console, config).await {
         Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached { targets }) => {
             // Fire-and-forget regime: tell the operator their shell(s) have
             // been started elsewhere so they don't wonder why the menu
@@ -111,12 +149,13 @@ async fn run_raw_shell_choice(
 /// pty terminal and show an error modal if it fails to start.
 #[cfg(feature = "pretty-shell")]
 async fn run_pretty_shell_choice(
+    sealed: crate::policy::Sealed,
     console: &mut dyn Console,
     app: &mut App<'static>,
     error_count: &mut u32,
     config: &Config,
 ) {
-    if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(console, config).await {
+    if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(sealed, console, config).await {
         let chain = format_chain(&e as &dyn std::error::Error);
         nmbl_warn!("pretty-shell session failed: {chain}");
         let _ = crate::ui::show_modal_error_over(

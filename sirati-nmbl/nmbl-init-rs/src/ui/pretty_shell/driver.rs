@@ -21,7 +21,16 @@ use super::{CHROME_COLS, CHROME_ROWS, PRETTY_SHELL_MIN_COLS, PRETTY_SHELL_MIN_RO
 /// `Err` only when the supporting plumbing fails (fork, openpty,
 /// terminal backend write). The caller in `src/shell.rs` treats both
 /// outcomes the same way: re-display the emergency menu.
-pub async fn run_pretty_shell(console: &mut dyn Console, config: &Config) -> Result<()> {
+pub async fn run_pretty_shell(
+    sealed: crate::policy::Sealed,
+    console: &mut dyn Console,
+    config: &Config,
+) -> Result<()> {
+    // `sealed` proves `policy::seal_secrets` ran before this PTY-shell
+    // fork (G3): the lock PCR is capped and every TPM-unsealed mapper is
+    // closed. The witness is required by type so a pretty shell cannot
+    // start without a seal (re-audit C-1).
+    let _sealed = sealed;
     // Derive the PTY grid size from the live console dimensions so the
     // alacritty terminal fills the bordered block. The renderer paints
     // a 3-row header + 1-row footer + bordered block (2 rows of border

@@ -39,6 +39,20 @@ pub(crate) fn run_force_rescue(
     noop: &mut NoopConsole,
 ) -> std::result::Result<TerminalAction, Box<(NmblError, Config)>> {
     nmbl_info!("force_on_boot: entering external rescue");
+    // SEAL ON ENTRY (G5): force-on-boot rescue drops the operator into an
+    // interactive rescue system, so cap the lock PCR + close every
+    // TPM-unsealed mapper FIRST (blocking — this runs after the runtime
+    // exits). `rescue::dispatch` re-seals idempotently. On a seal failure
+    // halt with the seal-failure banner instead of entering rescue.
+    if let Err(seal_err) = nmbl_init::policy::seal_secrets_blocking(config.tpm.require_tpm) {
+        nmbl_warn!(
+            "force_on_boot: seal-on-rescue failed; halting instead of opening rescue: {}",
+            format_chain(seal_err.cause() as &dyn std::error::Error)
+        );
+        return Ok(TerminalAction::HaltWithBanner {
+            cause: seal_err.into_cause(),
+        });
+    }
     // The network-rescue NIC drivers + `af_packet` are added to
     // `config.kernel_modules.explicit` for `rescue.network &&
     // rescue.mode == external` (see lib/config.nix `rescueNicModules`/

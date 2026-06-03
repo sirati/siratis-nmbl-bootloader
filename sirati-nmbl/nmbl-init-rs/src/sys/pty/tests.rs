@@ -48,6 +48,7 @@ fn spawn_shell_basic_roundtrip() {
     if std::fs::metadata(&echo).is_err() {
         return;
     }
+    // seal-exempt: unit test of the spawn primitive itself; forks /bin/echo (not an interactive shell) in a test harness with no TPM/mapper state, so no seal applies.
     let child = match spawn_shell(&echo, 80, 24) {
         Ok(c) => c,
         // Sandboxes that block fork or openpty return EPERM/ENOTTY.

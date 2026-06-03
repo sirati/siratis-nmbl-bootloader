@@ -73,7 +73,7 @@ mod recovery;
 mod tests;
 
 pub use banner::{print_banner, print_halt_banner};
-pub(crate) use dispatch::dispatch_emergency_choice;
+pub(crate) use dispatch::{dispatch_emergency_choice, refuse_on_seal_failure};
 
 use crate::config::Config;
 use crate::error::{NmblError, format_chain};
@@ -113,6 +113,15 @@ pub async fn drop_to_emergency(
     session: &SessionInteraction,
     sender: &LocalSender,
 ) -> TerminalAction {
+    // SEAL ON ENTRY (G1): before the emergency menu (which can offer a
+    // shell) renders, cap the lock PCR and close every TPM-unsealed
+    // mapper. The idempotent latch makes the per-choice G3 seal a no-op;
+    // sealing here closes the window between the menu rendering and the
+    // operator picking a shell. On a seal failure we refuse all
+    // interactive context and halt with the seal-failure banner.
+    if let Err(seal_err) = crate::policy::seal_secrets(config.tpm.require_tpm, sender).await {
+        return refuse_on_seal_failure(seal_err);
+    }
     let mut console = console;
 
     // Build the emergency App once and reuse it across every iteration
@@ -161,6 +170,14 @@ pub async fn drop_to_emergency(
 /// return [`TerminalAction::Reboot`] so the dispatcher reboots
 /// instead of leaving the operator at an inert PID 1.
 pub fn open_console_and_drop_to_emergency(config: &Config, err: NmblError) -> TerminalAction {
+    // SEAL ON ENTRY (G2): this synchronous bootstrap/panic/pre-console
+    // path runs OUTSIDE the runtime, so seal via the blocking shape
+    // before opening a console that leads to the (shell-offering)
+    // emergency menu. Refuse all interactive context on a seal failure.
+    // The inner `drop_to_emergency` (G1) re-seals idempotently.
+    if let Err(seal_err) = crate::policy::seal_secrets_blocking(config.tpm.require_tpm) {
+        return refuse_on_seal_failure(seal_err);
+    }
     // These call sites have no prior boot session (initial bring-up
     // failure, panic-recovery re-exec, pre-console phases), so no
     // keypress could have happened yet — a fresh latch is correct.
