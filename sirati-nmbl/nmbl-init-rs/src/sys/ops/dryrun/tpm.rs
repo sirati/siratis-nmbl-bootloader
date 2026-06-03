@@ -65,18 +65,24 @@ impl TpmOps for DryRunSys {
 
     fn cap_lock_pcr(&mut self) -> CapOutcome {
         // THE Property-6 boundary: NEVER perform the irreversible lock-PCR
-        // poison-extend. Record + return `NoTpm` (vacuous cap) so the seal's
-        // `cap_step` degrades open on a dry-run rather than diverting to a
-        // refuse it cannot honour. No real PCR is ever touched.
+        // poison-extend. Record + return `Capped` (the cap "succeeded" as a
+        // recorded no-op) so the seal's `cap_step` SUCCEEDS — modelling a
+        // healthy TPM host — even under `require_tpm`. Returning `NoTpm` here
+        // would fail `cap_step` on a `require_tpm` closure (the Nix default for
+        // every measure/secure-boot config) and spuriously divert the dry-run
+        // to the REFUSE terminus, which on a live host runs real `cryptsetup
+        // close` / sentinel writes. `Capped` keeps the dry-run on the intended
+        // emergency-console path. No real PCR is ever touched.
         self.record(MissingFile::new(
             "cap_lock_pcr",
             Path::new("/dev/tpmrm0"),
             "dry-run: lock-PCR cap suppressed (no real PCR poisoned)",
         ));
         // cap-exempt: the dry-run NEVER opens a TPM nor poisons a PCR, so the
-        // cap is vacuous by construction; returning NoTpm keeps the seal's
-        // degrade-open path (it cannot, and must not, fail-closed into a real
-        // refuse from a side-effect-free validation run).
-        CapOutcome::NoTpm
+        // cap is vacuous by construction; returning `Capped` models a healthy
+        // capped TPM so the seal succeeds and the dry-run reaches the emergency
+        // console as intended, instead of diverting to a refuse that would run
+        // real relock/sentinel side effects on a live host.
+        CapOutcome::Capped
     }
 }

@@ -34,6 +34,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::sys::ops::FsOps;
 
 /// Whether a rescue boot must be forced this boot (FIX-49). `force_external`
 /// is the caller's existing force-on-boot decision; this ORs in the
@@ -55,7 +56,13 @@ pub fn sentinel_present(config: &Config) -> bool {
 /// Write the empty sentinel marker (best-effort). Called from the refuse
 /// terminus BEFORE the relock tears down the backing device (FIX-21). Logs
 /// and swallows every failure — the imminent reboot is the real boundary.
-pub fn write_sentinel(config: &Config) {
+///
+/// Routed through the [`FsOps`] seam (Property-6): the real boot passes a
+/// `RealSys` whose `ensure_dir`/`write_file` forward to `std::fs::create_dir_all`
+/// / `std::fs::write` byte-identically; the `--validate-initrm` dry-run passes a
+/// `DryRunSys` that no-ops + records both, so a refuse reached under a
+/// validation run NEVER writes a real `/boot/nmbl/rescue` marker.
+pub fn write_sentinel(fs: &mut dyn FsOps, config: &Config) {
     let Some(path) = resolve_sentinel_path(config) else {
         crate::nmbl_warn!(
             "refuse: no writable boot mountpoint and no absolute sentinel path; \
@@ -64,16 +71,16 @@ pub fn write_sentinel(config: &Config) {
         return;
     };
     if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
+        && let Err(e) = fs.ensure_dir(parent)
     {
         crate::nmbl_warn!(
             "refuse: could not create sentinel dir {}: {e}; continuing",
             parent.display()
         );
     }
-    // An EMPTY file: presence is the whole signal (FIX-49). `write` with an
-    // empty slice truncates-or-creates atomically enough for a marker.
-    match std::fs::write(&path, b"") {
+    // An EMPTY file: presence is the whole signal (FIX-49). `write_file` with
+    // an empty slice truncates-or-creates atomically enough for a marker.
+    match fs.write_file(&path, b"") {
         Ok(()) => crate::nmbl_info!("refuse: wrote rescue sentinel {}", path.display()),
         Err(e) => crate::nmbl_warn!(
             "refuse: could not write rescue sentinel {}: {e}; \

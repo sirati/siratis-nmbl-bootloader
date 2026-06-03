@@ -5,10 +5,11 @@
 use std::path::PathBuf;
 
 use super::argv::relock_argv;
-use super::{refuse_require_tpm, relock_and_refuse_blocking};
+use super::{refuse_require_tpm, relock_and_refuse, relock_and_refuse_blocking};
 use crate::config::{Activation, ActivationKind, Config};
 use crate::error::NmblError;
 use crate::policy::guard::test_seam::Step;
+use crate::policy::seal_dryrun::{DryRunSealScope, real_terminus_ops, reset_real_terminus_ops};
 use crate::policy::{guard, registry};
 use crate::terminal::TerminalAction;
 
@@ -206,6 +207,130 @@ fn relock_order_is_cap_then_close_then_sentinel_then_relock() {
     assert!(
         crate::policy::sentinel_present(&cfg),
         "sentinel must be present after the refuse"
+    );
+}
+
+/// Block on `fut` in a fresh single-thread local runtime (the async refuse
+/// terminus needs a `LocalSender` and a reactor).
+fn block<F: std::future::Future>(fut: F) -> F::Output {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build_local(tokio::runtime::LocalOptions::default())
+        .expect("test runtime");
+    rt.block_on(fut)
+}
+
+/// PROPERTY-6 (the destructive-terminus regression): driving the ASYNC refuse
+/// terminus under a `DryRunSealScope` (the `--validate-initrm` mode) must
+/// perform ZERO real terminus ops — NO real `/boot/nmbl` sentinel write and NO
+/// real `cryptsetup close` / `vgchange -an` relock fork — even with a LUKS +
+/// LVM `require_tpm` config that has BOTH relock shapes. It must STILL mint the
+/// `RebootIntoRescue` terminus (the seam records "would relock/sentinel" and
+/// returns the witness, exactly as the dry-run seal already does for the cap).
+///
+/// This is the non-vacuous seam proof: after the cap fix the four
+/// `validate_initrm` scenarios no longer DIVERT to refuse, so this test drives
+/// the terminus directly to confirm the seam no-ops it.
+#[test]
+fn dry_run_refuse_terminus_performs_no_real_sentinel_or_relock_ops() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    registry::set_persist_path(dir.path().join("mappers"));
+    guard::reset_latch();
+    registry::reset();
+    guard::test_seam::reset();
+
+    // A relockable LUKS mapper AND an LVM volume group, so BOTH relock argv
+    // shapes are produced — a real run would fork `cryptsetup close cryptroot`
+    // and `vgchange -an vg0`.
+    let mut cfg = Config::recovery_default();
+    cfg.tpm.require_tpm = true;
+    cfg.runtime_boot_mountpoint = Some(dir.path().to_path_buf());
+    cfg.activations.push(act(
+        ActivationKind::LuksTpm,
+        "/bin/cryptsetup",
+        &["/dev/mapper/cryptroot"],
+    ));
+    cfg.activations.push(act(
+        ActivationKind::Lvm,
+        "/bin/vgchange",
+        &["/dev/vg0/root"],
+    ));
+
+    reset_real_terminus_ops();
+    // Enter the dry-run seal scope (the `--validate-initrm` mode), drive the
+    // genuine async refuse terminus, and drop the scope.
+    let action = {
+        let _scope = DryRunSealScope::enter();
+        block(relock_and_refuse(
+            &cfg,
+            NmblError::Signature {
+                stage: "gen-kernel",
+                detail: "dry-run terminus".to_string(),
+            },
+            &crate::sys::poller::build().1,
+        ))
+    };
+
+    // The terminus still yields the type-gated RebootIntoRescue (the witness is
+    // minted by the best-effort seal exactly as on the real path).
+    assert!(
+        matches!(action, TerminalAction::RebootIntoRescue { .. }),
+        "the dry-run refuse must still mint RebootIntoRescue"
+    );
+    // ZERO real terminus ops: no sentinel write, no relock fork.
+    assert_eq!(
+        real_terminus_ops(),
+        0,
+        "the dry-run refuse terminus must perform NO real sentinel write and NO \
+         real relock fork (routed through DryRunSys FsOps/ExecOps no-ops)"
+    );
+    // And NO sentinel file landed on disk under the resolved mountpoint.
+    assert!(
+        !crate::policy::sentinel_present(&cfg),
+        "the dry-run refuse must NOT write a real /boot/nmbl sentinel"
+    );
+}
+
+/// The real-boot-inert proof (invariant #1): with NO dry-run scope active, the
+/// async terminus seam takes the REAL branch and bumps the real-terminus
+/// counter (≥1 for the sentinel write). Pairs with the dry-run test above so a
+/// regression that wires the seam backwards — inert on real boots — is caught.
+/// Uses a config with NO activations so the real branch reaches only the
+/// sentinel write (no real `cryptsetup`/`vgchange` fork happens in the test).
+#[test]
+fn real_refuse_terminus_runs_the_real_sentinel_op() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    registry::set_persist_path(dir.path().join("mappers"));
+    guard::reset_latch();
+    registry::reset();
+    guard::test_seam::reset();
+
+    let mut cfg = Config::recovery_default();
+    cfg.runtime_boot_mountpoint = Some(dir.path().to_path_buf());
+
+    reset_real_terminus_ops();
+    // NO DryRunSealScope: the seam must take the real branch.
+    let action = block(relock_and_refuse(
+        &cfg,
+        NmblError::Signature {
+            stage: "gen-kernel",
+            detail: "real terminus".to_string(),
+        },
+        &crate::sys::poller::build().1,
+    ));
+
+    assert!(
+        matches!(action, TerminalAction::RebootIntoRescue { .. }),
+        "the real refuse must yield RebootIntoRescue"
+    );
+    assert!(
+        real_terminus_ops() >= 1,
+        "the real refuse terminus must perform the real sentinel op (counter \
+         proves the seam is NOT inert on a real boot)"
+    );
+    assert!(
+        crate::policy::sentinel_present(&cfg),
+        "the real refuse must write the real sentinel"
     );
 }
 

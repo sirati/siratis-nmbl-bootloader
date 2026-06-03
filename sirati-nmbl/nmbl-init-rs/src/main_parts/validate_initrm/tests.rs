@@ -109,6 +109,33 @@ fn config_with_luks(binary: &str) -> Config {
     c
 }
 
+/// The hardest Property-6 fixture: `require_tpm = true` (the Nix default for
+/// any measure/secure-boot config — the common install target) PLUS a
+/// relockable LUKS `/dev/mapper/cryptroot` and an LVM `/dev/vg0/root`. Under
+/// `require_tpm`, a `NoTpm` cap would FAIL the dry-run seal and divert to the
+/// refuse terminus — whose `write_sentinel` (real `/boot/nmbl` write) and
+/// `relock_volumes` (real `cryptsetup close` / `vgchange -an`) would run on a
+/// LIVE host. This fixture makes BOTH the seal's close-mapper path and the
+/// refuse terminus's relock+sentinel path reachable so the assertion that the
+/// dry-run performs ZERO real ops is non-vacuous.
+fn config_require_tpm_with_luks_and_lvm(cryptsetup: &str) -> Config {
+    let mut c = config_with_luks(cryptsetup);
+    // The Nix-default posture for the common install target: demand a TPM.
+    c.tpm.require_tpm = true;
+    let lvm: nmbl_init::config::Activation = toml::from_str(
+        r#"
+            kind = "lvm"
+            binary = "/bin/vgchange"
+            argv = ["-ay", "vg0"]
+            produces_devices = ["/dev/vg0/root"]
+            description = "activate LVM"
+        "#,
+    )
+    .expect("parse lvm activation");
+    c.activations.push(lvm);
+    c
+}
+
 #[test]
 fn luks_activation_dry_run_terminates_and_reports_cryptsetup() {
     // THE regression: an empty closure (no /bin/cryptsetup) must make the
@@ -175,6 +202,55 @@ fn validate_initrm_performs_no_real_tpm_or_cryptsetup_seal_ops() {
         "validate-initrm must perform NO real TPM cap or cryptsetup close: \
          the dry-run seal routes the cap through TpmOps (no-op) and suppresses \
          the mapper close"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn validate_initrm_require_tpm_performs_no_real_seal_or_terminus_ops() {
+    // Property-6, strengthened (the destructive-terminus regression): the
+    // previous test ran with `require_tpm` UNSET, so the seal degraded open and
+    // never approached the refuse terminus. With `require_tpm = true` (the Nix
+    // default for any measure/secure-boot config — the COMMON install target) a
+    // `NoTpm` dry-run cap used to FAIL the seal and divert to the refuse
+    // terminus, whose `write_sentinel` (real `std::fs::write("/boot/nmbl/...")`)
+    // and `relock_volumes` (real `cryptsetup close` / `vgchange -an` forks)
+    // execute DIRECTLY — destroying the live root mapper on a secure-boot
+    // install host. Neither effect ever touched `real_seal_ops`, which is why
+    // the leak was missed twice.
+    //
+    // After the fix the dry-run cap returns `Capped` (so the seal succeeds and
+    // the scenario reaches the emergency console as intended), AND every
+    // terminus op is routed through the `FsOps`/`ExecOps` seam (no-op'd by
+    // `DryRunSys` on the dry-run path). We stage a closure with cryptsetup + the
+    // LVM/shell tools present and a `require_tpm` LUKS+LVM config so BOTH the
+    // seal's close-mapper path AND the refuse terminus's relock+sentinel path
+    // are reachable, then assert BOTH the real-seal-op AND the new
+    // real-terminus-op counters stayed at zero across ALL FOUR scenarios.
+    let root = temp_closure("require-tpm-no-real-ops", |d| {
+        fs::create_dir_all(d.join("bin")).expect("mkdir bin");
+        fs::write(d.join("bin/cryptsetup"), b"#!/bin/sh\n").expect("write cryptsetup");
+        fs::write(d.join("bin/vgchange"), b"#!/bin/sh\n").expect("write vgchange");
+        fs::write(d.join("bin/sh"), b"#!/bin/sh\n").expect("write sh");
+    });
+    let config = config_require_tpm_with_luks_and_lvm("/bin/cryptsetup");
+
+    nmbl_init::policy::reset_real_seal_ops();
+    nmbl_init::policy::reset_real_terminus_ops();
+    let _report = validate_initrm(&config, None, &root);
+    assert_eq!(
+        nmbl_init::policy::real_seal_ops(),
+        0,
+        "require_tpm validate-initrm must perform NO real TPM cap or cryptsetup \
+         close across any scenario (the dry-run seal no-ops both)"
+    );
+    assert_eq!(
+        nmbl_init::policy::real_terminus_ops(),
+        0,
+        "require_tpm validate-initrm must perform NO real refuse-terminus op \
+         (NO /boot/nmbl sentinel write, NO cryptsetup close / vgchange relock \
+         fork) across any scenario: the terminus routes sentinel through FsOps \
+         and relock through ExecOps, both no-op'd by DryRunSys on the dry-run"
     );
     fs::remove_dir_all(&root).ok();
 }

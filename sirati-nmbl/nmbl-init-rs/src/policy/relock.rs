@@ -25,11 +25,18 @@
 //!    (FIX-21) and while the boot FS is still writable — so the next boot
 //!    sees the force-rescue marker even on a single-LUKS layout where the
 //!    boot FS lives behind the priority volume.
-//! 4. **Relock LUKS** via an async [`run_capture`] of a kind-aware
-//!    [`relock_argv`] (FIX-47): `cryptsetup close <name>` for LUKS (only a
-//!    `/dev/mapper/<name>` shape), `vgchange -an <vg>` for LVM, `mdadm
+//! 4. **Relock LUKS** via the async [`ExecOps::run_capture`] seam of a
+//!    kind-aware [`relock_argv`] (FIX-47): `cryptsetup close <name>` for LUKS
+//!    (only a `/dev/mapper/<name>` shape), `vgchange -an <vg>` for LVM, `mdadm
 //!    --stop <md>` for mdraid. A best-effort loop: a failed relock is
 //!    logged, never fatal.
+//!
+//! Steps 3–4 route through the [`FsOps`](crate::sys::ops::FsOps) /
+//! [`ExecOps`](crate::sys::ops::ExecOps) seam so a `--validate-initrm` dry-run
+//! (which sets `dry_run_seal_active()`) performs NO real sentinel write and NO
+//! real relock fork — exactly as the seal in step 1–2 already no-ops the cap +
+//! mapper close — while a real boot drives the genuine `RealSys` and every
+//! effect fires byte-identically (Property-6).
 //!
 //! Steps 1–2 are exactly the BEST-EFFORT seal (`guard::seal_for_refuse*`),
 //! which ALSO mints the unforgeable [`Sealed`] witness so the resulting
@@ -41,6 +48,8 @@
 use crate::config::Config;
 use crate::error::NmblError;
 use crate::policy::guard::{seal_for_refuse_async, seal_for_refuse_blocking};
+use crate::policy::seal_dryrun::{dry_run_seal_active, note_real_terminus_op};
+use crate::sys::ops::{ExecOps, RealSys, SysOps};
 use crate::sys::poller::LocalSender;
 use crate::terminal::TerminalAction;
 
@@ -97,11 +106,51 @@ pub async fn relock_and_refuse(
     // Best-effort: the refuse proceeds even on an uncappable TPM (FIX-27).
     // Minting the witness here is what makes RebootIntoRescue reachable.
     let sealed = seal_for_refuse_async(refuse_require_tpm(config), sender).await;
-    // (c) sentinel BEFORE (d) relock, while the FS is still writable.
-    super::sentinel::write_sentinel(config);
-    // (d) best-effort relock of every configured LUKS/LVM/mdraid volume.
-    relock_volumes_async(config, sender).await;
+    // (c) sentinel BEFORE (d) relock, while the FS is still writable. Both are
+    // routed through the Property-6 dry-run seam: a `--validate-initrm` run has
+    // `dry_run_seal_active()` set, so the sentinel write and the relock forks
+    // dispatch through a side-effect-free `DryRunSys` (no real `/boot/nmbl`
+    // write, no real `cryptsetup close`); a real boot dispatches through
+    // `RealSys`, byte-identical to the prior direct `std::fs`/`run_capture`.
+    terminus_effects_async(config, sender).await;
     TerminalAction::reboot_into_rescue(sealed, cause)
+}
+
+/// Run the async terminus effects — sentinel write then relock — through the
+/// Property-6 dry-run seam (mirrors the seal's `dry_run_seal_active` routing).
+/// On a dry-run we drive a side-effect-free `DryRunSys` (records "would
+/// sentinel/relock", performs nothing); on a real boot we drive the genuine
+/// `RealSys` over the runtime poller, so every terminus op really fires.
+async fn terminus_effects_async(config: &Config, sender: &LocalSender) {
+    if dry_run_seal_active() {
+        // The `--validate-initrm` path: NO real sentinel write, NO real relock
+        // fork. The `DryRunSys` no-ops + records both ops, exactly as the seal
+        // already no-ops the cap + mapper close on this path.
+        use crate::sys::ops::dryrun::{ClosureView, DryRunScenario, DryRunSys};
+        let mut dry = DryRunSys::new(
+            ClosureView::new(std::path::PathBuf::from("/")),
+            DryRunScenario::ErrorToErrorScreen,
+        );
+        run_terminus_effects(&mut dry, config, false).await;
+    } else {
+        // The genuine refuse: real sentinel write + real LUKS/LVM/mdraid
+        // relock forks. `RealSys` forwards `write_file`/`run_capture` to the
+        // same `std::fs`/`run_capture` calls the terminus used directly before.
+        let mut real = RealSys::new(sender);
+        run_terminus_effects(&mut real, config, true).await;
+    }
+}
+
+/// Sentinel-then-relock over an `ops` seam (`S: SysOps`). Shared by the
+/// dry-run (`DryRunSys`) and real (`RealSys`) async paths. `real` records the
+/// observability counter only when the genuine ops run, so the Property-6 test
+/// can assert a dry-run performs ZERO real terminus ops across every scenario.
+async fn run_terminus_effects<S: SysOps>(ops: &mut S, config: &Config, real: bool) {
+    if real {
+        note_real_terminus_op();
+    }
+    super::sentinel::write_sentinel(ops, config);
+    relock_volumes(ops, config, real).await;
 }
 
 /// Blocking sibling of [`relock_and_refuse`]. Same order; the relock loop
@@ -109,7 +158,12 @@ pub async fn relock_and_refuse(
 /// unwound (the only context this is reached from).
 pub fn relock_and_refuse_blocking(config: &Config, cause: NmblError) -> TerminalAction {
     let sealed = seal_for_refuse_blocking(refuse_require_tpm(config));
-    super::sentinel::write_sentinel(config);
+    // The blocking terminus is REAL-boot-only (`rescue::dispatch`,
+    // `run_force_rescue`, the pre-runtime bootstrap/panic refuse) — the
+    // `--validate-initrm` dry-run always runs inside the async runtime and so
+    // never reaches here. Write the sentinel through a sender-less `RealSys`
+    // (sync `FsOps` only), byte-identical to the prior direct `std::fs` write.
+    super::sentinel::write_sentinel(&mut RealSys::sync_only(), config);
     #[cfg(test)]
     super::guard::test_seam::record_sentinel();
     relock_volumes_blocking(config);
@@ -119,24 +173,33 @@ pub fn relock_and_refuse_blocking(config: &Config, cause: NmblError) -> Terminal
 }
 
 /// Run the kind-aware relock command for every activation that has one,
-/// through the async [`run_capture`] (FIX-47). Best-effort: a present
-/// mapper whose relock FAILS is loud-warned (a hard signal), an absent one
-/// is benign. Never aborts the refuse.
+/// through the async [`ExecOps::run_capture`] seam (FIX-47). Best-effort: a
+/// present mapper whose relock FAILS is loud-warned (a hard signal), an absent
+/// one is benign. Never aborts the refuse.
 ///
-/// [`run_capture`]: crate::sys::activation::run_capture
-async fn relock_volumes_async(config: &Config, sender: &LocalSender) {
+/// Routed through `ExecOps` (Property-6): the real boot's `RealSys::run_capture`
+/// forwards to [`crate::sys::activation::run_capture`] byte-identically and
+/// each fork bumps the real-terminus counter; the dry-run's
+/// `DryRunSys::run_capture` only presence-checks the binary and NEVER forks, so
+/// a refuse reached under `--validate-initrm` runs NO real `cryptsetup close` /
+/// `vgchange` / `mdadm`. `real` gates the observability counter.
+async fn relock_volumes<E: ExecOps>(ops: &mut E, config: &Config, real: bool) {
     for act in &config.activations {
         let Some(cmd) = relock_argv(act) else {
             continue;
         };
-        match crate::sys::activation::run_capture(&cmd.binary, &cmd.argv, sender).await {
+        if real {
+            note_real_terminus_op();
+        }
+        match ops.run_capture(&cmd.binary, &cmd.argv).await {
             Ok((outcome, _)) => report_relock(&cmd, outcome.exit_code),
             Err(e) => warn_relock_spawn(&cmd, &e),
         }
     }
 }
 
-/// Blocking sibling of [`relock_volumes_async`].
+/// Blocking sibling of [`relock_volumes`]. REAL-boot-only (the dry-run never
+/// reaches the blocking terminus), so it forks `run_capture_blocking` directly.
 fn relock_volumes_blocking(config: &Config) {
     for act in &config.activations {
         let Some(cmd) = relock_argv(act) else {

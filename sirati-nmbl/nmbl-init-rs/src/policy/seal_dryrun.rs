@@ -33,6 +33,17 @@ thread_local! {
     /// `--validate-initrm` run performs ZERO of them. Pure observability,
     /// inert on the real boot path. `Cell<u32>` per FIX-58.
     static REAL_SEAL_OPS: Cell<u32> = const { Cell::new(0) };
+
+    /// Count of REAL refuse-TERMINUS ops attempted (a real `cryptsetup
+    /// close` / `vgchange` / `mdadm` relock fork, or a real `/boot/nmbl`
+    /// sentinel `write`/`create_dir_all`). Distinct from `REAL_SEAL_OPS`
+    /// because the terminus's relock + sentinel are NOT seal ops and never
+    /// touched that counter — which is exactly why the dry-run's destructive
+    /// terminus leak went unobserved. Incremented ONLY when the async refuse
+    /// terminus runs against the REAL ops (not the dry-run seam), so the
+    /// Property-6 test can assert a `--validate-initrm` run performs ZERO of
+    /// them. `Cell<u32>` per FIX-58.
+    static REAL_TERMINUS_OPS: Cell<u32> = const { Cell::new(0) };
 }
 
 /// RAII scope putting the seal into Property-6 dry-run mode (cap routes
@@ -60,10 +71,12 @@ impl Drop for DryRunSealScope {
     }
 }
 
-/// `true` when the seal is running in Property-6 dry-run mode. Read only by
-/// the production seam in [`super::guard`]; under `cfg(test)` the recording
-/// `test_seam` replaces that seam, so this reader is then unused.
-#[cfg(not(test))]
+/// `true` when the seal is running in Property-6 dry-run mode. Read by the
+/// production cap/close seam in [`super::guard`] AND by the async refuse
+/// TERMINUS in [`super::relock`] (which routes its sentinel write + relock
+/// forks through the side-effect-free `DryRunSys` ops when this is set). Under
+/// `cfg(test)` the guard's recording `test_seam` replaces the guard seam; the
+/// relock module reads this directly on both paths.
 pub(super) fn dry_run_seal_active() -> bool {
     DRY_RUN_SEAL.with(Cell::get)
 }
@@ -86,4 +99,26 @@ pub fn reset_real_seal_ops() {
 #[cfg(not(test))]
 pub(super) fn note_real_seal_op() {
     REAL_SEAL_OPS.with(|c| c.set(c.get().saturating_add(1)));
+}
+
+/// Number of REAL refuse-terminus ops (relock fork + sentinel write)
+/// attempted on this thread since the last [`reset_real_terminus_ops`]. The
+/// Property-6 test asserts a dry-run `--validate-initrm` run leaves this at
+/// zero across ALL four scenarios — closing the hole the seal-op counter
+/// (which the terminus never touched) left open.
+#[must_use]
+pub fn real_terminus_ops() -> u32 {
+    REAL_TERMINUS_OPS.with(Cell::get)
+}
+
+/// Reset the real-terminus-op counter (for a test to measure a single run).
+pub fn reset_real_terminus_ops() {
+    REAL_TERMINUS_OPS.with(|c| c.set(0));
+}
+
+/// Record one real refuse-terminus op (a relock fork or a sentinel write).
+/// Incremented only on the REAL terminus path (not the dry-run seam), so the
+/// Property-6 test can assert a `--validate-initrm` run performs ZERO of them.
+pub(super) fn note_real_terminus_op() {
+    REAL_TERMINUS_OPS.with(|c| c.set(c.get().saturating_add(1)));
 }
