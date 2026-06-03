@@ -216,7 +216,7 @@ pub(crate) async fn run_boot_inside_runtime(
     // then `RebootIntoRescue` (R-1; NOT a halt). No console is open yet, so the
     // non-interactive refuse countdown does not render here; the reboot fires
     // in `execute_terminal_action` after the runtime unwinds.
-    let mut driver_images = match load_driver_images(&config) {
+    let mut driver_images = match load_driver_images(&mut ops, &config) {
         Ok(handle) => handle,
         Err(err) => {
             nmbl_warn!(
@@ -257,7 +257,7 @@ pub(crate) async fn run_boot_inside_runtime(
         &mut driver_images,
     )
     .await;
-    teardown_driver_images_if_normal(&action, &driver_images);
+    teardown_driver_images_if_normal(&mut ops, &action, &driver_images);
     BootOutcome::Done(Box::new(Ok(action)))
 }
 
@@ -276,7 +276,11 @@ pub(crate) fn should_teardown_driver_images(action: &TerminalAction) -> bool {
 /// Tear down the loaded driver images on the NORMAL pre-kexec path, but LEAVE
 /// them mounted when the boot diverted into the capped emergency shell
 /// ([`TerminalAction::Execve`]) — FIX-55.
-fn teardown_driver_images_if_normal(action: &TerminalAction, handle: &DriverImagesHandle) {
+fn teardown_driver_images_if_normal(
+    ops: &mut impl nmbl_init::sys::ops::FsOps,
+    action: &TerminalAction,
+    handle: &DriverImagesHandle,
+) {
     if handle.is_empty() {
         return;
     }
@@ -287,7 +291,7 @@ fn teardown_driver_images_if_normal(action: &TerminalAction, handle: &DriverImag
         );
         return;
     }
-    if let Err(err) = detach_all_driver_images(handle) {
+    if let Err(err) = detach_all_driver_images(ops, handle) {
         nmbl_warn!("driver-image teardown reported an error (continuing): {err}");
     }
 }

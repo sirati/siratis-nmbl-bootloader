@@ -183,7 +183,8 @@ fn teardown_of_empty_handle_on_kexec_is_a_noop() {
     // the handle is empty and the kexec-path teardown is a harmless no-op.
     let handle = DriverImagesHandle::empty();
     assert!(handle.is_empty());
-    detach_all_driver_images(&handle).expect("empty teardown is a no-op Ok");
+    let mut ops = nmbl_init::sys::ops::RealSys::sync_only();
+    detach_all_driver_images(&mut ops, &handle).expect("empty teardown is a no-op Ok");
     // The decision predicate still says "tear down" on Kexec; the empty-handle
     // guard inside `teardown_driver_images_if_normal` is what makes it a no-op.
     assert!(should_teardown_driver_images(&TerminalAction::Kexec));
@@ -258,7 +259,8 @@ fn staged_rerun_driver_image_is_registered_for_teardown() {
     );
     // Normal terminus ⇒ the whole set (base + staged) is torn down.
     assert!(should_teardown_driver_images(&TerminalAction::Kexec));
-    detach_all_driver_images(&accumulator).expect("teardown of the combined set is Ok");
+    let mut ops = nmbl_init::sys::ops::RealSys::sync_only();
+    detach_all_driver_images(&mut ops, &accumulator).expect("teardown of the combined set is Ok");
     // Capped-shell divert ⇒ left mounted for inspection (no secrets, FIX-55).
     assert!(!should_teardown_driver_images(&execve_action()));
 }

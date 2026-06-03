@@ -71,6 +71,8 @@ use crate::imageload::DriverImagesHandle;
 #[cfg(feature = "staged-boot")]
 use crate::policy::AttestedVolume;
 #[cfg(feature = "staged-boot")]
+use crate::sys::ops::SysOps;
+#[cfg(feature = "staged-boot")]
 use crate::sys::poller::LocalSender;
 #[cfg(feature = "staged-boot")]
 use crate::ui::{BootReporter, SessionInteraction, SkipSelector};
@@ -96,7 +98,14 @@ use crate::ui::{BootReporter, SessionInteraction, SkipSelector};
 /// the PRISTINE base at that point, so the caller's shared refuse render relocks
 /// against `config_before` (FIX-32/FIX-35).
 #[cfg(feature = "staged-boot")]
-pub async fn apply_staged_boot(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "staged-boot threads the ops seam (so --validate-initrm dry-runs the \
+              fragment verify + re-run) alongside the security context (attested \
+              volume + gate hooks); each is load-bearing"
+)]
+pub async fn apply_staged_boot<S: SysOps>(
+    ops: &mut S,
     attested: AttestedVolume,
     config: &mut Config,
     reporter: &mut BootReporter<'_, '_>,
@@ -124,6 +133,7 @@ pub async fn apply_staged_boot(
     // transactional guarantee (base untouched) backs the refuse against the
     // pristine config (FIX-32/FIX-35).
     match apply_inner(
+        ops,
         &attested,
         config,
         reporter,
@@ -160,7 +170,13 @@ pub(super) fn staged_boot_enabled(config: &Config) -> bool {
 /// failure — every other step runs either before the merge or on the already
 /// merged-and-validated config).
 #[cfg(feature = "staged-boot")]
-async fn apply_inner(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors apply_staged_boot: the ops seam plus the security context \
+              both flow through this fallible body"
+)]
+async fn apply_inner<S: SysOps>(
+    ops: &mut S,
     attested: &AttestedVolume,
     config: &mut Config,
     reporter: &mut BootReporter<'_, '_>,
@@ -170,8 +186,9 @@ async fn apply_inner(
     driver_images: &mut DriverImagesHandle,
 ) -> Result<Vec<KeyInjection>> {
     // (a) SINGLE-fd verify the staged image AND the fragment — each over its
-    // own pinned fd, before anything is loaded or merged.
-    verify::verify_staged_blobs(attested, config)?;
+    // own pinned fd, before anything is loaded or merged. The blob opens route
+    // through the `FsOps` seam so `--validate-initrm` verifies the shipped bytes.
+    verify::verify_staged_blobs(ops, attested, config)?;
 
     // (b)+(c) load the fragment, then TRANSACTIONALLY merge it into the base
     // config (validate-then-swap; base untouched on a validate failure).
@@ -183,6 +200,7 @@ async fn apply_inner(
     // staged driver images load into `driver_images` so they ride the base
     // set's measure + teardown bookkeeping (#28 / LOW-B).
     rerun::rerun_merged_effects(
+        ops,
         config,
         reporter,
         session,

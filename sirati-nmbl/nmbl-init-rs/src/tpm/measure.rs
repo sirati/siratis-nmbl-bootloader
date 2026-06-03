@@ -45,9 +45,9 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::generations::Generation;
 use crate::nmbl_info;
+use crate::sys::ops::TpmOps;
 
-use super::transport::TpmDevice;
-use super::{LOCK_PCR, pcr_extend};
+use super::LOCK_PCR;
 
 /// A driver-image reference contributed to the PCR-11 measurement (event #4).
 ///
@@ -179,9 +179,12 @@ pub fn predict_handoff_pcr(
 ///
 /// Posture gating (measure-on vs measure-off) and fail-closed routing live in
 /// the caller ([`crate::boot::handoff`]); this function only performs the
-/// extends and reports success/failure. It opens `/dev/tpmrm0` ONCE and reuses
-/// the handle for every extend.
-pub fn extend_handoff(
+/// extends and reports success/failure. Each extend is routed through the
+/// [`TpmOps`] seam so a `--validate-initrm` dry-run records-but-no-ops it
+/// (never opening `/dev/tpmrm0` nor extending a real PCR); `RealSys` performs
+/// the byte-identical live extend.
+pub fn extend_handoff<S: TpmOps>(
+    ops: &mut S,
     _config: &Config,
     generation: &Generation,
     kernel_digest: &[u8; 64],
@@ -190,9 +193,8 @@ pub fn extend_handoff(
     driver_images: &[DriverImageRef],
 ) -> Result<()> {
     let events = handoff_events(kernel_digest, initrd_digest, cmdline, driver_images);
-    let dev = TpmDevice::open()?;
     for event in &events {
-        pcr_extend(&dev, LOCK_PCR, event)?;
+        ops.pcr_extend(LOCK_PCR, event)?;
     }
     nmbl_info!(
         "measure: extended PCR-{} with {} handoff event(s) for generation {} (kernel+initrd+cmdline+{} image(s))",

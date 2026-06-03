@@ -5,6 +5,21 @@
 use super::*;
 use std::path::PathBuf;
 
+use crate::sys::ops::dryrun::{ClosureView, DryRunScenario, DryRunSys};
+
+/// A real-FS-backed, side-effect-free [`SysOps`] for the verify-gate and
+/// measure-handoff tests: a [`DryRunSys`] rooted at `/`, so `open_ro` /
+/// `read_file` resolve the absolute tempdir paths the tests create as an
+/// identity — the verify streams the exact bytes a `RealSys` open would, with
+/// no real side effects elsewhere. The measure paths return before any TPM op,
+/// so the closure root is never probed there.
+fn dryrun_ops() -> DryRunSys {
+    DryRunSys::new(
+        ClosureView::new(PathBuf::from("/")),
+        DryRunScenario::NormalBoot,
+    )
+}
+
 fn gen_for(params: &[&str]) -> Generation {
     Generation {
         number: 42,
@@ -114,7 +129,7 @@ fn verify_proceeds_when_signing_disabled() {
     let cfg = config_signing_disabled();
     let g = gen_for(&["root=/dev/sda1"]);
     assert!(
-        verify_generation_signature(&cfg, &g).is_ok(),
+        verify_generation_signature(&dryrun_ops(), &cfg, &g).is_ok(),
         "disabled signing must let the boot proceed"
     );
 }
@@ -132,8 +147,9 @@ fn measure_off_is_a_noop() {
     );
     let g = gen_for(&["root=/dev/sda1"]);
     let no_images = crate::imageload::DriverImagesHandle::empty();
+    let mut ops = dryrun_ops();
     assert!(
-        measure_handoff(&cfg, &g, None, "init=/sbin/init", &no_images).is_ok(),
+        measure_handoff(&mut ops, &cfg, &g, None, "init=/sbin/init", &no_images).is_ok(),
         "measure-off must be a no-op even with no verified generation",
     );
 }
@@ -213,7 +229,8 @@ mod secure_boot {
         let cfg = config_with_posture(&boot, true, true);
         let g = on_disk_generation(tmp.path());
 
-        let err = verify_generation_signature(&cfg, &g).expect_err("enforce + no sig must refuse");
+        let err = verify_generation_signature(&dryrun_ops(), &cfg, &g)
+            .expect_err("enforce + no sig must refuse");
         assert!(
             matches!(err, NmblError::PolicyRefused { .. }),
             "expected PolicyRefused, got {err:?}",
@@ -232,7 +249,7 @@ mod secure_boot {
         let g = on_disk_generation(tmp.path());
 
         assert!(
-            verify_generation_signature(&cfg, &g).is_ok(),
+            verify_generation_signature(&dryrun_ops(), &cfg, &g).is_ok(),
             "audit mode must proceed past a missing signature",
         );
     }
@@ -252,7 +269,8 @@ mod secure_boot {
         );
         let g = gen_for(&["root=/dev/sda1"]);
         let no_images = crate::imageload::DriverImagesHandle::empty();
-        let err = measure_handoff(&cfg, &g, None, "init=/sbin/init", &no_images)
+        let mut ops = super::dryrun_ops();
+        let err = measure_handoff(&mut ops, &cfg, &g, None, "init=/sbin/init", &no_images)
             .expect_err("measure required + unverified ⇒ refuse");
         assert!(
             matches!(err, NmblError::PolicyRefused { .. }),
@@ -283,7 +301,7 @@ mod secure_boot {
         let g = on_disk_generation(tmp.path());
 
         assert!(
-            verify_generation_signature(&cfg, &g).is_ok(),
+            verify_generation_signature(&dryrun_ops(), &cfg, &g).is_ok(),
             "disabled signing proceeds on a secure-boot build too",
         );
     }

@@ -26,7 +26,7 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::imageload::{DriverImagesHandle, load_driver_images};
 use crate::modules::load_explicit_modules;
-use crate::sys::ops::RealSys;
+use crate::sys::ops::SysOps;
 use crate::sys::poller::LocalSender;
 use crate::ui::{BootReporter, SessionInteraction, SkipSelector, TuiPasswordSupplier};
 
@@ -36,7 +36,13 @@ use crate::ui::{BootReporter, SessionInteraction, SkipSelector, TuiPasswordSuppl
 /// # Errors
 /// Propagates the first failing effect (module load, driver-image
 /// verify/mount/load, or activation) so the caller refuses the boot.
-pub(super) async fn rerun_merged_effects(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the staged re-run threads the ops seam alongside the security \
+              context it shares with the base post-console phase"
+)]
+pub(super) async fn rerun_merged_effects<S: SysOps>(
+    ops: &mut S,
     config: &mut Config,
     reporter: &mut BootReporter<'_, '_>,
     session: &SessionInteraction,
@@ -44,15 +50,13 @@ pub(super) async fn rerun_merged_effects(
     sender: &LocalSender,
     driver_images: &mut DriverImagesHandle,
 ) -> Result<Vec<KeyInjection>> {
-    // Adapter over the runtime poller sender so the staged re-run routes its
-    // module loads + activations through the same `SysOps` seam the base
-    // post-console phase uses; the staged path is real-boot-only, so a genuine
-    // `RealSys` is always the right impl here.
-    let mut ops = RealSys::new(sender);
+    // The staged re-run routes its module loads + activations through the SAME
+    // `SysOps` seam the base post-console phase uses (rather than a hardcoded
+    // `RealSys`), so `--validate-initrm` dry-runs the staged effects too.
 
     // (1) Explicit modules the fragment may have added.
     let _ = reporter.set_phase("staged-boot: re-loading explicit kernel modules");
-    load_explicit_modules(&mut ops, config, reporter)?;
+    load_explicit_modules(ops, config, reporter)?;
 
     // (2) The (now-verified) staged driver images. The loader single-fd verifies
     // every declared image under the driver-image domain before loop-mounting —
@@ -66,7 +70,7 @@ pub(super) async fn rerun_merged_effects(
     // refs also join the PCR-11 measure event #4 (#28), so a staged driver is
     // measured exactly like a baseline one.
     let _ = reporter.set_phase("staged-boot: loading staged driver images");
-    let staged_handle = load_driver_images(config)?;
+    let staged_handle = load_driver_images(ops, config)?;
     for image in staged_handle.images() {
         driver_images.push(image.clone());
     }
@@ -77,5 +81,5 @@ pub(super) async fn rerun_merged_effects(
     // for the kexec path. A config with no activations is a cheap no-op.
     let _ = reporter.set_phase("staged-boot: running staged activations");
     let mut supplier = TuiPasswordSupplier::new(config, session, skip_selector);
-    run_all_activations(&mut ops, config, reporter, Some(&mut supplier), sender).await
+    run_all_activations(ops, config, reporter, Some(&mut supplier), sender).await
 }

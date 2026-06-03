@@ -12,12 +12,11 @@
 
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{Mode, OFlags};
-
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::policy::AttestedVolume;
 use crate::sig::{self, DOMAIN_DRIVER_IMAGE, DOMAIN_STAGED_FRAGMENT, PolicyDecision};
+use crate::sys::ops::FsOps;
 
 /// Verify BOTH staged blobs — the image and the fragment — each single-fd.
 ///
@@ -30,7 +29,11 @@ use crate::sig::{self, DOMAIN_DRIVER_IMAGE, DOMAIN_STAGED_FRAGMENT, PolicyDecisi
 /// # Errors
 /// [`NmblError::Signature`] (wrapped) when either blob fails to open or its
 /// signature is refused under enforcement.
-pub(super) fn verify_staged_blobs(attested: &AttestedVolume, config: &Config) -> Result<()> {
+pub(super) fn verify_staged_blobs(
+    fs: &dyn FsOps,
+    attested: &AttestedVolume,
+    config: &Config,
+) -> Result<()> {
     let staged = config.staged.as_ref().ok_or_else(missing_staged)?;
     let mp = attested.mountpoint();
 
@@ -38,6 +41,7 @@ pub(super) fn verify_staged_blobs(attested: &AttestedVolume, config: &Config) ->
     let image_path = join_under(mp, &staged.image);
     let image_sig = sidecar_path(&image_path, &config.signing.sig_path_suffix);
     verify_one(
+        fs,
         &image_path,
         &image_sig,
         DOMAIN_DRIVER_IMAGE,
@@ -51,6 +55,7 @@ pub(super) fn verify_staged_blobs(attested: &AttestedVolume, config: &Config) ->
     let fragment_path = join_under(mp, &staged.fragment);
     let fragment_sig = join_under(mp, &staged.sig);
     verify_one(
+        fs,
         &fragment_path,
         &fragment_sig,
         DOMAIN_STAGED_FRAGMENT,
@@ -71,8 +76,11 @@ pub(super) fn resolve_fragment_path(attested: &AttestedVolume, config: &Config) 
 
 /// Open `blob` read-only ONCE and verify it against `sig_path` under `domain`,
 /// then apply the operator's signing posture. The pinned fd hashed here is the
-/// only fd opened for the blob (FIX-02).
+/// only fd opened for the blob (FIX-02); the open routes through
+/// [`FsOps::open_ro`] so `--validate-initrm` verifies the SHIPPED bytes from the
+/// closure with no path-reopen, while the real boot opens the on-disk blob.
 fn verify_one(
+    fs: &dyn FsOps,
     blob: &Path,
     sig_path: &Path,
     domain: &'static [u8],
@@ -81,16 +89,13 @@ fn verify_one(
 ) -> Result<()> {
     use std::os::fd::AsFd;
 
-    let fd =
-        rustix::fs::open(blob, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).map_err(|e| {
-            NmblError::Signature {
-                stage: label,
-                detail: format!("opening {} for verify: {e}", blob.display()),
-            }
-        })?;
+    let file = fs.open_ro(blob).map_err(|e| NmblError::Signature {
+        stage: label,
+        detail: format!("opening {} for verify: {e}", blob.display()),
+    })?;
 
     let desc = blob.display().to_string();
-    let verify_result = sig::verify_image_fd(fd.as_fd(), &desc, Some(sig_path), domain, config);
+    let verify_result = sig::verify_image_fd(file.as_fd(), &desc, Some(sig_path), domain, config);
 
     match sig::apply_policy(config, verify_result) {
         PolicyDecision::Proceed => Ok(()),
