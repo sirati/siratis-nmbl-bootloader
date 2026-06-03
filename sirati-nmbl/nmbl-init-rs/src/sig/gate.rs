@@ -51,6 +51,7 @@
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::generations::Generation;
+use crate::sys::ops::FsOps;
 use crate::{nmbl_info, nmbl_warn};
 
 use super::verify::{self, VerifyPolicy};
@@ -141,7 +142,11 @@ pub fn apply_policy(config: &Config, verify_result: Result<()>) -> PolicyDecisio
 /// posture is the operator declining the feature, not an allow-unsigned bypass
 /// of an enabled one (FIX-04).
 #[must_use]
-pub fn ensure_generation_signed_gated(config: &Config, generation: &Generation) -> PolicyDecision {
+pub fn ensure_generation_signed_gated(
+    fs: &dyn FsOps,
+    config: &Config,
+    generation: &Generation,
+) -> PolicyDecision {
     // signing safety: signing-disabled is the operator declining the feature,
     // NOT an allow-unsigned bypass of an enabled one (FIX-04). No keys, no
     // posture, nothing to verify against; proceed without pretending to verify.
@@ -149,7 +154,7 @@ pub fn ensure_generation_signed_gated(config: &Config, generation: &Generation) 
         nmbl_info!("signature verification disabled (signing.enable = false); skipping gate");
         return PolicyDecision::Proceed;
     }
-    let result = verify::ensure_generation_signed(config, generation);
+    let result = verify::ensure_generation_signed(fs, config, generation);
     apply_policy(config, result)
 }
 
@@ -253,6 +258,19 @@ mod tests {
             kernel_params: Vec::new(),
             label: String::new(),
         };
-        assert!(ensure_generation_signed_gated(&cfg, &g).is_proceed());
+        // The disabled short-circuit fires before any `fs` op, so a dry-run
+        // ops over a non-existent closure root is never touched.
+        let fs = dryrun_fs();
+        assert!(ensure_generation_signed_gated(&fs, &cfg, &g).is_proceed());
+    }
+
+    /// A side-effect-free [`FsOps`] for the gate tests: a [`DryRunSys`] over a
+    /// closure that is never read (the disabled short-circuit returns first).
+    fn dryrun_fs() -> crate::sys::ops::dryrun::DryRunSys {
+        use crate::sys::ops::dryrun::{ClosureView, DryRunScenario, DryRunSys};
+        DryRunSys::new(
+            ClosureView::new(std::path::PathBuf::from("/nonexistent")),
+            DryRunScenario::NormalBoot,
+        )
     }
 }

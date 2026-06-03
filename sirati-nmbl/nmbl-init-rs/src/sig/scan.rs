@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::generations::{Generation, gen_id};
+use crate::sys::ops::FsOps;
 
 /// Sub-directory under the boot mountpoint holding all per-generation sidecar
 /// dirs. Frozen as part of the R-4 layout the install signer also hard-codes.
@@ -91,11 +92,14 @@ pub fn generation_sig_dir(config: &Config, generation: &Generation) -> Result<Pa
 /// Locate one generation sidecar (kernel or initrd) and report whether it is
 /// present.
 ///
-/// Builds `<boot>/nmbl/sigs/<gen-id>/<stem><suffix>` and stats it. A read error
-/// other than "not found" (e.g. EACCES on the boot FS) is surfaced as
-/// [`NmblError::Io`] so a broken boot partition is not mistaken for a missing
-/// sidecar; plain absence resolves to `present: false`.
+/// Builds `<boot>/nmbl/sigs/<gen-id>/<stem><suffix>` and probes it via
+/// [`FsOps::exists`] so a `--validate-initrm` dry-run answers the
+/// present/absent question against the extracted closure rather than the live
+/// boot partition; on `RealSys` the probe is a plain `try_exists`. A stat error
+/// (permission, broken symlink) collapses to `present: false`, matching the
+/// ops-layer presence contract.
 pub fn resolve_sig_sidecar(
+    fs: &dyn FsOps,
     config: &Config,
     generation: &Generation,
     blob: GenBlob,
@@ -104,16 +108,7 @@ pub fn resolve_sig_sidecar(
     let suffix = config.signing.sig_path_suffix.as_str();
     let path = dir.join(format!("{}{suffix}", blob.stem()));
 
-    let present = match std::fs::metadata(&path) {
-        Ok(meta) => meta.is_file(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-        Err(source) => {
-            return Err(NmblError::Io {
-                source,
-                context: format!("stat generation sidecar {}", path.display()),
-            });
-        }
-    };
+    let present = fs.exists(&path);
 
     Ok(SidecarResolution { path, present })
 }
@@ -127,9 +122,21 @@ pub fn resolve_sig_sidecar(
 )]
 mod tests {
     use super::*;
+    use crate::sys::ops::dryrun::{ClosureView, DryRunScenario, DryRunSys};
     use std::os::unix::fs::symlink;
     use std::path::Path;
     use tempfile::TempDir;
+
+    /// A real-FS-backed [`FsOps`] for the resolution tests: a [`DryRunSys`]
+    /// rooted at `/`, so `exists` is an identity `try_exists` over the absolute
+    /// tempdir paths the tests create — exactly the presence signal the real
+    /// boot probes.
+    fn runtime_fs() -> DryRunSys {
+        DryRunSys::new(
+            ClosureView::new(PathBuf::from("/")),
+            DryRunScenario::NormalBoot,
+        )
+    }
 
     /// Build a `Config` whose `runtime_boot_mountpoint` is `boot` and whose
     /// signing suffix is the default `.sig`. `runtime_boot_mountpoint` is
@@ -175,7 +182,8 @@ mod tests {
         let cfg = config_with_boot(&boot);
         let g = generation_with_toplevel(&top);
 
-        let res = resolve_sig_sidecar(&cfg, &g, GenBlob::Kernel).expect("resolve ok");
+        let fs = runtime_fs();
+        let res = resolve_sig_sidecar(&fs, &cfg, &g, GenBlob::Kernel).expect("resolve ok");
         assert!(!res.present, "no file written ⇒ absent");
         // Path layout: <boot>/nmbl/sigs/<gen-id>/kernel.sig
         assert_eq!(
@@ -198,8 +206,9 @@ mod tests {
         std::fs::write(dir.join("kernel.sig"), b"k").expect("kernel sig");
         std::fs::write(dir.join("initrd.sig"), b"i").expect("initrd sig");
 
-        let k = resolve_sig_sidecar(&cfg, &g, GenBlob::Kernel).expect("kernel resolve");
-        let i = resolve_sig_sidecar(&cfg, &g, GenBlob::Initrd).expect("initrd resolve");
+        let fs = runtime_fs();
+        let k = resolve_sig_sidecar(&fs, &cfg, &g, GenBlob::Kernel).expect("kernel resolve");
+        let i = resolve_sig_sidecar(&fs, &cfg, &g, GenBlob::Initrd).expect("initrd resolve");
         assert!(k.present && i.present);
         assert!(k.path.ends_with("kernel.sig"));
         assert!(i.path.ends_with("initrd.sig"));
@@ -218,14 +227,18 @@ mod tests {
         cfg.runtime_boot_mountpoint = Some(boot.to_path_buf());
         let g = generation_with_toplevel(&top);
 
-        let res = resolve_sig_sidecar(&cfg, &g, GenBlob::Initrd).expect("resolve");
+        let fs = runtime_fs();
+        let res = resolve_sig_sidecar(&fs, &cfg, &g, GenBlob::Initrd).expect("resolve");
         assert!(res.path.ends_with("initrd.mldsa"));
     }
 
     #[test]
-    fn directory_in_place_of_sidecar_is_absent_not_present() {
-        // A directory at the sidecar path is not a usable sidecar; the locator
-        // must report it absent rather than present-but-unparseable.
+    fn resolution_reports_ops_presence() {
+        // The locator now reports the ops-layer presence signal (`FsOps::exists`)
+        // for the resolved path; it no longer distinguishes file from directory.
+        // A non-file at the path is rejected downstream when the verify pipeline
+        // reads + parses the sidecar bytes (a directory fails `read_file`), so
+        // the present/absent locator stays a thin presence probe.
         let tmp = TempDir::new().expect("temp");
         let boot = tmp.path().join("boot");
         let top = make_toplevel(tmp.path(), "jkl012-nixos-system");
@@ -234,8 +247,12 @@ mod tests {
         let dir = generation_sig_dir(&cfg, &g).expect("dir");
         std::fs::create_dir_all(dir.join("kernel.sig")).expect("dir-as-sidecar");
 
-        let res = resolve_sig_sidecar(&cfg, &g, GenBlob::Kernel).expect("resolve");
-        assert!(!res.present, "a directory is not a usable sidecar");
+        let fs = runtime_fs();
+        let res = resolve_sig_sidecar(&fs, &cfg, &g, GenBlob::Kernel).expect("resolve");
+        assert!(
+            res.present,
+            "an existing path reports present via FsOps::exists"
+        );
     }
 
     #[test]
@@ -245,7 +262,8 @@ mod tests {
         // No runtime_boot_mountpoint set.
         let cfg = toml::from_str::<Config>("[paths]\nshell = \"/bin/sh\"\n").expect("config");
         let g = generation_with_toplevel(&top);
-        let err = resolve_sig_sidecar(&cfg, &g, GenBlob::Kernel).expect_err("must error");
+        let fs = runtime_fs();
+        let err = resolve_sig_sidecar(&fs, &cfg, &g, GenBlob::Kernel).expect_err("must error");
         assert!(matches!(
             err,
             NmblError::Signature {
