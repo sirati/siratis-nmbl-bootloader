@@ -40,6 +40,13 @@ pub mod shell;
 pub mod sig;
 #[cfg(feature = "image-splash")]
 pub mod splash;
+/// Signed staged-boot fragment apply (FEATURE-#2): under the priority gate's
+/// attested volume, single-fd verify a staged driver image + signed config
+/// fragment, transactionally validate-then-swap merge the fragment into the
+/// running `Config`, and re-run the affected modules/drivers/activations. All
+/// contents are `#[cfg(feature = "staged-boot")]`; the module is otherwise
+/// empty (no staged path without signature verification — FIX-26).
+pub mod staged;
 #[cfg(feature = "stateful")]
 pub mod state;
 pub mod sys;
