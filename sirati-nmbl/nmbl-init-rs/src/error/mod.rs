@@ -120,6 +120,20 @@ pub enum NmblError {
         source: Box<NmblError>,
     },
 
+    /// A driver-image load step failed: locating, verifying, loop-binding,
+    /// mounting, or `finit_module`-ing one of the optional signed driver
+    /// squashfs blobs (#1 / FEATURE-#1). `stage` is a stable short tag naming
+    /// the step that refused (e.g. `"loop-alloc"`, `"loop-configure"`,
+    /// `"mount"`, `"finit"`); the boxed `source` carries the underlying
+    /// failure. A driver-image failure routes through `refuse_unsigned` like
+    /// every other trust-path refusal (R-1), so it never silently continues.
+    #[error("driver-image stage {stage} failed: {source}")]
+    DriverImage {
+        stage: &'static str,
+        #[source]
+        source: Box<NmblError>,
+    },
+
     #[error("recovered from panic (report at {report_path})")]
     Panicked { report_path: PathBuf },
 

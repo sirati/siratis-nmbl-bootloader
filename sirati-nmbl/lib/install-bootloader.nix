@@ -23,6 +23,10 @@
   nmblConfigToml,
   nmblRescueSquashfs,
   nmblUki,
+  # Install-time driver-image staging + `nmbl-sign` signing shell (#25a).
+  # Empty string when no driver images are enabled (default keeps older
+  # callers evaluable).
+  driverImageInstallShell ? "",
 }:
 
 let
@@ -172,6 +176,12 @@ pkgs.writeScript "install-nmbl-bootloader" ''
       echo "✓ Rescue squashfs installed: ${escapedDest}"
     ''
   )}
+
+  # Optional signed driver-image squashfs blobs (#25a). Each is staged onto
+  # the ESP and signed in place with `nmbl-sign --domain driver-image`
+  # (impure ML-DSA key read at install time). Empty string when no driver
+  # images are enabled.
+  ${driverImageInstallShell}
 
   ${lib.optionalString (cfg.splash.enable && cfg.splash.backgroundLocation == "boot-partition") (
     let
