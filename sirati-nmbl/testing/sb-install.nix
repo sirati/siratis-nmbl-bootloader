@@ -15,13 +15,22 @@
 #
 # The orchestrator reads the test keys from a RUNTIME directory (`--keys-dir`,
 # default `$NMBL_TEST_KEYS_DIR`, else `$PWD`'s `testing/keys`). It stages them
-# into the kexec-installer at the on-disk paths the config declares
-# (`/run/nmbl-test-keys/insecure-test-{gen.key,sb-db.key,sb-db.crt}`) between
-# nixos-anywhere's disko and install phases, so `installBootLoader` signs in
-# place. The committed test private key is PUBLICLY KNOWN (testing/keys/
+# between nixos-anywhere's disko and install phases at the on-disk paths the
+# config declares (`/var/lib/nmbl-test-keys/insecure-test-{gen.key,sb-db.key,
+# sb-db.crt}`) so `installBootLoader` signs in place. CRUCIALLY they are staged
+# under `/mnt/var/lib/nmbl-test-keys` (the freshly-installed root disko mounted),
+# because nixos-anywhere's install phase runs `installBootLoader` via
+# `nixos-install`, which `nixos-enter --root /mnt` CHROOTs into that root and
+# runs `switch-to-configuration boot` activation before signing — so the
+# absolute `/var/lib/nmbl-test-keys/...` key path is resolved against `/mnt`.
+# /var/lib (not /run!) because activation mounts a fresh tmpfs over /run inside
+# the chroot just before installBootLoader, which would shadow a /run-staged
+# key; /var/lib is a normal persistent dir activation never overmounts. The
+# keys are removed again after the install phase so the key does not persist on
+# the disk. The committed test private key is PUBLICLY KNOWN (testing/keys/
 # README.md) and only ever signs TEST artifacts; passing it as a runtime PATH
 # (not a Nix path literal) keeps it out of the store, mirroring a real operator
-# whose `db` key lives at `/run/secrets/...`.
+# whose `db` key lives at an on-disk secret path.
 
 {
   nixpkgs,
@@ -76,12 +85,30 @@ let
         CORES="4"
         SSH_KEY_FILE="''${NMBL_SSH_KEY:-}"
         # Where the INSTALL-TIME signing keys are read FROM at runtime. They are
-        # staged into the rescue installer's /run/nmbl-test-keys/ so NMBL's
-        # install-time signing reads them by PATH (never a derivation input).
+        # staged into the rescue installer so NMBL's install-time signing reads
+        # them by PATH (never a derivation input).
         KEYS_DIR="''${NMBL_TEST_KEYS_DIR:-$PWD/testing/keys}"
         # The on-disk paths the test-secure-boot config declares (its
-        # generationKeyFile / uki.{keyFile,certFile} defaults).
-        STAGE_DIR="/run/nmbl-test-keys"
+        # generationKeyFile / uki.{keyFile,certFile} defaults) are under
+        # /var/lib/nmbl-test-keys. nixos-anywhere runs installBootLoader (the
+        # install-time signing) via `nixos-install`, which `nixos-enter
+        # --root /mnt` CHROOTs into the freshly-installed root and runs
+        # `switch-to-configuration boot` (full activation) before signing.
+        # Inside that chroot the absolute key path /var/lib/nmbl-test-keys/...
+        # is resolved against /mnt, so the keys must physically live at
+        # /mnt/var/lib/nmbl-test-keys to be visible to the signer.
+        #
+        # WHY /var/lib AND NOT /run: activation mounts a FRESH tmpfs over /run
+        # (the system's mounts.sh runs `specialMount "tmpfs" "/run"`) just
+        # before installBootLoader; anything staged under /run/... is shadowed
+        # by that empty tmpfs and unreadable. /var/lib is a normal persistent
+        # directory activation never overmounts, so the staged key survives.
+        # We stage under $TARGET_ROOT/var/lib/nmbl-test-keys (= the chroot's
+        # /var/lib/nmbl-test-keys) and remove it again after install so the
+        # private key never persists on the installed disk.
+        TARGET_ROOT="/mnt"
+        STAGE_REL="var/lib/nmbl-test-keys"
+        STAGE_DIR="$TARGET_ROOT/$STAGE_REL"
 
         usage() {
           cat <<EOF
@@ -250,18 +277,29 @@ let
           --phases kexec,disko
 
         echo
-        echo "===== STAGE 2b: stage install-time signing keys into the installer ====="
+        echo "===== STAGE 2b: stage install-time signing keys into the install chroot ====="
         # Copy the committed test keys to the paths the config declares
         # (generationKeyFile / uki.{keyFile,certFile}). The install-time signer
         # reads them from here; they are NEVER a Nix derivation input.
+        #
+        # IMPORTANT: nixos-anywhere's install phase runs installBootLoader via
+        # `nixos-install`, which `nixos-enter --root /mnt` CHROOTs into the new
+        # root and runs activation before signing. The config's absolute key
+        # path /var/lib/nmbl-test-keys/... is therefore resolved against /mnt,
+        # so the keys must physically live at $TARGET_ROOT/var/lib/nmbl-test-keys
+        # (the chroot's /var/lib/nmbl-test-keys) — NOT the installer's own /run,
+        # which the chroot cannot see, and NOT /mnt/run, which activation's
+        # tmpfs-over-/run shadows. disko already mounted $TARGET_ROOT.
         ssh -i "$KEY" -p "$PORT" "''${SSH_OPTS[@]}" root@localhost \
-          "mkdir -p $STAGE_DIR && chmod 700 $STAGE_DIR"
+          "test -d $TARGET_ROOT || { echo 'ERROR: $TARGET_ROOT not mounted; disko phase must run first' >&2; exit 1; }
+           mkdir -p $STAGE_DIR && chmod 700 $STAGE_DIR"
         scp -i "$KEY" -P "$PORT" "''${SSH_OPTS[@]}" "$GEN_KEY" "root@localhost:$STAGE_DIR/insecure-test-gen.key"
         scp -i "$KEY" -P "$PORT" "''${SSH_OPTS[@]}" "$SB_KEY"  "root@localhost:$STAGE_DIR/insecure-test-sb-db.key"
         scp -i "$KEY" -P "$PORT" "''${SSH_OPTS[@]}" "$SB_CRT"  "root@localhost:$STAGE_DIR/insecure-test-sb-db.crt"
         ssh -i "$KEY" -p "$PORT" "''${SSH_OPTS[@]}" root@localhost \
           "chmod 600 $STAGE_DIR/insecure-test-gen.key $STAGE_DIR/insecure-test-sb-db.key && chmod 644 $STAGE_DIR/insecure-test-sb-db.crt"
-        echo "✓ install-time signing keys staged at $STAGE_DIR (read by PATH, not a derivation)"
+        echo "✓ install-time signing keys staged at $STAGE_DIR"
+        echo "  (visible inside the nixos-enter chroot as /$STAGE_REL; read by PATH, not a derivation)"
 
         echo
         echo "===== STAGE 2c: nixos-anywhere install (NMBL signs UKI + sidecars in place) ====="
@@ -274,6 +312,15 @@ let
           --ssh-option UserKnownHostsFile=/dev/null \
           -i "$KEY" \
           --phases install
+
+        echo
+        echo "===== STAGE 2d: remove staged signing keys from the installed disk ====="
+        # The keys were only needed during installBootLoader's in-chroot signing.
+        # Remove them so the (publicly-known but still private-shaped) test key
+        # never persists on the booted disk; the signed UKI + sidecars remain.
+        ssh -i "$KEY" -p "$PORT" "''${SSH_OPTS[@]}" root@localhost \
+          "rm -rf $STAGE_DIR 2>/dev/null || true"
+        echo "✓ staged signing keys removed from $STAGE_DIR"
 
         echo "Powering off rescue VM..."
         ssh -i "$KEY" -p "$PORT" "''${SSH_OPTS[@]}" root@localhost 'poweroff -f' 2>/dev/null || true
