@@ -309,8 +309,14 @@ let
         scp -i "$KEY" -P "$PORT" "''${SSH_OPTS[@]}" "$GEN_KEY" "root@localhost:$STAGE_DIR/insecure-test-gen.key"
         scp -i "$KEY" -P "$PORT" "''${SSH_OPTS[@]}" "$SB_KEY"  "root@localhost:$STAGE_DIR/insecure-test-sb-db.key"
         scp -i "$KEY" -P "$PORT" "''${SSH_OPTS[@]}" "$SB_CRT"  "root@localhost:$STAGE_DIR/insecure-test-sb-db.crt"
+        # Driver-image signing key (driver-image scenario, #1). Same ML-DSA pair
+        # as the generation key — the baked public anchor verifies BOTH domains —
+        # so stage the SAME committed key at the image-key path the
+        # test-secure-boot-driver config declares (signing.imageKeyFile). A
+        # config that doesn't enable driver images simply never reads it.
+        scp -i "$KEY" -P "$PORT" "''${SSH_OPTS[@]}" "$GEN_KEY" "root@localhost:$STAGE_DIR/insecure-test-image.key"
         ssh -i "$KEY" -p "$PORT" "''${SSH_OPTS[@]}" root@localhost \
-          "chmod 600 $STAGE_DIR/insecure-test-gen.key $STAGE_DIR/insecure-test-sb-db.key && chmod 644 $STAGE_DIR/insecure-test-sb-db.crt"
+          "chmod 600 $STAGE_DIR/insecure-test-gen.key $STAGE_DIR/insecure-test-image.key $STAGE_DIR/insecure-test-sb-db.key && chmod 644 $STAGE_DIR/insecure-test-sb-db.crt"
         echo "✓ install-time signing keys staged at $STAGE_DIR"
         echo "  (visible inside the nixos-enter chroot as /$STAGE_REL; read by PATH, not a derivation)"
 

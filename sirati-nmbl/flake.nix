@@ -496,6 +496,56 @@
         dbCert = ./testing/keys/insecure-test-sb-db.crt;
       };
 
+      # ── Driver-image scenario (#1 / FEATURE-#1) ─────────────────────────────
+      # The test-secure-boot-driver config wires the full secure-boot chain but
+      # adds `boot.nmbl.driverImages` (a signed squashfs carrying `dummy`, a
+      # module NOT in the base initrd) and opens cryptroot with the install
+      # PASSPHRASE so the boot reaches the post-kexec system. Same install-runtime
+      # signing model: the driver squashfs is signed in place by NMBL's
+      # install-time code from the staged `imageKeyFile` PATH — no key in any
+      # derivation.
+      secureBootDriverConfig = testing.mkTestConfigurations."test-secure-boot-driver";
+
+      # Install variant (deferInstallSigning forced off so the nixos-anywhere
+      # install signs the UKI + generation sidecars AND the driver squashfs in
+      # place from the staged key paths).
+      secureBootDriverInstallConfig = testing.mkTestVM (
+        testing.configs."test-secure-boot-driver" // {
+          extraModules =
+            (testing.configs."test-secure-boot-driver".extraModules or [ ])
+            ++ [ { boot.nmbl.signing.deferInstallSigning = lib.mkForce false; } ];
+        }
+      );
+
+      secureBootDriverInstaller = sbInstall.mkSbInstaller {
+        name = "test-secure-boot-driver";
+        config = secureBootDriverInstallConfig;
+        port = "22203";
+      };
+
+      # CLOSURE GUARD: the driver-image install artifact must reference NO signing
+      # private key (the ML-DSA generation/image key NOR the SB `db` key). The
+      # driver squashfs is a PURE derivation; its signature is produced at install
+      # runtime from a staged PATH, so neither key is in the closure.
+      secureBootDriverNoPrivateKey = testKeys.assertAbsentFromClosure {
+        name = "test-secure-boot-driver-no-private-key";
+        rootPaths = [
+          secureBootDriverInstallConfig.config.system.build.diskoScript
+          secureBootDriverInstallConfig.config.system.build.toplevel
+        ];
+        extraKeyPaths = [ ./testing/keys/insecure-test-sb-db.key ];
+      };
+
+      secureBootDriverRunner = testRunners.mkRunner {
+        name = "test-secure-boot-driver";
+        config = secureBootDriverConfig;
+        inherit vmSerialMan;
+        tpm = "tis";
+        secureBoot = true;
+        tpmPersist = true;
+        dbCert = ./testing/keys/insecure-test-sb-db.crt;
+      };
+
       # The runtime inputs every secure-boot scenario needs on PATH.
       sbScenarioInputs = [
         vmSerialMan
@@ -655,6 +705,39 @@
         # to the install-runtime-signed ENROLL disk by mkSbScenarioCheck above.
         extraInputs = [ pkgs.libguestfs-with-appliance ];
       };
+
+      # POSITIVE driver-image scenario (#1 / FEATURE-#1). Boots the
+      # test-secure-boot-driver config: NMBL verifies the signed driver squashfs,
+      # loop-mounts it, and `finit_module`s `dummy` (a module absent from the base
+      # initrd) BEFORE the generation kexec. cryptroot opens with the install
+      # passphrase so the boot reaches the post-kexec shell; the assertion proves
+      # the driver-image load ran+loaded the module from the IMAGE via the
+      # nmbl-init journal marker.
+      checkSbDriverImage = mkSbScenarioCheck {
+        scenario = "driver-image";
+        script = "sb-driver-image.sh";
+        installer = secureBootDriverInstaller;
+        installBin = "sb-install-test-secure-boot-driver";
+        installSubdir = "driver";
+        runner = secureBootDriverRunner;
+      };
+
+      # NEGATIVE driver-image scenario (#1 NEG). The SAME config + signed disk,
+      # but the driver squashfs is CORRUPTED on the FAT32 boot partition before
+      # boot, so the single-fd verify FAILS. Per the IMPLEMENTED enforce-mode
+      # behaviour (imageload/verify.rs → policy::refuse_unsigned, R-1) NMBL
+      # REFUSES and reboots into rescue — it never mounts the bad image. We assert
+      # the refuse, that no driver-image-loaded marker reaches the system, and
+      # that no emergency shell is offered. Needs libguestfs to tamper the disk.
+      checkSbDriverImageBadRefused = mkSbScenarioCheck {
+        scenario = "driver-image-bad-refused";
+        script = "sb-driver-image-bad-refused.sh";
+        installer = secureBootDriverInstaller;
+        installBin = "sb-install-test-secure-boot-driver";
+        installSubdir = "driver";
+        runner = secureBootDriverRunner;
+        extraInputs = [ pkgs.libguestfs-with-appliance ];
+      };
     in
     {
       # The main NixOS module
@@ -709,12 +792,17 @@
         # orchestrator's work dir. `nix build .#sb-install-test-secure-boot`.
         sb-install-test-secure-boot = secureBootInstaller;
         sb-install-test-secure-boot-enroll = secureBootEnrollInstaller;
+        sb-install-test-secure-boot-driver = secureBootDriverInstaller;
         # CLOSURE GUARD (#57 F6b): the secure-boot test INSTALL artifact's closure
         # (diskoScript + toplevel — everything nixos-anywhere ships) must contain
         # NEITHER the ML-DSA generation key NOR the SB `db` private key. Proves
         # the install signs from a runtime PATH, never a derivation input.
         # `nix build .#test-secure-boot-no-private-key`.
         test-secure-boot-no-private-key = secureBootNoPrivateKey;
+        # Same closure guard for the driver-image install artifact (#1): the
+        # driver squashfs is pure, signed at install runtime from a staged PATH,
+        # so no signing key is in its closure.
+        test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;
       };
 
       # Build-only validation gates surfaced for CI / `nix flake check`-style
@@ -724,6 +812,7 @@
       checks.${system} = {
         insecure-test-key-absent = insecureKeyAbsentFromProd;
         test-secure-boot-no-private-key = secureBootNoPrivateKey;
+        test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;
       };
 
       # Test configurations
@@ -776,6 +865,18 @@
           type = "app";
           program = "${checkSbBadSigRefused}/bin/test-secure-boot-bad-sig-refused";
         };
+        # Driver-image scenarios (#1 / FEATURE-#1): a signed driver squashfs
+        # carrying a module absent from the base initrd is verified, loop-mounted
+        # and loaded pre-kexec (positive), or refused when corrupted (negative).
+        # `nix run .#test-secure-boot-driver-image`.
+        test-secure-boot-driver-image = {
+          type = "app";
+          program = "${checkSbDriverImage}/bin/test-secure-boot-driver-image";
+        };
+        test-secure-boot-driver-image-bad-refused = {
+          type = "app";
+          program = "${checkSbDriverImageBadRefused}/bin/test-secure-boot-driver-image-bad-refused";
+        };
         # Standalone runtime SB-install orchestrators (#57 F6b). Run one to
         # produce the install-runtime-SIGNED disk on its own (the scenario apps
         # run it automatically, but #57 can pre-stage it). The disk is signed by
@@ -788,6 +889,10 @@
         sb-install-test-secure-boot-enroll = {
           type = "app";
           program = "${secureBootEnrollInstaller}/bin/sb-install-test-secure-boot-enroll";
+        };
+        sb-install-test-secure-boot-driver = {
+          type = "app";
+          program = "${secureBootDriverInstaller}/bin/sb-install-test-secure-boot-driver";
         };
       } // nixosAnywhereTestApps // testMatrix.apps // nixosAnywhereInstallAliases;
 
