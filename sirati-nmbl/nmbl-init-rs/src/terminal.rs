@@ -27,6 +27,7 @@ use nix::unistd::dup2;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
+use crate::policy::Sealed;
 
 /// Path the dispatcher opens to dup `0/1/2` onto before `execve`. We
 /// target `/dev/console` (rather than a hardcoded `/dev/tty1`) so the
@@ -107,6 +108,67 @@ pub enum TerminalAction {
     /// before the value reached this variant — only the cutover
     /// syscall is deferred to the dispatcher.
     Kexec,
+
+    /// `reboot(RB_AUTOBOOT)` — the SOLE untrusted-image / policy refuse
+    /// terminus (R-1). Reached after [`crate::policy::relock_and_refuse`]
+    /// has capped the lock PCR, closed every TPM-unsealed mapper,
+    /// relocked LUKS, and written the rescue sentinel; the non-interactive
+    /// refuse countdown then ran (Enter / timeout) before unwinding here.
+    /// The dispatcher reboots straight back into firmware, which — with
+    /// the sentinel now present — boots the rescue path with the TPM still
+    /// locked.
+    ///
+    /// **Constructible ONLY via [`TerminalAction::reboot_into_rescue`]**,
+    /// which requires a [`Sealed`] witness by value. The variant carries
+    /// that witness as a field, so a `RebootIntoRescue { … }` literal can
+    /// only be written by code that already holds a real [`Sealed`] — and
+    /// `Sealed`'s sole constructor lives behind [`crate::policy::seal_secrets`]
+    /// (cap PCR + close every TPM-unsealed mapper). By type this variant
+    /// therefore cannot be produced without having sealed first (R-2 /
+    /// FIX-29). [`HaltWithBanner`] is SUPERSEDED by this variant (R-1); do
+    /// not construct it on any new refuse path.
+    ///
+    /// [`HaltWithBanner`]: TerminalAction::HaltWithBanner
+    RebootIntoRescue {
+        /// The original failure that triggered the refuse. Printed in the
+        /// refuse banner / logs so the operator sees the full chain.
+        cause: NmblError,
+        /// Unforgeable proof the lock PCR was capped and every
+        /// TPM-unsealed mapper closed before this terminus was built. The
+        /// field exists purely to make the seal a TYPE precondition of the
+        /// variant: you cannot name a `Sealed` value without minting one
+        /// through [`crate::policy::seal_secrets`].
+        sealed: Sealed,
+    },
+}
+
+impl TerminalAction {
+    /// Build the [`TerminalAction::RebootIntoRescue`] terminus. Requires a
+    /// [`Sealed`] witness BY VALUE: a `RebootIntoRescue` is reachable only
+    /// after [`crate::policy::seal_secrets`] (cap PCR + close every
+    /// TPM-unsealed mapper) has minted the proof, so the refuse terminus
+    /// is type-gated on a successful seal (R-2 / FIX-29).
+    ///
+    /// This is the ergonomic constructor; the variant also stores the
+    /// witness so even a hand-written literal needs a real `Sealed`.
+    /// Callers reach it through [`crate::policy::relock_and_refuse`] /
+    /// [`crate::policy::refuse_unsigned`].
+    ///
+    /// The type-gate is compile-level: there is no way to obtain a
+    /// [`Sealed`] outside the `policy` module's seal functions, so building
+    /// the refuse terminus by hand does not compile —
+    ///
+    /// ```compile_fail
+    /// use nmbl_init::error::NmblError;
+    /// use nmbl_init::terminal::TerminalAction;
+    /// // No public `Sealed` constructor exists, so neither the literal nor
+    /// // the constructor can be reached without a real seal:
+    /// let cause = NmblError::Signature { stage: "x", detail: String::new() };
+    /// let _ = TerminalAction::RebootIntoRescue { cause }; // missing `sealed`, and `Sealed` is unconstructible
+    /// ```
+    pub fn reboot_into_rescue(sealed: Sealed, cause: NmblError) -> Self {
+        TerminalAction::RebootIntoRescue { cause, sealed }
+    }
 }
 
 /// Operator-facing emergency banner. Carried by

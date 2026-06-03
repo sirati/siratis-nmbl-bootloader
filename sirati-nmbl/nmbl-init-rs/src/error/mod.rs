@@ -190,6 +190,22 @@ pub enum NmblError {
     /// (`CapOutcome::Failed`), never as a benign no-TPM.
     #[error("tpm protocol error ({context}): {reason}")]
     TpmProto { context: String, reason: String },
+
+    /// The boot was REFUSED by the policy terminus (R-1 / R-13): an
+    /// untrusted image, a failed priority/signature gate, a seal failure
+    /// on a rescue path, or any other case routed through
+    /// [`crate::policy::refuse_unsigned`]. Carries the originating
+    /// `cause` so the refuse banner shows the full chain. The ONLY error
+    /// the `run_tui_session` Err arm maps to
+    /// [`crate::terminal::TerminalAction::RebootIntoRescue`]; by the time
+    /// it is produced the lock PCR has been capped, every TPM-unsealed
+    /// mapper closed, LUKS relocked, and the rescue sentinel written
+    /// (best-effort), so reaching it means secrets are already sealed.
+    #[error("boot refused by policy: {cause}")]
+    PolicyRefused {
+        #[source]
+        cause: Box<NmblError>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, NmblError>;
