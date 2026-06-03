@@ -522,12 +522,22 @@
           script,
           extraInputs ? [ ],
           extraEnv ? "",
+          # The install orchestrator + runner this scenario boots. Default to the
+          # real `test-secure-boot` config (tpm-unlock cryptroot). A scenario that
+          # only needs to prove NMBL verifies+measures+kexecs a validly-signed
+          # generation — but whose cryptroot must actually OPEN for the boot to
+          # reach that point — overrides these to the passphrase-unlock twin (the
+          # SAME signed generation, only the LUKS unlock differs).
+          installer ? secureBootInstaller,
+          installBin ? "sb-install-test-secure-boot",
+          installSubdir ? "real",
+          runner ? secureBootRunner,
         }:
         pkgs.writeShellApplication {
           name = "test-secure-boot-${scenario}";
           runtimeInputs = sbScenarioInputs ++ extraInputs ++ [ pkgs.qemu-utils ];
           text = ''
-            export NMBL_RUNNER=${secureBootRunner}
+            export NMBL_RUNNER=${runner}
 
             # Produce the install-runtime-SIGNED disk unless the caller already
             # staged one (NMBL_SB_SIGNED_DISK). The orchestrator reads the test
@@ -537,9 +547,9 @@
             if [ -z "''${NMBL_SB_SIGNED_DISK:-}" ]; then
               mkdir -p "$INSTALL_WORK"
               echo "=== signing the test disk at install runtime (nixos-anywhere) ==="
-              ${secureBootInstaller}/bin/sb-install-test-secure-boot \
-                --work-dir "$INSTALL_WORK/real"
-              NMBL_SB_SIGNED_DISK="$INSTALL_WORK/real/disk1.qcow2"
+              ${installer}/bin/${installBin} \
+                --work-dir "$INSTALL_WORK/${installSubdir}"
+              NMBL_SB_SIGNED_DISK="$INSTALL_WORK/${installSubdir}/disk1.qcow2"
             fi
             export NMBL_DISK_IMAGE="$NMBL_SB_SIGNED_DISK"
             export NMBL_SB_DISK="$NMBL_SB_SIGNED_DISK"
@@ -607,9 +617,22 @@
             bash "$assertions/sb-tpm-roundtrip.sh"
         '';
       };
+      # The positive control proves NMBL verifies+measures+kexecs a validly-signed
+      # generation and boots it. Reaching that proof requires the cryptroot to
+      # OPEN first (storage activation runs before generation verify+kexec). The
+      # real config's tpm-unlock cryptroot only opens against a TPM-sealed token,
+      # which this standalone scenario never enrols, so it would wedge on the
+      # emergency menu. Boot the passphrase-unlock twin instead: it ships the SAME
+      # install-signed generation (same kernel/initrd/cmdline/UKI signature) and
+      # opens cryptroot with the install passphrase, so the boot reaches NMBL's
+      # verify+measure+kexec and proves the signed generation actually runs.
       checkSbSignedGenHappy = mkSbScenarioCheck {
         scenario = "signed-gen-happy";
         script = "sb-signed-gen-happy.sh";
+        installer = secureBootEnrollInstaller;
+        installBin = "sb-install-test-secure-boot-enroll";
+        installSubdir = "enroll";
+        runner = secureBootEnrollRunner;
       };
       checkSbBadSigRefused = mkSbScenarioCheck {
         scenario = "bad-sig-refused";
