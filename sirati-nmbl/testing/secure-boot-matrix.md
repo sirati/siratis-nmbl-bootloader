@@ -126,6 +126,26 @@ The scenario apps run this for you; set `NMBL_SB_SIGNED_DISK` /
 | #1 | `test-secure-boot-driver-image` | driver-image load | A signed squashfs carrying `dummy` (a module NOT in the base initrd): single-fd verify ⇒ loop-mounted ⇒ `init_module` pre-init. The `test-secure-boot-driver` config opens cryptroot with the install passphrase so the boot reaches the post-kexec shell; NMBL emits `driver-image loaded: … dummy …` before the cpio-log freeze, so it lands in the post-kexec `nmbl-init` journal. (`/proc/modules` cannot prove it — kexec resets module state.) | `assertions/sb-driver-image.sh` exits 0: no refusal; `root@test-secure-boot-driver` shell reached+interactive; the `driver-image loaded` marker AND `dummy` present in the `nmbl-init` journal. |
 | #1-NEG | `test-secure-boot-driver-image-bad-refused` | corrupt driver image refused (NEG) | The driver squashfs (`/boot/nmbl/driver-extra.sfs`) is CORRUPTED on the ESP before boot → single-fd verify fails → NMBL refuses (enforce: `imageload/verify.rs` → `policy::refuse_unsigned` → `RebootIntoRescue`, R-1; the image is NEVER mounted). The refuse fires BEFORE the LUKS modal/console (driver-image load precedes `open_console`). Assert (a) a refuse marker, (b) `driver-image loaded` ABSENT, (c) the gen never boots un-refused, (d) NO emergency shell. | `assertions/sb-driver-image-bad-refused.sh` exits 0: refuse marker present; `driver-image loaded` ABSENT; booted-gen ABSENT (un-refused); emergency-shell markers ABSENT. |
 
+### Driver-image config prerequisites (learned wiring #1, both VM-verified GREEN)
+
+A `boot.nmbl.driverImages`-enabled config has two non-obvious requirements the
+`test-secure-boot-driver` config encodes (each was a real refuse caught in the VM):
+
+* **Bootstrap (external) config is REQUIRED.** The loader resolves the boot-
+  relative image path against the runtime boot mountpoint, which only exists once
+  Phase 0.5 mounts `/boot` (bootstrap mode). In embedded-config mode the loader
+  refuses with *"driver images require bootstrap mode"*. So set
+  `boot.nmbl.configLocation = "external"` + `boot.nmbl.bootstrap.bootFs.device`.
+* **`loop` + `squashfs` must be loaded EARLY.** The loader loop-mounts the
+  squashfs but does NOT modprobe these itself, so they must be present before the
+  driver-image phase: `boot.nmbl.earlyKernelModules = [ "loop" "squashfs" ]`. A
+  missing `loop` surfaces as *"loop-alloc failed: opening /dev/loop-control"*.
+
+A product gap fixed in passing: `lib/install-bootloader.nix` now defers the
+driver-image `nmbl-sign` step under `deferInstallSigning` (like the UKI/gen
+signing), so a disko/sealed image build — which lacks the impure `imageKeyFile` —
+no longer fails trying to sign the driver squashfs.
+
 ### Wire-in note for the SB smoke precondition (already landed, F6a)
 
 | id | app | scenario | exact assertion | expected PASS signal |
