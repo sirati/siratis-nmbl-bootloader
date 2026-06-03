@@ -381,6 +381,32 @@ let
                 e = builtins.getEnv "NMBL_GEN_KEY_FILE";
               in
               if e != "" then e else "/run/nmbl-test-keys/insecure-test-gen.key";
+
+            # ---- install-time UKI Secure-Boot signing (F1) ----------------
+            # sbsign the NMBL UKI at install with the INSECURE-TEST db cert so
+            # the SB-enforcing firmware (whose `db` we enroll that same cert
+            # into — see the test-db OVMF VARS in flake.nix) ACCEPTS and
+            # launches it. Without this the unsigned UKI is refused by the
+            # firmware before NMBL ever runs, and every NMBL scenario times
+            # out (audit F1). keyFile/certFile are IMPURE string paths read at
+            # install time (the closure-leak assert in lib/install-signing.nix
+            # rejects a store path); the #57 runner stages the committed
+            # testing/keys/insecure-test-sb-db.{key,crt} there (or exports the
+            # NMBL_SB_DB_{KEY,CERT}_FILE envs). The cert is PUBLICLY-KNOWN test
+            # material — it only ever signs TEST UKIs.
+            uki = {
+              enable = true;
+              keyFile =
+                let
+                  e = builtins.getEnv "NMBL_SB_DB_KEY_FILE";
+                in
+                if e != "" then e else "/run/nmbl-test-keys/insecure-test-sb-db.key";
+              certFile =
+                let
+                  e = builtins.getEnv "NMBL_SB_DB_CERT_FILE";
+                in
+                if e != "" then e else "/run/nmbl-test-keys/insecure-test-sb-db.crt";
+            };
           };
 
           # ---- measured boot (extend PCR 11, require a real TPM) -----------

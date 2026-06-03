@@ -82,8 +82,18 @@ let
       #   secureBoot : false — when true, boot under a Secure-Boot-enforcing
       #                OVMFFull firmware (`smm=on` + db-enrolled VARS). A fresh
       #                writable VARS copy is made per run.
+      #   dbCert     : null — only meaningful with secureBoot = true. When a
+      #                cert PATH is given, the enforcing VARS template is the
+      #                Microsoft `OVMF_VARS.ms.fd` with THIS cert ADDITIONALLY
+      #                enrolled in `db` (via virt-fw-vars). The firmware still
+      #                ENFORCES (MS db intact) but now ALSO TRUSTS a UKI signed
+      #                by this cert — so an NMBL UKI sbsign'd with the matching
+      #                key boots, while an unsigned UKI is still refused (F1).
+      #                null ⇒ MS-only db (refuses anything not MS-signed), used
+      #                by the unsigned-UKI smoke test.
       tpm ? null,
       secureBoot ? false,
+      dbCert ? null,
     }:
     let
       # Derive bootMode from config if not explicitly provided (must be first)
@@ -145,7 +155,28 @@ let
       # unsigned EFI binary). The `--sb-code`/`--sb-vars` flags flip the
       # qemu seam to `-machine …,smm=on` + secure pflash.
       sbCode = "${pkgs.OVMFFull.fd}/FV/OVMF_CODE.fd";
-      sbVarsTemplate = "${pkgs.OVMFFull.fd}/FV/OVMF_VARS.ms.fd";
+      msVarsTemplate = "${pkgs.OVMFFull.fd}/FV/OVMF_VARS.ms.fd";
+
+      # When a test `db` cert is supplied, derive an ENFORCING VARS that ALSO
+      # trusts a UKI signed by it: start from the Microsoft VARS (KEK/db/PK +
+      # SecureBoot already enrolled, so it still ENFORCES) and ADD our cert to
+      # `db` with virt-fw-vars. The result refuses an unsigned UKI exactly like
+      # the MS-only VARS, but ACCEPTS the NMBL UKI sbsign'd with the matching
+      # key — which is what lets NMBL actually run under enforcing SB (F1).
+      # A fixed owner GUID labels the enrolled entry (cosmetic only).
+      testDbVars =
+        pkgs.runCommand "ovmf-vars-ms-plus-test-db.fd"
+          {
+            nativeBuildInputs = [ pkgs.python3Packages.virt-firmware ];
+          }
+          ''
+            virt-fw-vars \
+              --input ${msVarsTemplate} \
+              --add-db 605dab50-e046-4300-abb6-3dd810dd8b23 ${dbCert} \
+              --output "$out"
+          '';
+
+      sbVarsTemplate = if dbCert != null then "${testDbVars}" else msVarsTemplate;
       sbArgs =
         if secureBoot then
           " --sb-code \"${sbCode}\" --sb-vars \"$WORK_DIR/sb-OVMF_VARS.fd\""

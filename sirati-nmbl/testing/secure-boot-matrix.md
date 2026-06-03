@@ -11,6 +11,9 @@ All scenarios boot the **`test-secure-boot`** NixOS config
 
 * `boot.nmbl.signing.{enable=true, enforce=true, algorithm="ml-dsa-87",
   publicKeys=[insecure-test-ml-dsa-87.pub], generationKeyFile=<impure>}`
+* `boot.nmbl.signing.uki.{enable=true, keyFile=<impure>, certFile=<impure>}`
+  — the NMBL UKI is `sbsign`'d at install with the INSECURE-TEST `db` key so
+  the enforcing firmware ACCEPTS it (audit F1).
 * `boot.nmbl.tpm.{measure=true, requireTpm=true, pcrIndex=11}`
 * `boot.nmbl.secureBoot.{enable=true, enforce=true, requireTpm=true}`
   (`priorityVolume.device=null` ⇒ no priority mount in the core flow)
@@ -18,7 +21,19 @@ All scenarios boot the **`test-secure-boot`** NixOS config
 * `loader="efi-stub"` ⇒ NMBL boots as a UKI
 
 Run under the **swtpm "tis" + SB-OVMF (smm=on)** seam via
-`mkRunner { tpm="tis"; secureBoot=true; }`.
+`mkRunner { tpm="tis"; secureBoot=true; dbCert=<insecure-test-sb-db.crt>; }`.
+
+**Firmware `db` enrollment (audit F1, load-bearing).** The three NMBL
+scenarios boot under an ENFORCING Secure-Boot OVMF whose `db` VARS is the
+Microsoft `OVMF_VARS.ms.fd` with the INSECURE-TEST `db` cert
+(`testing/keys/insecure-test-sb-db.crt`) ADDITIONALLY enrolled (`virt-fw-vars
+--add-db`). Because the NMBL UKI is `sbsign`'d at install with the matching key
+(`insecure-test-sb-db.key`), the firmware launches it — NMBL actually runs.
+Anything NOT signed by MS or this test cert is still refused, so the
+`check-sb-unsigned-uki` smoke (which keeps the MS-ONLY `db`, `dbCert` unset)
+still correctly proves firmware-refusal of an unsigned UKI. Net: the NMBL-
+behaviour rows boot NMBL under real enforcing SB; the unsigned-UKI smoke still
+proves the firmware enforces.
 
 `requireTpm=true` is load-bearing for the negatives: a TPM-less VM aborts the
 boot rather than degrading, so a negative can never false-green on a box
