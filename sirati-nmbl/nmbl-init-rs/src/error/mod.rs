@@ -170,6 +170,16 @@ pub enum NmblError {
     /// silently rewrite the file because doing so could mask a bug.
     #[error("state.bin at {path} did not round-trip through encode/decode")]
     StateRoundtripMismatch { path: PathBuf },
+
+    /// Signature-verification failure on a trust path: a bad/missing/
+    /// wrong-domain/wrong-key signature, a malformed sidecar, or an
+    /// internal inconsistency in the verify pipeline. `stage` is a stable
+    /// short tag naming the gate that refused (e.g. `"gen-kernel"`,
+    /// `"rescue-sfs"`, `"sidecar-parse"`); `detail` carries operator-facing
+    /// context. Every secure-boot refuse routes through here before
+    /// `refuse_unsigned` turns it into a `RebootIntoRescue` (R-1).
+    #[error("signature verification failed at {stage}: {detail}")]
+    Signature { stage: &'static str, detail: String },
 }
 
 pub type Result<T> = std::result::Result<T, NmblError>;
