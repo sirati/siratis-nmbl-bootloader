@@ -54,6 +54,27 @@ pub(super) fn handle_early_exit_modes(args: &Args) -> Option<ExitCode> {
         });
     }
 
+    // Shared generation-id computation (FIX-07): print the content-addressed
+    // `gen_id` for a system toplevel / profile-link path and exit. The install
+    // signer (#53) calls this to compute the `/boot/nmbl/sigs/<gen-id>/…` path
+    // the in-initramfs verifier scans, so signer and verifier share ONE
+    // derivation. Pure + side-effect-free (a canonicalize + basename).
+    if let Some(path) = args.print_gen_id.as_deref() {
+        return Some(match nmbl_init::generations::gen_id_of_path(path) {
+            Ok(id) => {
+                println!("{id}");
+                ExitCode::from(0)
+            }
+            Err(err) => {
+                eprintln!(
+                    "nmbl-init: --print-gen-id failed for {}: {err}",
+                    path.display()
+                );
+                ExitCode::from(1)
+            }
+        });
+    }
+
     // NixOS-only sandbox check: the toml must MATCH the NixOS filesystem
     // closure JSON. `config_toml` is guaranteed present by arg parsing.
     if let Some(json) = args.validate_closure.as_deref() {
