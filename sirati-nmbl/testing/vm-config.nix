@@ -41,6 +41,15 @@ let
           "${nixpkgs}/nixos/modules/profiles/qemu-guest.nix"
         ] ++ lib.optional (diskoModule != null) disko.nixosModules.disko
           ++ lib.optional (diskoModule != null) diskoModule
+          # disko / make-disk-image run `installBootLoader` inside a SEALED
+          # build VM whose only filesystem is the Nix store, so the
+          # install-time-impure signing keys (generationKeyFile / uki.*) are
+          # unreadable there and `nmbl-sign`/`sbsign` would kill the build.
+          # Defer in-installer signing for the image build (runtime POLICY is
+          # untouched — the baked anchor + config.toml still ENFORCE); the
+          # boot partition is signed host-side afterwards (see flake.nix's
+          # secure-boot disk wrapper).
+          ++ lib.optional (diskoModule != null) { boot.nmbl.signing.deferInstallSigning = lib.mkDefault true; }
           ++ extraModules
           ++ [
           {

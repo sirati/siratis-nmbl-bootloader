@@ -131,6 +131,32 @@ in
       '';
     };
 
+    deferInstallSigning = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = lib.mdDoc ''
+        BUILD-TIME-ONLY escape hatch for sealed image builders that cannot
+        read the impure signing keys. When `true`, the in-installer signing
+        steps are SKIPPED — the UNSIGNED NMBL UKI is installed and NO
+        generation sidecars are written — but the runtime POLICY is left
+        untouched: the baked trust anchor (`publicKeys`) and the config.toml
+        `[signing].enable`/`enforce` flags still make the booted NMBL ENFORCE
+        signatures. The signing must then be performed OUT OF BAND against the
+        installed boot partition where the keys are available (e.g. a
+        host-side post-build step).
+
+        The motivating case is the disko / `make-disk-image.nix` disk-image
+        build: it runs `nixos-install` (and thus `installBootLoader`) inside a
+        SEALED build VM whose only visible filesystem is the Nix store, so the
+        install-time-impure `generationKeyFile` / `uki.{keyFile,certFile}`
+        paths do not exist there and `nmbl-sign`/`sbsign` would fail, killing
+        the build. Setting this `true` lets the image BUILD; a host-side step
+        signs the boot partition afterwards. Default `false` — the normal
+        runtime install (nixos-anywhere / a real machine) signs in place where
+        the keys are readable. This flag NEVER relaxes runtime enforcement.
+      '';
+    };
+
     uki = {
       enable = lib.mkOption {
         type = lib.types.bool;

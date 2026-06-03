@@ -319,9 +319,106 @@
       # each scenario is its own `.#test-secure-boot-<scenario>` app the #57
       # runner executes. BUILT here; #57 runs the VMs.
       secureBootConfig = testing.mkTestConfigurations."test-secure-boot";
+
+      # The disko disk-image build installs NMBL with signing DEFERRED (the
+      # impure keys are unreadable inside the sealed build VM — see
+      # boot.nmbl.signing.deferInstallSigning). We finish the install HERE, on
+      # the host, where the committed INSECURE-TEST keys are available: sign
+      # every generation's kernel/initrd (ML-DSA, the baked trust anchor's
+      # private half) and `sbsign` the NMBL UKI with the test `db` key, then
+      # write the artifacts onto the disk's (unencrypted) ESP. This is the
+      # RUNTIME-install equivalent for a config the scenarios boot as a
+      # prebuilt disk; the store-imported keys are fine here because this is a
+      # TEST disk, NOT a production NMBL closure (the prod closure-leak guard
+      # `insecure-test-key-absent` still holds for production configs).
+      secureBootSignedDisk =
+        let
+          unsignedDisk = secureBootConfig.config.system.build.vmDiskImage;
+          toplevel = secureBootConfig.config.system.build.toplevel;
+          uki = secureBootConfig.config.system.build.nmblUki;
+          mlDsaKey = testKeys.privateKey;
+          sbKey = ./testing/keys/insecure-test-sb-db.key;
+          sbCert = ./testing/keys/insecure-test-sb-db.crt;
+          sigSuffix = secureBootConfig.config.boot.nmbl.signing.sigPathSuffix;
+        in
+        pkgs.runCommand "test-secure-boot-signed-disk-image"
+          {
+            nativeBuildInputs = [
+              pkgs.qemu-utils
+              pkgs.libguestfs-with-appliance
+              pkgs.sbsigntool
+              pkgs.coreutils
+            ] ++ lib.optional (nmblSign != null) nmblSign;
+          }
+          ''
+            mkdir -p "$out" stage/sigs
+            # Writable copy of the deferred (unsigned) image.
+            qemu-img convert -f qcow2 -O qcow2 \
+              ${unsignedDisk}/nixos.qcow2 "$out/nixos.qcow2"
+            chmod u+w "$out/nixos.qcow2"
+
+            # gen-id = file_name(canonicalize(toplevel)) — the SAME content-
+            # addressed store basename nmbl-init computes at boot (gen_id.rs /
+            # `nmbl-init --print-gen-id`), so the signer and the runtime
+            # verifier agree on the sidecar directory.
+            gen_id="$(basename "$(readlink -f ${toplevel})")"
+            echo "Signing generation $gen_id for the NMBL boot guard (host-side)..."
+
+            # Per-generation ML-DSA sidecars, per-role domains, exactly where
+            # src/sig/scan.rs::resolve_sig_sidecar looks:
+            #   /nmbl/sigs/<gen-id>/{kernel,initrd}<sigPathSuffix>
+            mkdir -p "stage/sigs/$gen_id"
+            ${if nmblSign == null then ''
+              echo "ERROR: nmbl-sign signer unavailable; cannot sign the test disk." >&2
+              exit 1
+            '' else ''
+              nmbl-sign sign --key ${mlDsaKey} --domain gen-kernel \
+                --out "stage/sigs/$gen_id/kernel${sigSuffix}" ${toplevel}/kernel
+              nmbl-sign sign --key ${mlDsaKey} --domain gen-initrd \
+                --out "stage/sigs/$gen_id/initrd${sigSuffix}" ${toplevel}/initrd
+            ''}
+
+            # sbsign the NMBL UKI with the INSECURE-TEST db key so the
+            # enforcing SB firmware (whose db we enrolled this cert into)
+            # launches it (audit F1).
+            echo "Signing the NMBL UKI for Secure Boot (sbsign, host-side)..."
+            sbsign --key ${sbKey} --cert ${sbCert} \
+              --output stage/BOOTX64.EFI ${uki}
+            sbverify --cert ${sbCert} stage/BOOTX64.EFI
+
+            # Write the signed UKI + sidecars onto the (unencrypted) ESP
+            # (disk-main-ESP = partition 2 in the disko layout).
+            echo "Writing signed artifacts onto the ESP..."
+            export LIBGUESTFS_BACKEND=direct
+            guestfish --rw -a "$out/nixos.qcow2" <<EOF
+            run
+            mount /dev/sda2 /
+            mkdir-p /EFI/BOOT
+            upload stage/BOOTX64.EFI /EFI/BOOT/BOOTX64.EFI
+            mkdir-p /nmbl/sigs/$gen_id
+            upload stage/sigs/$gen_id/kernel${sigSuffix} /nmbl/sigs/$gen_id/kernel${sigSuffix}
+            upload stage/sigs/$gen_id/initrd${sigSuffix} /nmbl/sigs/$gen_id/initrd${sigSuffix}
+            umount /
+            EOF
+            echo "✓ test-secure-boot disk signed: UKI sbsign'd, generation $gen_id ML-DSA sidecars staged."
+          '';
+
+      # The config the scenarios boot/tamper: identical to secureBootConfig but
+      # with vmDiskImage pointing at the HOST-SIGNED disk, so the runner copies
+      # the signed qcow2 and the bad-sig scenario tampers a signed image.
+      secureBootSignedConfig = secureBootConfig // {
+        config = secureBootConfig.config // {
+          system = secureBootConfig.config.system // {
+            build = secureBootConfig.config.system.build // {
+              vmDiskImage = secureBootSignedDisk;
+            };
+          };
+        };
+      };
+
       secureBootRunner = testRunners.mkRunner {
         name = "test-secure-boot";
-        config = secureBootConfig;
+        config = secureBootSignedConfig;
         inherit vmSerialMan;
         tpm = "tis";
         secureBoot = true;
@@ -384,7 +481,7 @@
         # off the FAT32 boot partition), so it needs libguestfs + the disk path.
         extraInputs = [ pkgs.libguestfs-with-appliance ];
         extraEnv = ''
-          export NMBL_SB_DISK=${secureBootConfig.config.system.build.vmDiskImage}/nixos.qcow2
+          export NMBL_SB_DISK=${secureBootSignedConfig.config.system.build.vmDiskImage}/nixos.qcow2
         '';
       };
     in
@@ -434,6 +531,11 @@
         # The unsigned-UKI Secure-Boot smoke-test disk (#55): a GPT/ESP image
         # whose BOOTX64.EFI is an UNSIGNED UKI, for the SB-refusal harness.
         sb-unsigned-uki-disk = sbSmoke.unsignedUkiDisk;
+        # The fully-signed test-secure-boot disk the chain scenarios boot: the
+        # disko image (NMBL installed, signing deferred) with the UKI sbsign'd
+        # and the generation ML-DSA sidecars written onto the ESP host-side.
+        # `nix build .#test-secure-boot-disk`.
+        test-secure-boot-disk = secureBootSignedDisk;
       };
 
       # Build-only validation gates surfaced for CI / `nix flake check`-style
