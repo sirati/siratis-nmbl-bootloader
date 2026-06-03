@@ -15,7 +15,7 @@ use crate::buffer::OutputBuffer;
 
 use super::handler::handle_client;
 use super::pty::SerialHandler;
-use super::qemu::{BootMode, Display, QemuConfig};
+use super::qemu::{BootMode, Display, QemuConfig, SecureBoot, TpmConfig};
 use super::utils::{cleanup_stale_sockets, shutdown_qemu_gracefully};
 
 /// VM Manager state
@@ -29,6 +29,8 @@ pub struct VmManager {
     buffer_lines: usize,
     buffer_seconds: u64,
     display: Display,
+    tpm: Option<TpmConfig>,
+    secure_boot: Option<SecureBoot>,
 }
 
 impl VmManager {
@@ -43,6 +45,8 @@ impl VmManager {
         buffer_lines: usize,
         buffer_seconds: u64,
         display: Display,
+        tpm: Option<TpmConfig>,
+        secure_boot: Option<SecureBoot>,
     ) -> Self {
         let socket_path = socket.unwrap_or_else(|| {
             PathBuf::from(format!("/tmp/vm-serial-man-{}.sock", std::process::id()))
@@ -58,6 +62,8 @@ impl VmManager {
             buffer_lines,
             buffer_seconds,
             display,
+            tpm,
+            secure_boot,
         }
     }
 
@@ -67,8 +73,8 @@ impl VmManager {
         cleanup_stale_sockets(&self.socket_path).await?;
 
         // Create Unix socket for control
-        let listener = UnixListener::bind(&self.socket_path)
-            .context("Failed to bind Unix socket")?;
+        let listener =
+            UnixListener::bind(&self.socket_path).context("Failed to bind Unix socket")?;
         debug!("Listening on socket: {}", self.socket_path.display());
 
         // Get socket directory for QEMU serial socket
@@ -83,6 +89,8 @@ impl VmManager {
             cores: self.cores,
             socket_dir,
             display: self.display,
+            tpm: self.tpm.clone(),
+            secure_boot: self.secure_boot.clone(),
         };
 
         let mut qemu_process = qemu_config.start().await?;
@@ -178,6 +186,13 @@ impl VmManager {
         debug!("Shutting down VM manager gracefully");
         drop(output_tx);
 
+        // Tear the swtpm sidecar down first: it must not outlive its VM, and
+        // its per-run state dir is removed so the next run starts on clean
+        // PCRs. (No-op when no TPM was configured.)
+        if let Some(swtpm) = qemu_process.swtpm.take() {
+            swtpm.shutdown().await;
+        }
+
         // Try graceful QEMU shutdown
         shutdown_qemu_gracefully(qemu_process.child, Duration::from_secs(5)).await?;
 
@@ -201,6 +216,8 @@ pub async fn run_manager(
     buffer_lines: usize,
     buffer_seconds: u64,
     display: Display,
+    tpm: Option<TpmConfig>,
+    secure_boot: Option<SecureBoot>,
 ) -> Result<()> {
     let manager = VmManager::new(
         name,
@@ -212,6 +229,8 @@ pub async fn run_manager(
         buffer_lines,
         buffer_seconds,
         display,
+        tpm,
+        secure_boot,
     );
 
     manager.run().await

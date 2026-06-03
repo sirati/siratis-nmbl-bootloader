@@ -7,12 +7,13 @@
 //! - `core`: Main VmManager orchestration
 //! - `screenshot`: Framebuffer capture via QEMU monitor
 
-mod qemu;
-mod pty;
-mod handler;
 mod core;
-mod utils;
+mod firmware;
+mod handler;
+mod pty;
+mod qemu;
 pub mod screenshot;
+mod utils;
 
 pub use core::run_manager;
-pub use qemu::{BootMode, Display};
+pub use qemu::{BootMode, Display, SecureBoot, TpmConfig, TpmKind};
