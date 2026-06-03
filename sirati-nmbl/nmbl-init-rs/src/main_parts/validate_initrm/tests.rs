@@ -151,6 +151,35 @@ fn luks_activation_dry_run_with_cryptsetup_present_does_not_report_it() {
 }
 
 #[test]
+fn validate_initrm_performs_no_real_tpm_or_cryptsetup_seal_ops() {
+    // Property-6: the `--validate-initrm` dry-run drives the GENUINE
+    // `drop_to_emergency` → `policy::seal_secrets` control flow (the
+    // ErrorToErrorScreen scenario fails an activation and routes there). It
+    // MUST NOT cap the real lock PCR (an irreversible TPM poison-extend) nor
+    // run a real `cryptsetup close`. We stage a closure WITH cryptsetup +
+    // shell present and a luks-tpm-style activation so the seal's
+    // close-mapper path is reachable, run all four scenarios, and assert the
+    // real-hardware-seal-op counter stayed at zero across every scenario.
+    let root = temp_closure("no-real-seal", |d| {
+        fs::create_dir_all(d.join("bin")).expect("mkdir bin");
+        fs::write(d.join("bin/cryptsetup"), b"#!/bin/sh\n").expect("write cryptsetup");
+        fs::write(d.join("bin/sh"), b"#!/bin/sh\n").expect("write sh");
+    });
+    let config = config_with_luks("/bin/cryptsetup");
+
+    nmbl_init::policy::reset_real_seal_ops();
+    let _report = validate_initrm(&config, None, &root);
+    assert_eq!(
+        nmbl_init::policy::real_seal_ops(),
+        0,
+        "validate-initrm must perform NO real TPM cap or cryptsetup close: \
+         the dry-run seal routes the cap through TpmOps (no-op) and suppresses \
+         the mapper close"
+    );
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn uki_missing_file_is_reported_as_parse_error() {
     // A `--uki` pointing at a nonexistent file must surface a UKI finding
     // (read error → ParseError note) and break cleanliness.

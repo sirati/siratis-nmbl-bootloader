@@ -23,6 +23,7 @@
 mod closure;
 mod report;
 mod scenario;
+mod tpm;
 
 use std::collections::HashSet;
 use std::io;
@@ -168,6 +169,37 @@ impl FsOps for DryRunSys {
         // the genuine caller's optional-read fallback) decides whether
         // the absence is a finding.
         self.closure.read_file(path)
+    }
+
+    fn open_ro(&self, path: &Path) -> io::Result<std::fs::File> {
+        // Open the CLOSURE-mapped path read-only: a side-effect-free real
+        // read of the shipped bytes, so the secure-boot verify pipeline's
+        // stream-hash runs against what would actually ship. An absent file
+        // surfaces as an `io::Error` the driving `&mut self` op records.
+        std::fs::File::open(self.closure.resolve_path(path))
+    }
+
+    fn write_file(&mut self, path: &Path, _contents: &[u8]) -> io::Result<()> {
+        // NEVER write: a sysfs firmware-load trigger / registry / sentinel
+        // write is a real side effect. Record + succeed so the boot flow
+        // continues exactly as if the write landed.
+        self.findings.push(MissingFile::new(
+            "write_file",
+            path,
+            "dry-run: write suppressed (no real side effect)",
+        ));
+        Ok(())
+    }
+
+    fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+        // NEVER unlink: registry / sentinel cleanup is a real side effect.
+        // Record + succeed so the cleanup-then-continue flow proceeds.
+        self.findings.push(MissingFile::new(
+            "remove_file",
+            path,
+            "dry-run: remove suppressed (no real side effect)",
+        ));
+        Ok(())
     }
 }
 

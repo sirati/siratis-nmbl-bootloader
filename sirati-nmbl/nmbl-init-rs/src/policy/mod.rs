@@ -36,6 +36,7 @@ pub mod guard;
 pub mod refuse_screen;
 pub mod registry;
 pub mod relock;
+pub mod seal_dryrun;
 pub mod sentinel;
 
 #[cfg(test)]
@@ -71,4 +72,5 @@ pub use relock::{
     RelockCommand, refuse_unsigned, refuse_unsigned_blocking, relock_and_refuse,
     relock_and_refuse_blocking, relock_argv,
 };
+pub use seal_dryrun::{DryRunSealScope, real_seal_ops, reset_real_seal_ops};
 pub use sentinel::{sentinel_present, should_force_rescue, write_sentinel};

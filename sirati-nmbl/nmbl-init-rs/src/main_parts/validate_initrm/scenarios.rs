@@ -156,7 +156,17 @@ pub(super) fn run_error_screen(
         // Enter selects the default Reboot item, exiting the menu loop
         // immediately. Reboot touches no ops, so nothing forks. SWALLOW.
         let console = ScriptedConsole::from_keys([KeyCode::Enter]);
+        // Property-6: `drop_to_emergency` runs the GENUINE
+        // `policy::seal_secrets`, which would otherwise cap the REAL lock PCR
+        // (irreversible poison) and run `cryptsetup close` on a TPM host. The
+        // dry-run seal scope routes the cap through the `DryRunSys` `TpmOps`
+        // no-op and suppresses the close for the duration of this run, so the
+        // emergency-screen path is exercised side-effect-free. The scope drops
+        // before the closure returns, restoring the real seal for any later
+        // caller on this thread.
+        let seal_scope = nmbl_init::policy::DryRunSealScope::enter();
         let _ = drop_to_emergency(Box::new(console), &config, err, &session, &sender).await;
+        drop(seal_scope);
         dryrun.into_findings().items().to_vec()
     });
     findings_or_runtime_note(result, "ErrorToErrorScreen")

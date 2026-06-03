@@ -104,6 +104,14 @@ impl ClosureView {
     pub fn read_file(&self, p: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(self.resolve(p))
     }
+
+    /// Resolve P to its on-disk location under `root` (the prefix-graft the
+    /// presence/read oracle uses), so a caller can `File::open` the shipped
+    /// bytes read-only (the `open_ro` dry-run path). Side-effect-free.
+    #[must_use]
+    pub fn resolve_path(&self, p: &Path) -> PathBuf {
+        self.resolve(p)
+    }
 }
 
 // Closure-probing helpers for `DryRunSys` that don't perform side effects:
