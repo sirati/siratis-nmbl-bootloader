@@ -10,6 +10,7 @@
 
 mod helpers;
 mod luks;
+mod seal;
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -29,6 +30,7 @@ use helpers::{
     loaded_modules, wait_for_source_device, wrap_runner_error,
 };
 use luks::{WrongPasswordHandled, handle_wrong_password, run_luks_with_spinner};
+use seal::register_tpm_mapper_if_luks_tpm;
 
 /// One passphrase to inject into the kexec'd initrd as a keyfile. The
 /// activation runner emits one of these per `luks-password` activation
@@ -297,30 +299,6 @@ async fn run_one_activation(
         return Err(exit_code_error(activation, outcome));
     };
     Ok(stdin_owned)
-}
-
-/// On a successful `luks-tpm` activation, push the unsealed mapper onto
-/// the always-compiled seal registry (FIX-03). The mapper name is the
-/// `/dev/mapper/<name>` node the activation produces; we strip the
-/// `/dev/mapper/` prefix and carry the `cryptsetup` binary so the seal
-/// path can run `cryptsetup close <name>` self-contained. A no-op for
-/// every other activation kind.
-fn register_tpm_mapper_if_luks_tpm(activation: &Activation) {
-    if activation.kind != ActivationKind::LuksTpm {
-        return;
-    }
-    for produced in &activation.produces_devices {
-        let Some(name) = produced
-            .to_str()
-            .and_then(|p| p.strip_prefix("/dev/mapper/"))
-        else {
-            continue;
-        };
-        crate::policy::register_tpm_mapper(crate::policy::MapperEntry {
-            cryptsetup: activation.binary.clone(),
-            name: name.to_string(),
-        });
-    }
 }
 
 #[cfg(test)]
