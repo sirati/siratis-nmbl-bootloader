@@ -33,7 +33,7 @@ use rustix::io::Errno as RustixErrno;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
-use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
+use crate::sys::loopdev::loop_bind_ro;
 use crate::sys::mount::mount_fs;
 
 /// Mountpoint where the writable rescue overlay is staged before the
@@ -101,16 +101,6 @@ pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'stati
     // surfaces the real error with its own `loop-alloc` stage.
     ensure_loop_squashfs_modules(config);
 
-    let index = allocate_loop_device().map_err(|source| NmblError::Rescue {
-        stage: "loop-alloc",
-        source: Box::new(source),
-    })?;
-
-    let loop_fd = open_loop_device(index, true).map_err(|source| NmblError::Rescue {
-        stage: "loop-open",
-        source: Box::new(source),
-    })?;
-
     let sfs_fd = rustix::fs::open(&sfs_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
         .map_err(|e| NmblError::Rescue {
             stage: "sfs-open",
@@ -120,9 +110,12 @@ pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'stati
             }),
         })?;
 
-    configure_loop_device(&loop_fd, &sfs_fd, true).map_err(|source| NmblError::Rescue {
-        stage: "loop-configure",
-        source: Box::new(source),
+    // Shared allocate→open→configure dance (`sys::loopdev::loop_bind_ro`);
+    // re-wrap its stage tag verbatim so the emergency banner reads exactly as
+    // before (`loop-alloc` / `loop-open` / `loop-configure`).
+    let index = loop_bind_ro(&sfs_fd).map_err(|e| NmblError::Rescue {
+        stage: e.stage,
+        source: e.source,
     })?;
 
     let loop_dev = PathBuf::from(format!("/dev/loop{index}"));

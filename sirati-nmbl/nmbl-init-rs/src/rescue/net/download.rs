@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{NmblError, Result};
 use crate::net::http::{self, HttpUrl};
-use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
+use crate::sys::loopdev::loop_bind_ro;
 
 use super::NetAttemptOutcome;
 use super::types::{DownloadStatus, RescueUi};
@@ -134,19 +134,12 @@ pub(super) fn mount_overlay_for_child(
 ) -> Result<&'static std::path::Path> {
     use std::path::{Path, PathBuf};
 
-    let index = allocate_loop_device().map_err(|source| NmblError::Rescue {
-        stage: "loop-alloc",
-        source: Box::new(source),
-    })?;
-
-    let loop_fd = open_loop_device(index, true).map_err(|source| NmblError::Rescue {
-        stage: "loop-open",
-        source: Box::new(source),
-    })?;
-
-    configure_loop_device(&loop_fd, backing, true).map_err(|source| NmblError::Rescue {
-        stage: "loop-configure",
-        source: Box::new(source),
+    // Shared allocate→open→configure dance (`sys::loopdev::loop_bind_ro`);
+    // re-wrap its stage tag verbatim so the network-rescue banner matches the
+    // disk path's (`loop-alloc` / `loop-open` / `loop-configure`).
+    let index = loop_bind_ro(backing).map_err(|e| NmblError::Rescue {
+        stage: e.stage,
+        source: e.source,
     })?;
 
     let loop_dev = PathBuf::from(format!("/dev/loop{index}"));
