@@ -7,6 +7,7 @@
 //! perform AFTER `seal_secrets` returns `Ok` so we can assert both
 //! `cap-index < fork` AND `close-index < fork`.
 
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use super::guard::test_seam::Step;
@@ -14,13 +15,25 @@ use super::guard::{seal_secrets, seal_secrets_blocking, test_seam};
 use super::registry::{self, MapperEntry, register_tpm_mapper};
 use crate::tpm::CapOutcome;
 
+/// Point the on-disk mapper registry at a per-test temp file so the
+/// re-exec survival tests don't touch `/run`. Returns the guard so the
+/// temp dir lives for the whole test.
+fn redirect_persist() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    registry::set_persist_path(dir.path().join("tpm-unsealed-mappers"));
+    dir
+}
+
 /// Wipe every thread-local the seal touches so each test starts clean:
-/// the once-latch, the mapper registry, and the seam's order log /
-/// cap result / close-fail set.
-fn fresh() {
+/// the cap-latch, the mapper registry, and the seam's order log /
+/// cap result / close-fail set. Redirects the on-disk registry to a temp
+/// file so no test pollutes `/run`.
+fn fresh() -> tempfile::TempDir {
+    let dir = redirect_persist();
     super::guard::reset_latch();
     registry::reset();
     test_seam::reset();
+    dir
 }
 
 /// Push one TPM-unsealed mapper onto the registry (the way a successful
@@ -46,7 +59,7 @@ fn dummy_sender() -> crate::sys::poller::LocalSender {
 
 #[test]
 fn blocking_seal_caps_then_closes_then_witness_before_fork() {
-    fresh();
+    let _persist = fresh();
     register("cryptroot");
     register("crypthome");
 
@@ -77,7 +90,7 @@ fn blocking_seal_caps_then_closes_then_witness_before_fork() {
 
 #[tokio::test]
 async fn async_seal_caps_then_closes_then_witness_before_fork() {
-    fresh();
+    let _persist = fresh();
     register("cryptroot");
     let sender = dummy_sender();
 
@@ -100,7 +113,7 @@ async fn async_seal_caps_then_closes_then_witness_before_fork() {
 /// render/fork.
 #[test]
 fn no_choice_remote_session_seals_before_first_render() {
-    fresh();
+    let _persist = fresh();
     // No mappers registered: a remote session that opened on a non-LUKS
     // box still must cap before rendering.
     let _sealed = seal_secrets_blocking(false).expect("seal succeeds with no mappers");
@@ -118,7 +131,7 @@ fn no_choice_remote_session_seals_before_first_render() {
 /// MUST NOT then fork — proving the divert-to-refuse leaves no shell.
 #[test]
 fn present_but_uncappable_tpm_diverts_with_no_shell() {
-    fresh();
+    let _persist = fresh();
     register("cryptroot");
     test_seam::set_cap(CapOutcome::Failed(crate::error::NmblError::TpmProto {
         context: "seed".to_string(),
@@ -151,7 +164,7 @@ fn present_but_uncappable_tpm_diverts_with_no_shell() {
 /// — the seal closes the registered mapper before any shell.
 #[test]
 fn non_refuse_path_after_post_unlock_failure_leaves_no_live_mapper() {
-    fresh();
+    let _persist = fresh();
     // A luks-tpm unlock SUCCEEDED (mapper registered) but a LATER
     // activation failed, dropping us toward the emergency menu (a
     // non-refuse G1 path). The seal there must still close the mapper.
@@ -176,7 +189,7 @@ fn non_refuse_path_after_post_unlock_failure_leaves_no_live_mapper() {
 /// `requireTpm` flips the no-TPM posture from degrade-open to fail-closed.
 #[test]
 fn require_tpm_fails_closed_on_no_tpm() {
-    fresh();
+    let _persist = fresh();
     test_seam::set_cap(CapOutcome::NoTpm);
     // require_tpm = false ⇒ degrade-open (Ok), even with no TPM.
     assert!(
@@ -184,7 +197,7 @@ fn require_tpm_fails_closed_on_no_tpm() {
         "no-TPM degrades open when requireTpm is off"
     );
 
-    fresh();
+    let _persist = fresh();
     test_seam::set_cap(CapOutcome::NoTpm);
     // require_tpm = true ⇒ fail-closed.
     assert!(
@@ -197,7 +210,7 @@ fn require_tpm_fails_closed_on_no_tpm() {
 /// mapper registered.
 #[test]
 fn stuck_mapper_fails_the_seal() {
-    fresh();
+    let _persist = fresh();
     register("cryptroot");
     test_seam::fail_close("cryptroot");
     let result = seal_secrets_blocking(false);
@@ -209,12 +222,13 @@ fn stuck_mapper_fails_the_seal() {
     );
 }
 
-/// FIX-58: the once-latch makes a second seal idempotent — no re-cap, no
-/// re-close — so re-entering the emergency menu after a shell exits does
-/// not error or double-cap.
+/// FIX-58: with the mapper already closed by the first seal, a second
+/// seal records NOTHING new — the cap is latched (no re-cap) and the now
+/// empty registry yields no further close — so re-entering the emergency
+/// menu after a shell exits does not error or double-cap.
 #[test]
-fn once_latch_makes_second_seal_idempotent() {
-    fresh();
+fn cap_latch_makes_second_seal_no_op_when_drained() {
+    let _persist = fresh();
     register("cryptroot");
     let _first = seal_secrets_blocking(false).expect("first seal");
     let after_first = test_seam::order().len();
@@ -222,6 +236,112 @@ fn once_latch_makes_second_seal_idempotent() {
     let after_second = test_seam::order().len();
     assert_eq!(
         after_first, after_second,
-        "latched seal must not re-record cap/close on the second call (FIX-58)"
+        "latched seal must not re-record cap/close once the registry is drained"
+    );
+}
+
+/// The cap-latch makes only the CAP idempotent — the CLOSE step ALWAYS
+/// drains the current registry. A mapper registered AFTER the first seal
+/// latched must still be closed by the next seal (the C-1 masking hole).
+#[test]
+fn second_seal_closes_a_mapper_registered_after_the_first() {
+    let _persist = fresh();
+    register("cryptroot");
+    let _first = seal_secrets_blocking(false).expect("first seal closes cryptroot");
+    assert_eq!(registry::pending(), 0, "first seal drains its mapper");
+
+    // A NEW mapper opens after the first seal already latched the cap.
+    register("crypthome");
+    assert_eq!(registry::pending(), 1, "the late mapper is registered");
+
+    let _second = seal_secrets_blocking(false).expect("second seal closes the late mapper");
+    let order = test_seam::order();
+    // Exactly ONE cap (the second seal skipped it) and a close for the
+    // late mapper.
+    assert_eq!(
+        order.iter().filter(|s| **s == Step::Cap).count(),
+        1,
+        "cap is idempotent-skippable: only the first seal caps"
+    );
+    assert!(
+        idx(&order, &Step::Close("crypthome".to_string())).is_some(),
+        "the second seal must close the late-registered mapper (C-1)"
+    );
+    assert_eq!(
+        registry::pending(),
+        0,
+        "late mapper is GONE after the second seal"
+    );
+}
+
+/// MED-2 / FIX-03: a mapper opened in a PRIOR (pre-panic) process image
+/// survives only on the on-disk registry file. A fresh process + empty
+/// in-memory registry must MERGE that file and close the file-sourced
+/// mapper on seal — proving the post-panic emergency shell sees no live
+/// TPM-unsealed plaintext.
+#[test]
+fn seal_closes_a_mapper_sourced_only_from_the_persist_file() {
+    let dir = fresh();
+    // Simulate the re-exec: the pre-panic process wrote the mapper line;
+    // the resumed process's in-memory registry is empty.
+    let path = dir.path().join("tpm-unsealed-mappers");
+    let mut f = std::fs::File::create(&path).expect("write persist file");
+    writeln!(f, "/bin/cryptsetup\tcryptroot").expect("write line");
+    drop(f);
+
+    assert_eq!(
+        registry::pending(),
+        1,
+        "the file-sourced mapper is visible to the fresh process"
+    );
+
+    let _sealed = seal_secrets_blocking(false).expect("seal closes the file-sourced mapper");
+    test_seam::record_fork();
+
+    let order = test_seam::order();
+    let close =
+        idx(&order, &Step::Close("cryptroot".to_string())).expect("file-sourced mapper closed");
+    let fork = idx(&order, &Step::Fork).expect("fork recorded");
+    assert!(
+        close < fork,
+        "file-sourced mapper closed before any shell (MED-2)"
+    );
+    assert_eq!(
+        registry::pending(),
+        0,
+        "the persist file is cleared once its mapper is closed"
+    );
+    assert!(
+        !path.exists(),
+        "the persist file is deleted after the last close"
+    );
+}
+
+/// MED-2 fail-closed: an unconfirmed close of a file-sourced mapper keeps
+/// the persist-file line intact AND returns `Err` — the re-exec survival
+/// path is fail-closed, never silently dropped.
+#[test]
+fn unconfirmed_close_keeps_the_persist_line_and_errs() {
+    let dir = fresh();
+    let path = dir.path().join("tpm-unsealed-mappers");
+    let mut f = std::fs::File::create(&path).expect("write persist file");
+    writeln!(f, "/bin/cryptsetup\tcryptroot").expect("write line");
+    drop(f);
+
+    test_seam::fail_close("cryptroot");
+    let result = seal_secrets_blocking(false);
+    assert!(
+        result.is_err(),
+        "an unconfirmed close fails the seal (MED-2)"
+    );
+    assert_eq!(
+        registry::pending(),
+        1,
+        "the un-closable file-sourced mapper stays registered (fail-closed)"
+    );
+    let body = std::fs::read_to_string(&path).expect("persist file still present");
+    assert!(
+        body.contains("cryptroot"),
+        "the persist-file line survives an unconfirmed close, got {body:?}"
     );
 }
