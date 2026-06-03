@@ -46,16 +46,17 @@ CONFIG_NAME="test-secure-boot-enroll"
 # luks-password activation shows an answerable modal; typing this opens
 # cryptroot so the boot can reach generation verify+kexec.
 LUKS_PASSPHRASE="${NMBL_LUKS_PASSPHRASE:-test}"
-# A best-effort detector for NMBL's luks-password modal. Matches the enroll
-# twin's configurable prompt label AND the modal chrome NMBL always renders
-# (the "Passphrase" box title + the permanent "Select NixOS Generation"
-# checkbox row). This is ONLY a diagnostic / fast-path hint: the modal is a
-# full-screen ratatui repaint that is NOT newline-terminated, so vm-serial-man's
-# line-oriented history (read_line splits on '\n') may never flush the frame
-# while NMBL blocks awaiting input. We therefore DO NOT gate typing on seeing
-# it — we type the passphrase on a fixed cadence below regardless (a human at
-# the console types once the box is up; we simply can't reliably "see" it).
+# Detector for NMBL's luks-password modal. The modal IS captured in history now
+# that the manager survives the boot (idle-flush flushes the un-terminated
+# ratatui frame), so we DETECT it and answer ONCE — see the typing block below.
+# Matches the prompt line the enroll twin renders ("Enter LUKS passphrase for
+# cryptroot …") and, as a fallback, the box title + permanent generation row.
 PASSWORD_PROMPT_RE='Enter LUKS passphrase|passphrase for cryptroot|Select NixOS Generation|Passphrase'
+# cryptsetup's re-prompt after a rejected attempt. NMBL repaints a
+# "Wrong password (attempt N)" box ("cryptsetup rejected the passphrase") and
+# re-shows the modal. Seeing this AFTER we already answered means our one
+# passphrase was wrong/raced — only then do we (carefully, capped) re-send.
+REPROMPT_RE='Wrong password \(attempt|cryptsetup rejected the passphrase'
 # The booted-system prompt (getty autologin). networking.hostName == the config
 # name (vm-config.nix), so the post-kexec shell prints "root@<config-name>".
 # Unlike the modal, this is a newline-terminated line and flushes to history.
@@ -147,34 +148,42 @@ fi
 # Answer NMBL stage-0's LUKS passphrase modal so cryptroot opens and the boot
 # can proceed to generation verify+measure+kexec.
 #
-# WHY WE TYPE BLIND (no wait-for-prompt gate): NMBL's passphrase modal is a
-# full-screen ratatui repaint that is NOT newline-terminated. vm-serial-man's
-# history is built by `read_line` (splits on '\n'), so while NMBL sits on the
-# modal awaiting input the un-terminated frame never flushes to the buffer —
-# `seen_in_history`/`trigger` for the modal text can hang/miss even though the
-# box is on screen. So we do what an operator does: give the boot a head-start
-# to reach the LUKS stage, then type the passphrase and Enter on a fixed cadence
-# until the system actually boots (or refuses). `send_cmd` appends the newline,
-# so each attempt submits. Extra Enters on an already-unlocked system are
-# harmless (blank shell prompts). The post-kexec markers we wait for ARE
-# newline-terminated and flush normally.
+# DETECT-THEN-ANSWER-ONCE: the modal IS in the captured history now (the manager
+# survives the boot and idle-flush flushes the un-terminated ratatui frame), so
+# we WAIT for the modal text to appear, then send the passphrase EXACTLY ONCE.
+# The old blind fixed-cadence re-send buffered stray chars before the box was
+# input-ready and piled up FAILED unlock attempts until NMBL hit its retry cap
+# and REFUSED (locking the TPM) — that is the bug. We only re-send if cryptsetup
+# genuinely RE-PROMPTS ("Wrong password (attempt N)"), and we cap total attempts
+# so a wrong/raced first try gets at most a couple of careful retries, never a
+# rapid loop. `send_cmd` appends the newline so each attempt submits.
 echo "=== feeding the LUKS passphrase so cryptroot opens ===" >&2
-# A short head-start so the firmware → NMBL → activation path can paint the
-# modal before the first keystroke (typing into a pre-modal console is a no-op).
-sleep 10
-# Informational only (never gates the typing): if the modal text DID flush to
-# history, note it — helps a reader correlate the keystroke with the prompt.
-if seen_in_history "$PASSWORD_PROMPT_RE"; then
-  echo "=== luks-password modal text seen in history; answering ===" >&2
+# Wait for the modal to actually appear before typing (typing into a pre-modal
+# console buffers stray chars). wait_for polls history + arms a trigger.
+if wait_for "$PASSWORD_PROMPT_RE" 90; then
+  echo "=== luks-password modal detected; answering once ===" >&2
+else
+  # The frame may not have flushed yet but the boot could still be at the modal;
+  # fall through and answer anyway rather than stall (a late flush is common).
+  echo "=== modal text not yet flushed; answering on best-effort timing ===" >&2
 fi
+# A brief settle so the modal is fully input-ready, then the single answer.
+sleep 3
 send_cmd "$LUKS_PASSPHRASE"
+attempts=1
+MAX_ATTEMPTS=3
+# Number of distinct cryptsetup re-prompts we have ALREADY answered. Each genuine
+# re-prompt adds a NEW "Wrong password (attempt N)" frame to history, so we count
+# those frames and only answer ones we have not yet responded to — this prevents
+# the same re-prompt from being answered repeatedly (the pileup that triggers
+# REFUSE) while still recovering from a genuine re-prompt.
+reprompts_answered=0
 
-# Wait for the booted root shell, re-typing the passphrase periodically in case
-# the first attempt raced the modal's appearance. A refusal at any point is an
-# immediate failure — the signed generation must verify and boot.
+# Wait for the booted root shell. Re-send ONLY on a NEW genuine cryptsetup
+# re-prompt (capped) — never on a blind timer. A refusal at any point is an
+# immediate failure: the signed generation must verify and boot.
 echo "=== waiting up to ${SHELL_TIMEOUT}s for the post-kexec root shell ===" >&2
 booted=false
-i=0
 for _ in $(seq 1 "$((SHELL_TIMEOUT / 5))"); do
   if seen_in_history "$REFUSE_RE"; then
     echo "FAIL: NMBL REFUSED a correctly-signed generation (refusal marker seen)" >&2
@@ -184,12 +193,18 @@ for _ in $(seq 1 "$((SHELL_TIMEOUT / 5))"); do
     booted=true
     break
   fi
-  # Re-feed the passphrase periodically until we see a kexec/boot marker. We do
-  # this BLIND (not gated on seeing the modal — it may never flush, see above),
-  # every ~15s, so a slow/late modal still gets answered.
-  i=$((i + 1))
-  if [ $((i % 3)) -eq 0 ] && ! seen_in_history "kexec|${BOOTED_RE}"; then
-    send_cmd "$LUKS_PASSPHRASE"
+  # Count distinct re-prompt frames currently in history. If a NEW one appeared
+  # (our previous answer was wrong/raced) and we are under the attempt cap,
+  # answer it ONCE. seen_count returns the number of matching history lines.
+  if [ "$attempts" -lt "$MAX_ATTEMPTS" ] && ! seen_in_history "kexec|${BOOTED_RE}"; then
+    reprompts_now="$(seen_count "$REPROMPT_RE")"
+    if [ "$reprompts_now" -gt "$reprompts_answered" ]; then
+      echo "=== cryptsetup re-prompted; re-answering (attempt $((attempts + 1))/${MAX_ATTEMPTS}) ===" >&2
+      sleep 2
+      send_cmd "$LUKS_PASSPHRASE"
+      attempts=$((attempts + 1))
+      reprompts_answered="$reprompts_now"
+    fi
   fi
   sleep 5
 done

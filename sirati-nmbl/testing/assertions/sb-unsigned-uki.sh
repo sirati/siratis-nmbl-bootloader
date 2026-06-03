@@ -29,9 +29,22 @@ CONFIG_NAME="sb-unsigned-uki"
 # blocked the unsigned image. Case-insensitive, ORed into one regex.
 SB_REFUSED_RE='Security Violation|Access Denied|Image failed to load|not allowed|verification failed|Secure Boot|UEFI Interactive Shell|Shell> '
 
-# Markers that NMBL actually started — i.e. the unsigned UKI LAUNCHED. Seeing
+# Markers that NMBL actually EXECUTED — i.e. the unsigned UKI LAUNCHED. Seeing
 # any of these is a HARD FAIL: Secure Boot did not enforce.
-NMBL_RAN_RE='NMBL|nmbl-init|phase [1-9]|Generations|Enter boot'
+#
+# These must be RUNTIME markers NMBL prints only once its init runs, NOT the
+# firmware's boot-entry NAME. The EFI boot entry / systemd-boot menu label is
+# literally "NMBL" (lib/install-signing.nix `efibootmgr -L NMBL`; install-script
+# `title NMBL Bootloader`), and OVMF/BdsDxe prints that label as it scans boot
+# options EVEN WHEN it then refuses the image (run10: firmware printed
+# "Access Denied -- rejected probably by Secure Boot" with NMBL never running,
+# yet the old `NMBL` token false-matched the boot-entry label and FAILed). So we
+# match the BootReporter phase progression NMBL renders to serial as it boots
+# (`phase 1: mount …`, `phase 2a/2b: … kernel modules`, `phase 3:`, `phase 4:`
+# — src/main.rs, src/modules.rs, src/activation/mod.rs) and the `nmbl-init`
+# runtime startup banner (src/main.rs `nmbl_info!("nmbl-init starting")`). The
+# firmware emits none of these; they appear only if NMBL's init actually ran.
+NMBL_RAN_RE='nmbl-init starting|phase [1-9][a-z]?:'
 
 # How long to watch for the firmware's decision. The refusal is near-immediate
 # (the boot manager rejects the image before any OS code runs), but give OVMF

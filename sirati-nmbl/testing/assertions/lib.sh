@@ -93,6 +93,19 @@ seen_in_history() {
     | grep -Eiq "$pattern"
 }
 
+# seen_count <pattern>
+# Prints the number of HISTORY lines matching <pattern> (0 if none / on error).
+# Used to count distinct repeated frames — e.g. cryptsetup's incrementing
+# "Wrong password (attempt N)" re-prompts — so a caller can answer each NEW
+# re-prompt exactly once instead of re-answering the same one repeatedly.
+seen_count() {
+  local pattern="$1"
+  local -a sock_args
+  _socket_args sock_args
+  vm-serial-man find "$(_ci_pattern "$pattern")" "${sock_args[@]}" 2>/dev/null \
+    | grep -Eic "$pattern" || true
+}
+
 # assert_journal_tag <tag> [phase_match]
 # Sends a journalctl query for <tag> and asserts a positive line count.
 # The shell prints a sentinel "NMBL_LINES_<n>" we can match deterministically
