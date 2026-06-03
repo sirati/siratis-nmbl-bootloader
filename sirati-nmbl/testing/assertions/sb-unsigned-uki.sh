@@ -106,6 +106,12 @@ if wait_for "$SB_REFUSED_RE" "$SB_WATCH"; then
   if seen_in_history "$NMBL_RAN_RE"; then
     echo "FAIL: a Secure-Boot banner appeared BUT a NMBL marker is also present" >&2
     echo "      — the unsigned UKI launched, so Secure Boot did NOT enforce." >&2
+    echo "=== diagnostic: serial lines matching NMBL_RAN_RE ===" >&2
+    vm-serial-man find "$(_ci_pattern "$NMBL_RAN_RE")" --socket "$VM_SOCKET" 2>&1 \
+      | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | awk 'NR<=30' >&2
+    echo "=== diagnostic: last 80 serial lines ===" >&2
+    vm-serial-man tail 80 --socket "$VM_SOCKET" 2>&1 \
+      | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' >&2
     exit 1
   fi
   echo "PASS: firmware REFUSED the unsigned UKI (Secure-Boot violation; NMBL never ran)." >&2
