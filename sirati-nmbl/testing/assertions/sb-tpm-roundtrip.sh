@@ -81,8 +81,13 @@ JOURNAL_TAG="nmbl-init"
 UNSEAL_OK_PHRASE="via TPM token"
 # A password PROMPT means auto-unseal FAILED (fell back to the modal). The modal
 # prompt is rendered by the terminus AFTER the console is released, so it DOES
-# reach live serial — we assert its ABSENCE on serial on phase 2.
+# reach live serial — we assert its ABSENCE on serial on phase 2. On phase 1 the
+# SAME pattern detects the enroll-boot modal so we answer it once (see below).
 PASSWORD_PROMPT_RE='Enter LUKS passphrase|passphrase for cryptroot'
+# cryptsetup's re-prompt after a rejected attempt on the phase-1 enroll boot.
+# NMBL repaints a "Wrong password (attempt N)" box and re-shows the modal; a NEW
+# one means our answer was wrong/raced and we (carefully, capped) re-send.
+REPROMPT_RE='Wrong password \(attempt|cryptsetup rejected the passphrase'
 # The enroll tool's success marker (lib/tpm-enroll.nix): a systemd-tpm2 token
 # is now present in the header. Phase 1 must reach this before we power-cycle.
 # The enroll tool runs on the BOOTED system (NMBL no longer holds the console),
@@ -197,44 +202,50 @@ fi
 # system initrd then unlocks from the injected key (passToStage1), not a
 # prompt, so this is the only passphrase entry on the enroll boot.
 #
-# WHY WE TYPE BLIND (no wait-for-prompt gate): NMBL's passphrase modal is a
-# full-screen ratatui repaint that is NOT newline-terminated. vm-serial-man's
-# history is built by `read_line` (splits on '\n'), so while NMBL sits on the
-# modal awaiting input the un-terminated frame never flushes to the buffer —
-# `wait_for`/`seen_in_history` for the modal text can hang/miss even though the
-# box is on screen. So we do what an operator does: give the boot a head-start
-# to reach the LUKS stage, then type the passphrase + Enter on a fixed cadence
-# until the enroll system actually boots. `send_cmd` appends the newline, so
-# each attempt submits. Extra Enters on an already-unlocked system are harmless
-# (blank shell prompts). The post-kexec markers we wait on ARE newline-
-# terminated and flush normally.
-echo "=== feeding the enroll-boot LUKS passphrase (blind) ===" >&2
-# A short head-start so the firmware → NMBL → activation path can paint the
-# modal before the first keystroke (typing into a pre-modal console is a no-op).
-sleep 10
-# Informational only (never gates the typing): if the modal text DID flush to
-# history, note it — helps a reader correlate the keystroke with the prompt.
-if seen_in_history "$PASSWORD_PROMPT_RE"; then
-  echo "=== luks-password modal text seen in history; answering ===" >&2
+# DETECT-THEN-ANSWER-ONCE: the modal IS in the captured history now (the manager
+# survives the boot and idle-flush flushes the un-terminated ratatui frame), so
+# we WAIT for the modal text, then send the passphrase EXACTLY ONCE. The old
+# blind fixed-cadence re-send buffered stray chars before the box was input-ready
+# and piled up FAILED unlock attempts until NMBL hit its retry cap and REFUSED
+# (locking the TPM). We re-send ONLY on a genuine cryptsetup re-prompt ("Wrong
+# password (attempt N)"), capped, never a rapid loop. `send_cmd` appends the
+# newline so each attempt submits.
+echo "=== feeding the enroll-boot LUKS passphrase ===" >&2
+# Wait for the modal to actually appear before typing (typing into a pre-modal
+# console buffers stray chars). wait_for polls history + arms a trigger.
+if wait_for "$PASSWORD_PROMPT_RE" 90; then
+  echo "=== luks-password modal detected; answering once ===" >&2
+else
+  # A late flush is common; fall through and answer rather than stall.
+  echo "=== modal text not yet flushed; answering on best-effort timing ===" >&2
 fi
+# A brief settle so the modal is fully input-ready, then the single answer.
+sleep 3
 send_cmd "$ENROLL_PASSPHRASE"
+attempts=1
+MAX_ATTEMPTS=3
+# Distinct cryptsetup re-prompts already answered (see sb-signed-gen-happy.sh).
+reprompts_answered=0
 
 # The passphrase-unlock twin must reach the booted system so we can enroll.
-# Re-type the passphrase periodically (BLIND — the modal may never flush, see
-# above) in case the first attempt raced the modal's appearance.
+# Re-send ONLY on a NEW genuine cryptsetup re-prompt (capped) — never a blind
+# timer — to avoid the failed-attempt pileup that triggers REFUSE.
 echo "=== waiting up to ${SHELL_TIMEOUT}s for the enroll system shell ===" >&2
 booted=false
-i=0
 for _ in $(seq 1 "$((SHELL_TIMEOUT / 5))"); do
   if seen_in_history "root@${ENROLL_CONFIG_NAME}|root@${CONFIG_NAME}"; then
     booted=true
     break
   fi
-  # Re-feed the passphrase every ~15s until a kexec/boot marker appears, so a
-  # slow/late modal still gets answered without gating on the unseeable frame.
-  i=$((i + 1))
-  if [ $((i % 3)) -eq 0 ] && ! seen_in_history "kexec|root@"; then
-    send_cmd "$ENROLL_PASSPHRASE"
+  if [ "$attempts" -lt "$MAX_ATTEMPTS" ] && ! seen_in_history "kexec|root@"; then
+    reprompts_now="$(seen_count "$REPROMPT_RE")"
+    if [ "$reprompts_now" -gt "$reprompts_answered" ]; then
+      echo "=== cryptsetup re-prompted; re-answering (attempt $((attempts + 1))/${MAX_ATTEMPTS}) ===" >&2
+      sleep 2
+      send_cmd "$ENROLL_PASSPHRASE"
+      attempts=$((attempts + 1))
+      reprompts_answered="$reprompts_now"
+    fi
   fi
   sleep 5
 done
