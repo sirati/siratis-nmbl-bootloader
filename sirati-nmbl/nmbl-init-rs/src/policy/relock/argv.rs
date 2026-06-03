@@ -89,13 +89,19 @@ fn luks_relock(act: &Activation) -> Option<RelockCommand> {
 }
 
 /// LVM: `vgchange -an <vg>`, deriving `<vg>` from a `/dev/mapper/<vg>-<lv>`
-/// or `/dev/<vg>/<lv>` produced device.
+/// or `/dev/<vg>/<lv>` produced device. Loud-warns and returns `None` on a
+/// shape we cannot parse a VG from (matching the LUKS arm — a mis-shaped
+/// device must be loud, not a silent no-relock — LOW-1).
 fn lvm_relock(act: &Activation) -> Option<RelockCommand> {
-    let vg = act
+    let Some(vg) = act
         .produces_devices
         .iter()
         .map(PathBuf::as_path)
-        .find_map(vg_of)?;
+        .find_map(vg_of)
+    else {
+        warn_unrecognized(act, "lvm", "a /dev/<vg>/<lv> or /dev/mapper/<vg>-<lv>");
+        return None;
+    };
     Some(RelockCommand {
         binary: PathBuf::from("vgchange"),
         argv: vec!["-an".to_string(), vg.clone()],
@@ -105,12 +111,17 @@ fn lvm_relock(act: &Activation) -> Option<RelockCommand> {
 }
 
 /// mdraid: `mdadm --stop <md>`, requiring a `/dev/md*` produced device.
+/// Loud-warns and returns `None` when no `/dev/md*` node is present (LOW-1).
 fn mdraid_relock(act: &Activation) -> Option<RelockCommand> {
-    let md = act
+    let Some(md) = act
         .produces_devices
         .iter()
         .map(PathBuf::as_path)
-        .find(|p| is_md_node(p))?;
+        .find(|p| is_md_node(p))
+    else {
+        warn_unrecognized(act, "mdraid", "a /dev/md*");
+        return None;
+    };
     let md = md.to_string_lossy().into_owned();
     Some(RelockCommand {
         binary: PathBuf::from("mdadm"),
@@ -118,6 +129,18 @@ fn mdraid_relock(act: &Activation) -> Option<RelockCommand> {
         label: format!("md array {md}"),
         absent_exit_code: 0,
     })
+}
+
+/// Loud-warn that an activation's `produces_devices` had no shape this kind
+/// could safely relock, so NO relock is run (LOW-1). The LUKS arm already
+/// warns via `MapperParse::is_none_warned`; this gives LVM/mdraid the same
+/// audible signal instead of a silent `None`.
+fn warn_unrecognized(act: &Activation, kind: &str, wanted: &str) {
+    crate::nmbl_warn!(
+        "refuse: {kind} activation {:?} produced no {wanted} device; \
+         NOT relocking (could not derive a safe target)",
+        act.description
+    );
 }
 
 /// A `/dev/mapper/<name>` device, parsed into its bare `<name>`. Returns

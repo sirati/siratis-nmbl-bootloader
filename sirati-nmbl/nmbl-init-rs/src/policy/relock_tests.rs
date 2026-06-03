@@ -104,9 +104,37 @@ fn mdraid_relock_stops_the_md_node() {
 }
 
 #[test]
+fn lvm_relock_warns_and_returns_none_on_an_unparseable_shape() {
+    // LOW-1: an LVM activation whose produced device yields no VG (e.g. a bare
+    // /dev/mapper/ with no `-` separator) must take the loud-warn path and
+    // return None — the same audible signal the LUKS arm gives, not a silent
+    // no-relock.
+    let a = act(
+        ActivationKind::Lvm,
+        "/bin/vgchange",
+        &["/dev/mapper/noseparator"],
+    );
+    assert!(
+        relock_argv(&a).is_none(),
+        "an unparseable LVM device must not relock (and warns)"
+    );
+}
+
+#[test]
 fn mdraid_relock_rejects_a_non_md_device() {
     let a = act(ActivationKind::Mdraid, "/bin/mdadm", &["/dev/sda1"]);
+    // LOW-1: this also takes the loud-warn path (no /dev/md* node found).
     assert!(relock_argv(&a).is_none(), "non-/dev/md* must not relock");
+}
+
+#[test]
+fn lvm_and_mdraid_with_no_produced_devices_warn_and_return_none() {
+    // No produced devices at all ⇒ the warn path fires and returns None for
+    // both kinds (LOW-1: a mis-emitted activation is loud, not silent).
+    let lvm = act(ActivationKind::Lvm, "/bin/vgchange", &[]);
+    let md = act(ActivationKind::Mdraid, "/bin/mdadm", &[]);
+    assert!(relock_argv(&lvm).is_none());
+    assert!(relock_argv(&md).is_none());
 }
 
 #[test]
