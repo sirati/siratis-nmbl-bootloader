@@ -169,6 +169,17 @@ impl BakedKey {
         fp(&self.pubkey)
     }
 
+    /// Build a `BakedKey` from RAW encoded public-key bytes, fail-closed
+    /// (wrong length / malformed encoding ⇒ `Err`). The public counterpart of
+    /// [`Self::parse`]: it lets the host signer's cross-crate round-trip KAT
+    /// (FIX-25/FIX-52) construct the verify-key for the public bytes it just
+    /// derived, so `verify_digest` runs on the EXACT key the sidecar was minted
+    /// under. Trust narrowing still happens on the full fingerprint, never on
+    /// who called this.
+    pub fn from_pubkey(bytes: &[u8], alg: AlgId) -> Result<Self> {
+        Self::parse(bytes, alg)
+    }
+
     /// Parse one `(raw-bytes, alg)` pair into a `BakedKey`, fail-closed.
     /// Crate-internal so the cross-cutting KATs can craft a key set.
     pub(crate) fn parse(bytes: &[u8], alg: AlgId) -> Result<Self> {
