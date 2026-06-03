@@ -12,6 +12,7 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::generations::Generation;
+use crate::imageload::DriverImagesHandle;
 use crate::sys;
 
 #[cfg(feature = "secure-boot")]
@@ -38,8 +39,9 @@ pub(super) fn measure_required(config: &Config) -> bool {
 /// * Measuring OFF ⇒ NO-OP (no extend), regardless of feature.
 /// * Measuring ON, secure-boot, a `VerifiedGeneration` in hand ⇒ extend PCR-11
 ///   with the identity marker, the REUSED kernel+initrd digests (FIX-02), the
-///   byte-exact `cmdline` (FIX-14), and the (currently empty) driver-image
-///   slice (#28 fills it). A TPM/measure failure is fail-closed: it surfaces as
+///   byte-exact `cmdline` (FIX-14), and the ORDERED driver-image refs the loader
+///   verified (#28 — `driver_images.measure_refs()`, name‖digest per image, no
+///   re-hash). A TPM/measure failure is fail-closed: it surfaces as
 ///   `PolicyRefused` so the boot routes to refuse rather than booting
 ///   unmeasured (FIX-27).
 /// * Measuring ON but NO verified generation (audit-mode failure, or signing
@@ -57,6 +59,7 @@ pub(super) fn measure_handoff(
     generation: &Generation,
     verified: Option<&VerifiedGeneration>,
     cmdline: &str,
+    driver_images: &DriverImagesHandle,
 ) -> Result<()> {
     if !measure_required(config) {
         return Ok(());
@@ -83,9 +86,12 @@ pub(super) fn measure_handoff(
             }));
         };
 
-        // #28 (Wave-4) supplies the ordered+hashed driver-image refs here; #27
-        // accepts an empty slice (event #4 is then absent).
-        let driver_images: &[measure::DriverImageRef] = &[];
+        // #28 (Wave-4): the ORDERED driver-image refs the loader verified —
+        // one name‖digest per loaded image, in declared/load order, reusing the
+        // SHA-512 the verify streamed over the pinned fd (FIX-02 — no re-hash).
+        // An empty handle (no driver images declared) yields an empty slice, so
+        // event #4 is then absent and the measurement is unchanged.
+        let refs = driver_images.measure_refs();
         // Fail CLOSED on any TPM/measure error: a present-but-uncappable or
         // absent TPM on a measure-required build must refuse, never boot
         // silently unmeasured (FIX-27).
@@ -95,7 +101,7 @@ pub(super) fn measure_handoff(
             &vg.kernel_digest,
             &vg.initrd_digest,
             cmdline,
-            driver_images,
+            &refs,
         )
         .map_err(refuse)?;
         Ok(())
@@ -137,11 +143,15 @@ pub(super) fn load_handoff(
 ) -> Result<()> {
     #[cfg(feature = "secure-boot")]
     if let Some(vg) = verified {
-        // Pin the verified fd into the load — no re-open by path (MED-1).
+        // Pin BOTH verified fds into the load — no re-open/re-read by path: the
+        // kernel fd (MED-1) and the initrd source fd (LOW-A). The initrd bytes
+        // spliced with the cpio fragment are read from the verified initrd fd,
+        // so they are byte-identical to the verified + measured ones.
         return sys::kexec::load_with_kernel_fd_and_extra_initrd_cpio(
             &generation.kernel,
             vg.kernel_fd.as_fd(),
             &generation.initrd,
+            vg.initrd_fd.as_fd(),
             fragment,
             cmdline,
             0,

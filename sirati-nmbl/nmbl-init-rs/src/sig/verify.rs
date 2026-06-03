@@ -297,17 +297,26 @@ fn verify_generation_blob(
 ///   signature; the loader hands THIS fd to `kexec_file_load(2)` (never
 ///   re-opening the path), so the loaded kernel is byte-identical to the
 ///   verified+measured one.
+/// * `initrd_fd` — the (pristine) initrd's OWN, still-open `O_RDONLY` fd, kept
+///   on the SAME footing as the kernel fd (LOW-A). The loader splices the NMBL
+///   cpio fragment onto the initrd bytes read from THIS fd — never re-reading
+///   the path — so the initrd bytes spliced into the kexec memfd are
+///   byte-identical to the ones verified + measured. Closing the verify→load
+///   window for the initrd too, not just the kernel.
 /// * `kernel_digest` / `initrd_digest` — the SHA-512 digests the verifier
 ///   already streamed over the pinned fds. The PCR-11 measure reuses these
 ///   verbatim (no second hash — FIX-02).
 ///
-/// Holding the fd in the witness keeps it alive for the whole verify→measure
-/// →load window: dropping the witness closes the fd, so the loader must consume
-/// it within that window.
+/// Holding the fds in the witness keeps them alive for the whole verify→measure
+/// →load window: dropping the witness closes them, so the loader must consume
+/// them within that window.
 #[derive(Debug)]
 pub struct VerifiedGeneration {
     /// The kernel's pinned fd — opened once for verify, reused for load.
     pub kernel_fd: OwnedFd,
+    /// The (pristine) initrd's pinned fd — opened once for verify, reused for
+    /// the kexec initrd splice (LOW-A — no path re-read).
+    pub initrd_fd: OwnedFd,
     /// SHA-512 of the kernel, reused by the measure step (no re-hash).
     pub kernel_digest: [u8; 64],
     /// SHA-512 of the (pristine) initrd, reused by the measure step.
@@ -321,13 +330,14 @@ pub struct VerifiedGeneration {
 /// verdict), this opens the kernel ONCE and KEEPS that fd, streams it through
 /// SHA-512 (the digest the sidecar verify uses AND the measure reuses), then
 /// verifies the signature over that one fd. The initrd is opened, hashed, and
-/// verified the same way; its fd is not retained (the loader re-reads the
-/// pristine initrd into a memfd to splice the NMBL cpio fragment — the initrd
-/// digest is what binds it, and it is measured, not the fragment — FIX-42).
+/// verified the same way, AND its fd is likewise RETAINED (LOW-A): the loader
+/// splices the NMBL cpio fragment onto the initrd bytes read from that pinned
+/// fd, so the bytes loaded == verified == measured for the initrd too (only the
+/// pristine initrd is measured, never the fragment — FIX-42).
 ///
-/// On success the returned [`VerifiedGeneration`] owns the live kernel fd; the
-/// caller loads THAT fd. On any verify failure the fd is dropped and the error
-/// propagates (the gate maps audit-vs-enforce).
+/// On success the returned [`VerifiedGeneration`] owns the live kernel + initrd
+/// fds; the caller loads from THOSE fds. On any verify failure the fds are
+/// dropped and the error propagates (the gate maps audit-vs-enforce).
 pub fn verify_generation_pinned(
     config: &Config,
     generation: &Generation,
@@ -354,9 +364,9 @@ pub fn verify_generation_pinned(
         config,
     )?;
 
-    // The initrd is verified over its own pinned fd; its digest is captured for
-    // the measure. Its fd is not retained (see the doc comment).
-    let initrd_digest = verify_generation_blob_digest(
+    // The initrd is verified over its OWN pinned fd, its digest captured for the
+    // measure, AND its fd RETAINED for the load splice (LOW-A — no path re-read).
+    let (initrd_fd, initrd_digest) = verify_generation_blob_pinned(
         config,
         &generation.initrd,
         &sig_dir.join(format!("initrd{suffix}")),
@@ -366,23 +376,27 @@ pub fn verify_generation_pinned(
 
     Ok(VerifiedGeneration {
         kernel_fd: kernel_file.into(),
+        initrd_fd,
         kernel_digest,
         initrd_digest,
     })
 }
 
-/// Like [`verify_generation_blob`], but also returns the SHA-512 digest the
-/// verify computed over the pinned fd, so the measure step reuses it (FIX-02).
-fn verify_generation_blob_digest(
+/// Like [`verify_generation_blob`], but opens the blob ONCE, verifies + hashes
+/// it over that single pinned fd, and RETURNS both the live fd and the SHA-512
+/// digest. The kept fd lets the loader splice from the exact verified+measured
+/// bytes (LOW-A); the digest is reused by the measure step (FIX-02).
+fn verify_generation_blob_pinned(
     config: &Config,
     blob: &Path,
     sig_path: &Path,
     desc: &str,
     domain: &'static [u8],
-) -> Result<[u8; 64]> {
+) -> Result<(OwnedFd, [u8; 64])> {
     let file = fs::File::open(blob).map_err(|source| NmblError::Io {
         source,
-        context: format!("open {desc} {} for verify", blob.display()),
+        context: format!("open {desc} {} for verify+load", blob.display()),
     })?;
-    verify_image_fd_digest(file.as_fd(), desc, Some(sig_path), domain, config)
+    let digest = verify_image_fd_digest(file.as_fd(), desc, Some(sig_path), domain, config)?;
+    Ok((file.into(), digest))
 }
