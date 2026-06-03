@@ -192,7 +192,7 @@ let
         echo "         Secure Boot enforcing: $sb_enforcing; cert in db: $cert_enrolled." >&2
         echo "         The signed UKI is installed, but the firmware->NMBL"   >&2
         echo "         trust chain is NOT yet enforceable on this machine."   >&2
-        echo "         Enroll ${toString certFileStr} into db out-of-band"    >&2
+        echo "         Enroll ${certArg} into db out-of-band"    >&2
         echo "         and enable/enforce Secure Boot to close the chain."    >&2
         echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
         ${lib.optionalString ukiRefuseIfNotEnforcing ''
