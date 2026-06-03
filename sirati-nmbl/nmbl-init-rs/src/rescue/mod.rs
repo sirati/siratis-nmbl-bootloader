@@ -65,14 +65,16 @@ pub fn dispatch(
     // interactive context (embedded `execve` into a shell, or a chrooted
     // rescue system), so cap the lock PCR + close every TPM-unsealed
     // mapper FIRST. This is the authoritative sentinel-seal point. A seal
-    // failure refuses all rescue interactivity — drop the console and halt
-    // with the seal-failure banner (no shell). Runs blocking: `dispatch`
-    // is synchronous and (for the External arm) builds its own runtime.
+    // failure refuses all rescue interactivity — drop the console and route
+    // through the refuse terminus (M1): best-effort relock + sentinel +
+    // reboot into rescue, no shell. Runs blocking: `dispatch` is
+    // synchronous and (for the External arm) builds its own runtime.
     if let Err(seal_err) = crate::policy::seal_secrets_blocking(config.tpm.require_tpm) {
         drop(console);
-        return Ok(TerminalAction::HaltWithBanner {
-            cause: seal_err.into_cause(),
-        });
+        return Ok(crate::policy::refuse_unsigned_blocking(
+            config,
+            seal_err.into_cause(),
+        ));
     }
     // `console` is owned by this function and drops by normal scope
     // exit before the dispatcher in `main` fires any syscall. The

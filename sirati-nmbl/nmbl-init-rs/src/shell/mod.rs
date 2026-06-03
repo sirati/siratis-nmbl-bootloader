@@ -118,9 +118,12 @@ pub async fn drop_to_emergency(
     // mapper. The idempotent latch makes the per-choice G3 seal a no-op;
     // sealing here closes the window between the menu rendering and the
     // operator picking a shell. On a seal failure we refuse all
-    // interactive context and halt with the seal-failure banner.
+    // interactive context and route through the refuse terminus (M1):
+    // best-effort relock + sentinel + reboot into rescue, no shell. The
+    // console drops here, restoring the VT before the reboot fires in main.
     if let Err(seal_err) = crate::policy::seal_secrets(config.tpm.require_tpm, sender).await {
-        return refuse_on_seal_failure(seal_err);
+        drop(console);
+        return refuse_on_seal_failure(seal_err, config, sender).await;
     }
     let mut console = console;
 
@@ -174,9 +177,11 @@ pub fn open_console_and_drop_to_emergency(config: &Config, err: NmblError) -> Te
     // path runs OUTSIDE the runtime, so seal via the blocking shape
     // before opening a console that leads to the (shell-offering)
     // emergency menu. Refuse all interactive context on a seal failure.
-    // The inner `drop_to_emergency` (G1) re-seals idempotently.
+    // The inner `drop_to_emergency` (G1) re-seals idempotently. This is a
+    // SYNC, pre-runtime site (no sender), so it routes through the BLOCKING
+    // refuse terminus (M1): best-effort relock + sentinel + reboot.
     if let Err(seal_err) = crate::policy::seal_secrets_blocking(config.tpm.require_tpm) {
-        return refuse_on_seal_failure(seal_err);
+        return crate::policy::refuse_unsigned_blocking(config, seal_err.into_cause());
     }
     // These call sites have no prior boot session (initial bring-up
     // failure, panic-recovery re-exec, pre-console phases), so no

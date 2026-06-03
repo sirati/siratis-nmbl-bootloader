@@ -169,6 +169,21 @@ pub(super) fn execute_terminal_action(action: TerminalAction) -> ! {
                 }
             }
         }
+        TerminalAction::RebootIntoRescue { cause, sealed } => {
+            // The untrusted-image / policy refuse terminus (R-1/R-13). By
+            // the time we reach here `relock_and_refuse` has already capped
+            // the lock PCR, closed every TPM-unsealed mapper, relocked LUKS,
+            // and written the rescue sentinel, and the non-interactive
+            // refuse countdown has run to its Enter/timeout. The `Sealed`
+            // witness rode along inside the value as the type-level proof
+            // that the seal happened before this terminus was built; drop it
+            // here — its job (gating construction) is done.
+            let _: nmbl_init::policy::Sealed = sealed;
+            print_halt_banner(&cause);
+            eprintln!("[nmbl] policy refuse: rebooting into rescue (sentinel set, TPM locked)");
+            let _ = reboot(RebootMode::RB_AUTOBOOT);
+            halt_final("reboot(RB_AUTOBOOT) returned after refuse; halting")
+        }
         TerminalAction::Kexec => {
             nmbl_info!("kexec: handing off to new kernel");
             // sys::kexec::execute returns Result<Infallible>; either
@@ -309,6 +324,20 @@ pub(super) async fn run_tui_session(
         Err(NmblError::OperatorChoseReboot { .. }) => {
             drop(console);
             TerminalAction::Reboot
+        }
+        // Policy refuse (R-1/R-13): an untrusted image / failed gate
+        // surfaced `PolicyRefused`. This is the ONE shared refuse-render
+        // entry — NEVER the shell-offering emergency menu (FIX-35). The
+        // security teardown (cap → close → sentinel → relock) and the
+        // non-interactive countdown both happen inside `run_refuse_screen`,
+        // which returns the type-gated `RebootIntoRescue` terminus. The
+        // console drops on return, restoring the VT before the reboot
+        // syscall fires in `execute_terminal_action`.
+        Err(NmblError::PolicyRefused { cause }) => {
+            let action =
+                nmbl_init::policy::run_refuse_screen(config, &mut *console, *cause, sender).await;
+            drop(console);
+            action
         }
         Err(err) => {
             // Hand the live boot console down to the emergency screen so
