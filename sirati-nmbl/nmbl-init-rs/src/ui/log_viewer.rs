@@ -44,6 +44,12 @@ pub struct LogViewer {
     offset: Cell<u16>,
     follow_bottom: Cell<bool>,
     source: LogSource,
+    /// When `true` the viewer shows a FIXED, caller-supplied line set and
+    /// MUST NOT re-read a live buffer: Ctrl+K (toggle source) is suppressed
+    /// so the operator cannot flip to the live `Nmbl`/`Kernel` buffer. Used
+    /// by the secure-boot refuse screen, where the pre-refuse transcript is
+    /// scrubbed and only a post-refuse snapshot may be shown (FIX-41).
+    scrubbed: bool,
 }
 
 /// What a key did to the viewer, so a host loop knows whether to redraw
@@ -72,6 +78,25 @@ impl LogViewer {
             offset: Cell::new(0),
             follow_bottom: Cell::new(true),
             source,
+            scrubbed: false,
+        }
+    }
+
+    /// Open a viewer on a FIXED, caller-supplied line set that is NEVER
+    /// re-read from a live buffer (FIX-41). Ctrl+K (toggle source) becomes a
+    /// no-op so a scrubbed view cannot be flipped back to the live
+    /// `Nmbl`/`Kernel` buffer and leak the pre-refuse transcript. Renders
+    /// under the [`LogSource::Nmbl`] chrome (the source label is cosmetic;
+    /// the lines are exactly what the caller passed). Used by the secure-boot
+    /// refuse screen.
+    #[must_use]
+    pub fn open_scrubbed(lines: Vec<String>) -> Self {
+        Self {
+            lines,
+            offset: Cell::new(0),
+            follow_bottom: Cell::new(true),
+            source: LogSource::Nmbl,
+            scrubbed: true,
         }
     }
 
@@ -114,6 +139,12 @@ impl LogViewer {
                 // the selector); a standalone host treats it as close too.
                 KeyCode::Char('l') => return LogViewerOutcome::Close,
                 KeyCode::Char('k') => {
+                    // In scrubbed mode there is no live buffer to toggle to:
+                    // suppress Ctrl+K so the operator cannot flip back to the
+                    // pre-refuse transcript (FIX-41).
+                    if self.scrubbed {
+                        return LogViewerOutcome::Ignored;
+                    }
                     self.toggle_source();
                     return LogViewerOutcome::Redraw;
                 }
