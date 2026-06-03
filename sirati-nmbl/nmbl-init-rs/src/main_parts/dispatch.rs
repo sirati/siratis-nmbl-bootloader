@@ -151,7 +151,24 @@ pub(super) fn execute_terminal_action(action: TerminalAction) -> ! {
             env,
             banner,
             rescue_handoff,
-        } => dispatch_execve(path, argv, env, banner, rescue_handoff),
+        } => {
+            // SEAL BACKSTOP (G10): the LAST line of defense before the
+            // execve syscall hands PID 1 to a shell. An `Execve` action is
+            // only ever produced AFTER a G-site seal (G4 `rescue::dispatch`
+            // is the authoritative, `requireTpm`-aware seal), so this hits
+            // the idempotent latch and returns instantly. If — by some
+            // future refactor — an unsealed `Execve` reaches here, this
+            // caps fail-closed (`require_tpm=false`: degrade-open on no-TPM,
+            // but a present-but-uncappable TPM still halts). `dispatch_execve`
+            // REQUIRES the witness by type, so it cannot run without a seal.
+            match nmbl_init::policy::seal_secrets_blocking(false) {
+                Ok(sealed) => dispatch_execve(sealed, path, argv, env, banner, rescue_handoff),
+                Err(seal_err) => {
+                    print_halt_banner(&seal_err.into_cause());
+                    halt_final("seal-on-execve failed; halting")
+                }
+            }
+        }
         TerminalAction::Kexec => {
             nmbl_info!("kexec: handing off to new kernel");
             // sys::kexec::execute returns Result<Infallible>; either
@@ -176,12 +193,17 @@ pub(super) fn execute_terminal_action(action: TerminalAction) -> ! {
 /// parent match arms short (the Execve arm alone carried 35 source
 /// lines of redirect + safety comment + execve call).
 fn dispatch_execve(
+    sealed: nmbl_init::policy::Sealed,
     path: std::ffi::CString,
     argv: Vec<std::ffi::CString>,
     env: Vec<std::ffi::CString>,
     banner: Option<nmbl_init::terminal::EmergencyBanner>,
     rescue_handoff: bool,
 ) -> ! {
+    // The `Sealed` witness proves the lock PCR was capped and every
+    // TPM-unsealed mapper closed before this single PID1 execve waist
+    // (re-audit C-1). Required by type so the execve cannot run unsealed.
+    let _sealed = sealed;
     if let Some(b) = banner {
         print_banner(&b);
     }

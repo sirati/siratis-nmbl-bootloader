@@ -241,6 +241,20 @@ async fn serve_session(
     sink: &ActionSink,
     sender: &crate::sys::poller::LocalSender,
 ) {
+    // SEAL ON ENTRY (G_remote / FIX-06): a remote-attach session reaches
+    // the SAME shell-offering emergency menu the local console does, so
+    // cap the lock PCR + close every TPM-unsealed mapper BEFORE building
+    // the TtyConsole or rendering the first frame — closing the pre-cap
+    // window a remote operator could otherwise exploit. On a seal failure
+    // we abandon the session entirely (no console, no shell). The local
+    // console keeps its own seal; this is the per-remote-session guard.
+    if let Err(seal_err) = crate::policy::seal_secrets(config.tpm.require_tpm, sender).await {
+        nmbl_warn!(
+            "remote-tui: seal-on-rescue failed; refusing session: {}",
+            crate::error::format_chain(seal_err.cause() as &dyn std::error::Error)
+        );
+        return;
+    }
     let console = match TtyConsole::from_pty(handle.pty, handle.winsize) {
         Ok(c) => c,
         Err(e) => {

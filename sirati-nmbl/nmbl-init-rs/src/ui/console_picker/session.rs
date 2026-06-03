@@ -45,9 +45,15 @@ pub enum PickerSessionOutcome {
 /// NMBL stays at PID 1 throughout. This is the deliberate departure
 /// from the legacy `EmergencyChoice::RawShell` -> execve path.
 pub async fn run_picker_session(
+    sealed: crate::policy::Sealed,
     console: &mut dyn Console,
     config: &Config,
 ) -> Result<PickerSessionOutcome> {
+    // `sealed` is the unforgeable proof that `policy::seal_secrets` ran
+    // (lock PCR capped, TPM-unsealed mappers closed) BEFORE this fork/exec
+    // waist. Holding it by value here is what makes "no shell without a
+    // seal" a compile-time guarantee (re-audit C-1).
+    let _sealed = sealed;
     let mut state = PickerState::build(config)?;
     if state.candidates.is_empty() {
         return Ok(PickerSessionOutcome::Cancelled);
@@ -148,6 +154,7 @@ pub(super) fn display_target_for(console: &dyn Console) -> PathBuf {
 /// attempted.
 fn fire_and_forget_spawn(config: &Config, targets: &[PathBuf]) -> Result<()> {
     for t in targets {
+        // seal-exempt: reached only via `run_picker_session`, which requires the `Sealed` witness; the seal (cap + close-mappers) already ran at the session entry before any shell forks here.
         match crate::sys::pty::spawn_shell_on_tty(&config.paths.shell, t) {
             Ok(_) => {}
             Err(e) => {

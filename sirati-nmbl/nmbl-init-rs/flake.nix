@@ -354,6 +354,66 @@
             fi
             touch $out
           '';
+
+          # The single MOST security-critical invariant: no interactive
+          # context (shell / PTY) is reachable while the lock PCR is
+          # uncappable or a TPM-unsealed LUKS mapper is still live. Every
+          # shell-fork waist (`spawn_shell` / `spawn_shell_on_tty`) MUST be
+          # preceded — within its enclosing function — by the `Sealed`
+          # witness that `policy::seal_secrets` mints (cap PCR + close
+          # mappers), OR carry a `// seal-exempt: <why>` justification
+          # (mirroring `// execve safety:`). A `Sealed` parameter on the
+          # function, a `seal_secrets` call, or the witness binding all
+          # satisfy the check; a bare spawn with neither fails CI. The
+          # type system is the real guarantee (the shell-spawn helpers
+          # require a `Sealed` by value); this is the machine-checked
+          # belt-and-suspenders that catches a new unguarded waist (FIX-29
+          # / re-audit C-1).
+          nmbl-init-must-seal = pkgs.runCommand "nmbl-init-must-seal" {
+            nativeBuildInputs = [ pkgs.gawk ];
+          } ''
+            cd ${./.}
+            rc=0
+            for f in $(find src -name '*.rs'); do
+              awk -v file="$f" '
+                # Ring buffer of the last WINDOW source lines so the
+                # witness (a `Sealed` param in the fn signature, a
+                # `seal_secrets` call, or a `// seal-exempt:` note) is
+                # found even when it sits several lines above the fork.
+                BEGIN { WINDOW = 80 }
+                {
+                  buf[NR % WINDOW] = $0
+                }
+                # A shell-fork waist: the two PTY shell-spawn primitives.
+                # Skip comment lines (doc-comments that merely mention the
+                # primitive) and their own definitions (`fn spawn_shell`).
+                ($0 ~ /\<spawn_shell(_on_tty)?\(/) \
+                  && $0 !~ /^[[:space:]]*\/\// \
+                  && $0 !~ /\<fn[[:space:]]+spawn_shell/ {
+                  ok = 0
+                  for (i = 0; i < WINDOW; i++) {
+                    j = (NR - i) % WINDOW
+                    line = buf[j]
+                    if (line ~ /seal-exempt:/ || line ~ /seal_secrets/ \
+                        || line ~ /Sealed/) {
+                      ok = 1
+                      break
+                    }
+                  }
+                  if (!ok) {
+                    printf "%s:%d:%s\n", file, FNR, $0
+                    bad = 1
+                  }
+                }
+                END { exit bad }
+              ' "$f" || rc=1
+            done
+            if [ "$rc" -ne 0 ]; then
+              echo "ERROR: every shell-fork (spawn_shell / spawn_shell_on_tty) must be preceded by the Sealed witness from policy::seal_secrets (cap PCR + close TPM-unsealed mappers) or carry a '// seal-exempt: <why>' justification"
+              exit 1
+            fi
+            touch $out
+          '';
         };
       }
     );
