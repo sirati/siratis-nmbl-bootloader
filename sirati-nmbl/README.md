@@ -198,6 +198,49 @@ Notable points:
   the TUI passphrase modal).
 - `verbose` defaults to inheriting `boot.initrd.verbose`.
 
+#### Sealing a LUKS volume to the TPM (`nmbl-tpm-enroll`)
+
+For `unlock = "tpm"` devices, the volume key is sealed to the TPM with
+the host helper **`nmbl-tpm-enroll`** (shipped on the installed system,
+never inside the initramfs). It is a thin wrapper over
+`systemd-cryptenroll` — there is no bespoke TPM sealing code. Run it
+once, after the box has first-booted the installed system, against the
+LUKS header:
+
+```sh
+# Seal the volume key to the TPM, bound to PCRs 11+7 (the default).
+sudo nmbl-tpm-enroll --device /dev/disk/by-partlabel/disk-main-luks
+```
+
+The **enroll → boot-unlock round trip**:
+
+1. **Enroll (host, once).** `nmbl-tpm-enroll` runs
+   `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=11+7 <device>`,
+   which generates a random volume key, seals it to the TPM under the
+   `{11, 7}` PCR policy, adds a LUKS2 keyslot for it, and writes a
+   `systemd-tpm2` **token** into the LUKS2 header. PCR 11 is NMBL's
+   measure PCR (`boot.nmbl.tpm.pcrIndex`); PCR 7 is the firmware /
+   Secure-Boot-state PCR.
+2. **Boot-unlock (NMBL).** At boot NMBL runs its existing
+   `cryptsetup open --token-only <device> <name>`. `--token-only` makes
+   libcryptsetup consume that `systemd-tpm2` token and unseal the
+   volume key from the TPM **without any passphrase prompt** — but only
+   if PCR 11 (NMBL's measured handoff) and PCR 7 (Secure-Boot state)
+   still match the values they had at enrol time.
+3. **Tamper / rescue ⇒ secrets safe.** PCR 11 is *capped* (extended with
+   a poison value) the moment NMBL diverts to rescue, and a tampered
+   kernel/initrd or a firmware that stopped enforcing Secure Boot moves
+   PCR 7. Either way the sealed PCR policy no longer matches, the
+   `--token-only` unseal **fails**, and the box falls back to the
+   passphrase modal instead of auto-unlocking — so the disk stays sealed
+   on an untampered-only basis.
+
+Keep a passphrase keyslot as a recovery path, and re-run
+`nmbl-tpm-enroll --wipe-existing …` after any change to the measured
+inputs (a new NMBL kernel/initrd, or a firmware update that moves PCR 7).
+The default PCR set is `11+7`; override with `--pcrs` if your
+`boot.nmbl.activation.luks.<name>.tpmPcrs` policy differs.
+
 ### efi-stub direct boot
 
 With `loader = "efi-stub"` (UEFI only) NMBL's kernel + initrd are

@@ -44,6 +44,14 @@ let
   };
   selectedNmblInit = signingBuild.selectedNmblInit;
 
+  # `nmbl-tpm-enroll` — the HOST / install-time LUKS-to-TPM seal helper. It is a
+  # `writeShellApplication` (reuses `systemd-cryptenroll` + the boot path's
+  # `cryptsetup --token-only`, no Rust TPM2_Unseal — master-plan §A). It MUST
+  # NEVER ship inside the initramfs (boot only ever UNSEALS, never enrolls). We
+  # build it here purely to compute its store path for the absence check below;
+  # the package output proper is exposed by the host flake.
+  nmblTpmEnroll = import ./tpm-enroll.nix { inherit pkgs lib; };
+
   # Activation options are contributed by ./modules/activation.nix. Read
   # defensively so this file still evaluates if that module hasn't been
   # imported yet (e.g. during sibling-subtask staggered merges). The
@@ -369,6 +377,42 @@ in
       else
         pkgs.writeText "nmbl-assertions-ok" "All NMBL assertions passed\n";
 
+    # ABSENT-FROM-INITRAMFS ASSERT (#51). `nmbl-tpm-enroll` is a HOST / install
+    # tool: it ENROLLS (seals) a LUKS key to the TPM AFTER the box has booted.
+    # The NMBL boot path only ever UNSEALS (`cryptsetup open --token-only`) and
+    # NEVER enrolls, so the enroll tool — and the heavy systemd-cryptenroll /
+    # systemd closure it drags in — MUST NOT enter the initramfs / nmbl-init
+    # closure. This mirrors the closure-leak / absence asserts used for the
+    # signing keys and host signer: it computes the transitive closure of the
+    # built initramfs and FAILs the build if the enroll tool's store path
+    # appears in it. The ENFORCING copy of this check is `builtins.seq`'d into
+    # the `nmblInitramfs` return below (over the LOCAL `initramfs` value — never
+    # the public `system.build.nmblInitramfs`, which would be a cycle), so it
+    # runs on every build that produces an initramfs (toplevel / UKI / install).
+    # It would FIRE if the tool were ever staged into the initramfs.
+    #
+    # This `system.build.*` attribute is the directly-BUILDABLE mirror of that
+    # enforcing check (`nix build …#…nmblTpmEnrollAbsenceCheck`), useful for CI /
+    # audits; it computes the same closure over the public initramfs.
+    system.build.nmblTpmEnrollAbsenceCheck =
+      let
+        enrollPath = "${nmblTpmEnroll}";
+        initrdClosure = pkgs.closureInfo { rootPaths = [ config.system.build.nmblInitramfs ]; };
+      in
+      pkgs.runCommand "nmbl-tpm-enroll-absent-from-initramfs" { } ''
+        # `store-paths` lists every store path in the initramfs's transitive
+        # closure. The enroll tool must NOT be among them.
+        if grep -qxF ${lib.escapeShellArg enrollPath} ${initrdClosure}/store-paths; then
+          echo "FAIL: nmbl-tpm-enroll (${enrollPath})" >&2
+          echo "      leaked into the NMBL initramfs closure. It is a HOST/install" >&2
+          echo "      tool — the boot path only UNSEALS via 'cryptsetup --token-only'," >&2
+          echo "      it NEVER enrolls. Keep nmbl-tpm-enroll out of the initramfs." >&2
+          exit 1
+        fi
+        echo "OK: nmbl-tpm-enroll is absent from the NMBL initramfs closure."
+        touch "$out"
+      '';
+
     # Build the minimal initramfs around the Rust /init binary.
     #
     # Contents are deliberately small:
@@ -479,10 +523,35 @@ in
           contents = baseContents ++ splashContents ++ activationExtraContents;
           compressor = "gzip -9";
         };
+
+        # Absence-from-initramfs assert over the LOCAL `initramfs` (NOT
+        # `config.system.build.nmblInitramfs`, which would be a cycle): fails the
+        # build if `nmbl-tpm-enroll`'s store path is in the initramfs closure.
+        # Seq'd into the return so it runs on every build that produces an
+        # initramfs (toplevel / UKI / install).
+        enrollAbsenceCheck =
+          let
+            enrollPath = "${nmblTpmEnroll}";
+            initrdClosure = pkgs.closureInfo { rootPaths = [ initramfs ]; };
+          in
+          pkgs.runCommand "nmbl-tpm-enroll-absent-from-initramfs" { } ''
+            if grep -qxF ${lib.escapeShellArg enrollPath} ${initrdClosure}/store-paths; then
+              echo "FAIL: nmbl-tpm-enroll (${enrollPath}) leaked into the NMBL" >&2
+              echo "      initramfs closure. It is a HOST/install tool — the boot" >&2
+              echo "      path only UNSEALS via 'cryptsetup --token-only', it NEVER" >&2
+              echo "      enrolls. Keep nmbl-tpm-enroll out of the initramfs." >&2
+              exit 1
+            fi
+            echo "OK: nmbl-tpm-enroll is absent from the NMBL initramfs closure."
+            touch "$out"
+          '';
       in
-      # Force assertion checking before returning initramfs
-      # builtins.seq forces evaluation of the first argument before returning the second
-      builtins.seq config.system.build.nmblAssertionCheck initramfs;
+      # Force assertion checking AND the enroll-absence check before returning
+      # the initramfs. builtins.seq forces evaluation of the first argument
+      # before returning the second; nest so BOTH run.
+      builtins.seq config.system.build.nmblAssertionCheck (
+        builtins.seq enrollAbsenceCheck initramfs
+      );
 
     # Build the bootloader kernel
     system.build.nmblKernel = cfg.kernelPackage;
@@ -632,8 +701,15 @@ in
 
     # Add install-nmbl to system packages. kexec-tools is no longer required:
     # the Rust /init drives kexec via the kexec_file_load(2) syscall directly.
+    #
+    # `nmbl-tpm-enroll` ships on the INSTALLED system (never the initramfs — it
+    # is asserted absent from the initramfs closure above): TPM enrolment must
+    # happen AFTER first boot, from the running NixOS, against the on-disk LUKS
+    # header. The operator runs it once to seal the volume key to PCRs 11+7 so
+    # subsequent measured boots auto-unlock via NMBL's `--token-only` path.
     environment.systemPackages = [
       installScriptModule.installNmbl
+      nmblTpmEnroll
     ];
   };
 }

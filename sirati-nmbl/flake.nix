@@ -87,6 +87,15 @@
       nmblSign =
         nmbl-init-rs.packages.${system}.nmbl-sign or null;
 
+      # The host / install-time LUKS-to-TPM seal helper (`nmbl-tpm-enroll`). It
+      # reuses `systemd-cryptenroll` to write a LUKS2 systemd-tpm2 token that
+      # NMBL's boot-time `cryptsetup open --token-only` unlock consumes (no Rust
+      # TPM2_Unseal — master-plan §A SEALING-REUSE). Exposed as a package so the
+      # installer / operator can run it once after first boot; it is asserted
+      # ABSENT from the initramfs closure by lib/config.nix.
+      nmblTpmEnroll = import ./lib/tpm-enroll.nix { inherit pkgs lib; };
+      lib = nixpkgs.lib;
+
       # Import rescue-vm-test app directly
       rescueVmTestFlake = import ../rescue-vm-test/flake.nix;
       rescueVmTestApp =
@@ -286,6 +295,15 @@
           # build to sign each squashfs at install time.
           _module.args.nmblSign = nmblSign;
         };
+
+      # Installer-available host tools. `nmbl-tpm-enroll` seals a LUKS volume
+      # key to the TPM bound to NMBL's measured-boot PCRs (11+7); run it once,
+      # after the box has first-booted the installed system, against the LUKS
+      # header. It is asserted ABSENT from the initramfs closure (it never ships
+      # in NMBL's boot environment). Build with `nix build .#nmbl-tpm-enroll`.
+      packages.${system} = {
+        nmbl-tpm-enroll = nmblTpmEnroll;
+      };
 
       # Test configurations
       nixosConfigurations = testing.mkTestConfigurations;
