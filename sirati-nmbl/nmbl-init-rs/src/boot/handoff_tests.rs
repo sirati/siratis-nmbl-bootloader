@@ -5,6 +5,18 @@
 use super::*;
 use std::path::PathBuf;
 
+/// A real-FS-backed [`SysOps`] for the verify-gate tests: a [`DryRunSys`]
+/// rooted at `/`, so `open_ro` / `read_file` resolve the absolute tempdir
+/// paths the tests create as an identity — the verify streams the exact bytes
+/// a `RealSys` open would, with no real side effects elsewhere.
+fn test_ops() -> crate::sys::ops::dryrun::DryRunSys {
+    use crate::sys::ops::dryrun::{ClosureView, DryRunScenario, DryRunSys};
+    DryRunSys::new(
+        ClosureView::new(PathBuf::from("/")),
+        DryRunScenario::NormalBoot,
+    )
+}
+
 fn gen_for(params: &[&str]) -> Generation {
     Generation {
         number: 42,
@@ -114,7 +126,7 @@ fn verify_proceeds_when_signing_disabled() {
     let cfg = config_signing_disabled();
     let g = gen_for(&["root=/dev/sda1"]);
     assert!(
-        verify_generation_signature(&cfg, &g).is_ok(),
+        verify_generation_signature(&test_ops(), &cfg, &g).is_ok(),
         "disabled signing must let the boot proceed"
     );
 }
@@ -213,7 +225,8 @@ mod secure_boot {
         let cfg = config_with_posture(&boot, true, true);
         let g = on_disk_generation(tmp.path());
 
-        let err = verify_generation_signature(&cfg, &g).expect_err("enforce + no sig must refuse");
+        let err = verify_generation_signature(&test_ops(), &cfg, &g)
+            .expect_err("enforce + no sig must refuse");
         assert!(
             matches!(err, NmblError::PolicyRefused { .. }),
             "expected PolicyRefused, got {err:?}",
@@ -232,7 +245,7 @@ mod secure_boot {
         let g = on_disk_generation(tmp.path());
 
         assert!(
-            verify_generation_signature(&cfg, &g).is_ok(),
+            verify_generation_signature(&test_ops(), &cfg, &g).is_ok(),
             "audit mode must proceed past a missing signature",
         );
     }
@@ -283,7 +296,7 @@ mod secure_boot {
         let g = on_disk_generation(tmp.path());
 
         assert!(
-            verify_generation_signature(&cfg, &g).is_ok(),
+            verify_generation_signature(&test_ops(), &cfg, &g).is_ok(),
             "disabled signing proceeds on a secure-boot build too",
         );
     }

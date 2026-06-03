@@ -193,7 +193,8 @@ struct Handoff {
         reason = "no-op verify when secure-boot is disabled at build time"
     )
 )]
-fn verify_generation_signature(
+fn verify_generation_signature<S: SysOps>(
+    ops: &S,
     config: &Config,
     generation: &Generation,
 ) -> Result<Option<VerifiedGeneration>> {
@@ -210,7 +211,12 @@ fn verify_generation_signature(
             return Ok(None);
         }
 
-        match verify_generation_pinned(config, generation) {
+        // Route every blob open + sidecar read through the ops layer so a
+        // `--validate-initrm` dry-run streams + verifies the extracted-closure
+        // copy; `&S` coerces to `&dyn FsOps` (SysOps: FsOps). The kernel/initrd
+        // fds `open_ro` returns are the EXACT ones stream-hashed and (on the
+        // real path) handed to kexec — never re-opened by path (FIX-02/MED-1).
+        match verify_generation_pinned(ops, config, generation) {
             // Verified: keep the pinned kernel fd + reused digests for
             // measure+load.
             Ok(verified) => Ok(Some(verified)),
@@ -286,7 +292,8 @@ pub(crate) fn verify_measure_then_load<S: SysOps>(
     // secure-boot happy path we get back the PINNED kernel fd + reused
     // kernel/initrd digests, threaded into measure (no re-hash) and load
     // (no re-open) below (MED-1).
-    let verified: Option<VerifiedGeneration> = verify_generation_signature(config, generation)?;
+    let verified: Option<VerifiedGeneration> =
+        verify_generation_signature(ops, config, generation)?;
 
     // Stage the NMBL log transcript into the next kernel's initramfs.
     // The byte ring lives in RAM and the current tmpfs at NMBL_LOG_PATH
