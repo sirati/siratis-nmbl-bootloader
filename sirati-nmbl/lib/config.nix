@@ -148,21 +148,6 @@ let
     (lib.getOutput "modules" cfg.kernelPackage)
   ];
 
-  # makeModulesClosure expects `firmware` to be a SINGLE store path it can
-  # `cd` into (it reads `$firmware/lib/firmware/<blob>`), not a list. The
-  # `boot.nmbl.rescue.fullSystem.firmware` option is a plain
-  # `listOf package` (no NixOS-style `apply`), so join it into one
-  # buildEnv exposing `/lib/firmware` — exactly as NixOS's
-  # `hardware.firmware` option does internally. An empty list still yields
-  # a valid (empty) `/lib/firmware`, so the closure builds cleanly when no
-  # firmware is configured (e.g. the VM test, where no driver needs blobs).
-  rescueFirmwareEnv = pkgs.buildEnv {
-    name = "nmbl-rescue-firmware";
-    paths = cfg.rescue.fullSystem.firmware;
-    pathsToLink = [ "/lib/firmware" ];
-    ignoreCollisions = true;
-  };
-
   # Module closure for the rescue squashfs, built against NMBL's exact
   # kernel so `uname -r` after switch_root matches `/lib/modules/<kver>`.
   # `firmware` pulls in only the blobs the staged modules reference
@@ -170,16 +155,24 @@ let
   # a big package like linux-firmware stays scoped. `allowMissing` keeps
   # the build green if a named driver is built into the kernel. Only built
   # when there are rescue modules to stage.
-  rescueModuleClosure =
-    if rescueFullSystemModules != [ ] then
-      pkgs.makeModulesClosure {
-        rootModules = rescueFullSystemModules;
-        kernel = rescueModulesTree;
-        firmware = rescueFirmwareEnv;
-        allowMissing = true;
-      }
-    else
-      null;
+  #
+  # De-duplicated (#25b) onto the shared `module-closure.nix` factor (#25a)
+  # the driver-image build also uses. The factor joins the firmware list into
+  # the SINGLE store path makeModulesClosure expects (the `nmbl-rescue-
+  # firmware` buildEnv — exactly NixOS's `hardware.firmware` pattern), unique-s
+  # the root modules (already unique here), and returns `null` when there is
+  # nothing to stage — so this is store-path-identical to the prior inline
+  # `makeModulesClosure` call (verified byte-for-byte against
+  # `system.build.nmblRescueSquashfs` per FIX-37). The EXPLICIT `firmwareName`
+  # keeps the rescue closure's firmware env from colliding with a driver-image
+  # one (FIX-36).
+  rescueModuleClosure = import ./modules/module-closure.nix { inherit pkgs lib; } {
+    rootModules = rescueFullSystemModules;
+    kernel = rescueModulesTree;
+    firmware = cfg.rescue.fullSystem.firmware;
+    firmwareName = "nmbl-rescue-firmware";
+    allowMissing = true;
+  };
 
   # Import kernel modules management module. The rescue full-system
   # modules are deliberately NOT in extraExplicitModules: NMBL must not
