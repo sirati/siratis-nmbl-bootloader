@@ -21,6 +21,13 @@ pub(super) struct Args {
     pub(super) config_toml: Option<PathBuf>,
     /// Tool paths supplied to `--validate-hardware` via `--tool=<kind>:<path>`.
     pub(super) tools: ToolPaths,
+    /// `--print-gen-id=<toplevel>`: print the shared content-addressed
+    /// generation id (FIX-07) for the given system toplevel / profile-link
+    /// path and exit. The install signer (#53) uses this to compute the
+    /// `/boot/nmbl/sigs/<gen-id>/…` path the in-initramfs verifier scans, so
+    /// signer and verifier share ONE id derivation. Mutually exclusive with
+    /// the other early-exit modes.
+    pub(super) print_gen_id: Option<PathBuf>,
     /// Installer-side: initialise (or validate) state.bin under the
     /// given directory and exit. Mutually exclusive with
     /// `validate_config` and `boot_succeeded_dir`.
@@ -64,6 +71,7 @@ where
     let mut validate_closure: Option<PathBuf> = None;
     let mut config_toml: Option<PathBuf> = None;
     let mut tools = ToolPaths::default();
+    let mut print_gen_id: Option<PathBuf> = None;
     #[cfg(feature = "stateful")]
     let mut init_state_dir: Option<PathBuf> = None;
     #[cfg(feature = "stateful")]
@@ -114,6 +122,12 @@ where
             && let Some(v) = iter.next()
         {
             tools.insert_spec(&v.to_string_lossy())?;
+        } else if let Some(rest) = arg.strip_prefix("--print-gen-id=") {
+            print_gen_id = Some(PathBuf::from(rest));
+        } else if arg == "--print-gen-id"
+            && let Some(v) = iter.next()
+        {
+            print_gen_id = Some(PathBuf::from(v));
         } else if let Some(value) = parse_stateful_flag(&arg, "--init-state", &mut iter)? {
             #[cfg(feature = "stateful")]
             {
@@ -147,12 +161,13 @@ where
     let early_exit_count = u8::from(validate_config.is_some())
         + u8::from(validate_hardware.is_some())
         + u8::from(validate_closure.is_some())
+        + u8::from(print_gen_id.is_some())
         + stateful_modes;
     if early_exit_count > 1 {
         return Err(
             "the early-exit modes (--validate-config, --validate-hardware, \
-             --validate-nix-filesystem-closure, --init-state, --boot-succeeded) \
-             are mutually exclusive"
+             --validate-nix-filesystem-closure, --print-gen-id, --init-state, \
+             --boot-succeeded) are mutually exclusive"
                 .to_string(),
         );
     }
@@ -170,6 +185,7 @@ where
         validate_closure,
         config_toml,
         tools,
+        print_gen_id,
         #[cfg(feature = "stateful")]
         init_state_dir,
         #[cfg(feature = "stateful")]
@@ -399,6 +415,21 @@ mod tests {
     fn validate_hardware_and_config_are_mutually_exclusive() {
         let err = parse_args_from(["--validate-config=/a", "--validate-hardware=/b"])
             .expect_err("two validate modes at once must be rejected");
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn print_gen_id_parses_both_forms() {
+        let a = parse_args_from(["--print-gen-id=/nix/store/top"]).expect("equals form");
+        assert_eq!(a.print_gen_id.as_deref(), Some(Path::new("/nix/store/top")));
+        let b = parse_args_from(["--print-gen-id", "/nix/store/top"]).expect("space form");
+        assert_eq!(b.print_gen_id.as_deref(), Some(Path::new("/nix/store/top")));
+    }
+
+    #[test]
+    fn print_gen_id_is_mutually_exclusive_with_validate_config() {
+        let err = parse_args_from(["--print-gen-id=/a", "--validate-config=/b"])
+            .expect_err("print-gen-id + validate-config at once must be rejected");
         assert!(err.contains("mutually exclusive"), "{err}");
     }
 

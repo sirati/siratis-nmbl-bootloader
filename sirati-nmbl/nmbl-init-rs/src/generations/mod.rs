@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+mod gen_id;
 mod readiness;
 mod resolve;
 mod scan;
@@ -28,6 +29,13 @@ pub struct Generation {
     /// Full path to the profile symlink itself
     /// (e.g. `/mnt/system/nix/var/nix/profiles/system-42-link`).
     pub profile_link: PathBuf,
+    /// Mount-aware resolved path to the generation's system toplevel — the
+    /// directory the profile link ultimately points at, rewritten under the
+    /// system-root mount prefix so it is reachable from NMBL's namespace.
+    /// Source of the shared content-addressed [`gen_id`]: its canonicalized
+    /// store basename is the `<gen-id>` under which signature sidecars live
+    /// (`/boot/nmbl/sigs/<gen-id>/…`, R-4/FIX-07).
+    pub toplevel: PathBuf,
     /// Resolved path to the kernel image.
     pub kernel: PathBuf,
     /// Resolved path to the initrd.
@@ -44,4 +52,5 @@ pub struct Generation {
     pub label: String,
 }
 
+pub use gen_id::{gen_id, gen_id_of_path};
 pub use scan::{active_generation_index, scan_generations};

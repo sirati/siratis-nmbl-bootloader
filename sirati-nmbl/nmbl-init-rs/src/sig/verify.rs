@@ -22,7 +22,7 @@
 
 use std::fs;
 use std::os::fd::{AsFd, BorrowedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
@@ -30,6 +30,7 @@ use crate::generations::Generation;
 use crate::util::hash;
 
 use super::keys::{self, BakedKey, KeyVerify};
+use super::scan::generation_sig_dir;
 use super::sidecar::SigSidecar;
 use super::wire;
 
@@ -266,45 +267,4 @@ fn verify_generation_blob(
         context: format!("open {desc} {} for verify", blob.display()),
     })?;
     verify_image_fd(file.as_fd(), desc, Some(sig_path), domain, config)
-}
-
-/// Resolve the per-generation sidecar directory `<boot>/nmbl/sigs/<gen-id>/`.
-///
-/// `<boot>` is the runtime boot mountpoint (Phase 0.5). `<gen-id>` is the
-/// content-addressed store basename of the generation's toplevel — the same id
-/// the install signer writes under — derived here as the file name of the
-/// generation's profile-link target. (The shared `gen_id(toplevel)` helper and
-/// the `scan.rs`-side resolution land in #18; this keeps the resolution local
-/// to the verify path until then, matching the R-4 layout.)
-fn generation_sig_dir(config: &Config, generation: &Generation) -> Result<PathBuf> {
-    let boot = config
-        .runtime_boot_mountpoint
-        .as_deref()
-        .ok_or_else(|| NmblError::Signature {
-            stage: "gen-sig-dir",
-            detail: "no runtime boot mountpoint to locate generation sidecars".to_string(),
-        })?;
-    let gen_id = gen_id_of(generation)?;
-    Ok(boot.join("nmbl").join("sigs").join(gen_id))
-}
-
-/// Content-addressed generation id: the file name of the canonicalized
-/// profile-link target (the store basename of the generation toplevel). Stable
-/// across rollback. Superseded by the shared `generations::gen_id` in #18.
-fn gen_id_of(generation: &Generation) -> Result<String> {
-    let toplevel = fs::canonicalize(&generation.profile_link).map_err(|source| NmblError::Io {
-        source,
-        context: format!("canonicalize {}", generation.profile_link.display()),
-    })?;
-    toplevel
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(str::to_owned)
-        .ok_or_else(|| NmblError::Signature {
-            stage: "gen-sig-dir",
-            detail: format!(
-                "generation toplevel {} has no store basename",
-                toplevel.display()
-            ),
-        })
 }

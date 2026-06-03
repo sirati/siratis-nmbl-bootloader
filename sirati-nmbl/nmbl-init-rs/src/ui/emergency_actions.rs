@@ -390,6 +390,7 @@ mod tests {
         Generation {
             number,
             profile_link: PathBuf::from(format!("/p/system-{number}-link")),
+            toplevel: PathBuf::from(format!("/p/toplevel-{number}")),
             kernel: PathBuf::from("/p/kernel"),
             initrd: PathBuf::from("/p/initrd"),
             init_path: PathBuf::from(format!("/p/system-{number}-link/init")),

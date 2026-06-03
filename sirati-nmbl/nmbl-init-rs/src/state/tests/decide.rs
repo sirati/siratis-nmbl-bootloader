@@ -20,6 +20,7 @@ fn fake_gen(n: u32) -> Generation {
     Generation {
         number: n,
         profile_link: PathBuf::from(format!("/profile-{n}")),
+        toplevel: PathBuf::from(format!("/toplevel-{n}")),
         kernel: PathBuf::from("/kernel"),
         initrd: PathBuf::from("/initrd"),
         init_path: PathBuf::from("/init"),
