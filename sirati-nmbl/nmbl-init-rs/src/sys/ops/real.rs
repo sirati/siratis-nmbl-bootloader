@@ -113,6 +113,10 @@ impl FsOps for RealSys<'_> {
     fn remove_file(&mut self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
     }
+
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        std::fs::canonicalize(path)
+    }
 }
 
 impl BlockOps for RealSys<'_> {

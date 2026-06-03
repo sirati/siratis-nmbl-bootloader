@@ -158,7 +158,11 @@ fn validate_initrm_mode(args: &Args) -> Option<ExitCode> {
 /// derivation. Pure + side-effect-free (a canonicalize + basename).
 fn print_gen_id_mode(args: &Args) -> Option<ExitCode> {
     let path = args.print_gen_id.as_deref()?;
-    Some(match nmbl_init::generations::gen_id_of_path(path) {
+    // The host signer runs this on the real filesystem; a sender-less `RealSys`
+    // gives the sync `FsOps::canonicalize` (a plain `std::fs::canonicalize`)
+    // without needing a poller.
+    let ops = nmbl_init::sys::ops::RealSys::sync_only();
+    Some(match nmbl_init::generations::gen_id_of_path(&ops, path) {
         Ok(id) => {
             println!("{id}");
             ExitCode::from(0)

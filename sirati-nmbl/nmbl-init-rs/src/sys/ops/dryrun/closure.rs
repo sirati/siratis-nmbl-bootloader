@@ -112,6 +112,18 @@ impl ClosureView {
     pub fn resolve_path(&self, p: &Path) -> PathBuf {
         self.resolve(p)
     }
+
+    /// Canonicalize P WITHIN the closure: graft P under `root` (the same
+    /// prefix-graft `open_ro`/`read_file` use), then `std::fs::canonicalize` the
+    /// grafted path so symlinks resolve INSIDE the extracted tree rather than on
+    /// the host. The returned path is the real on-disk location under `root`;
+    /// `gen_id` takes only its basename, so the closure-resolved store basename
+    /// is what a closure-rooted `--validate-initrm` run derives. For the runtime
+    /// view (`root == "/"`) the graft is the identity, so this is a plain
+    /// `std::fs::canonicalize` — byte-identical to the real boot.
+    pub fn canonicalize(&self, p: &Path) -> io::Result<PathBuf> {
+        std::fs::canonicalize(self.resolve(p))
+    }
 }
 
 // Closure-probing helpers for `DryRunSys` that don't perform side effects:
@@ -309,5 +321,31 @@ mod tests {
             view.resolve(Path::new("/bin/blkid")),
             PathBuf::from("/bin/blkid")
         );
+    }
+
+    #[test]
+    fn canonicalize_resolves_symlink_within_closure() {
+        // A closure-rooted canonicalize must follow a symlink to the store dir
+        // INSIDE the extracted tree (not escape to the host fs) and land on a
+        // path whose basename is the store basename `gen_id` keys the sidecar
+        // dir on.
+        let root = temp_closure("canon", |d| {
+            fs::create_dir_all(d.join("nix/store/abc123-system")).expect("store dir");
+            std::os::unix::fs::symlink(d.join("nix/store/abc123-system"), d.join("system-link"))
+                .expect("symlink");
+        });
+        let view = ClosureView::new(root.clone());
+        // Boot-absolute profile-link path grafts under root, then canonicalize
+        // follows the link to the store dir under root.
+        let resolved = view
+            .canonicalize(Path::new("/system-link"))
+            .expect("canonicalize within closure");
+        assert!(resolved.starts_with(&root), "must stay under closure root");
+        assert_eq!(
+            resolved.file_name().and_then(|n| n.to_str()),
+            Some("abc123-system"),
+            "basename must be the store basename gen_id derives",
+        );
+        fs::remove_dir_all(&root).ok();
     }
 }

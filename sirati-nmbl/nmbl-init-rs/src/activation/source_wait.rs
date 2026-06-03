@@ -210,6 +210,9 @@ mod tests {
         fn remove_file(&mut self, _path: &Path) -> io::Result<()> {
             panic!("wait_for_source_device never calls remove_file")
         }
+        fn canonicalize(&self, _path: &Path) -> io::Result<PathBuf> {
+            panic!("wait_for_source_device never calls canonicalize")
+        }
     }
 
     impl BlockOps for ScriptedOps {

@@ -109,9 +109,19 @@ fn dispatch_external(
     // sentinel → relock → RebootIntoRescue). Audit mode warns + proceeds; the
     // gate is `secure-boot`-only, so a feature-free build verifies nothing.
     #[cfg(feature = "secure-boot")]
-    if let crate::sig::PolicyDecision::Refuse(sig_cause) = verify::verify_rescue_sfs_gated(config) {
-        drop(console);
-        return Ok(crate::policy::refuse_unsigned_blocking(config, sig_cause));
+    {
+        // The rescue verify runs post-runtime (synchronous, no poller), so a
+        // sender-less `RealSys` provides the sync `FsOps` open_ro/read_file the
+        // gate routes through. Threading ops here means a future dry-run rescue
+        // scenario can verify the rescue sfs against the closure instead of the
+        // live boot fs; the real boot is byte-identical (`RealSys` → `std::fs`).
+        let ops = crate::sys::ops::RealSys::sync_only();
+        if let crate::sig::PolicyDecision::Refuse(sig_cause) =
+            verify::verify_rescue_sfs_gated(&ops, config)
+        {
+            drop(console);
+            return Ok(crate::policy::refuse_unsigned_blocking(config, sig_cause));
+        }
     }
 
     // Phase 1: mount the rescue squashfs as a writable overlay. We hold

@@ -113,6 +113,31 @@ fn attested_volume_exposes_its_mountpoint() {
     drop(attested); // must not panic / must not try to unmount a non-owned FS
 }
 
+#[test]
+fn dry_run_post_unlock_mount_owns_no_real_mount() {
+    // Under a dry-run `FsOps` the PostUnlock mount is a no-op, so the witness
+    // must NOT carry an `owned_mount`: its Drop would otherwise issue a stray
+    // real `umount(2)` on a path nothing actually mounted (Property-6). The
+    // mount source `/dev/none` is skipped by the dry-run mount heuristic, so no
+    // finding is forced.
+    use crate::sys::ops::dryrun::{ClosureView, DryRunScenario, DryRunSys};
+
+    let cfg = Config::recovery_default();
+    let vol = priority_vol(PathBuf::from("/dev/none"), true);
+    let mut fs = DryRunSys::new(
+        ClosureView::new(PathBuf::from("/")),
+        DryRunScenario::NormalBoot,
+    );
+    let attested =
+        super::mount_priority_volume(&mut fs, GatePhase::PostUnlock, &with_boot_mp(cfg), &vol)
+            .expect("dry-run post-unlock mount succeeds (no-op)");
+    assert!(
+        attested.owned_mount.is_none(),
+        "a dry-run mount must leave no owned mount for Drop to tear down",
+    );
+    drop(attested); // must not attempt a real umount
+}
+
 // ---- (b) bad / missing signature: REFUSE ----------------------------------
 
 #[test]

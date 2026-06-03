@@ -10,17 +10,14 @@
 //!
 //! * **(a) valid signature** ⇒ proceed, returning the unforgeable
 //!   [`AttestedVolume`] witness (FIX-26) that #33's `apply_staged_boot` REQUIRES
-//!   by type — the volume cannot be consumed without passing this gate.
+//!   by type.
 //! * **(b) missing / wrong / bad signature** ⇒ [`super::refuse_unsigned`] relocks
 //!   then reboots into rescue via
-//!   [`crate::terminal::TerminalAction::RebootIntoRescue`]. The boot is refused
-//!   AND rescue is gated behind a reboot — the next boot re-evaluates the
-//!   still-bad image with the TPM kept locked.
+//!   [`crate::terminal::TerminalAction::RebootIntoRescue`] — the next boot
+//!   re-evaluates the still-bad image with the TPM kept locked.
 //! * **(c) sentinel present** (an empty `/boot/nmbl/rescue`) ⇒ force rescue with
-//!   the TPM kept locked, taking the SAME `rescue::dispatch` path the
-//!   force-on-boot trigger does (this is the sentinel-aware union from
-//!   [`super::sentinel::should_force_rescue`] — checked by the caller before the
-//!   gate runs, see MED-1).
+//!   the TPM kept locked, taking the SAME `rescue::dispatch` path force-on-boot
+//!   does (the sentinel union from `should_force_rescue`, caller-checked — MED-1).
 //!
 //! Posture: **enforce** ⇒ fail closed; **audit** (`enable && !enforce`, itself
 //! gated by `allowAuditModeInsecure` — FIX-31) ⇒ verify + WARN but proceed;
@@ -28,10 +25,8 @@
 //!
 //! ## Two hooks (FIX-34) + the pre-console deferral (FIX-35)
 //!
-//! [`run_priority_gate_at`] runs at the TWO boot points via a [`GatePhase`]:
-//! [`GatePhase::PrePlainBoot`] (the plain-boot-FS gate, before any interactive
-//! work) and [`GatePhase::PostUnlock`] (the inside-LUKS gate, after the storage
-//! activations open the priority volume's backing mapper). BOTH defer their
+//! [`run_priority_gate_at`] runs at the TWO boot points via a [`GatePhase`]
+//! ([`GatePhase::PrePlainBoot`] / [`GatePhase::PostUnlock`]). BOTH defer their
 //! refuse: instead of relocking inline they return `Err(NmblError::PolicyRefused)`
 //! so the EXISTING `run_tui_session` Err arm renders the countdown through the
 //! one shared `run_refuse_screen` entry — NEVER the shell-offering emergency
@@ -91,12 +86,12 @@ impl GatePhase {
 
 /// The attested-volume witness (FIX-26): proof that the priority gate PASSED.
 ///
-/// Holds the mountpoint the signed file was read from and, when the gate
-/// mounted the volume itself, the mount lifetime — its [`Drop`] best-effort
-/// unmounts a gate-owned mount. `apply_staged_boot` (#33, Wave-3) REQUIRES an
-/// `AttestedVolume` by value, so the staged path is structurally unreachable
-/// without passing this gate. There is no public constructor: the only way to
-/// obtain one is [`run_priority_gate`] returning `Ok`.
+/// Holds the mountpoint the signed file was read from and, when the gate mounted
+/// the volume itself, the mount lifetime — its [`Drop`] best-effort unmounts a
+/// gate-owned mount. `apply_staged_boot` (#33) REQUIRES an `AttestedVolume` by
+/// value, so the staged path is structurally unreachable without passing this
+/// gate. No public constructor: the only way to obtain one is
+/// [`run_priority_gate`] returning `Ok`.
 #[derive(Debug)]
 pub struct AttestedVolume {
     /// Mountpoint the verified priority file was read from. `apply_staged_boot`
@@ -119,12 +114,11 @@ impl AttestedVolume {
 impl Drop for AttestedVolume {
     fn drop(&mut self) {
         // Only a gate-owned mount is torn down; an existing FS (the boot FS) is
-        // left for the rest of the boot. Best-effort + lazy: a busy unmount
-        // must never panic in Drop.
-        // Intentionally a DIRECT `sys::mount::umount`, not an ops call: it is
-        // dry-run-inert because a `--validate-initrm` run keeps the priority
-        // gate disabled (secure-boot off), so `owned_mount` is never `Some` and
-        // there is nothing to tear down on the dry-run path.
+        // left for the rest of the boot. Best-effort + lazy (a busy unmount must
+        // never panic in Drop). A DIRECT `sys::mount::umount`, not an ops call
+        // (Drop cannot hold `&mut dyn FsOps`): dry-run-inert because the gate
+        // leaves `owned_mount` as `None` when the volume was "mounted" through a
+        // dry-run `FsOps` (`fs.is_dry_run()`), so there is nothing to tear down.
         if let Some(mp) = self.owned_mount.take()
             && let Err(e) = crate::sys::mount::umount(&mp, nix::mount::MntFlags::MNT_DETACH)
         {
@@ -159,7 +153,7 @@ enum GateDecision {
 ///
 /// `Ok(None)` means the gate did not apply this phase (no priority volume, the
 /// volume belongs to the other phase, or secure-boot is disabled): the caller
-/// simply continues the legacy boot path.
+/// continues the legacy boot path.
 pub fn run_priority_gate_at(
     fs: &mut dyn FsOps,
     phase: GatePhase,
@@ -214,11 +208,11 @@ pub fn run_priority_gate(fs: &mut dyn FsOps, config: &Config) -> Result<Attested
     }
 }
 
-/// Evaluate the priority file into a [`GateDecision`]. Mounts the volume (when
-/// the gate owns the mount), reads the signed file + sidecar, narrows the keys
-/// on the FULL fingerprint, and verifies under [`DOMAIN_PRIORITY_FILE`]. A
-/// verify failure under an enforcing posture is a [`GateDecision::Refuse`]; under
-/// audit it WARNs and proceeds with the (still-mounted) attested volume.
+/// Evaluate the priority file into a [`GateDecision`]: mount the volume (when
+/// gate-owned), read the signed file + sidecar, narrow keys on the FULL
+/// fingerprint, and verify under [`DOMAIN_PRIORITY_FILE`]. A verify failure
+/// under enforce is a [`GateDecision::Refuse`]; under audit it WARNs and proceeds
+/// with the attested volume.
 fn evaluate(
     fs: &mut dyn FsOps,
     phase: GatePhase,
@@ -258,9 +252,9 @@ fn evaluate(
 }
 
 /// Decide a failure that left no attested volume (a mount error). Enforcing ⇒
-/// refuse; audit ⇒ proceed with a path-less placeholder witness (the staged
-/// path is unreachable in audit-only configs anyway — `staged.enable ⇒
-/// secure_boot.enable` is enforced, FIX-26).
+/// refuse; audit ⇒ proceed with a path-less placeholder witness (the staged path
+/// is unreachable in audit-only configs anyway — `staged.enable ⇒
+/// secure_boot.enable`, FIX-26).
 fn decide_no_volume(config: &Config, cause: NmblError) -> GateDecision {
     if enforcing(config) {
         crate::nmbl_warn!(
@@ -284,11 +278,10 @@ fn decide_no_volume(config: &Config, cause: NmblError) -> GateDecision {
     }
 }
 
-/// Resolve the priority volume to an [`AttestedVolume`] mountpoint. For the
-/// pre-plain-boot phase the file lives on the already-mounted boot FS, so we
-/// resolve against `runtime_boot_mountpoint` and DO NOT mount (no owned mount).
-/// For the post-unlock (inside-LUKS) phase the gate mounts the configured
-/// device read-only at the volume's mountpoint and owns that mount.
+/// Resolve the priority volume to an [`AttestedVolume`] mountpoint. Pre-plain-
+/// boot resolves against `runtime_boot_mountpoint` and does NOT mount (no owned
+/// mount); post-unlock (inside-LUKS) mounts the device read-only at the volume's
+/// mountpoint and owns that mount.
 fn mount_priority_volume(
     fs: &mut dyn FsOps,
     phase: GatePhase,
@@ -319,9 +312,17 @@ fn mount_priority_volume(
             // options for the mount it performs).
             let opts = ensure_ro(&vol.options);
             fs.mount(Some(&vol.device), &vol.mountpoint, &vol.fstype, &opts)?;
+            // A dry-run's `mount` no-ops, so leave `owned_mount` as `None` (its
+            // Drop would otherwise issue a stray real `umount(2)`). Real boot
+            // keeps the owned mount.
+            let owned_mount = if fs.is_dry_run() {
+                None
+            } else {
+                Some(vol.mountpoint.clone())
+            };
             Ok(AttestedVolume {
                 mountpoint: vol.mountpoint.clone(),
-                owned_mount: Some(vol.mountpoint.clone()),
+                owned_mount,
             })
         }
     }
@@ -341,8 +342,8 @@ fn ensure_ro(options: &str) -> String {
 
 /// Verify the signed priority file at `path` against the NARROWED key set under
 /// [`DOMAIN_PRIORITY_FILE`] (FIX-08). Opens the file ONCE, streams it through
-/// SHA-512 over the single pinned fd, reads its sidecar (`<path><suffix>`), and
-/// delegates to the pure [`verify_priority_against`] with the BAKED key set.
+/// SHA-512 over the single pinned fd, reads its sidecar, and delegates to the
+/// pure [`verify_priority_against`] with the BAKED key set.
 fn verify_signed_file(fs: &dyn FsOps, config: &Config, path: &Path) -> Result<()> {
     let file = fs.open_ro(path).map_err(|source| NmblError::Io {
         source,
@@ -362,14 +363,11 @@ fn verify_signed_file(fs: &dyn FsOps, config: &Config, path: &Path) -> Result<()
 
 /// The PURE narrowed-key verify core (FIX-08): parse the sidecar, narrow `baked`
 /// to the operator's FULL 32-byte fingerprints, and verify `digest` under the
-/// pinned [`DOMAIN_PRIORITY_FILE`] domain. Factored out of [`verify_signed_file`]
-/// so the FULL-fp narrowing and domain pinning are unit-testable with a crafted
-/// key set (the real `BAKED_KEYS` static is empty in this build).
-///
-/// Narrows ONLY on the full fingerprint: a key matching merely a short prefix of
-/// an allowed id is NOT in the narrowed set, so a prefix-collision key is
-/// rejected. The domain is pinned to `priority-file:v1`, so a sidecar minted for
-/// any other role fails the domain-cross check before a key is even tried.
+/// pinned [`DOMAIN_PRIORITY_FILE`] domain. Factored out so the FULL-fp narrowing
+/// and domain pinning are unit-testable with a crafted key set (the real
+/// `BAKED_KEYS` static is empty in this build). Narrows ONLY on the full
+/// fingerprint (a short-prefix match is NOT in the narrowed set), and the pinned
+/// domain rejects a sidecar minted for any other role before a key is tried.
 fn verify_priority_against(
     config: &Config,
     digest: &[u8; 64],
