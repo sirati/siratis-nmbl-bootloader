@@ -145,6 +145,13 @@ if ! "$RUNNER"; then
   exit 1
 fi
 
+# Pin VM_SOCKET to THIS scenario's own manager so every send/trigger/history
+# read below scopes to our VM — never a foreign manager a concurrent peer runs.
+if ! pin_vm_socket "$CONFIG_NAME"; then
+  echo "FAIL: could not pin VM_SOCKET to the ${CONFIG_NAME} manager" >&2
+  exit 1
+fi
+
 # Answer NMBL stage-0's LUKS passphrase modal so cryptroot opens and the boot
 # can proceed to generation verify+measure+kexec.
 #

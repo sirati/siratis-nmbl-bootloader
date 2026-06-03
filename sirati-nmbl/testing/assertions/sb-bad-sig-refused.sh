@@ -145,6 +145,13 @@ if ! "$RUNNER"; then
   exit 1
 fi
 
+# Pin VM_SOCKET to THIS scenario's own manager so every history/trigger read
+# below scopes to our VM — never a foreign manager a concurrent peer may run.
+if ! pin_vm_socket "$CONFIG_NAME"; then
+  echo "FAIL: could not pin VM_SOCKET to the ${CONFIG_NAME} manager" >&2
+  exit 1
+fi
+
 # 1) A refuse marker MUST appear: the tampered generation must be rejected.
 echo "=== asserting NMBL REFUSES the tampered generation ===" >&2
 if ! wait_for "$REFUSE_RE" "$REFUSE_WATCH"; then
