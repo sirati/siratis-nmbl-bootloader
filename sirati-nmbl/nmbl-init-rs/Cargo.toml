@@ -86,12 +86,17 @@ remote-tui = ["dep:futures-util"]
 # zeroize is a non-optional dep, so listing it here would be a cargo error
 # (FIX-30); the host signer's `Zeroizing` lives in nmbl-host-tools instead.
 # When OFF the `src/sig` and `src/tpm/measure` trees are `#[cfg]`d out and
-# none of these optional deps compile, so the default build is byte-for-byte
-# identical to a feature-free build (FIX-6 / FIX-23). `fips204` is pinned
-# with explicit ML-DSA features (NOT default-features-and-hope) so the
-# pre-hash `Ph::SHA512` path and ML-DSA-65/87 are guaranteed present
-# (FIX-50). `staged-boot` depends on `secure-boot`.
-secure-boot = ["dep:fips204", "dep:tpm2-protocol", "dep:sha2"]
+# none of THESE optional deps compile. The default build is byte-for-byte
+# identical to a feature-free build EXCEPT for the always-compiled `src/tpm`
+# core (cap/transport/presence), which links the now-NON-optional
+# `tpm2-protocol` even with `secure-boot` OFF — the lock-on-rescue guard
+# needs the cap path regardless of the feature axis (FIX-09). That is the
+# accepted FIX-09 cost; `tpm2-protocol` is pure-Rust, zero-dep/no_std, so it
+# is cheap. `fips204` is pinned with explicit ML-DSA features (NOT
+# default-features-and-hope) so the pre-hash `Ph::SHA512` path and
+# ML-DSA-65/87 are guaranteed present (FIX-50). `staged-boot` depends on
+# `secure-boot`.
+secure-boot = ["dep:fips204", "dep:sha2"]
 # Opt-in staged boot (a signed config fragment + drivers on a verified
 # priority volume). Structurally implies `secure-boot`: there is no staged
 # path without signature verification (R-3 / R-6).
@@ -172,16 +177,21 @@ oklab = { version = "1.1.2", optional = true, default-features = true }
 # `optional`, so the default build is byte-identical (FIX-6 / FIX-23).
 dhcproto = { version = "0.13", optional = true, default-features = false }
 sha2     = { version = "0.10", optional = true, default-features = false }
-# Secure/staged-boot (optional; gated behind `secure-boot`). fips204 is
-# the pure-Rust FIPS-204 (ML-DSA) verifier; `default-features = false`
-# drops its `default-rng` (we verify, never sign, so no getrandom is
-# forced) and we EXPLICITLY enable `ml-dsa-65` + `ml-dsa-87` so the
-# `AlgId::{MlDsa65,MlDsa87}` code paths and the pre-hash `Ph::SHA512`
-# entry are guaranteed compiled in (FIX-50). tpm2-protocol is the
-# pure-Rust TPM 2.0 marshaler/unmarshaler (`default-features = false`);
-# neither pulls a `*-sys`/`cc`/`openssl-sys` crate (FIX-43).
+# Secure/staged-boot. fips204 is the pure-Rust FIPS-204 (ML-DSA) verifier
+# (optional; gated behind `secure-boot`); `default-features = false` drops
+# its `default-rng` (we verify, never sign, so no getrandom is forced) and
+# we EXPLICITLY enable `ml-dsa-65` + `ml-dsa-87` so the
+# `AlgId::{MlDsa65,MlDsa87}` code paths and the pre-hash `Ph::SHA512` entry
+# are guaranteed compiled in (FIX-50).
 fips204       = { version = "0.4.6", optional = true, default-features = false, features = ["ml-dsa-65", "ml-dsa-87"] }
-tpm2-protocol = { version = "0.18", optional = true, default-features = false }
+# tpm2-protocol is the pure-Rust TPM 2.0 marshaler/unmarshaler
+# (`default-features = false`). NON-OPTIONAL on purpose (FIX-09): the
+# always-compiled `src/tpm` core (cap/transport/presence) and the
+# lock-on-rescue guard need the cap path even when `secure-boot` is OFF, so
+# this links into EVERY build. It is pure-Rust, zero-dep/no_std, and pulls
+# no `*-sys`/`cc`/`openssl-sys` crate, so the no-C-FFI closure invariant
+# holds (FIX-43).
+tpm2-protocol = { version = "0.18", default-features = false }
 # Single 4-byte read for the DHCPv4 XID. We avoid pulling in a full RNG
 # crate (`rand`); `getrandom::fill` reads straight from `getrandom(2)`.
 getrandom = { version = "0.3", optional = true, default-features = false }
