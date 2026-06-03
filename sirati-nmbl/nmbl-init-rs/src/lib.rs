@@ -4,6 +4,12 @@ pub mod config;
 pub mod devices;
 pub mod error;
 pub mod generations;
+/// Runtime loader for signed driver images (FEATURE-#1): verify → mount-ro →
+/// firmware → `init_module` over a single pinned fd. The public surface
+/// (`load_driver_images` / `detach_all_driver_images` / the handle types) is
+/// always compiled; the privileged verify+load body is `secure-boot`-gated
+/// because the verify pipeline it depends on is (FIX-05).
+pub mod imageload;
 #[cfg(feature = "remote-tui")]
 pub mod ipc;
 pub mod log;
