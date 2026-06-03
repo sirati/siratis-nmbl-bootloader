@@ -65,6 +65,20 @@ pub(super) fn validate_initrm(
         &scenarios::run_raw_shell_scenario(config, closure_root),
     );
 
+    // Secure-boot driver-image prerequisite check (build-time, Phase-B
+    // coverage). A `driver_images.enable` config loop-mounts a signed driver
+    // squashfs before kexec, which needs the `loop` + `squashfs` modules staged
+    // in NMBL's own initramfs — nothing in the Nix layer force-stages them, so
+    // an incomplete initramfs here is a real boot break. The per-scenario
+    // module walk soft-skips a module absent from modules.dep (can't tell it
+    // from a built-in), so this dedicated REQUIRED check is what actually fails
+    // the gate when a loop-mount prerequisite is missing. A no-op when driver
+    // images are disabled.
+    report.add_scenario(
+        "DriverImagePrereq",
+        &nmbl_init::sys::ops::dryrun::driver_image_prereq_findings(config, closure_root),
+    );
+
     if let Some(uki_path) = uki {
         // expected_cmdline is `None`: deriving the default-generation
         // cmdline here would mean scanning generations and re-running
