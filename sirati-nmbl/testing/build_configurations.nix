@@ -462,6 +462,142 @@ let
         })
       ];
     };
+
+    # Secure-boot chain variant (#57 F6b): wires the WHOLE measured/signed
+    # chain end-to-end for the VM matrix —
+    #   * boot.nmbl.signing.{enable,enforce,publicKeys,algorithm} — ML-DSA-87
+    #     verification of every generation against the INSECURE-TEST trust
+    #     anchor baked into nmbl-init (testing/keys/insecure-test-ml-dsa-87.pub),
+    #     fail-closed (enforce). generationKeyFile points at an IMPURE on-disk
+    #     copy of the matching private key so install-time gen-signing
+    #     (lib/install-gen-signing.nix) emits /boot/nmbl/sigs/<gen-id>/{kernel,
+    #     initrd}.sig the pre-kexec guard verifies.
+    #   * boot.nmbl.tpm.{measure,requireTpm,pcrIndex=11} — extend the lock PCR
+    #     with the boot handoff; requireTpm so a TPM-less VM FAILS CLOSED (a
+    #     negative scenario can never false-green on a box without /dev/tpmrm0).
+    #   * boot.nmbl.secureBoot.{enable,enforce,requireTpm} — the secure-boot
+    #     posture; priorityVolume.device is left null so the CORE flow needs no
+    #     priority mount (the priority-gate scenarios are wired next, see the
+    #     matrix manifest).
+    #   * a luks-tpm cryptroot device (unlock = "tpm", sealed to PCR 11+7) so
+    #     the tpm-roundtrip scenario can seal+unseal the LUKS key.
+    #   * loader = "efi-stub" so NMBL boots as a UKI (the install path the
+    #     SB-OVMF firmware launches); run under mkRunner { tpm="tis";
+    #     secureBoot=true; }.
+    #
+    # The committed INSECURE-TEST private key is PUBLICLY KNOWN (testing/keys/
+    # README.md); it only ever signs TEST artifacts. generationKeyFile resolves
+    # impurely (string path, never the store) so the closure-leak assert in
+    # lib/install-gen-signing.nix passes: it reads $NMBL_GEN_KEY_FILE when set,
+    # else the documented default /var/lib/nmbl-test-keys/insecure-test-gen.key
+    # the #57 runner stages the committed key to (see the matrix manifest).
+    #
+    # NOTE on the path: install-time signing runs inside nixos-anywhere's
+    # `nixos-install` chroot, whose activation mounts a FRESH tmpfs over /run
+    # (mounts.sh: specialMount "tmpfs" "/run") before installBootLoader runs —
+    # so a /run-staged key would be shadowed and unreadable. The key therefore
+    # lives under /var/lib (a normal persistent dir activation never overmounts),
+    # exactly where the orchestrator stages it into the chroot's root fs.
+    test-secure-boot = {
+      name = "test-secure-boot";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "uefi";
+        loader = "efi-stub";
+        loader_extra_args = {
+          timeout = 0;
+        };
+      };
+      # LUKS + TPM need a newer kernel for the dm-crypt/tpm stack, matching
+      # the luks-tpm target rationale.
+      nmblKernelPackage = (nixpkgs.legacyPackages.x86_64-linux).linuxPackages_latest.kernel;
+      diskoModule = ./disko-luks-password.nix;
+      extraModules = [
+        ({ lib, ... }: {
+          # ---- signature enforcement (verify every generation) -------------
+          boot.nmbl.signing = {
+            enable = true;
+            enforce = true;
+            algorithm = "ml-dsa-87";
+            # Baked trust anchor: the INSECURE-TEST public key. Path literal ⇒
+            # imported into the store and include_bytes!-baked into nmbl-init.
+            publicKeys = [ ./keys/insecure-test-ml-dsa-87.pub ];
+            # IMPURE private-key path read at install time (never the store).
+            generationKeyFile =
+              let
+                e = builtins.getEnv "NMBL_GEN_KEY_FILE";
+              in
+              if e != "" then e else "/var/lib/nmbl-test-keys/insecure-test-gen.key";
+
+            # ---- install-time UKI Secure-Boot signing (F1) ----------------
+            # sbsign the NMBL UKI at install with the INSECURE-TEST db cert so
+            # the SB-enforcing firmware (whose `db` we enroll that same cert
+            # into — see the test-db OVMF VARS in flake.nix) ACCEPTS and
+            # launches it. Without this the unsigned UKI is refused by the
+            # firmware before NMBL ever runs, and every NMBL scenario times
+            # out (audit F1). keyFile/certFile are IMPURE string paths read at
+            # install time (the closure-leak assert in lib/install-signing.nix
+            # rejects a store path); the #57 runner stages the committed
+            # testing/keys/insecure-test-sb-db.{key,crt} there (or exports the
+            # NMBL_SB_DB_{KEY,CERT}_FILE envs). The cert is PUBLICLY-KNOWN test
+            # material — it only ever signs TEST UKIs.
+            uki = {
+              enable = true;
+              keyFile =
+                let
+                  e = builtins.getEnv "NMBL_SB_DB_KEY_FILE";
+                in
+                if e != "" then e else "/var/lib/nmbl-test-keys/insecure-test-sb-db.key";
+              certFile =
+                let
+                  e = builtins.getEnv "NMBL_SB_DB_CERT_FILE";
+                in
+                if e != "" then e else "/var/lib/nmbl-test-keys/insecure-test-sb-db.crt";
+            };
+          };
+
+          # ---- measured boot (extend PCR 11, require a real TPM) -----------
+          boot.nmbl.tpm = {
+            measure = true;
+            requireTpm = true;
+            pcrIndex = 11;
+          };
+
+          # ---- secure-boot posture (no priority volume in the core flow) ---
+          boot.nmbl.secureBoot = {
+            enable = true;
+            enforce = true;
+            requireTpm = true;
+          };
+
+          # ---- luks-tpm cryptroot (seal the key to PCR 11+7) ---------------
+          boot.initrd.kernelModules = [
+            "dm_mod"
+            "dm-crypt"
+            "aesni_intel"
+            "tpm"
+            "tpm_tis"
+            "tpm_crb"
+          ];
+          boot.nmbl.activation.luks = [
+            {
+              name = "cryptroot";
+              device = "/dev/vda3";
+              unlock = "tpm";
+              tpmPcrs = [ 11 7 ];
+              promptLabel = "Enter LUKS passphrase for cryptroot (TPM fallback)";
+              passToStage1 = "/etc/nmbl-luks/cryptroot";
+            }
+          ];
+          boot.initrd.luks.devices.cryptroot = lib.mkForce {
+            device = "/dev/disk/by-partlabel/disk-main-luks";
+            keyFile = "/etc/nmbl-luks/cryptroot";
+            fallbackToPassword = true;
+            allowDiscards = true;
+          };
+        })
+      ];
+    };
   };
 
   # Build VM configurations. `cfg` may carry diskoModule / extraModules
@@ -472,4 +608,8 @@ in
 {
   inherit mkTestConfigurations;
   inherit configs;
+  # Exposed so callers can build a one-off VARIANT of a known config (e.g. the
+  # TPM-roundtrip enroll twin: the test-secure-boot config with the cryptroot
+  # unlock overridden to a passphrase) without re-deriving the whole builder.
+  inherit (vmConfig) mkTestVM;
 }

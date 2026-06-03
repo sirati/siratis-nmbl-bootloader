@@ -75,21 +75,25 @@ pub struct SidecarResolution {
 ///
 /// `<gen-id>` is the shared [`gen_id`] (FIX-07), derived by canonicalizing the
 /// toplevel through `fs` so a closure-rooted `--validate-initrm` dry-run
-/// resolves within the extracted tree. Fails if there is no writable boot
-/// mountpoint recorded (Phase 0.5 sets `runtime_boot_mountpoint`) or the
-/// generation's toplevel has no resolvable store basename — either is a hard
-/// "cannot locate sidecars" error, never a silent allow-all.
+/// resolves within the extracted tree. The boot mountpoint comes from
+/// [`Config::resolve_boot_mountpoint`], which prefers the Phase 0.5 bootstrap
+/// `runtime_boot_mountpoint` and falls back to the `/boot` filesystem entry
+/// resolved against `system_root` in embedded-config mode (the UKI boot path,
+/// where there is no Phase 0.5 to record it). Fails if neither yields a boot
+/// mountpoint, or the generation's toplevel has no resolvable store basename —
+/// either is a hard "cannot locate sidecars" error, never a silent allow-all.
 pub fn generation_sig_dir(
     fs: &dyn FsOps,
     config: &Config,
     generation: &Generation,
 ) -> Result<PathBuf> {
     let boot = config
-        .runtime_boot_mountpoint
-        .as_deref()
+        .resolve_boot_mountpoint()
         .ok_or_else(|| NmblError::Signature {
             stage: "gen-sig-dir",
-            detail: "no runtime boot mountpoint to locate generation sidecars".to_string(),
+            detail: "no boot mountpoint (bootstrap runtime mountpoint unset and no /boot \
+                     filesystem entry) to locate generation sidecars"
+                .to_string(),
         })?;
     let id = gen_id(fs, generation)?;
     Ok(boot.join(SIGS_SUBDIR).join(id))
@@ -265,7 +269,8 @@ mod tests {
     fn missing_boot_mountpoint_is_hard_error() {
         let tmp = TempDir::new().expect("temp");
         let top = make_toplevel(tmp.path(), "mno345-nixos-system");
-        // No runtime_boot_mountpoint set.
+        // Neither a runtime_boot_mountpoint NOR a /boot filesystem entry: the
+        // sidecar dir cannot be located either way, so this is a hard error.
         let cfg = toml::from_str::<Config>("[paths]\nshell = \"/bin/sh\"\n").expect("config");
         let g = generation_with_toplevel(&top);
         let fs = runtime_fs();
@@ -277,6 +282,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Embedded-config (UKI) mode: no Phase 0.5, so `runtime_boot_mountpoint`
+    /// is unset — but the `/boot` filesystem entry pins the boot partition's
+    /// runtime location under `system_root`. The sidecar dir must resolve to
+    /// `<system_root>/boot/nmbl/sigs/<gen-id>/`, the SAME path the install
+    /// signer wrote to, so a correctly-signed generation verifies (the
+    /// signed-gen-happy refuse-on-good-gen regression).
+    #[test]
+    fn embedded_mode_resolves_sidecar_dir_via_boot_filesystem_entry() {
+        let tmp = TempDir::new().expect("temp");
+        let top = make_toplevel(tmp.path(), "pqr678-nixos-system");
+        // No runtime_boot_mountpoint; the config declares a /boot entry and a
+        // non-default system_root (the runtime mount prefix).
+        let system_root = tmp.path().join("mnt/system");
+        let cfg = toml::from_str::<Config>(&format!(
+            "[paths]\nshell = \"/bin/sh\"\nsystem_root = \"{}\"\n\
+             [signing]\nenable = true\n\
+             [[filesystems]]\ndevice = \"/dev/sda2\"\nmountpoint = \"/\"\n\
+             fstype = \"ext4\"\nis_root = true\n\
+             [[filesystems]]\ndevice = \"/dev/sda1\"\nmountpoint = \"/boot\"\n\
+             fstype = \"vfat\"\n",
+            system_root.display(),
+        ))
+        .expect("config parses");
+        assert!(cfg.runtime_boot_mountpoint.is_none());
+        let g = generation_with_toplevel(&top);
+
+        let fs = runtime_fs();
+        let dir = generation_sig_dir(&fs, &cfg, &g).expect("sidecar dir resolves in embedded mode");
+        assert_eq!(
+            dir,
+            system_root.join("boot/nmbl/sigs/pqr678-nixos-system"),
+            "embedded mode must resolve <system_root>/boot/nmbl/sigs/<gen-id>"
+        );
     }
 
     #[test]

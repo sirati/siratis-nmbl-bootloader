@@ -786,3 +786,49 @@ fn load_fragment_reads_from_disk() {
     assert_eq!(frag.general.expect("general").timeout_ms, 9000);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A non-root `/boot` filesystem entry whose runtime mount lives under
+/// `system_root`.
+fn boot_fs_entry() -> FilesystemEntry {
+    FilesystemEntry {
+        mountpoint: PathBuf::from("/boot"),
+        fstype: "vfat".to_string(),
+        ..fs_entry("/dev/disk/by-partlabel/disk-main-ESP", "/boot")
+    }
+}
+
+/// The bootstrap `runtime_boot_mountpoint` is authoritative: when Phase 0.5
+/// recorded it, `resolve_boot_mountpoint` returns it verbatim and never falls
+/// back to deriving one from the filesystem table.
+#[test]
+fn resolve_boot_mountpoint_prefers_runtime_field() {
+    let mut c = config_with(vec![boot_fs_entry()]);
+    c.runtime_boot_mountpoint = Some(PathBuf::from("/run/nmbl-boot"));
+    assert_eq!(
+        c.resolve_boot_mountpoint(),
+        Some(PathBuf::from("/run/nmbl-boot")),
+    );
+}
+
+/// Embedded-config (UKI) mode: no Phase 0.5 ran, so the runtime field is
+/// unset, but the `/boot` filesystem entry pins the boot partition to
+/// `<system_root>/boot`. This is the signed-gen-happy fix — the verify must be
+/// able to locate the sidecars on the boot partition without bootstrap mode.
+#[test]
+fn resolve_boot_mountpoint_derives_from_boot_entry_in_embedded_mode() {
+    let mut c = config_with(vec![boot_fs_entry()]);
+    c.paths.system_root = PathBuf::from("/mnt/system");
+    assert!(c.runtime_boot_mountpoint.is_none());
+    assert_eq!(
+        c.resolve_boot_mountpoint(),
+        Some(PathBuf::from("/mnt/system/boot")),
+    );
+}
+
+/// No runtime field and no `/boot` entry ⇒ `None`, so the verify locator
+/// surfaces its hard "cannot locate sidecars" error rather than guessing.
+#[test]
+fn resolve_boot_mountpoint_is_none_without_runtime_field_or_boot_entry() {
+    let c = config_with(vec![fs_entry("/dev/sda1", "/data")]);
+    assert_eq!(c.resolve_boot_mountpoint(), None);
+}

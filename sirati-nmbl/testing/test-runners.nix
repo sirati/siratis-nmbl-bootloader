@@ -82,8 +82,29 @@ let
       #   secureBoot : false — when true, boot under a Secure-Boot-enforcing
       #                OVMFFull firmware (`smm=on` + db-enrolled VARS). A fresh
       #                writable VARS copy is made per run.
+      #   dbCert     : null — only meaningful with secureBoot = true. When a
+      #                cert PATH is given, the enforcing VARS template is the
+      #                Microsoft `OVMF_VARS.ms.fd` with THIS cert ADDITIONALLY
+      #                enrolled in `db` (via virt-fw-vars). The firmware still
+      #                ENFORCES (MS db intact) but now ALSO TRUSTS a UKI signed
+      #                by this cert — so an NMBL UKI sbsign'd with the matching
+      #                key boots, while an unsigned UKI is still refused (F1).
+      #                null ⇒ MS-only db (refuses anything not MS-signed), used
+      #                by the unsigned-UKI smoke test.
       tpm ? null,
       secureBoot ? false,
+      dbCert ? null,
+      # When true (only meaningful with `tpm != null`), the swtpm STATE dir is
+      # PERSISTED across this manager's lifetime: it is not wiped on start nor
+      # removed on stop. Two successive runs of the runner against the same
+      # $WORK_DIR therefore share one TPM, so a secret a first (enroll) boot
+      # seals survives into a second (unseal) boot — the measured-boot
+      # seal/unseal ROUNDTRIP. A fresh QEMU power-on still issues
+      # TPM2_Startup(CLEAR), so PCRs reset and NMBL re-extends the same
+      # deterministic event sequence, reproducing the sealed PCR value. The
+      # caller (the roundtrip assertion) owns deleting $WORK_DIR/swtpm-state
+      # when the roundtrip ends.
+      tpmPersist ? false,
     }:
     let
       # Derive bootMode from config if not explicitly provided (must be first)
@@ -133,11 +154,17 @@ let
       # The swtpm-backed TPM: a per-run state directory under $WORK_DIR and the
       # `--tpm`/`--tpm-kind` flags. Empty string when no TPM is requested, so
       # the launch command is unchanged.
+      # The swtpm state dir. Defaults to per-run under $WORK_DIR, but an
+      # NMBL_SWTPM_STATE env override lets a multi-phase roundtrip point two
+      # successive runner invocations (enroll, then unseal) at ONE shared,
+      # persisted state dir so the sealed object survives the power-cycle.
+      tpmStateExpr = "\${NMBL_SWTPM_STATE:-$WORK_DIR/swtpm-state}";
       tpmArgs =
         if tpm == null then
           ""
         else
-          " --tpm \"$WORK_DIR/swtpm-state\" --tpm-kind ${tpm}";
+          " --tpm \"${tpmStateExpr}\" --tpm-kind ${tpm}"
+          + lib.optionalString tpmPersist " --tpm-persist";
 
       # Secure-Boot OVMFFull: the SB-built code firmware (read-only) and a
       # PER-RUN writable copy of the db-enrolled VARS (`OVMF_VARS.ms.fd`, which
@@ -145,7 +172,28 @@ let
       # unsigned EFI binary). The `--sb-code`/`--sb-vars` flags flip the
       # qemu seam to `-machine …,smm=on` + secure pflash.
       sbCode = "${pkgs.OVMFFull.fd}/FV/OVMF_CODE.fd";
-      sbVarsTemplate = "${pkgs.OVMFFull.fd}/FV/OVMF_VARS.ms.fd";
+      msVarsTemplate = "${pkgs.OVMFFull.fd}/FV/OVMF_VARS.ms.fd";
+
+      # When a test `db` cert is supplied, derive an ENFORCING VARS that ALSO
+      # trusts a UKI signed by it: start from the Microsoft VARS (KEK/db/PK +
+      # SecureBoot already enrolled, so it still ENFORCES) and ADD our cert to
+      # `db` with virt-fw-vars. The result refuses an unsigned UKI exactly like
+      # the MS-only VARS, but ACCEPTS the NMBL UKI sbsign'd with the matching
+      # key — which is what lets NMBL actually run under enforcing SB (F1).
+      # A fixed owner GUID labels the enrolled entry (cosmetic only).
+      testDbVars =
+        pkgs.runCommand "ovmf-vars-ms-plus-test-db.fd"
+          {
+            nativeBuildInputs = [ pkgs.python3Packages.virt-firmware ];
+          }
+          ''
+            virt-fw-vars \
+              --input ${msVarsTemplate} \
+              --add-db 605dab50-e046-4300-abb6-3dd810dd8b23 ${dbCert} \
+              --output "$out"
+          '';
+
+      sbVarsTemplate = if dbCert != null then "${testDbVars}" else msVarsTemplate;
       sbArgs =
         if secureBoot then
           " --sb-code \"${sbCode}\" --sb-vars \"$WORK_DIR/sb-OVMF_VARS.fd\""
@@ -213,9 +261,21 @@ let
           ''
       }
       if [ ! -f "${diskName}" ]; then
-        echo "Copying VM disk image from Nix store..."
-        echo "Source: ${vmDiskImage}"
-        cp "${vmDiskImage}/nixos.qcow2" "${diskName}"
+        # NMBL_DISK_IMAGE overrides the disk source with a RUNTIME path (a qcow2
+        # produced at install time, e.g. by the secure-boot nixos-anywhere
+        # installer). This is how the secure-boot scenarios boot a disk SIGNED
+        # at install runtime instead of a build-time `vmDiskImage` store path —
+        # the signing key is never an input to a derivation. Falls back to the
+        # config's `vmDiskImage` (the normal non-secure-boot path) when unset.
+        if [ -n "''${NMBL_DISK_IMAGE:-}" ]; then
+          echo "Copying VM disk image from runtime path..."
+          echo "Source: ''${NMBL_DISK_IMAGE}"
+          cp "''${NMBL_DISK_IMAGE}" "${diskName}"
+        else
+          echo "Copying VM disk image from Nix store..."
+          echo "Source: ${vmDiskImage}"
+          cp "${vmDiskImage}/nixos.qcow2" "${diskName}"
+        fi
         chmod 644 "${diskName}"
         echo "✓ Disk image copied successfully"
       else
