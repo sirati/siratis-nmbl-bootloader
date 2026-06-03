@@ -67,13 +67,22 @@ pub(super) fn measure_handoff(
     #[cfg(feature = "secure-boot")]
     {
         use crate::error::NmblError;
-        use crate::tpm::measure;
+        use crate::tpm::{self, measure};
 
         let refuse = |cause: NmblError| -> NmblError {
             NmblError::PolicyRefused {
                 cause: Box::new(cause),
             }
         };
+
+        // (FIX-11) SB-state awareness, at the START of the measured path: read
+        // the authoritative `SecureBoot` efivar (+ PCR-7 for correlation) and,
+        // if Secure Boot is NOT enforcing, WARN LOUDLY — or, under the
+        // fail-closed posture (`secure_boot.enforce`), REFUSE rather than
+        // extend PCR-11 over an unprotected chain. Degrades gracefully on a
+        // BIOS/efivarfs-less box (warn + proceed). A refuse here routes through
+        // the same `PolicyRefused` terminus as a measure failure (R-1).
+        tpm::enforce_secure_boot_state(config.secure_boot.enforce).map_err(refuse)?;
 
         // A measure-required boot MUST have verified inputs to measure (FIX-27):
         // no honest measurement exists for an unverified/audit-bypassed image.
