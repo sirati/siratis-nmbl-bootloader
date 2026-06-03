@@ -161,7 +161,10 @@ wait_for() {
     echo "wait_for: FAIL (timeout) waiting for: $pattern" >&2
     return 1
   fi
-  if ! printf '%s' "$out" | grep -Eiq "$pattern"; then
+  # Drop the trigger's own banner line ("=== Waiting for trigger: <pattern> ===")
+  # before confirming the pattern — it echoes the pattern, which would otherwise
+  # always match even when only the banner (not a real serial line) is present.
+  if ! printf '%s' "$out" | grep -v '^=== Waiting for trigger:' | grep -Eiq "$pattern"; then
     echo "wait_for: FAIL (pattern absent) waiting for: $pattern" >&2
     return 1
   fi
@@ -186,8 +189,13 @@ seen_in_history() {
   local pattern="$1"
   local -a sock_args
   _socket_args sock_args
+  # find DOES the regex match itself and prints a "--- Match #N (line L) ---"
+  # header per hit. Detect a hit by that header — do NOT re-grep find's output
+  # for the pattern: find echoes the pattern in its "=== Searching for pattern:
+  # <p> ===" banner, so re-grepping would ALWAYS match the banner (a false
+  # positive that flips every absence check the moment the manager is reachable).
   vm-serial-man find "$(_ci_pattern "$pattern")" "${sock_args[@]}" 2>/dev/null \
-    | grep -Eiq "$pattern"
+    | grep -qE '^--- Match #[0-9]'
 }
 
 # seen_count <pattern>
@@ -199,8 +207,11 @@ seen_count() {
   local pattern="$1"
   local -a sock_args
   _socket_args sock_args
+  # Count the per-match "--- Match #N" headers, NOT lines matching the pattern:
+  # find echoes the pattern in its search banner (see seen_in_history), which
+  # would inflate the count by the banner lines.
   vm-serial-man find "$(_ci_pattern "$pattern")" "${sock_args[@]}" 2>/dev/null \
-    | grep -Eic "$pattern" || true
+    | grep -cE '^--- Match #[0-9]' || true
 }
 
 # first_match_line <pattern>
