@@ -386,17 +386,19 @@ echo "=== waiting up to ${SHELL_TIMEOUT}s for the post-kexec root shell" >&2
 echo "    (typing NOTHING — reaching it proves TPM-only auto-unseal) ===" >&2
 booted=false
 for _ in $(seq 1 "$((SHELL_TIMEOUT / 5))"); do
-  # The booted-system autologin prompt — ANCHORED (BOOTED_RE) so it cannot
-  # substring-match phase 1's `root@test-secure-boot-enroll`. This is the
-  # primary positive: a TPM-only unlock is the ONLY path to it here.
-  if seen_in_history "$BOOTED_RE"; then
-    booted=true
-    break
-  fi
+  # NEGATIVES FIRST — a FAILED unseal must be detected BEFORE the positive.
+  # The "boot failed" emergency terminus drops to a [Pretty/Raw Shell] whose
+  # getty runs UNDER THE REAL CONFIG, so its prompt is a legitimate
+  # `root@test-secure-boot` — i.e. BOOTED_RE matches the EMERGENCY shell too.
+  # If we checked the positive first, a broken-seal boot that lands in the
+  # emergency shell would FALSE-GREEN. So the failure/refusal negatives are
+  # checked first and hard-fail; only a boot with NO failure terminus and NO
+  # password prompt may then satisfy the positive.
+  #
   # A FAILED auto-unseal lands on the "boot failed" error terminus + emergency
   # action menu, which DOES reach serial — fail the instant we see it. This is a
   # DIRECT serial negative (not just the timeout): catch a broken seal even if
-  # the boot wedges short of any shell.
+  # the boot wedges short of any shell (or lands in the emergency shell).
   if seen_in_history "$BOOT_FAILED_RE"; then
     echo "FAIL: phase-2 boot hit the failure/emergency terminus — TPM auto-unseal" >&2
     echo "      FAILED (luks-tpm --token-only could not unseal; no fallback exists)." >&2
@@ -409,6 +411,13 @@ for _ in $(seq 1 "$((SHELL_TIMEOUT / 5))"); do
   if seen_in_history "$PASSWORD_PROMPT_RE"; then
     echo "FAIL: cryptroot fell back to the password modal — TPM auto-unseal FAILED" >&2
     exit 1
+  fi
+  # The booted-system autologin prompt — checked AFTER the negatives so the
+  # emergency shell's identical `root@test-secure-boot` prompt cannot pass for a
+  # clean boot. A TPM-only unlock with no failure terminus is the only path here.
+  if seen_in_history "$BOOTED_RE"; then
+    booted=true
+    break
   fi
   sleep 5
 done
