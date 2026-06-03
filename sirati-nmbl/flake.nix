@@ -546,6 +546,101 @@
         dbCert = ./testing/keys/insecure-test-sb-db.crt;
       };
 
+      # ── Staged-boot scenario config (matrix row #2 / FEATURE #2) ───────────
+      # A twin of test-secure-boot that proves STAGED BOOT: the priority volume
+      # (the inside-LUKS cryptroot) carries a signed config fragment + staged
+      # image NMBL loads as a second stage. After the post-unlock priority gate
+      # attests the volume, `apply_staged_boot` verifies the image
+      # (--domain driver-image) AND the fragment (--domain staged-fragment),
+      # transactionally merges the fragment, and re-runs its effects — here the
+      # fragment adds ONE extra explicit kernel module the base never loads, so
+      # the staged re-run loading it is the observable proof the merge applied.
+      #
+      # Like the enroll twin it overrides cryptroot to a PASSWORD unlock so the
+      # standalone scenario opens it without a TPM enrol (the SAME install-signed
+      # generation otherwise — same measured/SB posture). It additionally turns
+      # on the priority gate + staged boot and ships the `dummy` module in the
+      # initrd (available, NOT loaded by the base) for the fragment to load.
+      stagedOverride = { lib, ... }: {
+        # Open cryptroot with the install passphrase (no TPM enrol needed).
+        boot.nmbl.activation.luks = lib.mkForce [
+          {
+            name = "cryptroot";
+            device = "/dev/vda3";
+            unlock = "password";
+            promptLabel = "Enter LUKS passphrase for cryptroot (staged phase)";
+            passToStage1 = "/etc/nmbl-luks/cryptroot";
+          }
+        ];
+
+        # Priority gate on the inside-LUKS cryptroot: only after the activation
+        # opens /dev/mapper/cryptroot does the POST-UNLOCK gate fire, attest the
+        # volume, and hand staged-boot the AttestedVolume witness. The signed
+        # priority file + staged image + fragment all live on this volume,
+        # staged + signed at install runtime (lib/staged-install.nix).
+        boot.nmbl.secureBoot.priorityVolume = {
+          device = "/dev/mapper/cryptroot";
+          mountpoint = "/mnt/staged-priority";
+          fstype = "ext4";
+          insideLuks = true;
+        };
+        boot.nmbl.secureBoot.signedFilePath = "nmbl-staged/priority.signed";
+
+        boot.nmbl.staged = {
+          enable = true;
+          image = "nmbl-staged/staged.sfs";
+          fragment = "nmbl-staged/fragment.toml";
+          sig = "nmbl-staged/fragment.toml.sig";
+        };
+
+        # Ship `dummy` (a tiny, standalone in-tree net driver) in the initrd
+        # module tree WITHOUT loading it in the base config, so the staged
+        # fragment's explicit list is what actually loads it — the observable.
+        boot.initrd.availableKernelModules = [ "dummy" ];
+      };
+
+      secureBootStagedConfig = testing.mkTestVM (
+        testing.configs."test-secure-boot" // {
+          name = "test-secure-boot-staged";
+          extraModules =
+            (testing.configs."test-secure-boot".extraModules or [ ]) ++ [ stagedOverride ];
+        }
+      );
+
+      # Install variant: deferInstallSigning forced off so the nixos-anywhere
+      # install signs the UKI + generation sidecars AND the staged artifacts in
+      # place — same path-based install-time signing, no key in any derivation.
+      secureBootStagedInstallConfig = testing.mkTestVM (
+        testing.configs."test-secure-boot" // {
+          name = "test-secure-boot-staged";
+          extraModules =
+            (testing.configs."test-secure-boot".extraModules or [ ])
+            ++ [
+              stagedOverride
+              { boot.nmbl.signing.deferInstallSigning = lib.mkForce false; }
+            ];
+        }
+      );
+
+      secureBootStagedInstaller = sbInstall.mkSbInstaller {
+        name = "test-secure-boot-staged";
+        config = secureBootStagedInstallConfig;
+        # Port 22210 (clear of the 22201-22203 the real/enroll installers use) so
+        # this scenario's nixos-anywhere bootstrap never collides with a
+        # concurrent secure-boot install on the same host.
+        port = "22210";
+      };
+
+      secureBootStagedRunner = testRunners.mkRunner {
+        name = "test-secure-boot-staged";
+        config = secureBootStagedConfig;
+        inherit vmSerialMan;
+        tpm = "tis";
+        secureBoot = true;
+        tpmPersist = true;
+        dbCert = ./testing/keys/insecure-test-sb-db.crt;
+      };
+
       # The runtime inputs every secure-boot scenario needs on PATH.
       sbScenarioInputs = [
         vmSerialMan
@@ -738,6 +833,23 @@
         runner = secureBootDriverRunner;
         extraInputs = [ pkgs.libguestfs-with-appliance ];
       };
+
+      # STAGED BOOT (matrix row #2 / FEATURE #2). Boots the staged twin: the
+      # priority volume (inside-LUKS cryptroot) carries a signed fragment +
+      # staged image installed+signed AT RUNTIME by lib/staged-install.nix.
+      # cryptroot opens with the install passphrase, the post-unlock priority
+      # gate attests the volume, staged-boot verifies+merges the fragment (which
+      # adds an extra explicit module), then the boot reaches the root shell.
+      # The proof markers (priority-gate VALID, fragment applied, the staged
+      # module loaded) are read from the post-kexec nmbl-init journal.
+      checkSbStaged = mkSbScenarioCheck {
+        scenario = "staged";
+        script = "sb-staged.sh";
+        installer = secureBootStagedInstaller;
+        installBin = "sb-install-test-secure-boot-staged";
+        installSubdir = "staged";
+        runner = secureBootStagedRunner;
+      };
     in
     {
       # The main NixOS module
@@ -793,6 +905,7 @@
         sb-install-test-secure-boot = secureBootInstaller;
         sb-install-test-secure-boot-enroll = secureBootEnrollInstaller;
         sb-install-test-secure-boot-driver = secureBootDriverInstaller;
+        sb-install-test-secure-boot-staged = secureBootStagedInstaller;
         # CLOSURE GUARD (#57 F6b): the secure-boot test INSTALL artifact's closure
         # (diskoScript + toplevel — everything nixos-anywhere ships) must contain
         # NEITHER the ML-DSA generation key NOR the SB `db` private key. Proves
@@ -877,6 +990,13 @@
           type = "app";
           program = "${checkSbDriverImageBadRefused}/bin/test-secure-boot-driver-image-bad-refused";
         };
+        # Staged-boot apply (matrix row #2 / FEATURE #2). The priority volume
+        # carries a signed fragment + staged image NMBL loads as a second stage.
+        # `nix run .#test-secure-boot-staged`.
+        test-secure-boot-staged = {
+          type = "app";
+          program = "${checkSbStaged}/bin/test-secure-boot-staged";
+        };
         # Standalone runtime SB-install orchestrators (#57 F6b). Run one to
         # produce the install-runtime-SIGNED disk on its own (the scenario apps
         # run it automatically, but #57 can pre-stage it). The disk is signed by
@@ -893,6 +1013,10 @@
         sb-install-test-secure-boot-driver = {
           type = "app";
           program = "${secureBootDriverInstaller}/bin/sb-install-test-secure-boot-driver";
+        };
+        sb-install-test-secure-boot-staged = {
+          type = "app";
+          program = "${secureBootStagedInstaller}/bin/sb-install-test-secure-boot-staged";
         };
       } // nixosAnywhereTestApps // testMatrix.apps // nixosAnywhereInstallAliases;
 
