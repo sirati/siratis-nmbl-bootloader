@@ -19,6 +19,7 @@
 //! fallback) decides whether the absence is a finding.
 
 mod closure;
+mod prereq;
 mod report;
 mod scenario;
 mod tpm;
@@ -43,6 +44,7 @@ use crate::sys::blkid::BLKID_BINARY;
 use super::{BlockOps, ConsoleOps, ExecOps, FsOps, KexecOps, KexecTarget, ModuleOps};
 
 pub use closure::ClosureView;
+pub use prereq::driver_image_prereq_findings;
 pub use report::{Findings, MissingFile};
 pub use scenario::{DryRunScenario, ExecRole};
 
