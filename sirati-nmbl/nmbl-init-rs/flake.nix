@@ -504,6 +504,122 @@
             fi
             touch $out
           '';
+
+          # The no-bypass safety net (FIX-53/FIX-38): reaching recovery/rescue
+          # must NEVER bypass the TPM cap, and a boot must NEVER proceed past a
+          # signature gate without either a real verify or an EXPLICIT,
+          # operator-opted, justified relaxation. There is a small, enumerable
+          # set of legitimate sites where the cap is vacuous (no TPM to cap) or
+          # the verify is intentionally skipped/downgraded (signing disabled,
+          # or audit mode behind `allowAuditModeInsecure`). Each such site MUST
+          # carry — on the line or directly above — a `// cap-exempt: <why>`
+          # (a cap relaxation) or a `// signing safety: <why>` (a verify
+          # skip/downgrade) justification, mirroring the `// seal-exempt:` /
+          # `// execve safety:` conventions. A NEW bypass added without the
+          # comment fails CI: the reviewer is forced to name a reason, and the
+          # comment is the audit trail. Lines that are themselves comments
+          # (prose mentioning these tokens) never trip the guard.
+          #
+          # The matched bypass shapes:
+          #   * `if !config.signing.enable` / `if !config.secure_boot.enable`
+          #       — the skip-verify short-circuit (signing/secure-boot off).
+          #   * `VerifyPolicy::Audit =>`
+          #       — the audit-mode downgrade arm (a failed verify proceeds).
+          #   * `GateDecision::AuditProceed(` WITHOUT `=>` on the line
+          #       — the priority-gate audit-proceed PRODUCERS (the `=>` match
+          #         arm is the consumer, not a bypass; the enum decl has no
+          #         `GateDecision::` prefix).
+          #   * `CapOutcome::NoTpm =>` whose RHS is NOT another `CapOutcome::`
+          #       — a NoTpm cap-degrade reaching `Ok`/the require-tpm branch
+          #         (an identity remap `=> CapOutcome::NoTpm` is not a bypass).
+          nmbl-init-no-cap-bypass = pkgs.runCommand "nmbl-init-no-cap-bypass" {
+            nativeBuildInputs = [ pkgs.gawk ];
+          } ''
+            cd ${./.}
+            rc=0
+            for f in $(find src -name '*.rs'); do
+              awk -v file="$f" '
+                function is_comment(line) {
+                  return (line ~ /^[[:space:]]*\/\//)
+                }
+                # `tok` is a STRING pattern (not a regex literal — passing /…/
+                # to a function yields a boolean). A justification is in scope
+                # when the token is on THIS line OR anywhere in the contiguous
+                # comment block immediately above (accumulated into `just`).
+                function need(tok, kind) {
+                  if ($0 ~ tok || just ~ tok) { return 0 }
+                  printf "%s:%d: %s without justification — %s\n", file, FNR, kind, $0
+                  return 1
+                }
+                # Accumulate a contiguous run of comment lines so a multi-line
+                # justification block above the anchor counts.
+                { if (is_comment($0)) { just = just "\n" $0 } }
+                # ── Verify skip / downgrade sites: need `// signing safety:` ──
+                # signing/secure-boot disabled short-circuit.
+                (!is_comment($0) \
+                  && ($0 ~ /if[[:space:]]+!config\.signing\.enable/ \
+                      || $0 ~ /if[[:space:]]+!config\.secure_boot\.enable/)) {
+                  if (need("signing safety:", "verify-skip")) { bad = 1 }
+                }
+                # Audit-mode downgrade arm.
+                (!is_comment($0) && $0 ~ /VerifyPolicy::Audit[[:space:]]*=>/) {
+                  if (need("signing safety:", "audit-downgrade")) { bad = 1 }
+                }
+                # Priority-gate audit-proceed PRODUCER (construction, not the
+                # `=>` consumer arm).
+                (!is_comment($0) && $0 ~ /GateDecision::AuditProceed\(/ && $0 !~ /=>/) {
+                  if (need("signing safety:", "audit-proceed")) { bad = 1 }
+                }
+                # ── Cap relaxation sites: need `// cap-exempt:` ──────────────
+                # A NoTpm degrade arm reaching Ok / the require-tpm branch; an
+                # identity remap (`=> CapOutcome::`) is not a relaxation.
+                (!is_comment($0) && $0 ~ /CapOutcome::NoTpm[[:space:]]*=>/ \
+                  && $0 !~ /=>[[:space:]]*CapOutcome::/) {
+                  if (need("cap-exempt:", "cap-degrade")) { bad = 1 }
+                }
+                # Reset the comment context once a non-comment line passes the
+                # rules above, so the next anchor only sees ITS own block.
+                { if (!is_comment($0)) { just = "" } }
+                END { exit bad }
+              ' "$f" || rc=1
+            done
+            if [ "$rc" -ne 0 ]; then
+              echo "ERROR: every TPM-cap relaxation or signature skip/downgrade must carry a '// cap-exempt: <why>' or '// signing safety: <why>' justification on or directly above it (the no-bypass checklist — FIX-53). Reaching recovery/rescue must never silently bypass the cap, and a boot must never proceed past a verify gate without an explicit, justified relaxation."
+              exit 1
+            fi
+            touch $out
+          '';
+
+          # Pinned security-const defaults (FIX-38). The Rust `pub const`s in
+          # `src/security_consts.rs` are the single source the Nix mirror
+          # (`lib/security-consts.nix`) is round-trip-tested against by the
+          # `security_consts::tests::nmbl_init_security_consts_match_nix` cargo
+          # test (which reads the actual Nix file). That cargo test is skipped
+          # inside `nix flake check` (which sets `doCheck = false`) AND in the
+          # sandbox where the parent `lib/` is out of source, so this check is
+          # the flake-check-time half: it greps the literals straight out of the
+          # Rust source and asserts the pinned values byte-for-byte. A silent
+          # change to a security default here fails the flake check even with
+          # tests disabled; the cargo test then catches a Nix-side drift.
+          nmbl-init-security-consts = pkgs.runCommand "nmbl-init-security-consts" {
+            nativeBuildInputs = [ pkgs.gnugrep ];
+          } ''
+            cd ${./.}
+            f=src/security_consts.rs
+            fail() { echo "FAIL (FIX-38): $1"; exit 1; }
+
+            grep -qF 'pub const LOCK_PCR: u32 = 11;' "$f" \
+              || fail "LOCK_PCR must be pinned to 11 (security-consts.nix defaults.lockPcr)"
+            grep -qF 'pub const RELOCK_POISON_PREIMAGE: &[u8] = b"nmbl:relock-poison:v1";' "$f" \
+              || fail "RELOCK_POISON_PREIMAGE must be b\"nmbl:relock-poison:v1\" (defaults.relockPoisonPreimage)"
+            grep -qF 'pub const REFUSE_COUNTDOWN_SECONDS: u32 = 30;' "$f" \
+              || fail "REFUSE_COUNTDOWN_SECONDS must be 30 (defaults.refuseCountdownSeconds)"
+            grep -qF 'pub const SENTINEL_PATH: &str = "/boot/nmbl/rescue";' "$f" \
+              || fail "SENTINEL_PATH must be \"/boot/nmbl/rescue\" (defaults.sentinelPath)"
+
+            echo "OK: security-const defaults are pinned (LOCK_PCR=11, poison preimage, countdown=30, sentinel /boot/nmbl/rescue)"
+            touch $out
+          '';
         };
       }
     );

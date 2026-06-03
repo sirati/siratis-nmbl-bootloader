@@ -246,6 +246,11 @@ pub fn cap_pcr_outcome(pcr_index: u32, poison: &[u8; 32]) -> CapOutcome {
 /// decision; this exists for the simple "best-effort cap" call sites.
 pub fn cap_pcr(pcr_index: u32, poison: &[u8; 32]) -> Result<()> {
     match cap_pcr_outcome(pcr_index, poison) {
+        // cap-exempt: this is the simple best-effort cap shape; `NoTpm` (no PCR
+        // to cap) is `Ok` because nothing to cap is not an error. The policy
+        // layer's degrade-open-vs-fail-closed decision uses the richer
+        // `cap_pcr_outcome` directly (guard::cap_step), not this wrapper, so a
+        // `requireTpm` posture is never silently widened here.
         CapOutcome::Capped | CapOutcome::NoTpm => Ok(()),
         CapOutcome::Failed(e) => Err(e),
     }

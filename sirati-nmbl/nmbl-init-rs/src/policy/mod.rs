@@ -48,6 +48,20 @@ pub mod sentinel;
 )]
 mod tests;
 
+// FIX-53 strict-shape: reaching recovery/rescue is structurally dominated by
+// the cap/seal — never a shell with an uncapped TPM. Mock-based, drives the
+// real `rescue::dispatch` chokepoint through the `guard::test_seam` cap.
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests assert on contract failures"
+)]
+#[path = "recovery_shape_tests.rs"]
+mod recovery_shape_tests;
+
 #[cfg(feature = "secure-boot")]
 pub use gate::{AttestedVolume, GatePhase, run_priority_gate, run_priority_gate_at};
 pub use guard::{SealFailed, Sealed, seal_secrets, seal_secrets_blocking};

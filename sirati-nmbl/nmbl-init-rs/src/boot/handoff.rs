@@ -201,8 +201,9 @@ fn verify_generation_signature(
         use crate::error::NmblError;
         use crate::sig::{VerifyPolicy, verify_generation_pinned};
 
-        // Signing disabled is the operator declining the feature: proceed with
-        // no pinned fd (the load opens by path, the boot is not measured).
+        // signing safety: signing-disabled is the operator declining the
+        // feature, NOT an allow-unsigned bypass of an enabled one (FIX-04).
+        // Proceed with no pinned fd (the load opens by path, unmeasured).
         if !config.signing.enable {
             nmbl_info!("signature verification disabled (signing.enable = false); skipping gate");
             return Ok(None);
@@ -221,8 +222,10 @@ fn verify_generation_signature(
                 VerifyPolicy::Enforce => Err(NmblError::PolicyRefused {
                     cause: Box::new(err),
                 }),
-                // Audit (enable && !enforce, gated by allowAuditModeInsecure):
-                // the ONLY relaxation — warn and proceed unpinned + unmeasured.
+                // signing safety: the audit-mode downgrade (enable && !enforce,
+                // gated by allowAuditModeInsecure — FIX-31) — the ONLY
+                // relaxation. Warn and proceed unpinned + unmeasured; the
+                // operator opted into insecure observation. Never a default.
                 VerifyPolicy::Audit => {
                     nmbl_warn!(
                         "signature AUDIT mode: verification failed but boot proceeds (insecure, unmeasured): {err}"

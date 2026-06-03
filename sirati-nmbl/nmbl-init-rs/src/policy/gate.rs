@@ -156,6 +156,9 @@ enum GateDecision {
 /// volume belongs to the other phase, or secure-boot is disabled): the caller
 /// simply continues the legacy boot path.
 pub fn run_priority_gate_at(phase: GatePhase, config: &Config) -> Result<Option<AttestedVolume>> {
+    // signing safety: secure-boot disabled is the operator declining the
+    // priority gate, NOT a bypass of an enabled one (FIX-04). The gate is
+    // skipped and the legacy boot path runs; nothing claims to have verified.
     if !config.secure_boot.enable {
         return Ok(None);
     }
@@ -231,6 +234,10 @@ fn evaluate(phase: GatePhase, config: &Config, vol: &PriorityVolume) -> GateDeci
             crate::nmbl_warn!(
                 "priority-gate: signature check failed but AUDIT mode is active; proceeding (INSECURE): {cause}"
             );
+            // signing safety: the priority-gate audit downgrade. Reachable only
+            // when `enable && !enforce` (allowAuditModeInsecure — FIX-31). The
+            // operator opted into insecure audit observation; a failed verify
+            // proceeds with the attested volume. Never a default.
             GateDecision::AuditProceed(attested)
         }
     }
@@ -252,6 +259,10 @@ fn decide_no_volume(config: &Config, cause: NmblError) -> GateDecision {
             "priority-gate: could not mount/read the priority volume but AUDIT mode is active; \
              proceeding (INSECURE): {cause}"
         );
+        // signing safety: the no-volume audit downgrade (mount/read failed but
+        // `enable && !enforce`, allowAuditModeInsecure — FIX-31). Proceeds with
+        // a path-less placeholder; the staged path is unreachable in audit-only
+        // configs (`staged.enable ⇒ secure_boot.enable`, FIX-26). Never default.
         GateDecision::AuditProceed(AttestedVolume {
             mountpoint: PathBuf::new(),
             owned_mount: None,
