@@ -12,6 +12,23 @@ trivially forgeable by anyone with this repository.
 |------|------------|
 | `insecure-test-ml-dsa-87.key` | ML-DSA-87 **PRIVATE** key (`NMBLSK01` container). PUBLIC, INSECURE. |
 | `insecure-test-ml-dsa-87.pub` | ML-DSA-87 raw public key (2592 bytes) — the blob `boot.nmbl.signing.publicKeys` bakes. |
+| `insecure-test-sb-db.key` | RSA-2048 **PRIVATE** UEFI Secure-Boot `db` signing key (PEM). PUBLIC, INSECURE. `sbsign`s the test NMBL UKI at install. |
+| `insecure-test-sb-db.crt` | Self-signed X.509 `db` certificate (PEM) matching the key. Enrolled into the test OVMF firmware's `db` so the enforcing firmware ACCEPTS the test-signed UKI (and still refuses unsigned ones). |
+
+The Secure-Boot pair is used by the `test-secure-boot` matrix (audit F1): the
+NMBL UKI is `sbsign`'d with `insecure-test-sb-db.key` at install, and
+`insecure-test-sb-db.crt` is enrolled into the runner's `db`-VARS (on top of
+the Microsoft KEK/db) so the firmware boots the test UKI under ENFORCING Secure
+Boot, while the unsigned-UKI smoke test keeps the MS-only `db` and is still
+refused. Generated reproducibly with:
+
+```
+openssl req -new -x509 -newkey rsa:2048 -nodes \
+  -subj "/CN=INSECURE NMBL TEST Secure-Boot db/" \
+  -keyout testing/keys/insecure-test-sb-db.key \
+  -out    testing/keys/insecure-test-sb-db.crt \
+  -days 36500 -sha256
+```
 
 Generated reproducibly with the host signer:
 
