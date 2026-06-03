@@ -32,9 +32,54 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// Decode a hex string of EXACTLY `N` bytes into a fixed array, fail-closed.
+///
+/// Returns `None` on any non-hex character, an odd length, or a length that is
+/// not exactly `2 * N` characters (case-insensitive). Used by the secure-boot
+/// priority gate to parse operator-supplied key-fingerprint strings into the
+/// full 32-byte `FullFp` it narrows on (FIX-08) — a malformed fingerprint
+/// narrows to nothing rather than being silently truncated or padded.
+///
+/// `allow(dead_code)`: the only caller is the `secure-boot`-gated priority
+/// gate, so a feature-free build has no caller, but the helper must still
+/// compile so `util::hex` is buildable in every configuration.
+#[allow(
+    dead_code,
+    reason = "the sole caller is the secure-boot priority gate; must compile everywhere"
+)]
+pub(crate) fn decode_fixed<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    let bytes = s.as_bytes();
+    for (i, slot) in out.iter_mut().enumerate() {
+        // `i * 2 + 1 < s.len()` holds because `s.len() == N * 2` and `i < N`.
+        let hi = nibble(*bytes.get(i * 2)?)?;
+        let lo = nibble(*bytes.get(i * 2 + 1)?)?;
+        *slot = (hi << 4) | lo;
+    }
+    Some(out)
+}
+
+/// One hex nibble (0–15) from an ASCII byte, or `None` if it is not a hex
+/// digit. Case-insensitive.
+#[allow(
+    dead_code,
+    reason = "the sole caller is the secure-boot priority gate; must compile everywhere"
+)]
+fn nibble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::hex_lower;
+    use super::{decode_fixed, hex_lower};
 
     #[test]
     fn pads_single_byte_with_zero() {
@@ -50,5 +95,25 @@ mod tests {
     #[test]
     fn encodes_full_byte_range_boundaries() {
         assert_eq!(hex_lower(&[0x00, 0x0f, 0xf0, 0xff]), "000ff0ff");
+    }
+
+    #[test]
+    fn decode_round_trips_lower_and_upper() {
+        let bytes = [0x00u8, 0x0f, 0xf0, 0xff];
+        assert_eq!(decode_fixed::<4>(&hex_lower(&bytes)), Some(bytes));
+        assert_eq!(decode_fixed::<4>("000FF0FF"), Some(bytes));
+    }
+
+    #[test]
+    fn decode_rejects_wrong_length() {
+        assert_eq!(decode_fixed::<4>("00"), None);
+        assert_eq!(decode_fixed::<4>("000ff0ff00"), None);
+        assert_eq!(decode_fixed::<4>("000ff0f"), None);
+    }
+
+    #[test]
+    fn decode_rejects_non_hex() {
+        assert_eq!(decode_fixed::<2>("zz00"), None);
+        assert_eq!(decode_fixed::<2>("00 0"), None);
     }
 }
