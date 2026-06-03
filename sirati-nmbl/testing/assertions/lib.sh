@@ -106,6 +106,22 @@ seen_count() {
     | grep -Eic "$pattern" || true
 }
 
+# first_match_line <pattern>
+# Prints the 1-indexed HISTORY line number of the FIRST line matching <pattern>,
+# or nothing (empty) if the pattern never appears. `vm-serial-man find` prints
+# one "--- Match #N (line L) ---" header per match (L already 1-indexed, see
+# client/find.rs:113), in history order, so the first such header carries the
+# earliest matching line. Used to ORDER two markers against each other — e.g. to
+# tell a forbidden shell that booted BEFORE a refuse (a real security failure)
+# apart from a legitimate shell that only appears AFTER the refuse fired.
+first_match_line() {
+  local pattern="$1"
+  local -a sock_args
+  _socket_args sock_args
+  vm-serial-man find "$(_ci_pattern "$pattern")" --first 1 "${sock_args[@]}" 2>/dev/null \
+    | sed -n 's/^--- Match #[0-9]* (line \([0-9]*\)) ---$/\1/p;T;q'
+}
+
 # assert_journal_tag <tag> [phase_match]
 # Sends a journalctl query for <tag> and asserts a positive line count.
 # The shell prints a sentinel "NMBL_LINES_<n>" we can match deterministically
