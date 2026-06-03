@@ -28,7 +28,10 @@
 //! backstop) that run after the runtime has unwound.
 
 pub mod guard;
+pub mod refuse_screen;
 pub mod registry;
+pub mod relock;
+pub mod sentinel;
 
 #[cfg(test)]
 #[allow(
@@ -41,4 +44,10 @@ pub mod registry;
 mod tests;
 
 pub use guard::{SealFailed, Sealed, seal_secrets, seal_secrets_blocking};
+pub use refuse_screen::run_refuse_screen;
 pub use registry::{MapperEntry, register_tpm_mapper};
+pub use relock::{
+    RelockCommand, refuse_unsigned, refuse_unsigned_blocking, relock_and_refuse,
+    relock_and_refuse_blocking, relock_argv,
+};
+pub use sentinel::{sentinel_present, should_force_rescue, write_sentinel};

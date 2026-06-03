@@ -135,6 +135,77 @@ pub fn seal_secrets_blocking(require_tpm: bool) -> Result<Sealed, SealFailed> {
     Ok(Sealed::mint())
 }
 
+/// BEST-EFFORT seal for the REFUSE terminus (R-1 / R-7 / FIX-10). Unlike
+/// [`seal_secrets`], this NEVER returns an error: the refuse path is the
+/// safe fail-closed action and must proceed even when the cap or a mapper
+/// close did not confirm (a present-but-uncappable TPM, FIX-27). It still
+/// performs the cap FIRST and then closes every registered mapper — both
+/// best-effort — so the common case really does lock the TPM and tear down
+/// the plaintext devices before the refuse countdown renders. The real
+/// security boundary is the `reboot(RB_AUTOBOOT)` that follows (a reset
+/// re-initialises every PCR), so a failed best-effort cap degrades safely:
+/// we are rebooting immediately regardless. Returns the [`Sealed`] witness
+/// so [`super::relock::relock_and_refuse`] can mint the type-gated
+/// [`crate::terminal::TerminalAction::RebootIntoRescue`].
+pub(super) fn seal_for_refuse_blocking(require_tpm: bool) -> Sealed {
+    if !CAP_LATCH.with(Cell::get) {
+        // Best-effort: a `SealFailed` from the cap step is logged and
+        // swallowed — the refuse proceeds (and the imminent reboot is the
+        // real lock boundary). On success latch so a later real seal skips
+        // the redundant re-cap.
+        if cap_step(require_tpm).is_ok() {
+            CAP_LATCH.with(|l| l.set(true));
+        }
+    }
+    // Drain the registry best-effort; a stuck mapper is logged inside
+    // `close_one_blocking`'s caller and the entry stays registered, but we
+    // do NOT abort the refuse for it.
+    close_all_best_effort_blocking();
+    Sealed::mint()
+}
+
+/// Async sibling of [`seal_for_refuse_blocking`] for the refuse paths that
+/// run inside the interactive runtime (the priority-gate refuse, the
+/// seal-failure diverts in the emergency menu). Same best-effort,
+/// always-`Sealed` contract.
+pub(super) async fn seal_for_refuse_async(require_tpm: bool, sender: &LocalSender) -> Sealed {
+    if !CAP_LATCH.with(Cell::get) && cap_step(require_tpm).is_ok() {
+        CAP_LATCH.with(|l| l.set(true));
+    }
+    close_all_best_effort_async(sender).await;
+    Sealed::mint()
+}
+
+/// Close every registered mapper, swallowing per-mapper failures. A mapper
+/// whose close fails stays registered (so a later real seal still fails
+/// closed on it), but the refuse is never blocked.
+fn close_all_best_effort_blocking() {
+    for entry in registry::snapshot() {
+        match close_one_blocking(&entry) {
+            Ok(()) => registry::mark_closed(&entry.name),
+            Err(e) => crate::nmbl_warn!(
+                "refuse: best-effort close of mapper {} failed: {}; rebooting anyway",
+                entry.name,
+                e.cause()
+            ),
+        }
+    }
+}
+
+/// Async sibling of [`close_all_best_effort_blocking`].
+async fn close_all_best_effort_async(sender: &LocalSender) {
+    for entry in registry::snapshot() {
+        match close_one_async(&entry, sender).await {
+            Ok(()) => registry::mark_closed(&entry.name),
+            Err(e) => crate::nmbl_warn!(
+                "refuse: best-effort close of mapper {} failed: {}; rebooting anyway",
+                entry.name,
+                e.cause()
+            ),
+        }
+    }
+}
+
 /// Step 1 — cap the lock PCR (shared by both seal shapes). Maps the rich
 /// [`CapOutcome`] onto the seal policy (R-7 / FIX-27):
 /// * `Capped` ⇒ proceed.
@@ -277,6 +348,11 @@ pub(super) mod test_seam {
         /// The TEST simulated a fork/execve into a shell (recorded by the
         /// test after `seal_secrets` returned `Ok`).
         Fork,
+        /// `relock_and_refuse` wrote the rescue sentinel (recorded by the
+        /// relock ORDER test so it can assert sentinel-write < relock).
+        Sentinel,
+        /// `relock_and_refuse` ran the LUKS/LVM/mdraid relock loop.
+        Relock,
     }
 
     thread_local! {
@@ -307,6 +383,16 @@ pub(super) mod test_seam {
     /// Record that the test performed a fork/execve into a shell.
     pub fn record_fork() {
         ORDER.with(|o| o.borrow_mut().push(Step::Fork));
+    }
+
+    /// Record the relock ORDER test's sentinel-write step.
+    pub fn record_sentinel() {
+        ORDER.with(|o| o.borrow_mut().push(Step::Sentinel));
+    }
+
+    /// Record the relock ORDER test's relock-loop step.
+    pub fn record_relock() {
+        ORDER.with(|o| o.borrow_mut().push(Step::Relock));
     }
 
     /// Snapshot the recorded call order.
