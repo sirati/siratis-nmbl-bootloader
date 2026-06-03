@@ -113,6 +113,10 @@ pub(super) fn suggested_action(err: &NmblError) -> String {
         NmblError::Rescue { stage, .. } => {
             format!("Rescue stage '{stage}' failed; check the rescue squashfs/network state.")
         }
+        NmblError::DriverImage { stage, .. } => format!(
+            "Driver-image stage '{stage}' failed; check the signed driver squashfs and its \
+             signature on the boot partition."
+        ),
         NmblError::Panicked { report_path } => format!(
             "Recovered from a panic; report at {}.",
             report_path.display()
