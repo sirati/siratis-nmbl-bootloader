@@ -38,21 +38,65 @@ let
       showHelp ? true,
     }:
     ''
-      # Check if a previous instance is running
+      # MULTI-VM-SAFE manager lifecycle (no GLOBAL `vm-serial-man status|stop`).
+      #
+      # `vm-serial-man status`/`stop` WITHOUT `--socket` auto-detect across EVERY
+      # manager on the host, so when a peer runs another VM concurrently the old
+      # global stop could tear down the PEER's manager (or our own just-started
+      # one) and the global status check could latch onto a foreign manager. Both
+      # are scoped to THIS runner's own `--name ${sessionName}` manager here: we
+      # find its control socket the way the assertion helpers' `pin_vm_socket`
+      # does — the real `vm-serial-man manager` process whose argv carries our
+      # exact `--name`, then `/tmp/vm-serial-man-<pid>.sock` — and act ONLY on it.
+
+      # Print the control socket of OUR manager (the `vm-serial-man manager`
+      # process — NOT the screen wrapper — whose argv has `--name <sessionName>`
+      # as an exact token), or nothing if it is not up yet.
+      _own_sock() {
+        local cmd_file argv0 base i pid sock
+        for cmd_file in /proc/[0-9]*/cmdline; do
+          [ -r "$cmd_file" ] || continue
+          local -a argv=()
+          mapfile -d "" -t argv <"$cmd_file" 2>/dev/null || continue
+          [ "''${#argv[@]}" -gt 0 ] || continue
+          argv0="''${argv[0]}"; base="''${argv0##*/}"
+          [ "$base" = "vm-serial-man" ] || continue
+          local is_manager=false matched=false
+          for ((i = 1; i < ''${#argv[@]}; i++)); do
+            case "''${argv[i]}" in
+              manager) is_manager=true ;;
+              --name|-n) [ "''${argv[i + 1]:-}" = "${sessionName}" ] && matched=true ;;
+            esac
+          done
+          if [ "$is_manager" = true ] && [ "$matched" = true ]; then
+            pid="''${cmd_file#/proc/}"; pid="''${pid%/cmdline}"
+            sock="/tmp/vm-serial-man-''${pid}.sock"
+            [ -S "$sock" ] && { printf '%s\n' "$sock"; return 0; }
+          fi
+        done
+        return 1
+      }
+
+      # Stop ONLY a previous instance of OUR OWN session (scoped by --socket), so
+      # a concurrent peer manager is never touched.
       VM_WAS_RUNNING=false
-      if ${vmSerialMan}/bin/vm-serial-man status | grep -q "Running"; then
-        echo "Previous instance still running. Automatically issuing stop command"
-        ${vmSerialMan}/bin/vm-serial-man stop
+      OWN_SOCK="$(_own_sock || true)"
+      if [ -n "$OWN_SOCK" ]; then
+        echo "Previous instance of '${sessionName}' running. Stopping just that one."
+        ${vmSerialMan}/bin/vm-serial-man stop --socket "$OWN_SOCK" >/dev/null 2>&1 || true
         VM_WAS_RUNNING=true
+        # Wait for its socket to disappear before re-launching under the same name.
+        for _ in $(seq 1 25); do _own_sock >/dev/null 2>&1 || break; sleep 0.2; done
       fi
 
       # Start vm-serial-man in detached screen session
       ${pkgs.screen}/bin/screen -dmS "${sessionName}" ${screenCommand}
 
-      # Wait for VM manager to be ready (socket to appear)
-      echo "Waiting for VM manager to be ready..."
-      for i in {1..10}; do
-        if ${vmSerialMan}/bin/vm-serial-man status | grep -q "Running"; then
+      # Wait for OUR manager to be ready (its own socket to appear), not a global
+      # status that a foreign manager could satisfy.
+      echo "Waiting for VM manager '${sessionName}' to be ready..."
+      for i in {1..50}; do
+        if _own_sock >/dev/null 2>&1; then
           echo "✓ VM manager ready!"
           echo
 
@@ -64,7 +108,7 @@ let
         fi
         sleep 0.2
       done
-      echo "Warning: VM manager may still be starting..."
+      echo "Warning: VM manager '${sessionName}' may still be starting..."
       echo "Run 'vm-serial-man status' to check"
     '';
 
