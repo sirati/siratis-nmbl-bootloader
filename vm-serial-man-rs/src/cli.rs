@@ -43,6 +43,27 @@ impl FromStr for DisplayArg {
     }
 }
 
+/// CLI representation of the emulated-TPM front-end model. Parsed from `tis`
+/// or `crb`; defaults to TIS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TpmKindArg {
+    #[default]
+    Tis,
+    Crb,
+}
+
+impl FromStr for TpmKindArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "tis" => Ok(Self::Tis),
+            "crb" => Ok(Self::Crb),
+            other => Err(format!("expected 'tis' or 'crb', got {other:?}")),
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "vm-serial-man")]
 #[command(about = "VM Serial Manager - Manage QEMU VM serial I/O", long_about = None)]
@@ -122,6 +143,27 @@ pub struct ManagerConfig {
     /// where `PORT` is a TCP port >= 5900.
     #[arg(long, default_value = "serial")]
     pub display: DisplayArg,
+
+    /// Attach an emulated TPM 2.0 backed by an swtpm sidecar. The value is the
+    /// PER-RUN state directory (created fresh on start, removed on stop). When
+    /// omitted, the VM has no TPM and the QEMU invocation is unchanged.
+    #[arg(long)]
+    pub tpm: Option<PathBuf>,
+
+    /// TPM front-end model when `--tpm` is set: `tis` (default) or `crb`.
+    #[arg(long, default_value = "tis")]
+    pub tpm_kind: TpmKindArg,
+
+    /// Secure-Boot OVMF code firmware (read-only pflash). Setting both this and
+    /// `--sb-vars` enables a Secure-Boot-enforcing machine (`smm=on`),
+    /// overriding the boot-mode's own UEFI firmware.
+    #[arg(long, requires = "sb_vars")]
+    pub sb_code: Option<PathBuf>,
+
+    /// Writable, db-enrolled Secure-Boot OVMF VARS copy (read-write pflash).
+    /// Used with `--sb-code` to enable Secure-Boot enforcement.
+    #[arg(long, requires = "sb_code")]
+    pub sb_vars: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
