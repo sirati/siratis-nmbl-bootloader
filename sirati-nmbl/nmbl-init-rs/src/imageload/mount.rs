@@ -17,7 +17,7 @@ use nix::mount::MntFlags;
 use crate::error::{NmblError, Result};
 use crate::nmbl_warn;
 use crate::sys::loopdev::{loop_bind_ro, open_loop_device};
-use crate::sys::mount::{mount_fs, umount};
+use crate::sys::ops::FsOps;
 
 /// Root under which each driver image gets its own numbered mountpoint.
 const DRIVER_MOUNT_ROOT: &str = "/run/nmbl-driver-images";
@@ -43,7 +43,11 @@ pub(super) struct Mounted {
 /// `loop-open` / `loop-configure` (re-wrapped verbatim from
 /// [`loop_bind_ro`]'s [`crate::sys::loopdev::LoopBindError`]), `mkdir`, or
 /// `mount`.
-pub(super) fn mount_squashfs_ro(image_fd: BorrowedFd<'_>, index: usize) -> Result<Mounted> {
+pub(super) fn mount_squashfs_ro(
+    ops: &mut impl FsOps,
+    image_fd: BorrowedFd<'_>,
+    index: usize,
+) -> Result<Mounted> {
     // (a) Shared allocate→open→configure dance, read-only (#22). Re-wrap its
     // stage tag verbatim into a DriverImage so the banner names the exact step.
     let loop_index = loop_bind_ro(&image_fd).map_err(|e| NmblError::DriverImage {
@@ -55,16 +59,15 @@ pub(super) fn mount_squashfs_ro(image_fd: BorrowedFd<'_>, index: usize) -> Resul
     let loop_dev = PathBuf::from(format!("/dev/loop{loop_index}"));
 
     // (b) mkdir -p the per-image mountpoint before mounting onto it.
-    ensure_dir(&mountpoint)?;
+    ensure_dir(ops, &mountpoint)?;
 
     // (c) Mount the squashfs read-only. The driver image is immutable — there
     // is no writable overlay (unlike rescue): NMBL only reads `.ko` + firmware.
-    mount_fs(Some(&loop_dev), &mountpoint, "squashfs", "ro").map_err(|source| {
-        NmblError::DriverImage {
+    ops.mount(Some(&loop_dev), &mountpoint, "squashfs", "ro")
+        .map_err(|source| NmblError::DriverImage {
             stage: "mount",
             source: Box::new(source),
-        }
-    })?;
+        })?;
 
     Ok(Mounted {
         loop_index,
@@ -81,8 +84,8 @@ pub(super) fn mount_squashfs_ro(image_fd: BorrowedFd<'_>, index: usize) -> Resul
 /// it; the kernel also auto-releases the loop binding once the mount is gone,
 /// so the explicit `LOOP_CLR_FD` is belt-and-braces.
 #[cfg(feature = "secure-boot")]
-pub(super) fn teardown_image(loop_index: u32, mountpoint: &Path) {
-    if let Err(e) = umount(mountpoint, MntFlags::MNT_DETACH) {
+pub(super) fn teardown_image(ops: &mut impl FsOps, loop_index: u32, mountpoint: &Path) {
+    if let Err(e) = ops.umount(mountpoint, MntFlags::MNT_DETACH) {
         nmbl_warn!(
             "driver-image teardown: lazy unmount of {} failed: {}",
             mountpoint.display(),
@@ -110,10 +113,10 @@ pub(super) fn teardown_image(loop_index: u32, mountpoint: &Path) {
     }
 }
 
-/// `mkdir -p` the mountpoint, tolerating an already-existing dir. Wrapped as a
-/// `mkdir`-stage [`NmblError::DriverImage`].
-fn ensure_dir(path: &Path) -> Result<()> {
-    match std::fs::create_dir_all(path) {
+/// `mkdir -p` the mountpoint through the [`FsOps`] seam, tolerating an
+/// already-existing dir. Wrapped as a `mkdir`-stage [`NmblError::DriverImage`].
+fn ensure_dir(ops: &mut impl FsOps, path: &Path) -> Result<()> {
+    match ops.ensure_dir(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(NmblError::DriverImage {
@@ -142,9 +145,10 @@ mod tests {
     fn ensure_dir_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().join("a/b/c");
-        ensure_dir(&target).expect("first mkdir");
+        let mut ops = crate::sys::ops::RealSys::sync_only();
+        ensure_dir(&mut ops, &target).expect("first mkdir");
         // Second call on the now-existing dir must still succeed.
-        ensure_dir(&target).expect("idempotent mkdir");
+        ensure_dir(&mut ops, &target).expect("idempotent mkdir");
         assert!(target.is_dir());
     }
 
@@ -160,7 +164,9 @@ mod tests {
             return;
         }
         let backing = tempfile::tempfile().expect("tempfile");
-        let err = mount_squashfs_ro(backing.as_fd(), 0).expect_err("no loop-control must error");
+        let mut ops = crate::sys::ops::RealSys::sync_only();
+        let err = mount_squashfs_ro(&mut ops, backing.as_fd(), 0)
+            .expect_err("no loop-control must error");
         match err {
             NmblError::DriverImage { stage, .. } => assert_eq!(stage, "loop-alloc"),
             other => panic!("expected DriverImage(loop-alloc), got {other:?}"),

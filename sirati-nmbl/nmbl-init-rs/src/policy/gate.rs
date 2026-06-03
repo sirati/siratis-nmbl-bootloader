@@ -46,6 +46,7 @@ use crate::sig::{
     DOMAIN_PRIORITY_FILE, FullFp, SigSidecar, VerifyPolicy, parse_baked_keys, resolve_allowed_keys,
     verify_digest,
 };
+use crate::sys::ops::FsOps;
 use crate::util::hash;
 
 #[cfg(test)]
@@ -155,7 +156,11 @@ enum GateDecision {
 /// `Ok(None)` means the gate did not apply this phase (no priority volume, the
 /// volume belongs to the other phase, or secure-boot is disabled): the caller
 /// simply continues the legacy boot path.
-pub fn run_priority_gate_at(phase: GatePhase, config: &Config) -> Result<Option<AttestedVolume>> {
+pub fn run_priority_gate_at(
+    fs: &mut dyn FsOps,
+    phase: GatePhase,
+    config: &Config,
+) -> Result<Option<AttestedVolume>> {
     // signing safety: secure-boot disabled is the operator declining the
     // priority gate, NOT a bypass of an enabled one (FIX-04). The gate is
     // skipped and the legacy boot path runs; nothing claims to have verified.
@@ -178,7 +183,7 @@ pub fn run_priority_gate_at(phase: GatePhase, config: &Config) -> Result<Option<
         vol.mountpoint.display()
     );
 
-    match evaluate(phase, config, vol) {
+    match evaluate(fs, phase, config, vol) {
         GateDecision::Attested(vol) => {
             crate::nmbl_info!("priority-gate ({phase:?}): signature VALID, proceeding");
             Ok(Some(vol))
@@ -195,8 +200,8 @@ pub fn run_priority_gate_at(phase: GatePhase, config: &Config) -> Result<Option<
 /// The single-shot priority gate (FIX-26): the `PostUnlock` hook unwrapped to
 /// the bare [`AttestedVolume`], used where there is exactly one gate point (the
 /// boot path calls [`run_priority_gate_at`] at each of the two phases instead).
-pub fn run_priority_gate(config: &Config) -> Result<AttestedVolume> {
-    match run_priority_gate_at(GatePhase::PostUnlock, config)? {
+pub fn run_priority_gate(fs: &mut dyn FsOps, config: &Config) -> Result<AttestedVolume> {
+    match run_priority_gate_at(fs, GatePhase::PostUnlock, config)? {
         Some(vol) => Ok(vol),
         None => Err(NmblError::Signature {
             stage: "priority-gate-not-configured",
@@ -210,8 +215,13 @@ pub fn run_priority_gate(config: &Config) -> Result<AttestedVolume> {
 /// on the FULL fingerprint, and verifies under [`DOMAIN_PRIORITY_FILE`]. A
 /// verify failure under an enforcing posture is a [`GateDecision::Refuse`]; under
 /// audit it WARNs and proceeds with the (still-mounted) attested volume.
-fn evaluate(phase: GatePhase, config: &Config, vol: &PriorityVolume) -> GateDecision {
-    let attested = match mount_priority_volume(phase, config, vol) {
+fn evaluate(
+    fs: &mut dyn FsOps,
+    phase: GatePhase,
+    config: &Config,
+    vol: &PriorityVolume,
+) -> GateDecision {
+    let attested = match mount_priority_volume(fs, phase, config, vol) {
         Ok(a) => a,
         // No attested volume to keep: a mount failure is a hard refuse under
         // enforce (the trust-anchor file is unreachable, indistinguishable from a
@@ -222,7 +232,7 @@ fn evaluate(phase: GatePhase, config: &Config, vol: &PriorityVolume) -> GateDeci
     let signed_path = attested
         .mountpoint
         .join(&config.secure_boot.signed_file_path);
-    match verify_signed_file(config, &signed_path) {
+    match verify_signed_file(fs, config, &signed_path) {
         Ok(()) => GateDecision::Attested(attested),
         Err(cause) if enforcing(config) => {
             crate::nmbl_warn!(
@@ -276,6 +286,7 @@ fn decide_no_volume(config: &Config, cause: NmblError) -> GateDecision {
 /// For the post-unlock (inside-LUKS) phase the gate mounts the configured
 /// device read-only at the volume's mountpoint and owns that mount.
 fn mount_priority_volume(
+    fs: &mut dyn FsOps,
     phase: GatePhase,
     config: &Config,
     vol: &PriorityVolume,
@@ -292,17 +303,18 @@ fn mount_priority_volume(
             })
         }
         GatePhase::PostUnlock => {
-            std::fs::create_dir_all(&vol.mountpoint).map_err(|source| NmblError::Io {
-                source,
-                context: format!(
-                    "priority-gate: create mountpoint {}",
-                    vol.mountpoint.display()
-                ),
-            })?;
+            fs.ensure_dir(&vol.mountpoint)
+                .map_err(|source| NmblError::Io {
+                    source,
+                    context: format!(
+                        "priority-gate: create mountpoint {}",
+                        vol.mountpoint.display()
+                    ),
+                })?;
             // Always mount READ-ONLY (the gate never trusts the volume's own
             // options for the mount it performs).
             let opts = ensure_ro(&vol.options);
-            crate::sys::mount::mount_fs(Some(&vol.device), &vol.mountpoint, &vol.fstype, &opts)?;
+            fs.mount(Some(&vol.device), &vol.mountpoint, &vol.fstype, &opts)?;
             Ok(AttestedVolume {
                 mountpoint: vol.mountpoint.clone(),
                 owned_mount: Some(vol.mountpoint.clone()),
@@ -327,15 +339,15 @@ fn ensure_ro(options: &str) -> String {
 /// [`DOMAIN_PRIORITY_FILE`] (FIX-08). Opens the file ONCE, streams it through
 /// SHA-512 over the single pinned fd, reads its sidecar (`<path><suffix>`), and
 /// delegates to the pure [`verify_priority_against`] with the BAKED key set.
-fn verify_signed_file(config: &Config, path: &Path) -> Result<()> {
-    let file = std::fs::File::open(path).map_err(|source| NmblError::Io {
+fn verify_signed_file(fs: &dyn FsOps, config: &Config, path: &Path) -> Result<()> {
+    let file = fs.open_ro(path).map_err(|source| NmblError::Io {
         source,
         context: format!("priority-gate: open signed file {}", path.display()),
     })?;
     let (digest, _len) = hash::sha512_fd(file.as_fd())?;
 
     let sig_path = sidecar_path(path, &config.signing.sig_path_suffix);
-    let sig_bytes = std::fs::read(&sig_path).map_err(|source| NmblError::Io {
+    let sig_bytes = fs.read_file(&sig_path).map_err(|source| NmblError::Io {
         source,
         context: format!("priority-gate: read sidecar {}", sig_path.display()),
     })?;

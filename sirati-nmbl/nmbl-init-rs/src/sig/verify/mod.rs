@@ -21,18 +21,23 @@
 //! trust path verifies an already-open, pinned fd.
 
 use std::fs;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::BorrowedFd;
 use std::path::Path;
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
-use crate::generations::Generation;
 use crate::util::hash;
 
 use super::keys::{self, BakedKey, KeyVerify};
-use super::scan::generation_sig_dir;
 use super::sidecar::SigSidecar;
 use super::wire;
+
+// The per-generation verify path (open kernel/initrd + sidecars through the
+// ops layer, retain the pinned fds for kexec). Split out to keep this core
+// file within the file-size budget; its public surface is re-exported so the
+// `crate::sig::verify::*` paths the facade re-exports stay unchanged.
+mod generation;
+pub use generation::{VerifiedGeneration, ensure_generation_signed, verify_generation_pinned};
 
 // The stub Ok(())-returning bodies in this crate are GONE. This assert makes a
 // regression that re-introduces an unconditional `Ok(())` on a secure-boot
@@ -218,17 +223,33 @@ pub fn verify_image_fd_digest(
         detail: format!("no sidecar path supplied for {image_desc}"),
     })?;
 
+    let sig_bytes = fs::read(sig_path).map_err(|source| NmblError::Io {
+        source,
+        context: format!("read sidecar {} for {image_desc}", sig_path.display()),
+    })?;
+    verify_image_fd_digest_bytes(fd, image_desc, &sig_bytes, domain, config)
+}
+
+/// Like [`verify_image_fd_digest`] but takes the sidecar BYTES already in hand
+/// rather than a path to read them from. The ops-routed generation path reads
+/// the sidecar through [`FsOps::read_file`] (so a `--validate-initrm` dry-run
+/// verifies against the extracted closure) and hands the bytes here; the
+/// path-based [`verify_image_fd_digest`] reads them itself and calls the SAME
+/// core, so both share one verify body.
+fn verify_image_fd_digest_bytes(
+    fd: BorrowedFd<'_>,
+    image_desc: &str,
+    sig_bytes: &[u8],
+    domain: &'static [u8],
+    config: &Config,
+) -> Result<[u8; 64]> {
     // Stream the WHOLE image over the single pinned fd. `bytes_hashed` is the
     // exact length read after seeking to 0 (FIX-51); a downstream consumer
     // wanting a length cross-check has it, and the seek guarantees we never
     // hash only a tail.
     let (digest, _bytes_hashed) = hash::sha512_fd(fd)?;
 
-    let sig_bytes = fs::read(sig_path).map_err(|source| NmblError::Io {
-        source,
-        context: format!("read sidecar {} for {image_desc}", sig_path.display()),
-    })?;
-    let sidecar = SigSidecar::parse(&sig_bytes).map_err(|e| NmblError::Signature {
+    let sidecar = SigSidecar::parse(sig_bytes).map_err(|e| NmblError::Signature {
         stage: "sidecar-parse",
         detail: format!("{image_desc}: {e}"),
     })?;
@@ -237,166 +258,4 @@ pub fn verify_image_fd_digest(
     let policy = VerifyPolicy::from_config(config);
     verify_digest(&digest, domain, &sidecar, &baked, policy)?;
     Ok(digest)
-}
-
-/// Ensure a generation's kernel AND initrd both carry a valid signature.
-///
-/// Resolves the per-generation sidecar directory `<boot>/nmbl/sigs/<gen-id>/`
-/// (R-4) and verifies `kernel<suffix>` under [`DOMAIN_GEN_KERNEL`] and
-/// `initrd<suffix>` under [`DOMAIN_GEN_INITRD`], each over an own pinned fd via
-/// [`verify_image_fd`]. BOTH must verify.
-///
-/// (The generation parameter is named `generation`, not `gen`: `gen` is a
-/// reserved keyword in edition 2024.)
-pub fn ensure_generation_signed(config: &Config, generation: &Generation) -> Result<()> {
-    let sig_dir = generation_sig_dir(config, generation)?;
-    let suffix = config.signing.sig_path_suffix.as_str();
-
-    verify_generation_blob(
-        config,
-        &generation.kernel,
-        &sig_dir.join(format!("kernel{suffix}")),
-        "generation kernel",
-        DOMAIN_GEN_KERNEL,
-    )?;
-    verify_generation_blob(
-        config,
-        &generation.initrd,
-        &sig_dir.join(format!("initrd{suffix}")),
-        "generation initrd",
-        DOMAIN_GEN_INITRD,
-    )?;
-    Ok(())
-}
-
-/// Open `blob` read-only and verify it against `sig_path` under `domain`.
-/// Opens ONCE and hands the pinned fd straight to [`verify_image_fd`] — the
-/// path is never reopened for hashing (FIX-02/FIX-64).
-fn verify_generation_blob(
-    config: &Config,
-    blob: &Path,
-    sig_path: &Path,
-    desc: &str,
-    domain: &'static [u8],
-) -> Result<()> {
-    let file = fs::File::open(blob).map_err(|source| NmblError::Io {
-        source,
-        context: format!("open {desc} {} for verify", blob.display()),
-    })?;
-    verify_image_fd(file.as_fd(), desc, Some(sig_path), domain, config)
-}
-
-/// A generation whose kernel+initrd were verified over PINNED fds, carrying the
-/// artefacts every downstream step must REUSE rather than recompute (FIX-02).
-///
-/// Closing the verify→measure→load TOCTOU (MED-1) requires that the SAME bytes
-/// be verified, measured, AND loaded. This witness holds:
-///
-/// * `kernel_fd` — the kernel's OWN, still-open `O_RDONLY` fd. The verifier
-///   opened the kernel ONCE, hashed it over this fd, and verified its
-///   signature; the loader hands THIS fd to `kexec_file_load(2)` (never
-///   re-opening the path), so the loaded kernel is byte-identical to the
-///   verified+measured one.
-/// * `initrd_fd` — the (pristine) initrd's OWN, still-open `O_RDONLY` fd, kept
-///   on the SAME footing as the kernel fd (LOW-A). The loader splices the NMBL
-///   cpio fragment onto the initrd bytes read from THIS fd — never re-reading
-///   the path — so the initrd bytes spliced into the kexec memfd are
-///   byte-identical to the ones verified + measured. Closing the verify→load
-///   window for the initrd too, not just the kernel.
-/// * `kernel_digest` / `initrd_digest` — the SHA-512 digests the verifier
-///   already streamed over the pinned fds. The PCR-11 measure reuses these
-///   verbatim (no second hash — FIX-02).
-///
-/// Holding the fds in the witness keeps them alive for the whole verify→measure
-/// →load window: dropping the witness closes them, so the loader must consume
-/// them within that window.
-#[derive(Debug)]
-pub struct VerifiedGeneration {
-    /// The kernel's pinned fd — opened once for verify, reused for load.
-    pub kernel_fd: OwnedFd,
-    /// The (pristine) initrd's pinned fd — opened once for verify, reused for
-    /// the kexec initrd splice (LOW-A — no path re-read).
-    pub initrd_fd: OwnedFd,
-    /// SHA-512 of the kernel, reused by the measure step (no re-hash).
-    pub kernel_digest: [u8; 64],
-    /// SHA-512 of the (pristine) initrd, reused by the measure step.
-    pub initrd_digest: [u8; 64],
-}
-
-/// Verify a generation's kernel+initrd AND return the pinned kernel fd + reused
-/// digests (FIX-02 / MED-1).
-///
-/// Unlike [`ensure_generation_signed`] (which drops every fd once it has a
-/// verdict), this opens the kernel ONCE and KEEPS that fd, streams it through
-/// SHA-512 (the digest the sidecar verify uses AND the measure reuses), then
-/// verifies the signature over that one fd. The initrd is opened, hashed, and
-/// verified the same way, AND its fd is likewise RETAINED (LOW-A): the loader
-/// splices the NMBL cpio fragment onto the initrd bytes read from that pinned
-/// fd, so the bytes loaded == verified == measured for the initrd too (only the
-/// pristine initrd is measured, never the fragment — FIX-42).
-///
-/// On success the returned [`VerifiedGeneration`] owns the live kernel + initrd
-/// fds; the caller loads from THOSE fds. On any verify failure the fds are
-/// dropped and the error propagates (the gate maps audit-vs-enforce).
-pub fn verify_generation_pinned(
-    config: &Config,
-    generation: &Generation,
-) -> Result<VerifiedGeneration> {
-    let sig_dir = generation_sig_dir(config, generation)?;
-    let suffix = config.signing.sig_path_suffix.as_str();
-
-    // Open the kernel ONCE and keep its fd for the load (FIX-02). Verify +
-    // hash both happen over this exact fd.
-    let kernel_file = fs::File::open(&generation.kernel).map_err(|source| NmblError::Io {
-        source,
-        context: format!(
-            "open generation kernel {} for verify+load",
-            generation.kernel.display()
-        ),
-    })?;
-    let kernel_sig = sig_dir.join(format!("kernel{suffix}"));
-    // ONE hash over the pinned fd serves both verify and measure (FIX-02).
-    let kernel_digest = verify_image_fd_digest(
-        kernel_file.as_fd(),
-        "generation kernel",
-        Some(&kernel_sig),
-        DOMAIN_GEN_KERNEL,
-        config,
-    )?;
-
-    // The initrd is verified over its OWN pinned fd, its digest captured for the
-    // measure, AND its fd RETAINED for the load splice (LOW-A — no path re-read).
-    let (initrd_fd, initrd_digest) = verify_generation_blob_pinned(
-        config,
-        &generation.initrd,
-        &sig_dir.join(format!("initrd{suffix}")),
-        "generation initrd",
-        DOMAIN_GEN_INITRD,
-    )?;
-
-    Ok(VerifiedGeneration {
-        kernel_fd: kernel_file.into(),
-        initrd_fd,
-        kernel_digest,
-        initrd_digest,
-    })
-}
-
-/// Like [`verify_generation_blob`], but opens the blob ONCE, verifies + hashes
-/// it over that single pinned fd, and RETURNS both the live fd and the SHA-512
-/// digest. The kept fd lets the loader splice from the exact verified+measured
-/// bytes (LOW-A); the digest is reused by the measure step (FIX-02).
-fn verify_generation_blob_pinned(
-    config: &Config,
-    blob: &Path,
-    sig_path: &Path,
-    desc: &str,
-    domain: &'static [u8],
-) -> Result<(OwnedFd, [u8; 64])> {
-    let file = fs::File::open(blob).map_err(|source| NmblError::Io {
-        source,
-        context: format!("open {desc} {} for verify+load", blob.display()),
-    })?;
-    let digest = verify_image_fd_digest(file.as_fd(), desc, Some(sig_path), domain, config)?;
-    Ok((file.into(), digest))
 }

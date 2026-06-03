@@ -78,6 +78,7 @@ pub use handle::{DriverImageHandle, DriverImagesHandle, detach_all_driver_images
 
 use crate::config::Config;
 use crate::error::Result;
+use crate::sys::ops::{FsOps, ModuleOps};
 
 /// Load every declared, signed driver image in order (the #23 entry point).
 ///
@@ -98,7 +99,10 @@ use crate::error::Result;
 /// # Errors
 /// Returns [`crate::error::NmblError::DriverImage`] when an image fails to
 /// verify (enforce mode), loop-bind, mount, or load its modules.
-pub fn load_driver_images(config: &Config) -> Result<DriverImagesHandle> {
+pub fn load_driver_images<S: FsOps + ModuleOps>(
+    ops: &mut S,
+    config: &Config,
+) -> Result<DriverImagesHandle> {
     if !config.driver_images.enable || config.driver_images.images.is_empty() {
         return Ok(DriverImagesHandle::empty());
     }
@@ -108,6 +112,7 @@ pub fn load_driver_images(config: &Config) -> Result<DriverImagesHandle> {
     // rather than load an image we have no verify pipeline for.
     #[cfg(not(feature = "secure-boot"))]
     {
+        let _ = ops;
         Err(crate::error::NmblError::DriverImage {
             stage: "no-verify-feature",
             source: Box::new(crate::error::NmblError::ConfigInvalid {
@@ -122,7 +127,7 @@ pub fn load_driver_images(config: &Config) -> Result<DriverImagesHandle> {
     {
         let mut handle = DriverImagesHandle::empty();
         for (index, spec) in config.driver_images.images.iter().enumerate() {
-            let loaded = self::load_one(config, spec, index)?;
+            let loaded = self::load_one(ops, config, spec, index)?;
             handle.push(loaded);
         }
         Ok(handle)
@@ -134,7 +139,8 @@ pub fn load_driver_images(config: &Config) -> Result<DriverImagesHandle> {
 /// The exact-order pipeline documented at the module root. `index` only labels
 /// the per-image mountpoint so concurrent images do not collide.
 #[cfg(feature = "secure-boot")]
-fn load_one(
+fn load_one<S: FsOps + ModuleOps>(
+    ops: &mut S,
     config: &Config,
     spec: &crate::config::DriverImageSpec,
     index: usize,
@@ -144,8 +150,9 @@ fn load_one(
     let resolved = locate::resolve_image(config, spec)?;
 
     // ONE fd for the whole pipeline (FIX-02): the bytes we verify are the bytes
-    // the loop device serves to the kernel.
-    let image_fd = locate::open_image_ro(&resolved)?;
+    // the loop device serves to the kernel. Opened through the FsOps seam so
+    // --validate-initrm reads the closure-mapped squashfs bytes.
+    let image_fd = locate::open_image_ro(ops, &resolved)?;
 
     // (1) VERIFY first — never touch the loop/mount layer on a refusal. The
     // verify returns the SHA-512 it streamed over the pinned fd, which the
@@ -153,13 +160,13 @@ fn load_one(
     let digest = verify::verify_driver_image(image_fd.as_fd(), &resolved, config)?;
 
     // (2) MOUNT the SAME fd read-only.
-    let mounted = mount::mount_squashfs_ro(image_fd.as_fd(), index)?;
+    let mounted = mount::mount_squashfs_ro(ops, image_fd.as_fd(), index)?;
 
     // (3) FIRMWARE search path for this image's lib/firmware.
-    firmware::add_firmware_search_path(&mounted.mountpoint);
+    firmware::add_firmware_search_path(ops, &mounted.mountpoint);
 
     // (4) LOAD the declared modules (reuses crate::modules::load_modules).
-    modules::load_image_modules(config, spec, &mounted.mountpoint)?;
+    modules::load_image_modules(ops, config, spec, &mounted.mountpoint)?;
 
     // The measure event #4 name is the operator-declared boot-relative path
     // (`spec.path`): a STABLE, off-box-reproducible identifier (the absolute

@@ -54,7 +54,8 @@ pub(super) fn measure_required(config: &Config) -> bool {
         reason = "measure path only compiles under the secure-boot feature"
     )
 )]
-pub(super) fn measure_handoff(
+pub(super) fn measure_handoff<S: SysOps>(
+    ops: &mut S,
     config: &Config,
     generation: &Generation,
     verified: Option<&VerifiedGeneration>,
@@ -82,7 +83,7 @@ pub(super) fn measure_handoff(
         // extend PCR-11 over an unprotected chain. Degrades gracefully on a
         // BIOS/efivarfs-less box (warn + proceed). A refuse here routes through
         // the same `PolicyRefused` terminus as a measure failure (R-1).
-        tpm::enforce_secure_boot_state(config.secure_boot.enforce).map_err(refuse)?;
+        tpm::enforce_secure_boot_state(ops, config.secure_boot.enforce).map_err(refuse)?;
 
         // A measure-required boot MUST have verified inputs to measure (FIX-27):
         // no honest measurement exists for an unverified/audit-bypassed image.
@@ -105,6 +106,7 @@ pub(super) fn measure_handoff(
         // absent TPM on a measure-required build must refuse, never boot
         // silently unmeasured (FIX-27).
         measure::extend_handoff(
+            ops,
             config,
             generation,
             &vg.kernel_digest,

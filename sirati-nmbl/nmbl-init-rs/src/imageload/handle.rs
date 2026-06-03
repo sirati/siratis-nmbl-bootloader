@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use crate::error::Result;
+use crate::sys::ops::FsOps;
 
 /// What one loaded driver image left mounted, for teardown — PLUS the stable
 /// name + verified digest the PCR-11 measure event #4 binds (#28).
@@ -178,22 +179,22 @@ impl DriverImagesHandle {
 /// Never returns `Err` for an individual image (failures are logged); the
 /// `Result` shape is kept so the call site can stay uniform with the other
 /// teardown helpers and a future hard-fail policy can be slotted in.
-pub fn detach_all_driver_images(handle: &DriverImagesHandle) -> Result<()> {
+pub fn detach_all_driver_images(ops: &mut impl FsOps, handle: &DriverImagesHandle) -> Result<()> {
     for image in handle.images().iter().rev() {
-        detach_one(image);
+        detach_one(ops, image);
     }
     Ok(())
 }
 
 /// Best-effort teardown of a single image: lazy-unmount then `LOOP_CLR_FD`.
-fn detach_one(image: &DriverImageHandle) {
+fn detach_one(ops: &mut impl FsOps, image: &DriverImageHandle) {
     // Only the secure-boot build can have produced a handle (FIX-05), so the
     // privileged teardown body lives behind the feature; a non-secure-boot
     // build never reaches here with a non-empty handle.
     #[cfg(feature = "secure-boot")]
-    super::mount::teardown_image(image.loop_index(), image.mountpoint());
+    super::mount::teardown_image(ops, image.loop_index(), image.mountpoint());
 
-    // Silence the unused-arg warning on the (unreachable) non-secure-boot path.
+    // Silence the unused-arg warnings on the (unreachable) non-secure-boot path.
     #[cfg(not(feature = "secure-boot"))]
-    let _ = image;
+    let _ = (ops, image);
 }
