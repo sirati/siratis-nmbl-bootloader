@@ -194,12 +194,16 @@ fn loaded_handle_records_order_for_the_measure_seam() {
     // the ordered handle the hook returns preserves declared order.
     let mut handle = DriverImagesHandle::empty();
     handle.push(DriverImageHandle::new(
+        "a.sfs".to_string(),
         std::path::PathBuf::from("/run/nmbl-boot/a.sfs"),
+        [0xa1u8; 64],
         3,
         std::path::PathBuf::from("/run/nmbl-driver-images/0"),
     ));
     handle.push(DriverImageHandle::new(
+        "b.sfs".to_string(),
         std::path::PathBuf::from("/run/nmbl-boot/b.sfs"),
+        [0xb2u8; 64],
         4,
         std::path::PathBuf::from("/run/nmbl-driver-images/1"),
     ));
@@ -209,4 +213,50 @@ fn loaded_handle_records_order_for_the_measure_seam() {
     assert_eq!(imgs.get(1).expect("second").loop_index(), 4);
     // A reboot terminus tears this non-empty handle down.
     assert!(should_teardown_driver_images(&TerminalAction::Reboot));
+}
+
+/// LOW-B: a staged-rerun driver image, appended to the SAME accumulator the #24
+/// hook owns, rides the base set's teardown — it is registered for the normal
+/// pre-kexec terminus, not dropped without bookkeeping. This mirrors the exact
+/// append `staged::rerun::rerun_merged_effects` performs (push the staged
+/// handle's images into the shared accumulator) and asserts the combined set is
+/// torn down on the normal terminus and left mounted only on the capped-shell
+/// divert (FIX-55).
+#[test]
+fn staged_rerun_driver_image_is_registered_for_teardown() {
+    // The base #24-hook accumulator with one baseline image.
+    let mut accumulator = DriverImagesHandle::empty();
+    accumulator.push(DriverImageHandle::new(
+        "base.sfs".to_string(),
+        std::path::PathBuf::from("/run/nmbl-boot/base.sfs"),
+        [0x01u8; 64],
+        1,
+        std::path::PathBuf::from("/run/nmbl-driver-images/0"),
+    ));
+
+    // The staged loader returns its own handle; rerun appends each image into
+    // the shared accumulator (the LOW-B fix).
+    let mut staged = DriverImagesHandle::empty();
+    staged.push(DriverImageHandle::new(
+        "staged.sfs".to_string(),
+        std::path::PathBuf::from("/run/nmbl-boot/staged.sfs"),
+        [0x02u8; 64],
+        2,
+        std::path::PathBuf::from("/run/nmbl-driver-images/1"),
+    ));
+    for image in staged.images() {
+        accumulator.push(image.clone());
+    }
+
+    // The staged image now lives in the accumulator the #24 hook tears down.
+    assert_eq!(accumulator.len(), 2, "staged image joined the base set");
+    assert_eq!(
+        accumulator.images().get(1).expect("staged image").name(),
+        "staged.sfs",
+    );
+    // Normal terminus ⇒ the whole set (base + staged) is torn down.
+    assert!(should_teardown_driver_images(&TerminalAction::Kexec));
+    detach_all_driver_images(&accumulator).expect("teardown of the combined set is Ok");
+    // Capped-shell divert ⇒ left mounted for inspection (no secrets, FIX-55).
+    assert!(!should_teardown_driver_images(&execve_action()));
 }

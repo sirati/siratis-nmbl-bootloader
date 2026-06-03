@@ -24,7 +24,7 @@
 use crate::activation::{KeyInjection, run_all_activations};
 use crate::config::Config;
 use crate::error::Result;
-use crate::imageload::load_driver_images;
+use crate::imageload::{DriverImagesHandle, load_driver_images};
 use crate::modules::load_explicit_modules;
 use crate::sys::poller::LocalSender;
 use crate::ui::{BootReporter, SessionInteraction, SkipSelector, TuiPasswordSupplier};
@@ -41,6 +41,7 @@ pub(super) async fn rerun_merged_effects(
     session: &SessionInteraction,
     skip_selector: &SkipSelector,
     sender: &LocalSender,
+    driver_images: &mut DriverImagesHandle,
 ) -> Result<Vec<KeyInjection>> {
     // (1) Explicit modules the fragment may have added.
     let _ = reporter.set_phase("staged-boot: re-loading explicit kernel modules");
@@ -49,11 +50,19 @@ pub(super) async fn rerun_merged_effects(
     // (2) The (now-verified) staged driver images. The loader single-fd verifies
     // every declared image under the driver-image domain before loop-mounting —
     // the staged drivers go through the exact same #23 verify as a baseline set.
-    // The handle is intentionally not torn down here: like the baseline images
-    // it stays mounted into kexec (the kexec teardown owns the unmount), and
-    // driver images carry no secrets (FIX-55).
+    //
+    // The loaded images are APPENDED to the shared `driver_images` accumulator
+    // (LOW-B): that handle is the one the #24 hook tears down on the normal
+    // pre-kexec terminus (and leaves mounted only on the capped-shell divert,
+    // FIX-55), so a staged image is now registered for the SAME teardown as a
+    // baseline one — no benign loop/mount leak across kexec. Their verified
+    // refs also join the PCR-11 measure event #4 (#28), so a staged driver is
+    // measured exactly like a baseline one.
     let _ = reporter.set_phase("staged-boot: loading staged driver images");
-    let _driver_handle = load_driver_images(config)?;
+    let staged_handle = load_driver_images(config)?;
+    for image in staged_handle.images() {
+        driver_images.push(image.clone());
+    }
 
     // (3) Activations the fragment added (e.g. a new LUKS volume the staged
     // drivers expose). Run through the same activation runner as the base phase
