@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::imageload::{DriverImagesHandle, load_driver_images};
 use crate::modules::load_explicit_modules;
+use crate::nmbl_info;
 use crate::sys::ops::SysOps;
 use crate::sys::poller::LocalSender;
 use crate::ui::{BootReporter, SessionInteraction, SkipSelector, TuiPasswordSupplier};
@@ -57,6 +58,17 @@ pub(super) async fn rerun_merged_effects<S: SysOps>(
     // (1) Explicit modules the fragment may have added.
     let _ = reporter.set_phase("staged-boot: re-loading explicit kernel modules");
     load_explicit_modules(ops, config, reporter)?;
+    // Direct proof the merged-config modules ACTUALLY loaded (the set_phase
+    // above only proves the phase was entered). Names the explicit list the
+    // loader just walked — a fragment-added module (e.g. `dummy`) shows up here
+    // only after `load_explicit_modules` returned Ok. Plain format over the
+    // names, no unwrap/panic.
+    let explicit = &config.kernel_modules.explicit;
+    nmbl_info!(
+        "staged rerun: loaded {} explicit module(s) [{}]",
+        explicit.len(),
+        explicit.join(", ")
+    );
 
     // (2) The (now-verified) staged driver images. The loader single-fd verifies
     // every declared image under the driver-image domain before loop-mounting —

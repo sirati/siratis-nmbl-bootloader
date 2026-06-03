@@ -598,6 +598,155 @@ let
         })
       ];
     };
+
+    # Driver-image variant (#1 / FEATURE-#1): the SAME secure-boot chain as
+    # test-secure-boot, but with `boot.nmbl.driverImages` enabled and a
+    # cryptroot the operator opens with the install PASSPHRASE (so the boot
+    # actually REACHES the post-kexec system the assertion inspects, instead of
+    # wedging on a never-enrolled TPM token). NMBL verifies the signed driver
+    # squashfs, loop-mounts it, and `finit_module`s a module that is NOT in the
+    # base initrd (`dummy`, the net dummy device) BEFORE the generation kexec.
+    # The driver image is signed AT INSTALL RUNTIME with the same ML-DSA key the
+    # generation uses (`signing.imageKeyFile`, a string PATH staged into the
+    # install chroot — never a derivation input), whose public half is the baked
+    # INSECURE-TEST trust anchor, so the runtime verify passes.
+    test-secure-boot-driver = {
+      name = "test-secure-boot-driver";
+      bootstrapper = {
+        partition_table = "gpt";
+        bootMode = "uefi";
+        loader = "efi-stub";
+        loader_extra_args = {
+          timeout = 0;
+        };
+      };
+      nmblKernelPackage = (nixpkgs.legacyPackages.x86_64-linux).linuxPackages_latest.kernel;
+      diskoModule = ./disko-luks-password.nix;
+      extraModules = [
+        ({ lib, ... }: {
+          # ---- signature enforcement (verify every generation + driver image) --
+          boot.nmbl.signing = {
+            enable = true;
+            enforce = true;
+            algorithm = "ml-dsa-87";
+            publicKeys = [ ./keys/insecure-test-ml-dsa-87.pub ];
+            generationKeyFile =
+              let
+                e = builtins.getEnv "NMBL_GEN_KEY_FILE";
+              in
+              if e != "" then e else "/var/lib/nmbl-test-keys/insecure-test-gen.key";
+            # The driver-image signing key (same ML-DSA pair as the generation
+            # key; public half is the baked anchor). IMPURE string path read at
+            # install time — never a derivation input. The sb-install
+            # orchestrator stages the committed test key here.
+            imageKeyFile =
+              let
+                e = builtins.getEnv "NMBL_IMAGE_KEY_FILE";
+              in
+              if e != "" then e else "/var/lib/nmbl-test-keys/insecure-test-image.key";
+            uki = {
+              enable = true;
+              keyFile =
+                let
+                  e = builtins.getEnv "NMBL_SB_DB_KEY_FILE";
+                in
+                if e != "" then e else "/var/lib/nmbl-test-keys/insecure-test-sb-db.key";
+              certFile =
+                let
+                  e = builtins.getEnv "NMBL_SB_DB_CERT_FILE";
+                in
+                if e != "" then e else "/var/lib/nmbl-test-keys/insecure-test-sb-db.crt";
+            };
+          };
+
+          # ---- measured boot (extend PCR 11, require a real TPM) -----------
+          boot.nmbl.tpm = {
+            measure = true;
+            requireTpm = true;
+            pcrIndex = 11;
+          };
+
+          # ---- secure-boot posture -----------------------------------------
+          boot.nmbl.secureBoot = {
+            enable = true;
+            enforce = true;
+            requireTpm = true;
+          };
+
+          # ---- the driver image: ship `dummy` (a module NOT in the base) ----
+          # `dummy` (drivers/net/dummy.ko) needs no firmware and no dependents,
+          # so it always builds and loads cleanly against NMBL's kernel. It is
+          # NOT in this config's initrd/explicit module set, so its presence in
+          # NMBL's pre-kexec load log proves it came FROM the signed image.
+          boot.nmbl.driverImages = {
+            enable = true;
+            images.extra = {
+              modules = [ "dummy" ];
+              path = "nmbl/driver-extra.sfs";
+              sigPath = "nmbl/driver-extra.sfs.sig";
+            };
+          };
+
+          # ---- bootstrap (external) config — REQUIRED by driver images -------
+          # The driver-image loader resolves the boot-relative image path against
+          # the RUNTIME boot mountpoint, which only exists once Phase 0.5
+          # (bootstrap mode) mounts /boot. In legacy embedded-config mode there is
+          # no runtime boot mountpoint, so the loader refuses ("driver images
+          # require bootstrap mode") and NMBL reboots into rescue. So this config
+          # MUST run external/bootstrap: the initramfs ships only bootstrap.toml,
+          # the full config.toml + the signed driver squashfs live on the ESP, and
+          # Phase 0.5 mounts it first. On the disko-luks layout the ESP is vda2
+          # (vda1 = BIOS-boot, vda3 = LUKS).
+          boot.nmbl.configLocation = "external";
+          boot.nmbl.bootstrap.bootFs.device = "/dev/vda2";
+          boot.nmbl.bootstrap.kernelModules.explicit = [
+            "virtio_pci"
+            "virtio_blk"
+            "vfat"
+            "nls_cp437"
+            "nls_iso8859_1"
+          ];
+
+          # ---- loop + squashfs — REQUIRED to loop-mount the driver image -----
+          # The driver-image loader binds the verified squashfs to a loop device
+          # (`/dev/loop-control`) and mounts it `squashfs`-typed. Unlike the rescue
+          # path it does NOT modprobe these on demand, so they must already be in
+          # the kernel. Load them EARLY (phase 2a) so they are present before the
+          # driver-image hook runs (which is right after the early-module load).
+          boot.nmbl.earlyKernelModules = [
+            "loop"
+            "squashfs"
+          ];
+
+          # ---- cryptroot opened with the install PASSPHRASE -----------------
+          # (so the boot reaches the post-kexec system the assertion queries —
+          # the real config's tpm-unlock cryptroot would never open here).
+          boot.initrd.kernelModules = [
+            "dm_mod"
+            "dm-crypt"
+            "aesni_intel"
+            "tpm"
+            "tpm_tis"
+            "tpm_crb"
+          ];
+          boot.nmbl.activation.luks = [
+            {
+              name = "cryptroot";
+              device = "/dev/vda3";
+              unlock = "password";
+              promptLabel = "Enter LUKS passphrase for cryptroot (driver-image scenario)";
+              passToStage1 = "/etc/nmbl-luks/cryptroot";
+            }
+          ];
+          boot.initrd.luks.devices.cryptroot = lib.mkForce {
+            device = "/dev/disk/by-partlabel/disk-main-luks";
+            keyFile = "/etc/nmbl-luks/cryptroot";
+            fallbackToPassword = true;
+            allowDiscards = true;
+          };
+        })
+      ];
+    };
   };
 
   # Build VM configurations. `cfg` may carry diskoModule / extraModules

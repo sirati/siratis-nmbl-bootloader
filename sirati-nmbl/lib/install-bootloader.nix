@@ -32,6 +32,11 @@
   # Empty string when no driver images are enabled (default keeps older
   # callers evaluable).
   driverImageInstallShell ? "",
+  # Install-time staged-boot staging + `nmbl-sign` signing shell (FEATURE #2).
+  # Empty string when `boot.nmbl.staged.enable` is off. Unlike the driver-image
+  # shell (which writes onto /boot), this writes onto the install root `/` — the
+  # decrypted priority volume the boot-time gate later mounts read-only.
+  stagedInstallShell ? "",
   # The host-platform `nmbl-sign` ML-DSA signer (flake `_module.args.nmblSign`).
   # Threaded into install-signing.nix for per-generation signing; `null` on an
   # older host flake (only dereferenced when signing is enabled).
@@ -55,6 +60,15 @@ let
       null
     else
       { };
+
+  # Build-time-only signing skip — the SAME flag install-signing.nix uses to
+  # leave the UKI unsigned + emit no generation sidecars (line 394 below). A
+  # sealed/disko image builder runs `installBootLoader` WITHOUT the impure
+  # signing keys staged, so any install-time `nmbl-sign` call would fail there.
+  # The driver-image staging+signing shell reads `signing.imageKeyFile` exactly
+  # the same way, so it MUST honour the same defer flag: skip it in the deferred
+  # (build-VM) pass and run it only in the real install where the key is staged.
+  deferInstallSigning = cfg.signing.deferInstallSigning or false;
 
   # Resolve the cryptsetup the activation plan uses (prefer the static
   # build, same as lib/modules/activation.nix's `tryStatic`). Handed to
@@ -232,8 +246,18 @@ pkgs.writeScript "install-nmbl-bootloader" ''
   # Optional signed driver-image squashfs blobs (#25a). Each is staged onto
   # the ESP and signed in place with `nmbl-sign --domain driver-image`
   # (impure ML-DSA key read at install time). Empty string when no driver
-  # images are enabled.
-  ${driverImageInstallShell}
+  # images are enabled. DEFERRED under `deferInstallSigning` exactly like the
+  # UKI/generation signing: the build-VM (disko image) pass has no staged
+  # `imageKeyFile`, so the `nmbl-sign` call would fail there — the real install
+  # (deferInstallSigning = false) stages the key and signs in place.
+  ${lib.optionalString (!deferInstallSigning) driverImageInstallShell}
+
+  # Optional staged-boot artifacts (FEATURE #2). Staged onto the priority
+  # volume's filesystem — the install root `/` (the decrypted cryptroot the
+  # boot-time priority gate mounts read-only after the LUKS activation) — and
+  # signed in place with `nmbl-sign` (impure ML-DSA key read at install time).
+  # Empty string when staged boot is off.
+  ${stagedInstallShell}
 
   ${lib.optionalString (cfg.splash.enable && cfg.splash.backgroundLocation == "boot-partition") (
     let
@@ -439,7 +463,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     # Build-time-only: skip in-installer signing (unsigned UKI, no sidecars) so
     # a sealed image builder that cannot read the impure keys still completes.
     # Runtime enforcement is unchanged; the boot partition is signed out of band.
-    deferInstallSigning = cfg.signing.deferInstallSigning or false;
+    inherit deferInstallSigning;
   }}
 
   # Create /init symlink for NixOS stage-1
