@@ -29,6 +29,13 @@ CONFIG_NAME="test-secure-boot"
 # should verify. Covers the refuse countdown, the policy-refused terminus, and
 # the signature-failure stage markers.
 REFUSE_RE='RebootIntoRescue|refuse|Refusing|signature (verification )?failed|PolicyRefused|bad signature|reboot.*rescue|countdown'
+# POSITIVE proof the verify+measure guard actually RAN — not merely that the
+# box booted. `signature verified:` is emitted ONLY on the enforce-mode
+# verify-OK arm (src/boot/handoff.rs); `measure: extended PCR-11` is emitted by
+# the post-verify measure step (src/tpm/measure.rs). Asserting these rejects a
+# build where signing silently didn't engage (it would boot but emit neither).
+VERIFY_OK_RE='signature verified:'
+MEASURE_OK_RE='measure: extended PCR-11'
 
 SHELL_TIMEOUT="${NMBL_SHELL_TIMEOUT:-240}"
 
@@ -106,6 +113,24 @@ if [ "$ready" != true ]; then
   echo "FAIL: booted shell never became interactive" >&2
   exit 1
 fi
+
+# POSITIVE verify+measure proof. Booting to a shell is NOT enough: a build
+# where the secure-boot feature silently didn't engage would also reach the
+# autologin shell. Require BOTH the enforce-mode verify-OK marker AND the
+# PCR-11 measure marker in the scrollback — they fire only when the
+# verify→measure guard actually ran (handoff.rs / measure.rs).
+echo "=== asserting the verify+measure guard RAN (positive markers) ===" >&2
+if ! seen_in_history "$VERIFY_OK_RE"; then
+  echo "FAIL: no positive signature-verified marker — the verify guard did NOT" >&2
+  echo "      run/pass (signing may have silently not engaged)." >&2
+  exit 1
+fi
+if ! seen_in_history "$MEASURE_OK_RE"; then
+  echo "FAIL: no 'measure: extended PCR-11' marker — the measured-boot step did" >&2
+  echo "      NOT run, so verify+measure was not exercised on this boot." >&2
+  exit 1
+fi
+echo "=== PASS: signature verified AND PCR-11 extended (verify+measure ran) ===" >&2
 
 echo "PASS: signed generation verified, measured, kexec'd — system booted." >&2
 exit 0

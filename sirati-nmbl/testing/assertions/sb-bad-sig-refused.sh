@@ -37,9 +37,15 @@ CONFIG_NAME="test-secure-boot"
 # A REFUSE happened: any of the refuse/rescue/signature-failure markers.
 REFUSE_RE='RebootIntoRescue|Refusing|refuse|signature (verification )?failed|PolicyRefused|bad signature|reboot.*rescue|countdown|verify failed|relock'
 # An emergency SHELL being offered is a HARD FAIL: the refuse terminus must
-# never drop to (or offer) the shell-offering emergency path. These are the
-# emergency-shell prompt signatures NMBL prints when it offers a shell.
-EMERGENCY_SHELL_RE='emergency shell|drop to.*shell|nmbl.shell|Entering emergency|/bin/sh|rescue shell|press .* for a shell|sh-[0-9]'
+# never drop to (or offer) the shell-offering emergency path. These are NMBL's
+# ACTUAL emergency-shell signatures, not any shell-ish string (audit F6 — the
+# old `/bin/sh` / `sh-[0-9]` terms over-matched). Matched case-insensitively:
+#   * "NMBL: dropped to emergency shell" — the entry banner (shell/banner.rs:12)
+#   * "Emergency shell"                  — the offer-menu / modal title
+#   * "Pretty Shell" / "Raw Shell"       — the shell menu items (builders.rs)
+#   * "Choose what to do next"           — the emergency-menu prompt
+#   * "nmbl.shell"                       — the debug emergency-shell kernel arg
+EMERGENCY_SHELL_RE='dropped to emergency shell|Emergency shell|Pretty Shell|Raw Shell|Choose what to do next|nmbl\.shell'
 # The bad generation BOOTING is a HARD FAIL: it must never reach the system.
 BOOTED_RE="root@${CONFIG_NAME}"
 

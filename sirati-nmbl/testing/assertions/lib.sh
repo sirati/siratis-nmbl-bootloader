@@ -16,6 +16,14 @@
 # Marker string trigger prints when it gives up. Matching this means FAIL.
 NMBL_TRIGGER_TIMEOUT_RE='=== Trigger Timeout ===|did not match'
 
+# Console-marker matching is CASE-INSENSITIVE by design: firmware/NMBL banners
+# vary in casing (OVMF prints "Verification failed"; NMBL "verify"/"Refusing"),
+# and a scenario must not false-FAIL purely on letter case (audit F6). Both the
+# vm-serial-man regex (Rust `regex`, via an inline `(?i)`) and the lib.sh grep
+# confirmation (`grep -Ei`) honour it. The trigger-TIMEOUT banner above is
+# matched case-sensitively (it is a fixed literal we emit, not guest output).
+_ci_pattern() { printf '(?i)%s' "$1"; }
+
 # Populate the named array with the optional `--socket <path>` argv.
 # Empty VM_SOCKET → no args, so the client auto-detects the lone running
 # manager. Usage: `local a; _socket_args a; cmd "${a[@]}"`.
@@ -44,7 +52,7 @@ wait_for() {
   local out
   local -a sock_args
   _socket_args sock_args
-  out="$(vm-serial-man trigger "$pattern" \
+  out="$(vm-serial-man trigger "$(_ci_pattern "$pattern")" \
     --match-timeout "$match_timeout" \
     --line-timeout 5 \
     "${sock_args[@]}" 2>&1)"
@@ -56,7 +64,7 @@ wait_for() {
     echo "wait_for: FAIL (timeout) waiting for: $pattern" >&2
     return 1
   fi
-  if ! printf '%s' "$out" | grep -Eq "$pattern"; then
+  if ! printf '%s' "$out" | grep -Eiq "$pattern"; then
     echo "wait_for: FAIL (pattern absent) waiting for: $pattern" >&2
     return 1
   fi
@@ -81,8 +89,8 @@ seen_in_history() {
   local pattern="$1"
   local -a sock_args
   _socket_args sock_args
-  vm-serial-man find "$pattern" "${sock_args[@]}" 2>/dev/null \
-    | grep -Eq "$pattern"
+  vm-serial-man find "$(_ci_pattern "$pattern")" "${sock_args[@]}" 2>/dev/null \
+    | grep -Eiq "$pattern"
 }
 
 # assert_journal_tag <tag> [phase_match]
