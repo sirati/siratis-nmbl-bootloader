@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Secure-boot scenario: signed generation happy path (#57 / matrix id #4a).
+#
+# A correctly-signed generation must verify, measure, and kexec into the
+# system. The generation's kernel + initrd were signed at install time with
+# the INSECURE-TEST private key whose public half is baked into nmbl-init, so
+# the pre-kexec verify guard (verify_measure_then_load) passes and NMBL boots
+# the system normally — NO refuse, NO reboot-into-rescue.
+#
+# Flow:
+#   1. Launch the test-secure-boot runner (swtpm "tis" + SB-OVMF, smm=on),
+#      whose disk carries /boot/nmbl/sigs/<gen-id>/{kernel,initrd}.sig.
+#   2. Assert NMBL did NOT refuse: no refuse-countdown / reboot-into-rescue /
+#      signature-failure marker appears.
+#   3. Assert the system reaches the post-kexec root shell (verify passed, the
+#      generation was kexec'd).
+#   4. Tear the VM down and clean up everything THIS script started.
+#
+# Exit 0 on success, 1 on any failure.
+#
+# Required on PATH: vm-serial-man, the runner ($NMBL_RUNNER or
+# `run-test-secure-boot`), screen, coreutils, gnugrep, qemu, OVMFFull, swtpm.
+
+set -uo pipefail
+
+CONFIG_NAME="test-secure-boot"
+
+# A REFUSAL (any form) on the happy path is a HARD FAIL: the signed generation
+# should verify. Covers the refuse countdown, the policy-refused terminus, and
+# the signature-failure stage markers.
+REFUSE_RE='RebootIntoRescue|refuse|Refusing|signature (verification )?failed|PolicyRefused|bad signature|reboot.*rescue|countdown'
+
+SHELL_TIMEOUT="${NMBL_SHELL_TIMEOUT:-240}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib.sh
+. "${SCRIPT_DIR}/lib.sh"
+
+RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nmbl-sb-gen.XXXXXX")"
+
+cleanup() {
+  local rc=$?
+  echo "=== cleanup ===" >&2
+  vm-serial-man stop >/dev/null 2>&1 || true
+  if screen -ls 2>/dev/null | grep -q "\.${CONFIG_NAME}\b"; then
+    screen -S "${CONFIG_NAME}" -X quit >/dev/null 2>&1 || true
+  fi
+  rm -rf "${RUN_DIR}" >/dev/null 2>&1 || true
+  exit "$rc"
+}
+trap cleanup EXIT INT TERM
+
+RUNNER="${NMBL_RUNNER:-run-${CONFIG_NAME}}"
+if ! command -v "$RUNNER" >/dev/null 2>&1 && [ ! -x "$RUNNER" ]; then
+  echo "FAIL: runner '${RUNNER}' not found on PATH" >&2
+  exit 1
+fi
+
+echo "=== launching SB+TPM VM via ${RUNNER} (workdir ${RUN_DIR}) ===" >&2
+cd "${RUN_DIR}" || {
+  echo "FAIL: could not cd into ${RUN_DIR}" >&2
+  exit 1
+}
+if ! "$RUNNER"; then
+  echo "FAIL: runner exited non-zero" >&2
+  exit 1
+fi
+
+# Wait for the booted root shell. If a refusal appears at any point it is an
+# immediate failure (checked after, via history) — the signed generation must
+# verify and boot.
+echo "=== waiting up to ${SHELL_TIMEOUT}s for the post-kexec root shell ===" >&2
+booted=false
+for _ in $(seq 1 "$((SHELL_TIMEOUT / 5))"); do
+  if seen_in_history "$REFUSE_RE"; then
+    echo "FAIL: NMBL REFUSED a correctly-signed generation (refusal marker seen)" >&2
+    exit 1
+  fi
+  if seen_in_history "root@${CONFIG_NAME}"; then
+    booted=true
+    break
+  fi
+  sleep 5
+done
+if [ "$booted" != true ]; then
+  echo "FAIL: never reached the booted root shell (signed gen did not kexec)" >&2
+  exit 1
+fi
+
+# Double-check no refusal slipped past in the scrollback.
+if seen_in_history "$REFUSE_RE"; then
+  echo "FAIL: a refusal marker is present in the history — verify did NOT pass" >&2
+  exit 1
+fi
+
+# Confirm the shell is actually interactive (not a stale autologin banner).
+ready=false
+for _ in $(seq 1 12); do
+  send_cmd "echo NMBL_SHELL_READY"
+  if wait_for "NMBL_SHELL_READY" 10; then
+    ready=true
+    break
+  fi
+done
+if [ "$ready" != true ]; then
+  echo "FAIL: booted shell never became interactive" >&2
+  exit 1
+fi
+
+echo "PASS: signed generation verified, measured, kexec'd — system booted." >&2
+exit 0
