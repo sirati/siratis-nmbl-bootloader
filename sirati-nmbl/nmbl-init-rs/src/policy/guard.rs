@@ -40,6 +40,15 @@ impl Sealed {
     fn mint() -> Self {
         Sealed(())
     }
+
+    /// Fabricate a witness for tests of the fork/execve primitives that
+    /// the seal gates. Test-only — production code can ONLY obtain a
+    /// `Sealed` from a real [`seal_secrets`] call.
+    #[cfg(test)]
+    #[must_use]
+    pub fn test_witness() -> Self {
+        Sealed(())
+    }
 }
 
 /// The seal could not complete: either the lock PCR is present but
@@ -79,12 +88,15 @@ impl std::fmt::Display for SealFailed {
 }
 
 thread_local! {
-    /// Once-latch: flips to `true` ONLY after a full seal succeeds (cap
-    /// done AND all mappers closed). A second call short-circuits to a
-    /// fresh [`Sealed`] without re-capping/re-closing (idempotent), so
-    /// re-entering the emergency menu after a shell exits does not error.
-    /// `Cell<bool>` per FIX-58 — never an atomic / `OnceLock`.
-    static SEALED_LATCH: Cell<bool> = const { Cell::new(false) };
+    /// Cap-only latch: flips to `true` ONLY after the lock PCR is capped
+    /// (the irreversible PCR poison-extend is idempotent — re-extending
+    /// the same value is pointless and a `Failed` re-cap would wrongly
+    /// fail a later seal). The CLOSE step is NOT gated by this latch: it
+    /// re-drains the registry on EVERY seal so a mapper registered AFTER
+    /// the first seal is still closed before the next interactive context
+    /// (the C-1 masking hole). `Cell<bool>` per FIX-58 — never an atomic
+    /// / `OnceLock`.
+    static CAP_LATCH: Cell<bool> = const { Cell::new(false) };
 }
 
 /// ASYNC seal for sites already inside the interactive [`LocalRuntime`]
@@ -94,12 +106,15 @@ thread_local! {
 /// [`Sealed`]. `require_tpm` decides the no-TPM posture (degrade-open
 /// vs. fail-closed); a present-but-uncappable TPM ALWAYS fails closed.
 pub async fn seal_secrets(require_tpm: bool, sender: &LocalSender) -> Result<Sealed, SealFailed> {
-    if SEALED_LATCH.with(Cell::get) {
-        return Ok(Sealed::mint());
+    // The CAP is idempotent-skippable (PCR already poison-extended); the
+    // CLOSE always drains the current merged registry so a mapper opened
+    // after an earlier seal — or surfaced from the on-disk file after a
+    // panic re-exec — is still closed (C-1 / FIX-03).
+    if !CAP_LATCH.with(Cell::get) {
+        cap_step(require_tpm)?;
+        CAP_LATCH.with(|l| l.set(true));
     }
-    cap_step(require_tpm)?;
     close_all_async(sender).await?;
-    SEALED_LATCH.with(|l| l.set(true));
     Ok(Sealed::mint())
 }
 
@@ -109,12 +124,14 @@ pub async fn seal_secrets(require_tpm: bool, sender: &LocalSender) -> Result<Sea
 /// as [`seal_secrets`] but drives the mapper close through the blocking
 /// fork/exec runner because there is no live runtime to await on.
 pub fn seal_secrets_blocking(require_tpm: bool) -> Result<Sealed, SealFailed> {
-    if SEALED_LATCH.with(Cell::get) {
-        return Ok(Sealed::mint());
+    // Same split-latch contract as [`seal_secrets`]: cap once, close on
+    // every call so a later-registered (or post-panic file-sourced)
+    // mapper is never masked by the latch (C-1 / FIX-03).
+    if !CAP_LATCH.with(Cell::get) {
+        cap_step(require_tpm)?;
+        CAP_LATCH.with(|l| l.set(true));
     }
-    cap_step(require_tpm)?;
     close_all_blocking()?;
-    SEALED_LATCH.with(|l| l.set(true));
     Ok(Sealed::mint())
 }
 
@@ -229,11 +246,11 @@ fn close_one_blocking(entry: &MapperEntry) -> Result<(), SealFailed> {
 #[cfg(test)]
 pub(super) use test_seam::{cap_lock_pcr_seam, close_one_async, close_one_blocking};
 
-/// Reset the once-latch. Test-only. Declared BEFORE the test seam module
+/// Reset the cap-latch. Test-only. Declared BEFORE the test seam module
 /// so clippy's `items_after_test_module` lint stays happy.
 #[cfg(test)]
 pub(super) fn reset_latch() {
-    SEALED_LATCH.with(|l| l.set(false));
+    CAP_LATCH.with(|l| l.set(false));
 }
 
 #[cfg(test)]
