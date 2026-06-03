@@ -257,6 +257,12 @@ async fn run_one_activation(
         // rather than failing. The LUKS volume is accessible either
         // way, so treat both as a clean break.
         if is_activation_success(outcome.exit_code) {
+            // A TPM-unsealed LUKS mapper is now live. Record it on the
+            // always-compiled seal registry so `policy::seal_secrets`
+            // closes it (cryptsetup close) before any interactive context
+            // is reached — a refuse/rescue/shell must leave no readable
+            // TPM-unsealed plaintext device behind (FIX-03 / re-audit C-1).
+            register_tpm_mapper_if_luks_tpm(activation);
             break stdin_owned;
         }
 
@@ -265,7 +271,7 @@ async fn run_one_activation(
         // other non-zero exit code is fatal as before.
         if activation.kind == ActivationKind::LuksPassword && outcome.exit_code == 2 {
             attempts = attempts.saturating_add(1);
-            match handle_wrong_password(config, console, activation, attempts).await? {
+            match handle_wrong_password(config, console, activation, attempts, sender).await? {
                 WrongPasswordHandled::TryAgain => continue,
                 WrongPasswordHandled::Reboot => {
                     return Err(NmblError::OperatorChoseReboot {
@@ -291,6 +297,30 @@ async fn run_one_activation(
         return Err(exit_code_error(activation, outcome));
     };
     Ok(stdin_owned)
+}
+
+/// On a successful `luks-tpm` activation, push the unsealed mapper onto
+/// the always-compiled seal registry (FIX-03). The mapper name is the
+/// `/dev/mapper/<name>` node the activation produces; we strip the
+/// `/dev/mapper/` prefix and carry the `cryptsetup` binary so the seal
+/// path can run `cryptsetup close <name>` self-contained. A no-op for
+/// every other activation kind.
+fn register_tpm_mapper_if_luks_tpm(activation: &Activation) {
+    if activation.kind != ActivationKind::LuksTpm {
+        return;
+    }
+    for produced in &activation.produces_devices {
+        let Some(name) = produced
+            .to_str()
+            .and_then(|p| p.strip_prefix("/dev/mapper/"))
+        else {
+            continue;
+        };
+        crate::policy::register_tpm_mapper(crate::policy::MapperEntry {
+            cryptsetup: activation.binary.clone(),
+            name: name.to_string(),
+        });
+    }
 }
 
 #[cfg(test)]

@@ -14,6 +14,12 @@ pub mod mount;
 #[cfg(feature = "network-rescue")]
 pub mod net;
 pub mod panic;
+/// Lock-on-rescue SEAL policy (ALWAYS-COMPILED — FIX-09): `seal_secrets`
+/// caps the lock PCR then closes every TPM-unsealed LUKS mapper, minting
+/// the unforgeable `Sealed` witness every interactive (shell / rescue /
+/// remote / execve) waist requires. Off the `secure-boot` feature axis so
+/// lock-on-rescue works on a plain `luks-tpm` box too.
+pub mod policy;
 pub mod rescue;
 /// Single-source security defaults mirrored by `lib/security-consts.nix`.
 /// Always compiled so the Nix↔Rust round-trip test runs in every build.
