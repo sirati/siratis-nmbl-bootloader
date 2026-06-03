@@ -131,8 +131,9 @@ fn measure_off_is_a_noop() {
         "measure must be off for a bare config"
     );
     let g = gen_for(&["root=/dev/sda1"]);
+    let no_images = crate::imageload::DriverImagesHandle::empty();
     assert!(
-        measure_handoff(&cfg, &g, None, "init=/sbin/init").is_ok(),
+        measure_handoff(&cfg, &g, None, "init=/sbin/init", &no_images).is_ok(),
         "measure-off must be a no-op even with no verified generation",
     );
 }
@@ -250,7 +251,8 @@ mod secure_boot {
             "tpm.measure = true ⇒ measure required"
         );
         let g = gen_for(&["root=/dev/sda1"]);
-        let err = measure_handoff(&cfg, &g, None, "init=/sbin/init")
+        let no_images = crate::imageload::DriverImagesHandle::empty();
+        let err = measure_handoff(&cfg, &g, None, "init=/sbin/init", &no_images)
             .expect_err("measure required + unverified ⇒ refuse");
         assert!(
             matches!(err, NmblError::PolicyRefused { .. }),

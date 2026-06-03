@@ -208,7 +208,7 @@ pub(crate) async fn run_boot_inside_runtime(
     // then `RebootIntoRescue` (R-1; NOT a halt). No console is open yet, so the
     // non-interactive refuse countdown does not render here; the reboot fires
     // in `execute_terminal_action` after the runtime unwinds.
-    let driver_images = match load_driver_images(&config) {
+    let mut driver_images = match load_driver_images(&config) {
         Ok(handle) => handle,
         Err(err) => {
             nmbl_warn!(
@@ -219,11 +219,11 @@ pub(crate) async fn run_boot_inside_runtime(
             return BootOutcome::Done(Box::new(Ok(action)));
         }
     };
-    // Seam for #28 (Wave-4): `driver_images.images()` is the ORDERED set of
-    // loaded image refs that must feed TPM measure event #4. #28 threads them
-    // into `tpm::measure::extend_handoff` via the kexec handoff; we only make
-    // the ordered handle available here and tear it down below — no measure
-    // threading yet.
+    // #28 (Wave-4): `driver_images` is the ORDERED accumulator of every loaded
+    // driver image (this base set, plus any staged-rerun additions the session
+    // appends). It is threaded `&mut` into `run_tui_session` so the staged path
+    // can extend it, and its verified `measure_refs()` feed TPM measure event #4
+    // through the kexec handoff. It is torn down below on the normal terminus.
     let console: Box<dyn Console> = match open_console(&config, false) {
         Ok(c) => c,
         Err(err) => {
@@ -240,7 +240,7 @@ pub(crate) async fn run_boot_inside_runtime(
         ));
     }
     let session = SessionInteraction::new();
-    let action = run_tui_session(&mut config, console, &session, &sender).await;
+    let action = run_tui_session(&mut config, console, &session, &sender, &mut driver_images).await;
     teardown_driver_images_if_normal(&action, &driver_images);
     BootOutcome::Done(Box::new(Ok(action)))
 }

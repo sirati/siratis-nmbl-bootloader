@@ -17,6 +17,7 @@ use crate::config::Config;
 use crate::devices::resolve_mountpoint;
 use crate::error::Result;
 use crate::generations::Generation;
+use crate::imageload::DriverImagesHandle;
 use crate::sys;
 use crate::terminal::TerminalAction;
 use crate::{nmbl_info, nmbl_warn};
@@ -62,19 +63,30 @@ fn detach(target: &Path) {
 /// containing those files is appended to the system initrd via
 /// `memfd_create(2)` before `kexec_file_load(2)` — the typed
 /// passphrases never touch disk.
+///
+/// `driver_images` is the ordered set of signed driver images the boot loaded
+/// (#24 hook + any staged-rerun additions); their verified name‖digest refs are
+/// measured into PCR-11 event #4 (#28). An empty handle (no driver images, or
+/// the emergency-retry path) leaves event #4 absent.
 pub fn kexec_into(
     config: &Config,
     generation: &Generation,
     cmdline_override: Option<&str>,
     key_injections: &[KeyInjection],
+    driver_images: &DriverImagesHandle,
 ) -> Result<TerminalAction> {
     // Build the cmdline, VERIFY the generation's signature, leave the
-    // PCR-11 measure seam (#27), then fill the kexec image slot — in that
+    // PCR-11 measure seam (#27/#28), then fill the kexec image slot — in that
     // fixed order. An enforce-mode signature failure short-circuits with
     // `NmblError::PolicyRefused`, which the `run_tui_session` Err arm maps
     // to the RebootIntoRescue terminus (R-1) — no image is loaded.
-    let cmdline =
-        handoff::verify_measure_then_load(config, generation, cmdline_override, key_injections)?;
+    let cmdline = handoff::verify_measure_then_load(
+        config,
+        generation,
+        cmdline_override,
+        key_injections,
+        driver_images,
+    )?;
     nmbl_info!("kexec: image loaded ({} bytes cmdline)", cmdline.len());
 
     nix::unistd::sync();

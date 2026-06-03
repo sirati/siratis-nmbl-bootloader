@@ -228,7 +228,19 @@ fn decision_to_action(
                     context: "emergency-retry decision dispatch".to_string(),
                 });
             };
-            kexec_into(config, target, cmdline_override.as_deref(), injections)
+            // The emergency-retry path does not own the boot's driver-image
+            // accumulator (those were loaded — and possibly already torn down or
+            // left mounted into a shell, FIX-55 — before this recovery path was
+            // reached), so it measures NO driver images: an empty handle leaves
+            // PCR-11 event #4 absent. The kernel/initrd/cmdline are still
+            // measured on a measure-required build (#28).
+            kexec_into(
+                config,
+                target,
+                cmdline_override.as_deref(),
+                injections,
+                &crate::imageload::DriverImagesHandle::empty(),
+            )
         }
         Decision::Reboot => Ok(TerminalAction::Reboot),
         Decision::Shell => Err(NmblError::Tui {
