@@ -88,6 +88,22 @@ in
       '';
     };
 
+    imageKeyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = lib.mdDoc ''
+        ML-DSA signing PRIVATE key, read IMPURELY at install time to sign
+        detached image sidecars (currently driver images — `nmbl-sign sign
+        --domain driver-image`). The pair of a baked `publicKeys` entry. Never
+        embedded in the store or emitted to config.toml: pass it as a STRING
+        path to an on-disk secret (e.g. `"/run/secrets/nmbl-img.key"`), NOT a
+        Nix path literal like `./img.key` — a path literal would be imported
+        into the store, and the build FAILS the eval (closure-leak assertion)
+        if it resolves under the store dir. Required when
+        `boot.nmbl.driverImages.enable` is set.
+      '';
+    };
+
     uki = {
       enable = lib.mkOption {
         type = lib.types.bool;

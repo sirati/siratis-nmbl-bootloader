@@ -79,6 +79,14 @@
         nmbl-init-rs.legacyPackages.${system}.mkNmblInit
           or (_: nmblInit);
 
+      # The host-platform `nmbl-sign` ML-DSA image signer. Used by
+      # lib/modules/driver-image.nix to sign each driver-image squashfs at
+      # install time (`--domain driver-image`). `null` on an older sibling
+      # flake that predates the signer; driver-image.nix turns that into a
+      # hard eval error only WHEN driver images are enabled.
+      nmblSign =
+        nmbl-init-rs.packages.${system}.nmbl-sign or null;
+
       # Import rescue-vm-test app directly
       rescueVmTestFlake = import ../rescue-vm-test/flake.nix;
       rescueVmTestApp =
@@ -274,6 +282,9 @@
           # is enabled — produces a /init with the `network-rescue`
           # Cargo feature compiled in.
           _module.args.mkNmblInit = mkNmblInit;
+          # The `nmbl-sign` ML-DSA image signer, used by the driver-image
+          # build to sign each squashfs at install time.
+          _module.args.nmblSign = nmblSign;
         };
 
       # Test configurations
