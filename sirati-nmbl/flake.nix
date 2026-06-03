@@ -403,6 +403,31 @@
             echo "✓ test-secure-boot disk signed: UKI sbsign'd, generation $gen_id ML-DSA sidecars staged."
           '';
 
+      # The real (tpm-unlock) config's host-signed NMBL UKI, as a standalone
+      # PE. The TPM-roundtrip needs it to power-cycle the SAME disk (with the
+      # token the enroll phase sealed onto vda3) into the tpm-unlock NMBL stage:
+      # the enroll twin and the real config differ ONLY in their embedded NMBL
+      # initrd (password vs token unlock), and for an efi-stub loader that
+      # config lives inside the UKI. Swapping just `/EFI/BOOT/BOOTX64.EFI` on the
+      # shared disk therefore switches phase 2 to tpm-unlock while keeping the
+      # enrolled LUKS2 token on vda3 intact.
+      secureBootSignedUki =
+        let
+          uki = secureBootConfig.config.system.build.nmblUki;
+          sbKey = ./testing/keys/insecure-test-sb-db.key;
+          sbCert = ./testing/keys/insecure-test-sb-db.crt;
+        in
+        pkgs.runCommand "test-secure-boot-signed-uki"
+          {
+            nativeBuildInputs = [ pkgs.sbsigntool pkgs.coreutils ];
+          }
+          ''
+            mkdir -p "$out"
+            sbsign --key ${sbKey} --cert ${sbCert} \
+              --output "$out/BOOTX64.EFI" ${uki}
+            sbverify --cert ${sbCert} "$out/BOOTX64.EFI"
+          '';
+
       # The config the scenarios boot/tamper: identical to secureBootConfig but
       # with vmDiskImage pointing at the HOST-SIGNED disk, so the runner copies
       # the signed qcow2 and the bad-sig scenario tampers a signed image.
@@ -422,6 +447,16 @@
         inherit vmSerialMan;
         tpm = "tis";
         secureBoot = true;
+        # PERSIST the swtpm state across the manager's lifetime so the TPM
+        # seal/unseal ROUNDTRIP works: the enroll phase seals a token into the
+        # SAME persisted swtpm this (unseal) phase then power-cycles into. A
+        # fresh QEMU power-on still issues TPM2_Startup(CLEAR), so PCRs reset
+        # and NMBL re-extends the same deterministic sequence (same generation
+        # ⇒ same PCR-11, same firmware/db/UKI ⇒ same PCR-7). The non-roundtrip
+        # scenarios (signed-gen, bad-sig) also run with persist on, which is
+        # harmless: each is a single run and the assertion deletes the shared
+        # state dir at cleanup.
+        tpmPersist = true;
         # ENFORCING SB firmware that ALSO trusts the test UKI (F1): the test
         # db CERT is enrolled into the MS VARS' `db` so the firmware accepts
         # the NMBL UKI sbsign'd with the matching key at install time, while
@@ -430,6 +465,127 @@
         # key/cert must stay out of the store, which they do — they are impure
         # string paths). The unsigned-UKI smoke (sbSmoke.runner) leaves dbCert
         # unset so it KEEPS the MS-only db and still refuses the unsigned UKI.
+        dbCert = ./testing/keys/insecure-test-sb-db.crt;
+      };
+
+      # ── TPM-roundtrip ENROLL twin ──────────────────────────────────────────
+      # The roundtrip's phase 1 needs a boot that REACHES the post-kexec system
+      # so `nmbl-tpm-enroll` can seal the volume key to the live PCRs. NMBL's
+      # `luks-tpm` activation runs `cryptsetup open --token-only` and cannot use
+      # a passphrase, so a fresh (un-enrolled) disk would never reach the
+      # system. This twin overrides ONLY the cryptroot unlock to `password`
+      # (the install passphrase), so it boots the SAME generation — same
+      # kernel/initrd/cmdline ⇒ the SAME PCR-11 event sequence the real config
+      # extends — and reaches the system to enroll. PCR 7 is identical too (same
+      # SB db / UKI signature). After it seals the token onto the on-disk LUKS2
+      # header, the real tpm-unlock config power-cycles into the SAME swtpm and
+      # auto-unseals. The twin is a SEPARATE signed disk (its config.toml/UKI
+      # differ), built only when the roundtrip runs.
+      secureBootEnrollConfig =
+        let
+          baseCfg = testing.configs."test-secure-boot";
+          # Re-instantiate the test-secure-boot config through the SAME builder
+          # but with one extra module that forces the cryptroot activation to a
+          # passphrase unlock. Everything else (the generation: kernel, initrd,
+          # cmdline, signing, SB posture) is identical, so the PCR-11 events and
+          # PCR 7 match the real config — the seal the enroll phase makes is
+          # exactly what the tpm-unlock phase unseals. `passToStage1` hands the
+          # passphrase to the post-kexec system initrd.
+          enrollOverride = { lib, ... }: {
+            boot.nmbl.activation.luks = lib.mkForce [
+              {
+                name = "cryptroot";
+                device = "/dev/vda3";
+                unlock = "password";
+                promptLabel = "Enter LUKS passphrase for cryptroot (enroll phase)";
+                passToStage1 = "/etc/nmbl-luks/cryptroot";
+              }
+            ];
+          };
+        in
+        testing.mkTestVM (baseCfg // {
+          name = "test-secure-boot-enroll";
+          extraModules = (baseCfg.extraModules or [ ]) ++ [ enrollOverride ];
+        });
+
+      # Host-sign the enroll twin's disk the same way the real config's disk is
+      # signed (UKI sbsign + per-generation ML-DSA sidecars on the ESP), so the
+      # enforcing firmware launches its UKI and NMBL's verify guard passes.
+      secureBootEnrollSignedDisk =
+        let
+          unsignedDisk = secureBootEnrollConfig.config.system.build.vmDiskImage;
+          toplevel = secureBootEnrollConfig.config.system.build.toplevel;
+          uki = secureBootEnrollConfig.config.system.build.nmblUki;
+          mlDsaKey = testKeys.privateKey;
+          sbKey = ./testing/keys/insecure-test-sb-db.key;
+          sbCert = ./testing/keys/insecure-test-sb-db.crt;
+          sigSuffix = secureBootEnrollConfig.config.boot.nmbl.signing.sigPathSuffix;
+        in
+        pkgs.runCommand "test-secure-boot-enroll-signed-disk-image"
+          {
+            nativeBuildInputs = [
+              pkgs.qemu-utils
+              pkgs.libguestfs-with-appliance
+              pkgs.sbsigntool
+              pkgs.coreutils
+            ] ++ lib.optional (nmblSign != null) nmblSign;
+          }
+          ''
+            mkdir -p "$out" stage/sigs
+            qemu-img convert -f qcow2 -O qcow2 \
+              ${unsignedDisk}/nixos.qcow2 "$out/nixos.qcow2"
+            chmod u+w "$out/nixos.qcow2"
+
+            gen_id="$(basename "$(readlink -f ${toplevel})")"
+            echo "Signing enroll-twin generation $gen_id (host-side)..."
+            mkdir -p "stage/sigs/$gen_id"
+            ${if nmblSign == null then ''
+              echo "ERROR: nmbl-sign signer unavailable; cannot sign the enroll disk." >&2
+              exit 1
+            '' else ''
+              nmbl-sign sign --key ${mlDsaKey} --domain gen-kernel \
+                --out "stage/sigs/$gen_id/kernel${sigSuffix}" ${toplevel}/kernel
+              nmbl-sign sign --key ${mlDsaKey} --domain gen-initrd \
+                --out "stage/sigs/$gen_id/initrd${sigSuffix}" ${toplevel}/initrd
+            ''}
+
+            echo "sbsign'ing the enroll-twin UKI for Secure Boot..."
+            sbsign --key ${sbKey} --cert ${sbCert} \
+              --output stage/BOOTX64.EFI ${uki}
+            sbverify --cert ${sbCert} stage/BOOTX64.EFI
+
+            export LIBGUESTFS_BACKEND=direct
+            guestfish --rw -a "$out/nixos.qcow2" <<EOF
+            run
+            mount /dev/sda2 /
+            mkdir-p /EFI/BOOT
+            upload stage/BOOTX64.EFI /EFI/BOOT/BOOTX64.EFI
+            mkdir-p /nmbl/sigs/$gen_id
+            upload stage/sigs/$gen_id/kernel${sigSuffix} /nmbl/sigs/$gen_id/kernel${sigSuffix}
+            upload stage/sigs/$gen_id/initrd${sigSuffix} /nmbl/sigs/$gen_id/initrd${sigSuffix}
+            umount /
+            EOF
+            echo "✓ enroll-twin disk signed."
+          '';
+
+      secureBootEnrollSignedConfig = secureBootEnrollConfig // {
+        config = secureBootEnrollConfig.config // {
+          system = secureBootEnrollConfig.config.system // {
+            build = secureBootEnrollConfig.config.system.build // {
+              vmDiskImage = secureBootEnrollSignedDisk;
+            };
+          };
+        };
+      };
+
+      secureBootEnrollRunner = testRunners.mkRunner {
+        name = "test-secure-boot-enroll";
+        config = secureBootEnrollSignedConfig;
+        inherit vmSerialMan;
+        tpm = "tis";
+        secureBoot = true;
+        # Persist so the token this phase seals survives into the unseal phase.
+        tpmPersist = true;
         dbCert = ./testing/keys/insecure-test-sb-db.crt;
       };
 
@@ -469,6 +625,18 @@
       checkSbTpmRoundtrip = mkSbScenarioCheck {
         scenario = "tpm-roundtrip";
         script = "sb-tpm-roundtrip.sh";
+        # The roundtrip drives TWO runners against one persisted swtpm: the
+        # passphrase-unlock enroll twin (phase 1, seals the token onto vda3) and
+        # the real tpm-unlock config (phase 2, auto-unseals after the
+        # power-cycle). The two phases share ONE disk (the enrolled qcow2);
+        # before phase 2 the script swaps that disk's ESP UKI for the real
+        # tpm-unlock UKI (NMBL_SB_TPM_UKI) so the token on vda3 stays intact
+        # while the NMBL stage switches to token unlock — needs libguestfs.
+        extraInputs = [ pkgs.libguestfs-with-appliance ];
+        extraEnv = ''
+          export NMBL_ENROLL_RUNNER=${secureBootEnrollRunner}
+          export NMBL_SB_TPM_UKI=${secureBootSignedUki}/BOOTX64.EFI
+        '';
       };
       checkSbSignedGenHappy = mkSbScenarioCheck {
         scenario = "signed-gen-happy";
@@ -536,6 +704,15 @@
         # and the generation ML-DSA sidecars written onto the ESP host-side.
         # `nix build .#test-secure-boot-disk`.
         test-secure-boot-disk = secureBootSignedDisk;
+        # The TPM-roundtrip ENROLL twin's signed disk: same generation as
+        # test-secure-boot but with a passphrase cryptroot so phase 1 of the
+        # roundtrip can boot into the system and run nmbl-tpm-enroll.
+        # `nix build .#test-secure-boot-enroll-disk`.
+        test-secure-boot-enroll-disk = secureBootEnrollSignedDisk;
+        # The real (tpm-unlock) config's host-signed NMBL UKI, swapped onto the
+        # shared disk's ESP for the roundtrip's phase 2.
+        # `nix build .#test-secure-boot-signed-uki`.
+        test-secure-boot-signed-uki = secureBootSignedUki;
       };
 
       # Build-only validation gates surfaced for CI / `nix flake check`-style

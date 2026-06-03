@@ -461,4 +461,8 @@ in
 {
   inherit mkTestConfigurations;
   inherit configs;
+  # Exposed so callers can build a one-off VARIANT of a known config (e.g. the
+  # TPM-roundtrip enroll twin: the test-secure-boot config with the cryptroot
+  # unlock overridden to a passphrase) without re-deriving the whole builder.
+  inherit (vmConfig) mkTestVM;
 }

@@ -94,6 +94,17 @@ let
       tpm ? null,
       secureBoot ? false,
       dbCert ? null,
+      # When true (only meaningful with `tpm != null`), the swtpm STATE dir is
+      # PERSISTED across this manager's lifetime: it is not wiped on start nor
+      # removed on stop. Two successive runs of the runner against the same
+      # $WORK_DIR therefore share one TPM, so a secret a first (enroll) boot
+      # seals survives into a second (unseal) boot — the measured-boot
+      # seal/unseal ROUNDTRIP. A fresh QEMU power-on still issues
+      # TPM2_Startup(CLEAR), so PCRs reset and NMBL re-extends the same
+      # deterministic event sequence, reproducing the sealed PCR value. The
+      # caller (the roundtrip assertion) owns deleting $WORK_DIR/swtpm-state
+      # when the roundtrip ends.
+      tpmPersist ? false,
     }:
     let
       # Derive bootMode from config if not explicitly provided (must be first)
@@ -143,11 +154,17 @@ let
       # The swtpm-backed TPM: a per-run state directory under $WORK_DIR and the
       # `--tpm`/`--tpm-kind` flags. Empty string when no TPM is requested, so
       # the launch command is unchanged.
+      # The swtpm state dir. Defaults to per-run under $WORK_DIR, but an
+      # NMBL_SWTPM_STATE env override lets a multi-phase roundtrip point two
+      # successive runner invocations (enroll, then unseal) at ONE shared,
+      # persisted state dir so the sealed object survives the power-cycle.
+      tpmStateExpr = "\${NMBL_SWTPM_STATE:-$WORK_DIR/swtpm-state}";
       tpmArgs =
         if tpm == null then
           ""
         else
-          " --tpm \"$WORK_DIR/swtpm-state\" --tpm-kind ${tpm}";
+          " --tpm \"${tpmStateExpr}\" --tpm-kind ${tpm}"
+          + lib.optionalString tpmPersist " --tpm-persist";
 
       # Secure-Boot OVMFFull: the SB-built code firmware (read-only) and a
       # PER-RUN writable copy of the db-enrolled VARS (`OVMF_VARS.ms.fd`, which
