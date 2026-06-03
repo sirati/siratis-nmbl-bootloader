@@ -58,6 +58,33 @@ pub(super) struct Args {
     pub(super) boot_succeeded_dir: Option<PathBuf>,
 }
 
+impl Args {
+    /// Empty accumulator the parser fills in: every early-exit mode
+    /// `None`, the config path at its default. The loop mutates fields
+    /// in place, so the parsed value IS the returned `Args`.
+    fn with_defaults() -> Self {
+        Args {
+            config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+            errored_report: None,
+            validate_config: None,
+            #[cfg(feature = "staged-boot")]
+            validate_fragment: None,
+            validate_hardware: None,
+            validate_closure: None,
+            config_toml: None,
+            tools: ToolPaths::default(),
+            validate_initrm: None,
+            uki: None,
+            initrm_closure: None,
+            print_gen_id: None,
+            #[cfg(feature = "stateful")]
+            init_state_dir: None,
+            #[cfg(feature = "stateful")]
+            boot_succeeded_dir: None,
+        }
+    }
+}
+
 /// Hand-rolled arg parsing: clap is too big for the size budget. We
 /// recognise `--config=<v>` / `--config <v>` and the same two forms
 /// for `--errored`, `--validate-config`, `--init-state`, and
@@ -82,144 +109,174 @@ where
     I: IntoIterator<Item = S>,
     S: Into<std::ffi::OsString>,
 {
-    let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
-    let mut errored_report: Option<PathBuf> = None;
-    let mut validate_config: Option<PathBuf> = None;
-    #[cfg(feature = "staged-boot")]
-    let mut validate_fragment: Option<PathBuf> = None;
-    let mut validate_hardware: Option<PathBuf> = None;
-    let mut validate_closure: Option<PathBuf> = None;
-    let mut config_toml: Option<PathBuf> = None;
-    let mut tools = ToolPaths::default();
-    let mut validate_initrm: Option<PathBuf> = None;
-    let mut uki: Option<PathBuf> = None;
-    let mut initrm_closure: Option<PathBuf> = None;
-    let mut print_gen_id: Option<PathBuf> = None;
-    #[cfg(feature = "stateful")]
-    let mut init_state_dir: Option<PathBuf> = None;
-    #[cfg(feature = "stateful")]
-    let mut boot_succeeded_dir: Option<PathBuf> = None;
+    let mut acc = Args::with_defaults();
 
     let mut iter = args.into_iter().map(Into::into);
     while let Some(arg_os) = iter.next() {
         let arg = arg_os.to_string_lossy();
-        if let Some(rest) = arg.strip_prefix("--config=") {
-            config_path = PathBuf::from(rest);
-        } else if arg == "--config"
-            && let Some(v) = iter.next()
-        {
-            config_path = PathBuf::from(v);
-        } else if let Some(rest) = arg.strip_prefix("--errored=") {
-            errored_report = Some(PathBuf::from(rest));
-        } else if arg == "--errored"
-            && let Some(v) = iter.next()
-        {
-            errored_report = Some(PathBuf::from(v));
-        } else if let Some(rest) = arg.strip_prefix("--validate-config=") {
-            validate_config = Some(PathBuf::from(rest));
-        } else if arg == "--validate-config"
-            && let Some(v) = iter.next()
-        {
-            validate_config = Some(PathBuf::from(v));
-        } else if let Some(value) =
-            parse_fragment_flag(&arg, "--validate-config-fragment", &mut iter)?
-        {
-            #[cfg(feature = "staged-boot")]
-            {
-                validate_fragment = Some(value);
-            }
-            #[cfg(not(feature = "staged-boot"))]
-            {
-                let _ = value;
-            }
-        } else if let Some(rest) = arg.strip_prefix("--validate-hardware=") {
-            validate_hardware = Some(PathBuf::from(rest));
-        } else if arg == "--validate-hardware"
-            && let Some(v) = iter.next()
-        {
-            validate_hardware = Some(PathBuf::from(v));
-        } else if let Some(rest) = arg.strip_prefix("--validate-nix-filesystem-closure=") {
-            validate_closure = Some(PathBuf::from(rest));
-        } else if arg == "--validate-nix-filesystem-closure"
-            && let Some(v) = iter.next()
-        {
-            validate_closure = Some(PathBuf::from(v));
-        } else if let Some(rest) = arg.strip_prefix("--validate-initrm=") {
-            validate_initrm = Some(PathBuf::from(rest));
-        } else if arg == "--validate-initrm"
-            && let Some(v) = iter.next()
-        {
-            validate_initrm = Some(PathBuf::from(v));
-        } else if let Some(rest) = arg.strip_prefix("--uki=") {
-            uki = Some(PathBuf::from(rest));
-        } else if arg == "--uki"
-            && let Some(v) = iter.next()
-        {
-            uki = Some(PathBuf::from(v));
-        } else if let Some(rest) = arg.strip_prefix("--initrm-closure=") {
-            initrm_closure = Some(PathBuf::from(rest));
-        } else if arg == "--initrm-closure"
-            && let Some(v) = iter.next()
-        {
-            initrm_closure = Some(PathBuf::from(v));
-        } else if let Some(rest) = arg.strip_prefix("--config-toml=") {
-            config_toml = Some(PathBuf::from(rest));
-        } else if arg == "--config-toml"
-            && let Some(v) = iter.next()
-        {
-            config_toml = Some(PathBuf::from(v));
-        } else if let Some(rest) = arg.strip_prefix("--tool=") {
-            tools.insert_spec(rest)?;
-        } else if arg == "--tool"
-            && let Some(v) = iter.next()
-        {
-            tools.insert_spec(&v.to_string_lossy())?;
-        } else if let Some(rest) = arg.strip_prefix("--print-gen-id=") {
-            print_gen_id = Some(PathBuf::from(rest));
-        } else if arg == "--print-gen-id"
-            && let Some(v) = iter.next()
-        {
-            print_gen_id = Some(PathBuf::from(v));
-        } else if let Some(value) = parse_stateful_flag(&arg, "--init-state", &mut iter)? {
-            #[cfg(feature = "stateful")]
-            {
-                init_state_dir = Some(value);
-            }
-            #[cfg(not(feature = "stateful"))]
-            {
-                let _ = value;
-            }
-        } else if let Some(value) = parse_stateful_flag(&arg, "--boot-succeeded", &mut iter)? {
-            #[cfg(feature = "stateful")]
-            {
-                boot_succeeded_dir = Some(value);
-            }
-            #[cfg(not(feature = "stateful"))]
-            {
-                let _ = value;
-            }
+        // Each cluster reports whether it consumed `arg`; the first match
+        // wins and the rest are skipped. Unrecognised flags fall through
+        // both clusters and are silently ignored (PID 1 has no usage to
+        // print). The `&str` view of `arg` is borrowed by both calls.
+        if parse_path_flags(&arg, &mut iter, &mut acc)? {
+            continue;
         }
+        let _ = parse_gated_flags(&arg, &mut iter, &mut acc)?;
     }
 
-    // Mutual exclusion across all early-exit modes. Each funnels into a
-    // different exit path; combining them would silently pick one and
-    // drop the rest, masking an operator typo. The three validate modes
-    // are always present; the stateful pair only in stateful builds.
+    validate_mode_exclusivity(&acc)?;
+    Ok(acc)
+}
+
+/// Parse the plain `--flag=<v>` / `--flag <v>` path flags (and `--tool`)
+/// that assign directly to an [`Args`] field in every build. Returns
+/// `Ok(true)` when `arg` matched and was consumed, `Ok(false)` otherwise,
+/// `Err` when `--tool` got a malformed spec.
+fn parse_path_flags<I>(arg: &str, iter: &mut I, acc: &mut Args) -> std::result::Result<bool, String>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    if let Some(rest) = arg.strip_prefix("--config=") {
+        acc.config_path = PathBuf::from(rest);
+    } else if arg == "--config"
+        && let Some(v) = iter.next()
+    {
+        acc.config_path = PathBuf::from(v);
+    } else if let Some(rest) = arg.strip_prefix("--errored=") {
+        acc.errored_report = Some(PathBuf::from(rest));
+    } else if arg == "--errored"
+        && let Some(v) = iter.next()
+    {
+        acc.errored_report = Some(PathBuf::from(v));
+    } else if let Some(rest) = arg.strip_prefix("--validate-config=") {
+        acc.validate_config = Some(PathBuf::from(rest));
+    } else if arg == "--validate-config"
+        && let Some(v) = iter.next()
+    {
+        acc.validate_config = Some(PathBuf::from(v));
+    } else if let Some(rest) = arg.strip_prefix("--validate-hardware=") {
+        acc.validate_hardware = Some(PathBuf::from(rest));
+    } else if arg == "--validate-hardware"
+        && let Some(v) = iter.next()
+    {
+        acc.validate_hardware = Some(PathBuf::from(v));
+    } else if let Some(rest) = arg.strip_prefix("--validate-nix-filesystem-closure=") {
+        acc.validate_closure = Some(PathBuf::from(rest));
+    } else if arg == "--validate-nix-filesystem-closure"
+        && let Some(v) = iter.next()
+    {
+        acc.validate_closure = Some(PathBuf::from(v));
+    } else if let Some(rest) = arg.strip_prefix("--validate-initrm=") {
+        acc.validate_initrm = Some(PathBuf::from(rest));
+    } else if arg == "--validate-initrm"
+        && let Some(v) = iter.next()
+    {
+        acc.validate_initrm = Some(PathBuf::from(v));
+    } else if let Some(rest) = arg.strip_prefix("--uki=") {
+        acc.uki = Some(PathBuf::from(rest));
+    } else if arg == "--uki"
+        && let Some(v) = iter.next()
+    {
+        acc.uki = Some(PathBuf::from(v));
+    } else if let Some(rest) = arg.strip_prefix("--initrm-closure=") {
+        acc.initrm_closure = Some(PathBuf::from(rest));
+    } else if arg == "--initrm-closure"
+        && let Some(v) = iter.next()
+    {
+        acc.initrm_closure = Some(PathBuf::from(v));
+    } else if let Some(rest) = arg.strip_prefix("--config-toml=") {
+        acc.config_toml = Some(PathBuf::from(rest));
+    } else if arg == "--config-toml"
+        && let Some(v) = iter.next()
+    {
+        acc.config_toml = Some(PathBuf::from(v));
+    } else if let Some(rest) = arg.strip_prefix("--tool=") {
+        acc.tools.insert_spec(rest)?;
+    } else if arg == "--tool"
+        && let Some(v) = iter.next()
+    {
+        acc.tools.insert_spec(&v.to_string_lossy())?;
+    } else if let Some(rest) = arg.strip_prefix("--print-gen-id=") {
+        acc.print_gen_id = Some(PathBuf::from(rest));
+    } else if arg == "--print-gen-id"
+        && let Some(v) = iter.next()
+    {
+        acc.print_gen_id = Some(PathBuf::from(v));
+    } else {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Parse the feature-gated flags (`--validate-config-fragment`,
+/// `--init-state`, `--boot-succeeded`) via the cfg-aware sub-parsers.
+/// Returns `Ok(true)` when one matched, `Ok(false)` otherwise, `Err`
+/// when a path argument is missing or the feature is absent.
+fn parse_gated_flags<I>(
+    arg: &str,
+    iter: &mut I,
+    acc: &mut Args,
+) -> std::result::Result<bool, String>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    if let Some(value) = parse_fragment_flag(arg, "--validate-config-fragment", iter)? {
+        #[cfg(feature = "staged-boot")]
+        {
+            acc.validate_fragment = Some(value);
+        }
+        #[cfg(not(feature = "staged-boot"))]
+        {
+            let _ = (value, &mut *acc);
+        }
+        return Ok(true);
+    }
+    if let Some(value) = parse_stateful_flag(arg, "--init-state", iter)? {
+        #[cfg(feature = "stateful")]
+        {
+            acc.init_state_dir = Some(value);
+        }
+        #[cfg(not(feature = "stateful"))]
+        {
+            let _ = (value, &mut *acc);
+        }
+        return Ok(true);
+    }
+    if let Some(value) = parse_stateful_flag(arg, "--boot-succeeded", iter)? {
+        #[cfg(feature = "stateful")]
+        {
+            acc.boot_succeeded_dir = Some(value);
+        }
+        #[cfg(not(feature = "stateful"))]
+        {
+            let _ = (value, &mut *acc);
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Mutual exclusion across all early-exit modes. Each funnels into a
+/// different exit path; combining them would silently pick one and
+/// drop the rest, masking an operator typo. The three validate modes
+/// are always present; the stateful pair only in stateful builds. Also
+/// enforces that the closure check carries its companion toml.
+fn validate_mode_exclusivity(acc: &Args) -> std::result::Result<(), String> {
     #[cfg(feature = "stateful")]
     let stateful_modes =
-        u8::from(init_state_dir.is_some()) + u8::from(boot_succeeded_dir.is_some());
+        u8::from(acc.init_state_dir.is_some()) + u8::from(acc.boot_succeeded_dir.is_some());
     #[cfg(not(feature = "stateful"))]
     let stateful_modes = 0u8;
     #[cfg(feature = "staged-boot")]
-    let fragment_mode = u8::from(validate_fragment.is_some());
+    let fragment_mode = u8::from(acc.validate_fragment.is_some());
     #[cfg(not(feature = "staged-boot"))]
     let fragment_mode = 0u8;
-    let early_exit_count = u8::from(validate_config.is_some())
-        + u8::from(validate_hardware.is_some())
-        + u8::from(validate_closure.is_some())
-        + u8::from(validate_initrm.is_some())
+    let early_exit_count = u8::from(acc.validate_config.is_some())
+        + u8::from(acc.validate_hardware.is_some())
+        + u8::from(acc.validate_closure.is_some())
+        + u8::from(acc.validate_initrm.is_some())
         + fragment_mode
-        + u8::from(print_gen_id.is_some())
+        + u8::from(acc.print_gen_id.is_some())
         + stateful_modes;
     if early_exit_count > 1 {
         return Err(
@@ -231,29 +288,10 @@ where
     }
 
     // The closure check needs its companion toml.
-    if validate_closure.is_some() && config_toml.is_none() {
+    if acc.validate_closure.is_some() && acc.config_toml.is_none() {
         return Err("--validate-nix-filesystem-closure requires --config-toml=<toml>".to_string());
     }
-
-    Ok(Args {
-        config_path,
-        errored_report,
-        validate_config,
-        #[cfg(feature = "staged-boot")]
-        validate_fragment,
-        validate_hardware,
-        validate_closure,
-        config_toml,
-        tools,
-        validate_initrm,
-        uki,
-        initrm_closure,
-        print_gen_id,
-        #[cfg(feature = "stateful")]
-        init_state_dir,
-        #[cfg(feature = "stateful")]
-        boot_succeeded_dir,
-    })
+    Ok(())
 }
 
 /// Recognise a stateful-only flag (`--init-state` / `--boot-succeeded`)

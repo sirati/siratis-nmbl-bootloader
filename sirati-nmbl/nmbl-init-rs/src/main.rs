@@ -43,14 +43,16 @@ mod phases;
 #[cfg(feature = "stateful")]
 #[path = "main_parts/stateful.rs"]
 mod stateful;
+#[path = "main_parts/terminal_action.rs"]
+mod terminal_action;
 #[path = "main_parts/validate_initrm/mod.rs"]
 mod validate_initrm;
 
 use args::{Args, parse_args};
 use boot_runtime::{BootOutcome, run_boot_inside_runtime, run_force_rescue};
-use dispatch::execute_terminal_action;
 use early_exit::handle_early_exit_modes;
 use phases::run_phase_1;
+use terminal_action::execute_terminal_action;
 
 const BOOTSTRAP_CONFIG_PATH: &str = "/etc/nmbl/bootstrap.toml";
 
