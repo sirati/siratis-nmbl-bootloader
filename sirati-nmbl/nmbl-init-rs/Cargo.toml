@@ -1,3 +1,14 @@
+# Explicit workspace (FIX-25): `nmbl-init` is the root package AND the workspace
+# root; `nmbl-host-tools` (the HOST-platform signer `nmbl-sign`) is a member that
+# reuses `nmbl_init::sig::{wire,alg}` via a path dependency. `nmbl-init` MUST
+# NEVER depend on `nmbl-host-tools` — the edge is strictly host-tools → init — so
+# the signer and verifier share ONE sidecar-format definition and can never
+# drift. The host tool is built by a SEPARATE crane `buildPackage` for the host
+# target, outside the initramfs `cargoArtifacts`.
+[workspace]
+members = ["nmbl-host-tools"]
+resolver = "2"
+
 [package]
 name = "nmbl-init"
 version = "0.1.0"

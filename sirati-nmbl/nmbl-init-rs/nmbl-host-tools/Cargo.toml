@@ -1,0 +1,60 @@
+[package]
+name = "nmbl-host-tools"
+version = "0.1.0"
+edition = "2024"
+description = "Host-side trust-root tooling for NMBL (the ML-DSA image signer nmbl-sign)."
+license = "MIT"
+publish = false
+
+# HOST-platform binary (NOT the static-musl initramfs target). Produces the
+# detached NMBLSIG1 sidecars the in-initramfs `nmbl-init` verifier consumes.
+[[bin]]
+name = "nmbl-sign"
+path = "src/main.rs"
+
+[lib]
+name = "nmbl_host_tools"
+path = "src/lib.rs"
+
+# Same panic-free lint posture as nmbl-init: a signer that panics mid-write
+# could leave a half-written sidecar, so every fallible path returns an error.
+[lints.clippy]
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+indexing_slicing = "deny"
+todo             = "deny"
+unimplemented    = "deny"
+unreachable      = "deny"
+dbg_macro        = "deny"
+
+[dependencies]
+# Path dependency on the verifier crate (FIX-25): the signer reuses the SINGLE
+# sidecar-format definition (`sig::wire::{encode,domain_tag,fp,Header}`,
+# `AlgId`/`HashId`, and the per-role `DOMAIN_*` consts) so the encoder is the
+# literal inverse of the verifier's decoder. `secure-boot` is enabled so the
+# crypto-bearing wire helpers (`domain_tag`/`fp`, gated on `sha2`) and the
+# `DOMAIN_*` role consts compile; `default-features = false` drops the
+# interactive `pretty-shell` default. `nmbl-init` NEVER depends back on this
+# crate (the edge is one-way — FIX-25).
+nmbl-init = { path = "..", default-features = false, features = ["secure-boot"] }
+# Same FIPS-204 pin as nmbl-init (0.4.6, ML-DSA-65/87). `default-rng` is enabled
+# HERE only (host side) so keygen and signing draw from the OS RNG (`OsRng`);
+# nmbl-init keeps `default-features = false` (it verifies, never signs, so it
+# forces no getrandom — FIX-50).
+fips204 = { version = "0.4.6", default-features = false, features = ["ml-dsa-65", "ml-dsa-87", "default-rng"] }
+# The SHA-512 pre-hash digest the signer feeds to ML-DSA's `Ph::SHA512` entry,
+# matching the verifier's `util::hash::sha512_*`.
+sha2 = { version = "0.10", default-features = false }
+# Private-key bytes are wrapped in `Zeroizing` so the secret key material is
+# wiped from memory on drop. zeroize lives HERE, not pulled through nmbl-init
+# (FIX-30: nmbl-init's `secure-boot` feature must NOT list `dep:zeroize`).
+zeroize = { version = "1", default-features = false }
+
+[dev-dependencies]
+# The cross-crate round-trip KAT (FIX-25/FIX-52) signs with this crate and
+# verifies with `nmbl_init::sig::verify_digest`, exercising BOTH crates' code on
+# the same bytes. tempfile gives the sign-to-file path a scratch dir; sha2
+# recomputes the verifier's digest for the on-disk-sidecar assertion.
+tempfile = "3"
+sha2 = { version = "0.10", default-features = false }
