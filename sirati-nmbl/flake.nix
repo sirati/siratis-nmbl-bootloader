@@ -313,6 +313,71 @@
             bash "$assertions/sb-unsigned-uki.sh"
         '';
       };
+
+      # Secure-boot CHAIN VM scenarios (#57 F6b). One runner wires the whole
+      # measured/signed chain under the swtpm "tis" + SB-OVMF (smm=on) seam;
+      # each scenario is its own `.#test-secure-boot-<scenario>` app the #57
+      # runner executes. BUILT here; #57 runs the VMs.
+      secureBootConfig = testing.mkTestConfigurations."test-secure-boot";
+      secureBootRunner = testRunners.mkRunner {
+        name = "test-secure-boot";
+        config = secureBootConfig;
+        inherit vmSerialMan;
+        tpm = "tis";
+        secureBoot = true;
+      };
+
+      # The runtime inputs every secure-boot scenario needs on PATH.
+      sbScenarioInputs = [
+        vmSerialMan
+        pkgs.screen
+        pkgs.coreutils
+        pkgs.gnugrep
+        pkgs.gnused
+        pkgs.qemu_kvm
+        pkgs.OVMFFull
+        pkgs.swtpm
+      ];
+
+      # Build one scenario check app from its assertion script. `extraEnv` lets
+      # the bad-sig scenario export the pristine disk path it tampers.
+      mkSbScenarioCheck =
+        {
+          scenario,
+          script,
+          extraInputs ? [ ],
+          extraEnv ? "",
+        }:
+        pkgs.writeShellApplication {
+          name = "test-secure-boot-${scenario}";
+          runtimeInputs = sbScenarioInputs ++ extraInputs;
+          text = ''
+            export NMBL_RUNNER=${secureBootRunner}
+            ${extraEnv}
+            assertions=${./testing/assertions}
+            timeout "''${NMBL_WALL_TIMEOUT:-900}" \
+              bash "$assertions/${script}"
+          '';
+        };
+
+      checkSbTpmRoundtrip = mkSbScenarioCheck {
+        scenario = "tpm-roundtrip";
+        script = "sb-tpm-roundtrip.sh";
+      };
+      checkSbSignedGenHappy = mkSbScenarioCheck {
+        scenario = "signed-gen-happy";
+        script = "sb-signed-gen-happy.sh";
+      };
+      checkSbBadSigRefused = mkSbScenarioCheck {
+        scenario = "bad-sig-refused";
+        script = "sb-bad-sig-refused.sh";
+        # The bad-sig scenario tampers a pristine disk copy (removes a sidecar
+        # off the FAT32 boot partition), so it needs libguestfs + the disk path.
+        extraInputs = [ pkgs.libguestfs-with-appliance ];
+        extraEnv = ''
+          export NMBL_SB_DISK=${secureBootConfig.config.system.build.vmDiskImage}/nixos.qcow2
+        '';
+      };
     in
     {
       # The main NixOS module
@@ -402,6 +467,21 @@
         check-sb-unsigned-uki = {
           type = "app";
           program = "${checkSbUnsignedUki}/bin/check-sb-unsigned-uki";
+        };
+        # Secure-boot CHAIN scenarios (#57 F6b). Each boots the test-secure-boot
+        # config (swtpm "tis" + SB-OVMF) and drives one assertion script.
+        # `nix run .#test-secure-boot-<scenario>`.
+        test-secure-boot-tpm-roundtrip = {
+          type = "app";
+          program = "${checkSbTpmRoundtrip}/bin/test-secure-boot-tpm-roundtrip";
+        };
+        test-secure-boot-signed-gen-happy = {
+          type = "app";
+          program = "${checkSbSignedGenHappy}/bin/test-secure-boot-signed-gen-happy";
+        };
+        test-secure-boot-bad-sig-refused = {
+          type = "app";
+          program = "${checkSbBadSigRefused}/bin/test-secure-boot-bad-sig-refused";
         };
       } // nixosAnywhereTestApps // testMatrix.apps // nixosAnywhereInstallAliases;
 
