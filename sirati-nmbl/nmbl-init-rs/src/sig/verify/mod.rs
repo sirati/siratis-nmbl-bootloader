@@ -236,7 +236,13 @@ pub fn verify_image_fd_digest(
 /// verifies against the extracted closure) and hands the bytes here; the
 /// path-based [`verify_image_fd_digest`] reads them itself and calls the SAME
 /// core, so both share one verify body.
-fn verify_image_fd_digest_bytes(
+///
+/// `pub(crate)` so the ops-routed consumers (driver-image / staged / rescue
+/// verify) can read their sidecar through
+/// [`FsOps::read_file`](crate::sys::ops::FsOps) — verifying the closure copy on
+/// a `--validate-initrm` dry-run — and hand the bytes here, rather than the
+/// path-based [`verify_image_fd_digest`] reading the LIVE filesystem.
+pub(crate) fn verify_image_fd_digest_bytes(
     fd: BorrowedFd<'_>,
     image_desc: &str,
     sig_bytes: &[u8],

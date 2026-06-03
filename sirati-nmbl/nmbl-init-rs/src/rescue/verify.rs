@@ -40,6 +40,7 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::sig::{self, DOMAIN_RESCUE_SFS, PolicyDecision};
+use crate::sys::ops::FsOps;
 
 /// Verify the external rescue squashfs and apply the `[signing]` policy gate.
 ///
@@ -56,7 +57,7 @@ use crate::sig::{self, DOMAIN_RESCUE_SFS, PolicyDecision};
 /// image — this function only produces the decision, it never mounts, caps,
 /// or constructs a `TerminalAction`.
 #[must_use]
-pub fn verify_rescue_sfs_gated(config: &Config) -> PolicyDecision {
+pub fn verify_rescue_sfs_gated(fs: &dyn FsOps, config: &Config) -> PolicyDecision {
     // signing safety: signing-disabled is the operator declining the feature,
     // NOT an allow-unsigned bypass of an enabled one (FIX-04). The legacy
     // (feature-free) rescue verifies nothing; this matches that posture.
@@ -66,33 +67,45 @@ pub fn verify_rescue_sfs_gated(config: &Config) -> PolicyDecision {
         );
         return PolicyDecision::Proceed;
     }
-    sig::apply_policy(config, verify_rescue_sfs(config))
+    sig::apply_policy(config, verify_rescue_sfs(fs, config))
 }
 
 /// Resolve the sidecar, open the squashfs once, and verify it over a single
 /// pinned fd under [`DOMAIN_RESCUE_SFS`]. Returns the raw verify `Result` for
 /// [`verify_rescue_sfs_gated`] to map through the policy gate.
-fn verify_rescue_sfs(config: &Config) -> Result<()> {
+fn verify_rescue_sfs(fs: &dyn FsOps, config: &Config) -> Result<()> {
     let sfs_path = super::locate_sfs(config)?;
     let sig_path = rescue_sig_sidecar(&sfs_path, &config.signing.sig_path_suffix);
 
-    // Open the image ONCE and hand the pinned fd straight to the verify
-    // pipeline (FIX-02/FIX-64): the path is never reopened for hashing, so the
-    // bytes verified are exactly the bytes this fd refers to. `prepare_disk_rescue`
-    // opens its own fd for the loop bind afterwards; both resolve the same
-    // boot-partition path, and the enforce-refuse short-circuits before any
-    // mount so a tampered image is never loop-bound.
-    let file = std::fs::File::open(&sfs_path).map_err(|source| NmblError::Io {
+    // Open the image ONCE through the ops seam and hand the pinned fd straight
+    // to the verify pipeline (FIX-02/FIX-64): the path is never reopened for
+    // hashing, so the bytes verified are exactly the bytes this fd refers to.
+    // Routing through `FsOps` means a `--validate-initrm` dry-run verifies the
+    // closure copy of the rescue sfs. `prepare_disk_rescue` opens its own fd for
+    // the loop bind afterwards; both resolve the same boot-partition path, and
+    // the enforce-refuse short-circuits before any mount so a tampered image is
+    // never loop-bound.
+    let file = fs.open_ro(&sfs_path).map_err(|source| NmblError::Io {
         source,
         context: format!("open rescue squashfs {} for verify", sfs_path.display()),
     })?;
-    sig::verify_image_fd(
+    // Read the sidecar through the SAME seam so blob + sidecar come from one
+    // source (closure on a dry-run, live boot fs on a real boot).
+    let sig_bytes = fs.read_file(&sig_path).map_err(|source| NmblError::Io {
+        source,
+        context: format!(
+            "read rescue squashfs sidecar {} for verify",
+            sig_path.display()
+        ),
+    })?;
+    sig::verify_image_fd_digest_bytes(
         file.as_fd(),
         "rescue squashfs",
-        Some(&sig_path),
+        &sig_bytes,
         DOMAIN_RESCUE_SFS,
         config,
     )
+    .map(|_digest| ())
 }
 
 /// Build the detached-sidecar path for the rescue squashfs: the sibling file
@@ -117,7 +130,18 @@ mod tests {
     use super::*;
     use crate::config::RescueConfig;
     use crate::rescue::RescueMode;
+    use crate::sys::ops::dryrun::{ClosureView, DryRunScenario, DryRunSys};
     use std::path::Path;
+
+    /// A real-FS-backed [`FsOps`] for these tests: a [`DryRunSys`] rooted at
+    /// `/`, so `open_ro`/`read_file` are identity opens over the absolute
+    /// tempdir paths — the same I/O the real boot performs.
+    fn runtime_fs() -> DryRunSys {
+        DryRunSys::new(
+            ClosureView::new(PathBuf::from("/")),
+            DryRunScenario::NormalBoot,
+        )
+    }
 
     fn cfg(enable: bool, enforce: bool, mountpoint: Option<PathBuf>) -> Config {
         let mut c = Config::recovery_default();
@@ -154,7 +178,7 @@ mod tests {
         // not an allow-unsigned bypass — FIX-04). A mountpoint pointing at a
         // path with no rescue image proves verify never ran.
         let c = cfg(false, false, Some(PathBuf::from("/nonexistent")));
-        assert!(verify_rescue_sfs_gated(&c).is_proceed());
+        assert!(verify_rescue_sfs_gated(&runtime_fs(), &c).is_proceed());
     }
 
     #[test]
@@ -165,7 +189,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let c = cfg(true, true, Some(dir.path().to_path_buf()));
         assert!(matches!(
-            verify_rescue_sfs_gated(&c),
+            verify_rescue_sfs_gated(&runtime_fs(), &c),
             PolicyDecision::Refuse(_)
         ));
     }
@@ -178,22 +202,22 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let c = cfg(true, false, Some(dir.path().to_path_buf()));
         assert!(
-            verify_rescue_sfs_gated(&c).is_proceed(),
+            verify_rescue_sfs_gated(&runtime_fs(), &c).is_proceed(),
             "audit mode must proceed on a missing/bad rescue signature"
         );
     }
 
     #[test]
     fn enforce_present_image_unsigned_is_refuse() {
-        // A present squashfs blob with NO sidecar under enforce must refuse:
-        // verify_image_fd fails to read the sidecar, and enforce maps that to
-        // Refuse (a bad/missing signature never enters the rescue — R-1).
+        // A present squashfs blob with NO sidecar under enforce must refuse: the
+        // sidecar read fails, and enforce maps that to Refuse (a bad/missing
+        // signature never enters the rescue — R-1).
         let dir = tempfile::tempdir().expect("tempdir");
         let sfs = dir.path().join("nmbl-rescue.sfs");
         std::fs::write(&sfs, b"not-really-a-squashfs").expect("write sfs");
         let c = cfg(true, true, Some(dir.path().to_path_buf()));
         assert!(matches!(
-            verify_rescue_sfs_gated(&c),
+            verify_rescue_sfs_gated(&runtime_fs(), &c),
             PolicyDecision::Refuse(_)
         ));
     }
