@@ -325,6 +325,15 @@
         inherit vmSerialMan;
         tpm = "tis";
         secureBoot = true;
+        # ENFORCING SB firmware that ALSO trusts the test UKI (F1): the test
+        # db CERT is enrolled into the MS VARS' `db` so the firmware accepts
+        # the NMBL UKI sbsign'd with the matching key at install time, while
+        # still refusing anything unsigned. PUBLICLY-KNOWN test cert (path
+        # literal ⇒ store import is fine; only the install-time signing
+        # key/cert must stay out of the store, which they do — they are impure
+        # string paths). The unsigned-UKI smoke (sbSmoke.runner) leaves dbCert
+        # unset so it KEEPS the MS-only db and still refuses the unsigned UKI.
+        dbCert = ./testing/keys/insecure-test-sb-db.crt;
       };
 
       # The runtime inputs every secure-boot scenario needs on PATH.
