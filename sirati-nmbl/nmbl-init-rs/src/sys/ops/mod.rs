@@ -79,6 +79,18 @@ pub trait FsOps {
     fn umount(&mut self, target: &Path, flags: MntFlags) -> Result<()>;
     /// Read the whole file at `path`.
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>>;
+    /// Open `path` read-only, returning the live handle. The secure-boot
+    /// verify pipeline streams-hashes this fd and hands the SAME fd to
+    /// kexec, so the dry-run impl must return a real readable fd: it opens
+    /// the [`ClosureView`](crate::sys::ops::dryrun::ClosureView)-mapped path
+    /// read-only so the ML-DSA verify runs against the shipped bytes
+    /// (side-effect-free). An absent file is an `io::Error`.
+    fn open_ro(&self, path: &Path) -> io::Result<std::fs::File>;
+    /// Write `contents` to `path` (sysfs firmware-load trigger,
+    /// unsealed-mapper registry, rescue sentinel). Dry-run no-ops + records.
+    fn write_file(&mut self, path: &Path, contents: &[u8]) -> io::Result<()>;
+    /// Remove `path` (registry / sentinel cleanup). Dry-run no-ops + records.
+    fn remove_file(&mut self, path: &Path) -> io::Result<()>;
 }
 
 /// Block-device operations: device-readiness wait, node creation, by-*
@@ -218,10 +230,41 @@ pub trait ConsoleOps {
     fn open_console(&mut self, config: &Config, panic_recovery: bool) -> Result<Box<dyn Console>>;
 }
 
+/// TPM 2.0 hardware operations: presence, raw transact, PCR extend, the
+/// Secure-Boot efivar state, and the lock-PCR poison cap.
+///
+/// [`RealSys`] forwards each method to the genuine `crate::tpm::*` op (real
+/// `/dev/tpmrm0` / efivarfs I/O); [`DryRunSys`](dryrun::DryRunSys) makes
+/// `tpm_present` synthetic, reads the SB-state from the closure (or
+/// degrades), and NO-OPS every mutating op (`tpm_transmit`, `pcr_extend`,
+/// `cap_lock_pcr`) so `--validate-initrm` can never open a real TPM, extend
+/// a real PCR, or poison the irreversible lock PCR (Property-6). Routing the
+/// seal's cap through this seam is what guarantees the dry-run cannot poison
+/// a real PCR.
+pub trait TpmOps {
+    /// `true` iff a TPM is present (deterministic `/sys/class/tpm/tpm0`
+    /// sysfs check) — see [`crate::tpm::tpm_present`].
+    fn tpm_present(&self) -> bool;
+    /// Round-trip a marshaled command frame to a response frame through the
+    /// resource-manager device — see [`crate::tpm::transport::TpmDevice`].
+    fn tpm_transmit(&mut self, command: &[u8]) -> Result<Vec<u8>>;
+    /// `TPM2_PCR_Extend` of `digest` (SHA-256 bank) into PCR `index` — see
+    /// [`crate::tpm::pcr_extend`].
+    fn pcr_extend(&mut self, index: u32, digest: &[u8]) -> Result<()>;
+    /// Read the authoritative `SecureBoot` efivar state — see
+    /// [`crate::tpm::sbstate::read_secure_boot_efivar`].
+    fn read_sb_state(&self) -> crate::tpm::SbEfiState;
+    /// Cap (poison) the lock PCR with the committed relock poison, returning
+    /// the rich [`CapOutcome`](crate::tpm::CapOutcome) the seal policy
+    /// consumes — see [`crate::tpm::cap_lock_pcr`]. The dry-run NEVER
+    /// performs the irreversible extend.
+    fn cap_lock_pcr(&mut self) -> crate::tpm::CapOutcome;
+}
+
 /// Super-trait bundling every focused capability. Boot code that needs the
 /// full system takes `<S: SysOps>`; helpers that need one slice take the
-/// focused trait. The blanket impl means any type implementing all six
+/// focused trait. The blanket impl means any type implementing all seven
 /// focused traits is a `SysOps` for free.
-pub trait SysOps: FsOps + BlockOps + ModuleOps + ExecOps + KexecOps + ConsoleOps {}
+pub trait SysOps: FsOps + BlockOps + ModuleOps + ExecOps + KexecOps + ConsoleOps + TpmOps {}
 
-impl<T: FsOps + BlockOps + ModuleOps + ExecOps + KexecOps + ConsoleOps> SysOps for T {}
+impl<T: FsOps + BlockOps + ModuleOps + ExecOps + KexecOps + ConsoleOps + TpmOps> SysOps for T {}

@@ -90,26 +90,38 @@ fn secure_boot_var_path(root: &Path) -> PathBuf {
     root.join(format!("SecureBoot-{EFI_GLOBAL_GUID}"))
 }
 
-/// Reads the `SecureBoot` efivar from the efivarfs rooted at `root` and
-/// classifies it into [`SbEfiState`]. The file body is the 4-byte attribute
-/// header followed by the state byte; any read failure / short body / out-of-
-/// range value is [`SbEfiState::Unreadable`] rather than an error (degrade).
-pub fn read_secure_boot_efivar_at(root: &Path) -> SbEfiState {
-    let path = secure_boot_var_path(root);
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        // ENOENT (BIOS/CSM box, efivarfs unmounted) and any other IO error
-        // degrade to Unreadable — we do not have positive SB-state proof.
-        Err(_) => return SbEfiState::Unreadable,
-    };
+/// The live efivarfs path of the `SecureBoot` global variable. Exposed so a
+/// side-effect-free reader (the `--validate-initrm` dry-run `TpmOps`) can
+/// resolve it through a closure rather than reading the host's efivarfs.
+#[must_use]
+pub fn secure_boot_efivar_path() -> PathBuf {
+    secure_boot_var_path(Path::new(EFIVARS_DIR))
+}
+
+/// Classifies a `SecureBoot` efivar body into [`SbEfiState`]. The body is the
+/// 4-byte attribute header followed by the state byte; `None` (no readable
+/// file) or a short / out-of-range body is [`SbEfiState::Unreadable`] rather
+/// than an error (degrade). Pure so a closure-backed reader can reuse it.
+#[must_use]
+pub fn classify_secure_boot_bytes(bytes: Option<&[u8]>) -> SbEfiState {
     // The state byte sits immediately after the 4-byte attribute header.
-    match bytes.get(EFIVAR_ATTR_LEN) {
+    match bytes.and_then(|b| b.get(EFIVAR_ATTR_LEN)) {
         Some(0) => SbEfiState::Disabled,
         Some(1) => SbEfiState::Enabled,
         // A value other than 0/1, or a body too short to carry one, is not a
         // shape we can trust — treat as unreadable rather than guess.
         _ => SbEfiState::Unreadable,
     }
+}
+
+/// Reads the `SecureBoot` efivar from the efivarfs rooted at `root` and
+/// classifies it into [`SbEfiState`]. Any read failure / short body / out-of-
+/// range value is [`SbEfiState::Unreadable`] rather than an error (degrade).
+pub fn read_secure_boot_efivar_at(root: &Path) -> SbEfiState {
+    let path = secure_boot_var_path(root);
+    // ENOENT (BIOS/CSM box, efivarfs unmounted) and any other IO error
+    // degrade to Unreadable — we do not have positive SB-state proof.
+    classify_secure_boot_bytes(std::fs::read(&path).ok().as_deref())
 }
 
 /// Reads the live `SecureBoot` efivar from the real efivarfs ([`EFIVARS_DIR`]).

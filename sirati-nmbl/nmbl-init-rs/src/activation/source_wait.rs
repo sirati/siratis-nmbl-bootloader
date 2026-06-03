@@ -201,6 +201,15 @@ mod tests {
         fn read_file(&self, _path: &Path) -> io::Result<Vec<u8>> {
             panic!("wait_for_source_device never calls read_file")
         }
+        fn open_ro(&self, _path: &Path) -> io::Result<std::fs::File> {
+            panic!("wait_for_source_device never calls open_ro")
+        }
+        fn write_file(&mut self, _path: &Path, _contents: &[u8]) -> io::Result<()> {
+            panic!("wait_for_source_device never calls write_file")
+        }
+        fn remove_file(&mut self, _path: &Path) -> io::Result<()> {
+            panic!("wait_for_source_device never calls remove_file")
+        }
     }
 
     impl BlockOps for ScriptedOps {

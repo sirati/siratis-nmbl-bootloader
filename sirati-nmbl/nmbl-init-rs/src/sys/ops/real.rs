@@ -28,7 +28,8 @@ use crate::ui::console::Console;
 use crate::ui::{BootReporter, ProgressSink};
 
 use super::{
-    BlockOps, ConsoleOps, ExecOps, FsOps, KexecOps, KexecTarget, ModuleOps, VerifiedKexecFds,
+    BlockOps, ConsoleOps, ExecOps, FsOps, KexecOps, KexecTarget, ModuleOps, TpmOps,
+    VerifiedKexecFds,
 };
 
 /// Genuine system-operations impl. Borrows the poller's [`LocalSender`] so
@@ -99,6 +100,18 @@ impl FsOps for RealSys<'_> {
 
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         std::fs::read(path)
+    }
+
+    fn open_ro(&self, path: &Path) -> io::Result<std::fs::File> {
+        std::fs::File::open(path)
+    }
+
+    fn write_file(&mut self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        std::fs::write(path, contents)
+    }
+
+    fn remove_file(&mut self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
     }
 }
 
@@ -239,5 +252,28 @@ impl ConsoleOps for RealSys<'_> {
         // `RealSys` is itself the `FsOps` the splash file-reads route
         // through; pass `self` so font/PNG loads dispatch through the seam.
         crate::ui::console::open_console(self, config, panic_recovery)
+    }
+}
+
+impl TpmOps for RealSys<'_> {
+    fn tpm_present(&self) -> bool {
+        crate::tpm::tpm_present()
+    }
+
+    fn tpm_transmit(&mut self, command: &[u8]) -> Result<Vec<u8>> {
+        crate::tpm::transport::TpmDevice::open()?.transact(command)
+    }
+
+    fn pcr_extend(&mut self, index: u32, digest: &[u8]) -> Result<()> {
+        let dev = crate::tpm::transport::TpmDevice::open()?;
+        crate::tpm::pcr_extend(&dev, index, digest)
+    }
+
+    fn read_sb_state(&self) -> crate::tpm::SbEfiState {
+        crate::tpm::sbstate::read_secure_boot_efivar()
+    }
+
+    fn cap_lock_pcr(&mut self) -> crate::tpm::CapOutcome {
+        crate::tpm::cap_lock_pcr()
     }
 }
