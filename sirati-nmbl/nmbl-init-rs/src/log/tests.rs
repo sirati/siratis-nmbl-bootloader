@@ -9,7 +9,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use super::byte_ring::{
-    BYTE_RING_CAPACITY, ByteLog, decode_snapshot_lines, new_byte_log, write_truncated,
+    BYTE_RING_CAPACITY, ByteLog, assemble_flush_bytes, decode_snapshot_lines, new_byte_log,
+    write_truncated,
 };
 use super::ring::{LOG_RING_CAPACITY, ring_push, ring_snapshot};
 use super::tui_flag::{clear_tui_active, set_tui_active, tui_active};
@@ -147,6 +148,47 @@ fn flush_to_omits_header_without_truncation() {
 
     let text = std::fs::read_to_string(&path).expect("read");
     assert_eq!(text, "hello\nworld\n");
+}
+
+#[test]
+fn assemble_flush_bytes_equals_the_on_disk_flush_no_header() {
+    // The ops-routed kexec-staging flush materialises the SAME bytes the direct
+    // on-disk `write_truncated` would persist. Assert the in-memory assembler
+    // matches `write_truncated`'s output byte-for-byte on a header-less ring.
+    let mut log = new_byte_log();
+    log.append_line("hello");
+    log.append_line("world");
+    let body: Vec<u8> = log.buf.iter().copied().collect();
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let path = dir.path().join("nmbl.log");
+    write_truncated(&path, log.flush_header().as_deref(), &body).expect("write ok");
+    let on_disk = std::fs::read(&path).expect("read flushed file");
+
+    let staged = assemble_flush_bytes(log.flush_header().as_deref(), &body);
+    assert_eq!(staged, on_disk, "staged bytes must equal the on-disk flush");
+    assert_eq!(staged, b"hello\nworld\n");
+}
+
+#[test]
+fn assemble_flush_bytes_includes_truncation_header() {
+    // When the ring overflowed, the staged bytes must carry the SAME truncation
+    // header `write_truncated` prepends, ahead of the body.
+    let log = overflowed_byte_log('z');
+    let body: Vec<u8> = log.buf.iter().copied().collect();
+    let header = log.flush_header().expect("overflow yields a header");
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let path = dir.path().join("nmbl.log");
+    write_truncated(&path, Some(&header), &body).expect("write ok");
+    let on_disk = std::fs::read(&path).expect("read flushed file");
+
+    let staged = assemble_flush_bytes(Some(&header), &body);
+    assert_eq!(staged, on_disk, "staged bytes must equal the on-disk flush");
+    assert!(
+        staged.starts_with(b"=== nmbl-init: log truncated, earlier "),
+        "staged bytes must lead with the truncation header",
+    );
 }
 
 #[test]

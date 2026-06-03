@@ -76,6 +76,13 @@ pub use verify::{
     verify_image_fd_digest,
 };
 
+// The bytes-core verify entry: the ops-routed consumers (driver-image, staged,
+// rescue) read their sidecar through `FsOps::read_file` (closure-aware) and call
+// this with the bytes in hand, so a `--validate-initrm` dry-run verifies the
+// sidecar from the extracted closure rather than the live host filesystem.
+#[cfg(feature = "secure-boot")]
+pub(crate) use verify::verify_image_fd_digest_bytes;
+
 // ---- Always-compiled feature-presence probes (carried from the F1 stub) ----
 // These prove at compile time that each optional dep the `secure-boot` feature
 // pulls actually links (and that `fips204`'s pinned `ml-dsa-65`/`ml-dsa-87`

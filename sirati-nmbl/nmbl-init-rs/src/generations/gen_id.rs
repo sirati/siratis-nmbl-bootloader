@@ -25,6 +25,7 @@
 use std::path::Path;
 
 use crate::error::{NmblError, Result};
+use crate::sys::ops::FsOps;
 
 use super::Generation;
 
@@ -37,11 +38,16 @@ use super::Generation;
 /// taking the basename, so the id matches what `nix-env --list-generations`
 /// (and thus the install signer) sees for the same generation.
 ///
+/// The canonicalize is routed through `fs` ([`FsOps::canonicalize`]) so a
+/// closure-rooted `--validate-initrm` dry-run resolves the toplevel WITHIN the
+/// extracted tree rather than the live host fs; on `RealSys` it is a plain
+/// `std::fs::canonicalize`.
+///
 /// Fails (`NmblError::Io` / `NmblError::Signature`) when the toplevel cannot be
 /// canonicalized or has no usable basename — the caller treats either as a
 /// hard "cannot locate this generation's sidecars" error, never an allow-all.
-pub fn gen_id(generation: &Generation) -> Result<String> {
-    gen_id_of_path(&generation.toplevel)
+pub fn gen_id(fs: &dyn FsOps, generation: &Generation) -> Result<String> {
+    gen_id_of_path(fs, &generation.toplevel)
 }
 
 /// The basename-of-canonicalize core, factored so both [`gen_id`] and the
@@ -49,8 +55,8 @@ pub fn gen_id(generation: &Generation) -> Result<String> {
 /// derivation. Any caller passing a profile-link path gets the same id as one
 /// passing the already-resolved toplevel, because `canonicalize` follows the
 /// link to the same store path either way.
-pub fn gen_id_of_path(toplevel: &Path) -> Result<String> {
-    let canonical = std::fs::canonicalize(toplevel).map_err(|source| NmblError::Io {
+pub fn gen_id_of_path(fs: &dyn FsOps, toplevel: &Path) -> Result<String> {
+    let canonical = fs.canonicalize(toplevel).map_err(|source| NmblError::Io {
         source,
         context: format!("canonicalize generation toplevel {}", toplevel.display()),
     })?;

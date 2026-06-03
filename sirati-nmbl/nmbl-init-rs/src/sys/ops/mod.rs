@@ -91,6 +91,26 @@ pub trait FsOps {
     fn write_file(&mut self, path: &Path, contents: &[u8]) -> io::Result<()>;
     /// Remove `path` (registry / sentinel cleanup). Dry-run no-ops + records.
     fn remove_file(&mut self, path: &Path) -> io::Result<()>;
+    /// Canonicalize `path`, resolving symlinks to a real absolute path. Used by
+    /// the shared `gen_id` derivation to follow a generation's profile link to
+    /// its store toplevel before taking the basename. `RealSys` forwards to
+    /// `std::fs::canonicalize`; the dry-run resolves WITHIN the
+    /// [`ClosureView`](crate::sys::ops::dryrun::ClosureView) root (same
+    /// prefix-graft as `open_ro`/`read_file`) so a closure-rooted
+    /// `--validate-initrm` run resolves the extracted tree, not the host fs.
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
+    /// `true` only for the side-effect-free `--validate-initrm` dry-run impl.
+    ///
+    /// A consumer whose cleanup runs in a `Drop` (which cannot hold `&mut dyn
+    /// FsOps` to route an unmount through the seam) reads this at construction
+    /// time to remember it must NOT perform the real syscall later. The priority
+    /// gate uses it to leave `AttestedVolume::owned_mount` as `None` on a dry-run
+    /// (the `DryRunSys::mount` no-op never actually mounted anything), so its
+    /// `Drop` issues no stray `umount(2)`. Defaults to `false` so `RealSys` and
+    /// every other genuine impl behave exactly as before.
+    fn is_dry_run(&self) -> bool {
+        false
+    }
 }
 
 /// Block-device operations: device-readiness wait, node creation, by-*

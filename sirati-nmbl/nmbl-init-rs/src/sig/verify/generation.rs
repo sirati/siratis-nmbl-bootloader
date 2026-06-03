@@ -43,7 +43,7 @@ pub fn ensure_generation_signed(
     config: &Config,
     generation: &Generation,
 ) -> Result<()> {
-    let sig_dir = generation_sig_dir(config, generation)?;
+    let sig_dir = generation_sig_dir(fs, config, generation)?;
     let suffix = config.signing.sig_path_suffix.as_str();
 
     verify_generation_blob(
@@ -152,7 +152,7 @@ pub fn verify_generation_pinned(
     config: &Config,
     generation: &Generation,
 ) -> Result<VerifiedGeneration> {
-    let sig_dir = generation_sig_dir(config, generation)?;
+    let sig_dir = generation_sig_dir(fs, config, generation)?;
     let suffix = config.signing.sig_path_suffix.as_str();
 
     // Open the kernel ONCE via the ops layer and keep its fd for the load
@@ -255,12 +255,14 @@ mod tests {
             .expect("config parses")
     }
 
-    /// A generation whose kernel/initrd are CLOSURE-relative boot paths (so
-    /// `open_ro` grafts them under the closure root) but whose `toplevel` is the
-    /// REAL on-disk store dir under `root` — `gen_id` canonicalizes it directly
-    /// (it is not routed through ops) and takes its basename for the sidecar dir.
+    /// A generation whose kernel/initrd AND `toplevel` are CLOSURE-relative boot
+    /// paths: `open_ro`/`read_file` graft the blobs under the closure root, and
+    /// `gen_id` now routes its canonicalize through ops, so the closure-relative
+    /// `/nix/store/abc123-nixos-system-7` grafts under `root` to the on-disk
+    /// store dir `lay_out_closure` creates — its basename keys the sidecar dir.
     fn closure_generation(root: &std::path::Path) -> Generation {
-        let top = root.join("nix/store/abc123-nixos-system-7");
+        let top = PathBuf::from("/nix/store/abc123-nixos-system-7");
+        let _ = root;
         Generation {
             number: 7,
             profile_link: top.clone(),

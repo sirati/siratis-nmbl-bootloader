@@ -156,8 +156,10 @@ fn load_one<S: FsOps + ModuleOps>(
 
     // (1) VERIFY first — never touch the loop/mount layer on a refusal. The
     // verify returns the SHA-512 it streamed over the pinned fd, which the
-    // handle carries for the PCR-11 measure (#28 — no re-hash, FIX-02).
-    let digest = verify::verify_driver_image(image_fd.as_fd(), &resolved, config)?;
+    // handle carries for the PCR-11 measure (#28 — no re-hash, FIX-02). The
+    // sidecar is read through `ops` (closure-aware) so the dry-run verifies the
+    // closure copy, matching how `open_image_ro` opened the blob.
+    let digest = verify::verify_driver_image(&*ops, image_fd.as_fd(), &resolved, config)?;
 
     // (2) MOUNT the SAME fd read-only.
     let mounted = mount::mount_squashfs_ro(ops, image_fd.as_fd(), index)?;

@@ -94,8 +94,21 @@ fn verify_one(
         detail: format!("opening {} for verify: {e}", blob.display()),
     })?;
 
+    // Read the sidecar through the ops seam too (not the path-based
+    // `verify_image_fd`, which `std::fs::read`s the LIVE host fs): both the blob
+    // and its sidecar then come from the SAME source, so a `--validate-initrm`
+    // dry-run verifies the closure copy of both.
     let desc = blob.display().to_string();
-    let verify_result = sig::verify_image_fd(file.as_fd(), &desc, Some(sig_path), domain, config);
+    let verify_result = fs
+        .read_file(sig_path)
+        .map_err(|source| NmblError::Io {
+            source,
+            context: format!("read {label} sidecar {} for verify", sig_path.display()),
+        })
+        .and_then(|sig_bytes| {
+            sig::verify_image_fd_digest_bytes(file.as_fd(), &desc, &sig_bytes, domain, config)
+                .map(|_digest| ())
+        });
 
     match sig::apply_policy(config, verify_result) {
         PolicyDecision::Proceed => Ok(()),

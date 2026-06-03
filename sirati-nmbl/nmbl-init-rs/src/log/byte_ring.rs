@@ -124,22 +124,58 @@ pub(super) fn push_byte_ring(line: &str) {
 /// the front, so downstream tooling does not silently treat the
 /// remainder as the entire transcript.
 pub fn flush_to(path: &Path) -> std::io::Result<()> {
-    let (header, body) = {
-        let guard = BYTE_LOG
-            .lock()
-            .map_err(|_| std::io::Error::other("byte log mutex poisoned"))?;
-        match guard.as_ref() {
-            Some(log) => {
-                let header = log.flush_header();
-                // Clone bytes out under the lock so we release it before
-                // doing file I/O (which can block on disk, fsync, etc.).
-                let body: Vec<u8> = log.buf.iter().copied().collect();
-                (header, body)
-            }
-            None => (None, Vec::new()),
-        }
-    };
+    let (header, body) = snapshot_flush_parts();
     write_truncated(path, header.as_deref(), &body)
+}
+
+/// Snapshot the optional truncation header + body bytes the next [`flush_to`]
+/// would persist, holding the `BYTE_LOG` lock only long enough to clone the
+/// bytes out (same access pattern as [`flush_to`] / [`snapshot_full`]). On a
+/// poisoned mutex this degrades to an empty transcript rather than erroring —
+/// the byte ring is best-effort.
+fn snapshot_flush_parts() -> (Option<String>, Vec<u8>) {
+    let Ok(guard) = BYTE_LOG.lock() else {
+        return (None, Vec::new());
+    };
+    match guard.as_ref() {
+        Some(log) => {
+            let header = log.flush_header();
+            // Clone bytes out under the lock so we release it before doing any
+            // further work (the caller may block on disk / fsync, etc.).
+            let body: Vec<u8> = log.buf.iter().copied().collect();
+            (header, body)
+        }
+        None => (None, Vec::new()),
+    }
+}
+
+/// Materialise the EXACT bytes [`flush_to`] would write to `path` (optional
+/// truncation header followed by the body), WITHOUT performing any file I/O.
+///
+/// Used by the pre-kexec log staging so the flush can be routed through the
+/// [`FsOps`](crate::sys::ops::FsOps) seam: `--validate-initrm` no-ops the write
+/// instead of a direct `create + truncate + fsync`, while a real boot writes
+/// the byte-identical content via `FsOps::write_file`. The header/body are
+/// assembled the same way [`write_truncated`] lays them on disk, so the staged
+/// bytes equal what `flush_to` produces.
+#[must_use]
+pub fn snapshot_flush_bytes() -> Vec<u8> {
+    let (header, body) = snapshot_flush_parts();
+    assemble_flush_bytes(header.as_deref(), &body)
+}
+
+/// Concatenate the optional truncation `header` and `body` into the single
+/// buffer [`snapshot_flush_bytes`] returns — laid out EXACTLY as
+/// [`write_truncated`] writes them to disk (header first, then body). The pure
+/// half of [`snapshot_flush_bytes`], so the in-memory staging bytes can be
+/// asserted byte-for-byte on a local fixture without the `BYTE_LOG` static.
+pub(super) fn assemble_flush_bytes(header: Option<&str>, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(header.map_or(0, str::len) + body.len());
+    if let Some(h) = header {
+        out.extend_from_slice(h.as_bytes());
+    }
+    out.extend_from_slice(body);
+    out
 }
 
 /// Snapshot the FULL buffered boot transcript as lines (oldest first).
