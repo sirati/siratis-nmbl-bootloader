@@ -161,6 +161,21 @@ fn load_one(
     // (4) LOAD the declared modules (reuses crate::modules::load_modules).
     modules::load_image_modules(config, spec, &mounted.mountpoint)?;
 
+    // POSITIVE success marker (#1 VM scenario). The shared loader only logs a
+    // generic `loaded N modules` count, which cannot prove a module came from
+    // THIS image rather than the base initrd. Emit a per-image line naming the
+    // declared boot-relative path + the modules `finit_module`d from it. Like
+    // the generation-verify marker it is recorded BEFORE kexec, so it survives
+    // the cpio-log freeze into the post-kexec `nmbl-init` journal where a VM
+    // test can assert it (the loaded module itself is gone after kexec).
+    crate::nmbl_info!(
+        "driver-image loaded: {} module(s) {:?} from {} (loop{})",
+        spec.modules.len(),
+        spec.modules,
+        spec.path.display(),
+        mounted.loop_index,
+    );
+
     // The measure event #4 name is the operator-declared boot-relative path
     // (`spec.path`): a STABLE, off-box-reproducible identifier (the absolute
     // `resolved.image_path` carries the runtime mountpoint prefix, so it is NOT
