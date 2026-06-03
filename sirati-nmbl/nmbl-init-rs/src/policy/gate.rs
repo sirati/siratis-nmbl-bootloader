@@ -121,6 +121,10 @@ impl Drop for AttestedVolume {
         // Only a gate-owned mount is torn down; an existing FS (the boot FS) is
         // left for the rest of the boot. Best-effort + lazy: a busy unmount
         // must never panic in Drop.
+        // Intentionally a DIRECT `sys::mount::umount`, not an ops call: it is
+        // dry-run-inert because a `--validate-initrm` run keeps the priority
+        // gate disabled (secure-boot off), so `owned_mount` is never `Some` and
+        // there is nothing to tear down on the dry-run path.
         if let Some(mp) = self.owned_mount.take()
             && let Err(e) = crate::sys::mount::umount(&mp, nix::mount::MntFlags::MNT_DETACH)
         {

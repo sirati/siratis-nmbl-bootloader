@@ -73,6 +73,11 @@ pub(super) fn run_normal_boot(config: &Config, closure_root: &std::path::Path) -
     // staged-boot merge path); the dry-run never enables staged-boot, so the
     // config is only ever read, but the signature requires `&mut`.
     let mut config: Config = config.clone();
+    // A successful (dry-run exit-0) `luks-tpm` activation registers its mapper,
+    // which would otherwise append to the REAL `/run/nmbl` registry file. Hold
+    // the dry-run seal scope for the whole scenario so the registry's on-disk
+    // persistence is suppressed (the mapper close it pairs with is no-op'd too).
+    let seal_scope = nmbl_init::policy::DryRunSealScope::enter();
     let result = block_on_tui_with_poller(|sender| async move {
         let session = SessionInteraction::new();
         let skip_selector = SkipSelector::new();
@@ -111,6 +116,8 @@ pub(super) fn run_normal_boot(config: &Config, closure_root: &std::path::Path) -
         }
         dryrun.into_findings().items().to_vec()
     });
+    // Restore the real seal/registry path for any later caller on this thread.
+    drop(seal_scope);
     findings_or_runtime_note(result, "NormalBoot")
 }
 
