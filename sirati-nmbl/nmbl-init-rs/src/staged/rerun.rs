@@ -66,7 +66,7 @@ pub(super) async fn rerun_merged_effects(
     // refs also join the PCR-11 measure event #4 (#28), so a staged driver is
     // measured exactly like a baseline one.
     let _ = reporter.set_phase("staged-boot: loading staged driver images");
-    let staged_handle = load_driver_images(config)?;
+    let staged_handle = load_driver_images(&mut ops, config)?;
     for image in staged_handle.images() {
         driver_images.push(image.clone());
     }

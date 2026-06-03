@@ -7,13 +7,12 @@
 //! opens the image `O_RDONLY | CLOEXEC` ONCE so the rest of the pipeline shares
 //! a single pinned fd (FIX-02).
 
-use std::os::fd::OwnedFd;
+use std::fs::File;
 use std::path::{Path, PathBuf};
-
-use rustix::fs::{Mode, OFlags};
 
 use crate::config::{Config, DriverImageSpec};
 use crate::error::{NmblError, Result};
+use crate::sys::ops::FsOps;
 
 /// A driver image's resolved absolute paths.
 #[derive(Debug)]
@@ -59,25 +58,24 @@ pub(super) fn resolve_image(config: &Config, spec: &DriverImageSpec) -> Result<R
     })
 }
 
-/// Open the resolved image `O_RDONLY | CLOEXEC` — the single pinned fd the whole
-/// verify→mount→load pipeline shares (FIX-02). Never reopened.
+/// Open the resolved image read-only through the [`FsOps`] seam — the single
+/// pinned fd the whole verify→mount→load pipeline shares (FIX-02). Never
+/// reopened. Routing through `open_ro` lets `--validate-initrm` open the
+/// closure-mapped bytes (side-effect-free) while the real boot opens the
+/// on-disk squashfs; either way the fd verified is the fd mounted.
 ///
 /// # Errors
 /// [`NmblError::DriverImage`] (`stage = "open"`) wrapping the underlying
 /// `NmblError::Io` when the image cannot be opened.
-pub(super) fn open_image_ro(resolved: &ResolvedImage) -> Result<OwnedFd> {
-    rustix::fs::open(
-        &resolved.image_path,
-        OFlags::RDONLY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| NmblError::DriverImage {
-        stage: "open",
-        source: Box::new(NmblError::Io {
-            source: std::io::Error::from_raw_os_error(e.raw_os_error()),
-            context: format!("opening driver image {}", resolved.image_path.display()),
-        }),
-    })
+pub(super) fn open_image_ro(ops: &mut impl FsOps, resolved: &ResolvedImage) -> Result<File> {
+    ops.open_ro(&resolved.image_path)
+        .map_err(|e| NmblError::DriverImage {
+            stage: "open",
+            source: Box::new(NmblError::Io {
+                source: e,
+                context: format!("opening driver image {}", resolved.image_path.display()),
+            }),
+        })
 }
 
 /// Build a `locate`-stage [`NmblError::DriverImage`] wrapping a
@@ -186,7 +184,8 @@ mod tests {
             image_path: dir.path().join("does-not-exist.sfs"),
             sig_path: dir.path().join("does-not-exist.sfs.sig"),
         };
-        let err = open_image_ro(&resolved).expect_err("missing image must error");
+        let mut ops = crate::sys::ops::RealSys::sync_only();
+        let err = open_image_ro(&mut ops, &resolved).expect_err("missing image must error");
         assert!(matches!(err, NmblError::DriverImage { stage: "open", .. }));
     }
 
@@ -201,6 +200,7 @@ mod tests {
         };
         // Opening succeeds even though the bytes are not a real squashfs — the
         // fd is just pinned here; verify/mount handle the content later.
-        open_image_ro(&resolved).expect("open existing image");
+        let mut ops = crate::sys::ops::RealSys::sync_only();
+        open_image_ro(&mut ops, &resolved).expect("open existing image");
     }
 }
