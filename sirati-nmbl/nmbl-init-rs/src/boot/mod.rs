@@ -5,6 +5,7 @@
 //! is loaded is logged + swallowed; we're about to replace this kernel.
 
 mod handoff;
+mod handoff_load;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

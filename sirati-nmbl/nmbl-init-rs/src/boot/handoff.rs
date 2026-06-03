@@ -5,8 +5,8 @@
 //! image via `kexec_file_load(2)`. Split out of `boot/mod.rs` so the
 //! verify/measure insertion points live next to the staging they gate.
 //! Load MUST happen before any unmount —
-//! [`sys::kexec::load_with_extra_initrd_cpio`] reads kernel+initrd from
-//! the still-mounted `/mnt/system`.
+//! [`crate::sys::kexec::load_with_extra_initrd_cpio`] reads kernel+initrd
+//! from the still-mounted `/mnt/system`.
 //!
 //! ## verify → [measure seam] → load (FIX-02 / FIX-13 / FIX-14)
 //!
@@ -38,9 +38,21 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::generations::Generation;
 use crate::log;
-use crate::sys;
 use crate::sys::cpio::{InjectionEntry, build_fragment};
 use crate::{nmbl_info, nmbl_warn};
+
+#[cfg(feature = "secure-boot")]
+pub(super) use crate::sig::VerifiedGeneration;
+
+// Re-imported so the `#[path]`-included test module (a child of `handoff`) can
+// reach the measure helpers that physically live in `handoff_load`.
+#[cfg(test)]
+use super::handoff_load::{measure_handoff, measure_required};
+
+// When `secure-boot` is off there is no verify pipeline and no pinned fd; the
+// witness type degrades to a unit so the single code path below still compiles.
+#[cfg(not(feature = "secure-boot"))]
+pub(super) type VerifiedGeneration = std::convert::Infallible;
 
 // Tmpfs path the NMBL byte-ring is flushed to before kexec — recreated
 // in the next kernel's initramfs by the cpio fragment we splice into
@@ -144,26 +156,31 @@ struct Handoff {
     cmdline: String,
 }
 
-/// VERIFY the generation's signature before anything is loaded (#20 step a).
+/// VERIFY the generation's signature before anything is loaded (#20 step a),
+/// returning the PINNED kernel fd + reused digests on the secure-boot path so
+/// the measure and load steps consume the EXACT bytes that were verified
+/// (FIX-02 / MED-1).
 ///
-/// Runs the audit-vs-enforce gate [`crate::sig::ensure_generation_signed_gated`]
-/// over the generation. That gate streams each blob through SHA-512 over a
-/// SINGLE pinned fd (FIX-02 — opened once inside the verify pipeline, never
-/// re-opened by path for hashing) and applies the operator's `[signing]`
-/// posture:
+/// Runs the audit-vs-enforce gate over the generation. The verify streams each
+/// blob through SHA-512 over a SINGLE pinned fd (FIX-02 — opened once inside the
+/// verify pipeline, never re-opened by path for hashing) and applies the
+/// operator's `[signing]` posture:
 ///
-/// * **Proceed** — verification passed, OR audit mode (`signing.enable &&
-///   !enforce`) downgraded a failure to a warning. The boot continues.
-/// * **Refuse(cause)** — enforce mode rejected a bad/missing signature. We
-///   wrap `cause` in [`NmblError::PolicyRefused`] so the `run_tui_session`
-///   Err arm routes it to `policy::run_refuse_screen` →
-///   [`RebootIntoRescue`] (R-1). There is NO bypass and NO allow-unsigned
-///   branch here (FIX-04): the only relaxation is the gate's own audit mode.
+/// * **Proceed (verified)** — verification passed. Returns
+///   `Ok(Some(VerifiedGeneration))`: the kernel fd is kept open for the load,
+///   and the kernel+initrd digests are carried to the measure (no re-hash).
+/// * **Proceed (no pin)** — signing is disabled, OR audit mode (`signing.enable
+///   && !enforce`) downgraded a failure to a warning. Returns `Ok(None)`: there
+///   is no verified fd to pin, so the load falls back to open-by-path and the
+///   measure has no reused digest (an unverified/audit boot is not measured).
+/// * **Refuse(cause)** — enforce mode rejected a bad/missing signature. Returns
+///   `Err(PolicyRefused)` so the `run_tui_session` Err arm routes it to
+///   `policy::run_refuse_screen` → [`RebootIntoRescue`] (R-1). There is NO
+///   bypass and NO allow-unsigned branch here (FIX-04).
 ///
-/// When the `secure-boot` feature is off there are no signatures to check,
-/// so this is a no-op `Ok(())` — the feature being absent is the operator
-/// declining signature enforcement, decided at build time, not a runtime
-/// bypass of an enabled policy.
+/// When the `secure-boot` feature is off there are no signatures to check, so
+/// this is a no-op `Ok(None)` — the feature being absent is the operator
+/// declining signature enforcement at build time, not a runtime bypass.
 ///
 /// [`RebootIntoRescue`]: crate::terminal::TerminalAction::RebootIntoRescue
 #[cfg_attr(
@@ -174,26 +191,49 @@ struct Handoff {
         reason = "no-op verify when secure-boot is disabled at build time"
     )
 )]
-fn verify_generation_signature(config: &Config, generation: &Generation) -> Result<()> {
+fn verify_generation_signature(
+    config: &Config,
+    generation: &Generation,
+) -> Result<Option<VerifiedGeneration>> {
     #[cfg(feature = "secure-boot")]
     {
         use crate::error::NmblError;
-        use crate::sig::{PolicyDecision, ensure_generation_signed_gated};
+        use crate::sig::{VerifyPolicy, verify_generation_pinned};
 
-        match ensure_generation_signed_gated(config, generation) {
-            PolicyDecision::Proceed => Ok(()),
-            // Enforce-mode refusal: hand the cause to the shared refuse
-            // terminus via PolicyRefused. The `run_tui_session` Err arm
-            // (FIX-35) maps this to the non-interactive refuse countdown +
-            // RebootIntoRescue — NEVER the shell-offering emergency menu.
-            PolicyDecision::Refuse(cause) => Err(NmblError::PolicyRefused {
-                cause: Box::new(cause),
-            }),
+        // Signing disabled is the operator declining the feature: proceed with
+        // no pinned fd (the load opens by path, the boot is not measured).
+        if !config.signing.enable {
+            nmbl_info!("signature verification disabled (signing.enable = false); skipping gate");
+            return Ok(None);
+        }
+
+        match verify_generation_pinned(config, generation) {
+            // Verified: keep the pinned kernel fd + reused digests for
+            // measure+load.
+            Ok(verified) => Ok(Some(verified)),
+            // A verify failure: map through the audit-vs-enforce posture.
+            Err(err) => match VerifyPolicy::from_config(config) {
+                // Enforce: hand the cause to the shared refuse terminus via
+                // PolicyRefused. The `run_tui_session` Err arm (FIX-35) maps it
+                // to the non-interactive refuse countdown + RebootIntoRescue —
+                // NEVER the shell-offering emergency menu. Nothing is loaded.
+                VerifyPolicy::Enforce => Err(NmblError::PolicyRefused {
+                    cause: Box::new(err),
+                }),
+                // Audit (enable && !enforce, gated by allowAuditModeInsecure):
+                // the ONLY relaxation — warn and proceed unpinned + unmeasured.
+                VerifyPolicy::Audit => {
+                    nmbl_warn!(
+                        "signature AUDIT mode: verification failed but boot proceeds (insecure, unmeasured): {err}"
+                    );
+                    Ok(None)
+                }
+            },
         }
     }
     #[cfg(not(feature = "secure-boot"))]
     {
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -235,8 +275,11 @@ pub(crate) fn verify_measure_then_load(
     // fds, BEFORE the image is staged into the kexec slot (FIX-02). An
     // enforce-mode failure short-circuits here with PolicyRefused — no
     // load, no bypass (R-1/FIX-04). Audit mode warns inside the gate and
-    // returns Ok so the boot proceeds.
-    verify_generation_signature(config, generation)?;
+    // returns Ok(None) so the boot proceeds unpinned + unmeasured. On the
+    // secure-boot happy path we get back the PINNED kernel fd + reused
+    // kernel/initrd digests, threaded into measure (no re-hash) and load
+    // (no re-open) below (MED-1).
+    let verified: Option<VerifiedGeneration> = verify_generation_signature(config, generation)?;
 
     // Stage the NMBL log transcript into the next kernel's initramfs.
     // The byte ring lives in RAM and the current tmpfs at NMBL_LOG_PATH
@@ -275,26 +318,23 @@ pub(crate) fn verify_measure_then_load(
         );
     }
 
-    // #27 measure seam: (b) extend PCR-11 with the verified generation
-    // HERE — AFTER verify, BEFORE load (FIX-14). Wave-3's
-    // `tpm::measure::extend_handoff(config, generation, driver_images,
-    // &handoff.cmdline)` slots in at this point: it hashes the SAME kernel
-    // over a pinned fd and binds `handoff.cmdline` (the byte-exact buffer
-    // the load below consumes) into the measurement, so the value measured
-    // equals the value loaded. The extend is NOT implemented here (#20
-    // owns only verify+load); this seam reserves its exact position and the
-    // byte-identical cmdline it must measure.
+    // (b) #27 MEASURE: extend PCR-11 with the verified handoff HERE — AFTER
+    // verify, BEFORE load (FIX-14). The extend reuses the kernel+initrd
+    // digests the verify already streamed over the pinned fds (FIX-02 — no
+    // re-hash) and binds `handoff.cmdline` (the byte-exact buffer the load
+    // below consumes). Gated on the measure posture: a NO-OP when measuring
+    // is off; a measure failure on a measure-required build fails CLOSED
+    // (routes to refuse, never an unmeasured boot — FIX-27).
+    super::handoff_load::measure_handoff(config, generation, verified.as_ref(), &handoff.cmdline)?;
+
     let Handoff { cmdline } = handoff;
 
     // (c) LOAD the verified image with the SAME cmdline the seam carried
-    // (FIX-14): `&cmdline` here is the identical buffer measured above.
-    sys::kexec::load_with_extra_initrd_cpio(
-        &generation.kernel,
-        &generation.initrd,
-        fragment.as_slice(),
-        &cmdline,
-        0,
-    )?;
+    // (FIX-14) and — on the secure-boot path — the SAME pinned kernel fd
+    // that was verified and measured (FIX-02 / MED-1), so the loaded kernel
+    // is byte-identical to the verified+measured one. When there is no
+    // verified fd (non-secure-boot / audit), the loader opens by path.
+    super::handoff_load::load_handoff(generation, verified, fragment.as_slice(), &cmdline)?;
     Ok(cmdline)
 }
 
