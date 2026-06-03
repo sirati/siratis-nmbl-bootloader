@@ -79,6 +79,11 @@ ENROLL_WATCH="${NMBL_ENROLL_WATCH:-180}"
 LUKS_DEV="${NMBL_LUKS_DEV:-/dev/disk/by-partlabel/disk-main-luks}"
 ENROLL_PCRS="${NMBL_ENROLL_PCRS:-11+7}"
 
+# The fixed install LUKS passphrase (disko-luks-password.nix). It answers NMBL
+# stage-0's luks-password modal on the phase-1 enroll boot AND feeds
+# systemd-cryptenroll the existing keyslot so the seal can be added.
+ENROLL_PASSPHRASE="${NMBL_LUKS_PASSPHRASE:-test}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib.sh
 . "${SCRIPT_DIR}/lib.sh"
@@ -97,6 +102,24 @@ RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nmbl-sb-tpm.XXXXXX")"
 # it at cleanup (rm -rf "$RUN_DIR").
 export NMBL_SWTPM_STATE="${RUN_DIR}/swtpm-state-shared"
 
+# Best-effort dump of the VM's serial scrollback so a FAILED boot shows WHERE it
+# stalled (firmware? NMBL verify? the passphrase modal? the post-kexec system?).
+# Never let the dump itself error the script — the manager/socket may already be
+# gone, in which case we simply note that and move on.
+dump_serial_history() {
+  echo "=== VM serial history (best-effort diagnostic) ===" >&2
+  local -a sock_args
+  _socket_args sock_args
+  if vm-serial-man tail 400 "${sock_args[@]}" >&2 2>/dev/null; then
+    :
+  elif vm-serial-man lines 1 400 "${sock_args[@]}" >&2 2>/dev/null; then
+    :
+  else
+    echo "(no VM serial history available — manager socket gone or empty)" >&2
+  fi
+  echo "=== end VM serial history ===" >&2
+}
+
 stop_vm() {
   vm-serial-man stop >/dev/null 2>&1 || true
   for s in "${CONFIG_NAME}" "${ENROLL_CONFIG_NAME}"; do
@@ -108,6 +131,9 @@ stop_vm() {
 
 cleanup() {
   local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    dump_serial_history || true
+  fi
   echo "=== cleanup ===" >&2
   stop_vm
   rm -rf "${RUN_DIR}" >/dev/null 2>&1 || true
@@ -136,31 +162,48 @@ if ! "$ENROLL_RUNNER"; then
 fi
 
 # NMBL's stage-1 luks-password activation shows a passphrase modal; type the
-# fixed install passphrase ("test") so the enroll twin unlocks cryptroot and
-# kexecs. Retry a few times so we don't race the modal's appearance. The
+# fixed install passphrase so the enroll twin unlocks cryptroot and kexecs. The
 # system initrd then unlocks from the injected key (passToStage1), not a
 # prompt, so this is the only passphrase entry on the enroll boot.
-echo "=== feeding the enroll-boot LUKS passphrase ===" >&2
-if wait_for "$PASSWORD_PROMPT_RE" 90; then
-  for _ in 1 2 3; do
-    send_cmd "test"
-    if wait_for "$TPM_PRESENT_RE|kexec|root@" 20; then
-      break
-    fi
-  done
+#
+# WHY WE TYPE BLIND (no wait-for-prompt gate): NMBL's passphrase modal is a
+# full-screen ratatui repaint that is NOT newline-terminated. vm-serial-man's
+# history is built by `read_line` (splits on '\n'), so while NMBL sits on the
+# modal awaiting input the un-terminated frame never flushes to the buffer —
+# `wait_for`/`seen_in_history` for the modal text can hang/miss even though the
+# box is on screen. So we do what an operator does: give the boot a head-start
+# to reach the LUKS stage, then type the passphrase + Enter on a fixed cadence
+# until the enroll system actually boots. `send_cmd` appends the newline, so
+# each attempt submits. Extra Enters on an already-unlocked system are harmless
+# (blank shell prompts). The post-kexec markers we wait on ARE newline-
+# terminated and flush normally.
+echo "=== feeding the enroll-boot LUKS passphrase (blind) ===" >&2
+# A short head-start so the firmware → NMBL → activation path can paint the
+# modal before the first keystroke (typing into a pre-modal console is a no-op).
+sleep 10
+# Informational only (never gates the typing): if the modal text DID flush to
+# history, note it — helps a reader correlate the keystroke with the prompt.
+if seen_in_history "$PASSWORD_PROMPT_RE"; then
+  echo "=== luks-password modal text seen in history; answering ===" >&2
 fi
+send_cmd "$ENROLL_PASSPHRASE"
 
 # The passphrase-unlock twin must reach the booted system so we can enroll.
+# Re-type the passphrase periodically (BLIND — the modal may never flush, see
+# above) in case the first attempt raced the modal's appearance.
 echo "=== waiting up to ${SHELL_TIMEOUT}s for the enroll system shell ===" >&2
 booted=false
+i=0
 for _ in $(seq 1 "$((SHELL_TIMEOUT / 5))"); do
   if seen_in_history "root@${ENROLL_CONFIG_NAME}|root@${CONFIG_NAME}"; then
     booted=true
     break
   fi
-  # Re-feed the passphrase if the modal is still up (slow appearance).
-  if seen_in_history "$PASSWORD_PROMPT_RE" && ! seen_in_history "kexec|root@"; then
-    send_cmd "test"
+  # Re-feed the passphrase every ~15s until a kexec/boot marker appears, so a
+  # slow/late modal still gets answered without gating on the unseeable frame.
+  i=$((i + 1))
+  if [ $((i % 3)) -eq 0 ] && ! seen_in_history "kexec|root@"; then
+    send_cmd "$ENROLL_PASSPHRASE"
   fi
   sleep 5
 done
@@ -177,8 +220,8 @@ if ! wait_for "NMBL_ENROLL_SHELL_READY" 20; then
 fi
 echo "=== running nmbl-tpm-enroll (seal LUKS key to PCRs ${ENROLL_PCRS}) ===" >&2
 # PASSWORD env feeds the existing passphrase non-interactively to
-# systemd-cryptenroll (the install passphrase is the fixed test value "test").
-send_cmd "PASSWORD=test nmbl-tpm-enroll --device ${LUKS_DEV} --pcrs ${ENROLL_PCRS}"
+# systemd-cryptenroll (the fixed install passphrase, same as the modal answer).
+send_cmd "PASSWORD=${ENROLL_PASSPHRASE} nmbl-tpm-enroll --device ${LUKS_DEV} --pcrs ${ENROLL_PCRS}"
 if ! wait_for "$ENROLL_OK_RE" "$ENROLL_WATCH"; then
   echo "FAIL: nmbl-tpm-enroll did not report a sealed systemd-tpm2 token" >&2
   exit 1
