@@ -13,14 +13,39 @@ mod manager;
 mod protocol;
 
 use clap::Parser;
-use cli::{BootModeArgs, Cli, Commands, DisplayArg};
-use manager::{screenshot, BootMode, Display};
+use cli::{BootModeArgs, Cli, Commands, DisplayArg, ManagerConfig, TpmKindArg};
+use manager::{screenshot, BootMode, Display, SecureBoot, TpmConfig, TpmKind};
 
 fn display_from_arg(arg: DisplayArg) -> Display {
     match arg {
         DisplayArg::Serial => Display::Serial,
         DisplayArg::Sdl => Display::Sdl,
         DisplayArg::Vnc { port } => Display::Vnc { port },
+    }
+}
+
+/// Build the optional [`TpmConfig`] from the manager flags: `Some` iff
+/// `--tpm <statedir>` was given.
+fn tpm_from_config(config: &ManagerConfig) -> Option<TpmConfig> {
+    config.tpm.clone().map(|state_dir| TpmConfig {
+        kind: match config.tpm_kind {
+            TpmKindArg::Tis => TpmKind::Tis,
+            TpmKindArg::Crb => TpmKind::Crb,
+        },
+        state_dir,
+    })
+}
+
+/// Build the optional [`SecureBoot`] from the manager flags: `Some` iff both
+/// `--sb-code` and `--sb-vars` were given (clap's `requires` keeps them
+/// paired).
+fn secure_boot_from_config(config: &ManagerConfig) -> Option<SecureBoot> {
+    match (&config.sb_code, &config.sb_vars) {
+        (Some(code), Some(vars)) => Some(SecureBoot {
+            code: code.clone(),
+            vars: vars.clone(),
+        }),
+        _ => None,
     }
 }
 
@@ -53,6 +78,8 @@ async fn main() -> Result<()> {
                 },
             };
             let display = display_from_arg(config.display);
+            let tpm = tpm_from_config(&config);
+            let secure_boot = secure_boot_from_config(&config);
             manager::run_manager(
                 config.name,
                 config.disk,
@@ -63,6 +90,8 @@ async fn main() -> Result<()> {
                 config.buffer_lines,
                 config.buffer_seconds,
                 display,
+                tpm,
+                secure_boot,
             )
             .await
         }

@@ -148,6 +148,19 @@ pub(super) async fn run_luks_with_spinner<S: ExecOps>(
     Ok(outcome)
 }
 
+/// Divert a wrong-password recovery-shell request when the seal fails
+/// (FIX-27): never open a shell over a still-uncapped PCR or a live
+/// TPM-unsealed mapper. We fail closed to [`WrongPasswordHandled::Reboot`]
+/// (the caller turns it into `OperatorChoseReboot`, exiting the boot
+/// non-interactively). The PCR was already capped by the seal attempt.
+fn refuse_wrong_password_shell(err: crate::policy::SealFailed) -> WrongPasswordHandled {
+    crate::nmbl_warn!(
+        "seal-on-rescue failed during wrong-password recovery; refusing shell: {}",
+        crate::error::format_chain(err.cause() as &dyn std::error::Error)
+    );
+    WrongPasswordHandled::Reboot
+}
+
 /// Render the wrong-password modal, dispatch on the operator's choice,
 /// and — for the shell branches — drive the chosen in-process shell
 /// session. Returns when the operator's choice has been fully
@@ -157,6 +170,7 @@ pub(super) async fn handle_wrong_password(
     console: &mut dyn Console,
     _activation: &Activation,
     attempt: u32,
+    sender: &crate::sys::poller::LocalSender,
 ) -> Result<WrongPasswordHandled> {
     use crate::ui::{WrongPasswordOutcome, show_wrong_password_modal};
 
@@ -165,12 +179,19 @@ pub(super) async fn handle_wrong_password(
         WrongPasswordOutcome::Reboot => Ok(WrongPasswordHandled::Reboot),
         #[cfg(feature = "pretty-shell")]
         WrongPasswordOutcome::PrettyShell => {
-            // This path has no poller `sender` in scope; the shell spawn is
-            // sync and never touches the sender, so a sender-less `RealSys`
-            // satisfies the `ExecOps::spawn_shell` route safely.
+            // SEAL BEFORE SPAWN: a wrong-password recovery shell is reached
+            // while an EARLIER luks-tpm mapper may still be live, so cap +
+            // close-mappers first. A seal failure refuses the shell.
+            let sealed = match crate::policy::seal_secrets(config.tpm.require_tpm, sender).await {
+                Ok(s) => s,
+                Err(e) => return Ok(refuse_wrong_password_shell(e)),
+            };
+            // The shell spawn routes through the `ExecOps::spawn_shell` seam;
+            // this path has no poller `sender` for that route, but the spawn is
+            // sync and never touches it, so a sender-less `RealSys` satisfies it.
             let mut ops = crate::sys::ops::RealSys::sync_only();
             if let Err(e) =
-                crate::ui::pretty_shell::run_pretty_shell(&mut ops, console, config).await
+                crate::ui::pretty_shell::run_pretty_shell(sealed, &mut ops, console, config).await
             {
                 let chain = crate::error::format_chain(&e as &dyn std::error::Error);
                 crate::nmbl_warn!("wrong-password pretty-shell failed: {chain}");
@@ -185,12 +206,19 @@ pub(super) async fn handle_wrong_password(
             Ok(WrongPasswordHandled::ShellExited)
         }
         WrongPasswordOutcome::RawShell => {
+            // SEAL BEFORE SPAWN (see the PrettyShell arm above).
+            let sealed = match crate::policy::seal_secrets(config.tpm.require_tpm, sender).await {
+                Ok(s) => s,
+                Err(e) => return Ok(refuse_wrong_password_shell(e)),
+            };
             // Console-picker + multiplexed busybox PTY (overlap) or
             // fire-and-forget (no overlap). Errors are surfaced via a
             // modal-error so the wrong-password flow doesn't crash the
             // boot — we still want the operator to be able to retry.
             let mut ops = crate::sys::ops::RealSys::sync_only();
-            match crate::ui::console_picker::run_picker_session(&mut ops, console, config).await {
+            match crate::ui::console_picker::run_picker_session(sealed, &mut ops, console, config)
+                .await
+            {
                 Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached { targets }) => {
                     let joined = targets
                         .iter()

@@ -28,6 +28,14 @@
   # script: building the bootloader thus BUILDS the gate, failing the build
   # on an incomplete initramfs before the install-time check ever runs.
   nmblInitrmCheck,
+  # Install-time driver-image staging + `nmbl-sign` signing shell (#25a).
+  # Empty string when no driver images are enabled (default keeps older
+  # callers evaluable).
+  driverImageInstallShell ? "",
+  # The host-platform `nmbl-sign` ML-DSA signer (flake `_module.args.nmblSign`).
+  # Threaded into install-signing.nix for per-generation signing; `null` on an
+  # older host flake (only dereferenced when signing is enabled).
+  nmblSign ? null,
 }:
 
 let
@@ -221,6 +229,12 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     ''
   )}
 
+  # Optional signed driver-image squashfs blobs (#25a). Each is staged onto
+  # the ESP and signed in place with `nmbl-sign --domain driver-image`
+  # (impure ML-DSA key read at install time). Empty string when no driver
+  # images are enabled.
+  ${driverImageInstallShell}
+
   ${lib.optionalString (cfg.splash.enable && cfg.splash.backgroundLocation == "boot-partition") (
     let
       # Splash background sidecar mode: the PNG is NOT embedded in the
@@ -391,59 +405,38 @@ pkgs.writeScript "install-nmbl-bootloader" ''
         echo "✓ systemd-boot bootloader installed"
   ''}
 
-  ${lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "efi-stub") ''
-    # UEFI direct boot. The ESP holds a single NMBL UKI PE (kernel + initrd
-    # embedded; systemd-stub passes the .initrd section to the kernel). No
-    # separate nmbl-kernel/nmbl-initrd files (those copies are skipped above
-    # in this mode).
-    #
-    # Install target = loader_extra_args.efiStubInstallPath:
-    #   * default EFI/BOOT/BOOTX64.EFI — the firmware removable/fallback path,
-    #     auto-booted with no NVRAM entry (dedicated NMBL disk or a manually
-    #     uploaded image; this is what stardust/live-usb use).
-    #   * an own path e.g. EFI/nmbl/nmbl.efi — installs ALONGSIDE another
-    #     bootloader (GRUB) without touching its fallback binary, and a UEFI
-    #     NVRAM entry "NMBL" (first in BootOrder) is registered so firmware
-    #     boots it. GRUB's own NVRAM entry is left intact.
-    echo "Installing NMBL UKI (UEFI efi-stub mode) to /boot/${efiStubInstallPath}..."
-    mkdir -p /boot/${efiStubDir}
-    cp -f ${nmblUki} /boot/${efiStubInstallPath}
-    echo "✓ NMBL UKI installed at /boot/${efiStubInstallPath}"
-
-    ${lib.optionalString (!efiStubIsFallback) (
-      if efiStubCanTouchEfi then ''
-        # Own (non-fallback) path: firmware won't auto-boot it, so register a
-        # NVRAM boot entry. Derive the ESP disk + partition number from the
-        # mounted /boot, drop any stale "NMBL" entries (idempotent re-install),
-        # then create a fresh one — efibootmgr puts new entries first in
-        # BootOrder, leaving GRUB's entry as the fallback choice.
-        echo "Registering UEFI NVRAM boot entry for NMBL..."
-        ESP_DEV=$(${pkgs.util-linux}/bin/findmnt -n -o SOURCE --target /boot)
-        ESP_DISK=/dev/$(${pkgs.util-linux}/bin/lsblk -no PKNAME "$ESP_DEV")
-        ESP_PART=$(cat /sys/class/block/$(basename "$ESP_DEV")/partition 2>/dev/null || echo "")
-        if [ -b "$ESP_DISK" ] && [ -n "$ESP_PART" ]; then
-          for n in $(${pkgs.efibootmgr}/bin/efibootmgr | ${pkgs.gnused}/bin/sed -nE 's/^Boot([0-9A-Fa-f]{4})\*? NMBL$/\1/p'); do
-            ${pkgs.efibootmgr}/bin/efibootmgr -b "$n" -B || true
-          done
-          ${pkgs.efibootmgr}/bin/efibootmgr --create --disk "$ESP_DISK" --part "$ESP_PART" \
-            --label NMBL --loader '${efiStubLoaderBackslash}' --unicode \
-            || echo "WARNING: efibootmgr failed to create the NMBL boot entry; add it manually."
-          echo "✓ NVRAM boot entry 'NMBL' -> ${efiStubLoaderBackslash} ($ESP_DISK part $ESP_PART)"
-        else
-          echo "WARNING: could not resolve ESP disk/partition from /boot (source: $ESP_DEV)."
-          echo "         Add the NMBL boot entry manually:"
-          echo "           efibootmgr -c -d <ESP-disk> -p <part#> -L NMBL -l '${efiStubLoaderBackslash}'"
-        fi
-      '' else ''
-        # Own path but canTouchEfiVariables = false: NVRAM is left untouched.
-        # The UKI exists but firmware will NOT auto-boot it (only the fallback
-        # path is auto-booted). Add a UEFI boot entry by hand.
-        echo "NOTE: NMBL UKI installed at an own path but canTouchEfiVariables = false."
-        echo "      Firmware will NOT auto-boot it. Add a UEFI boot entry manually:"
-        echo "        efibootmgr -c -d <ESP-disk> -p <ESP-part#> -L NMBL -l '${efiStubLoaderBackslash}'"
-      ''
-    )}
-  ''}
+  ${import ./install-signing.nix {
+    inherit
+      lib
+      pkgs
+      config
+      bootstrapper
+      actualLoader
+      actualLoaderExtraArgs
+      nmblUki
+      nmblSign
+      ;
+    # Install-time UKI Secure-Boot signing policy. `cfg.signing` may be the
+    # bare skeleton on builds without the security slice; read with `or`
+    # defaults so non-secure-boot configs keep installing the unsigned PE.
+    ukiSigning =
+      let u = cfg.signing.uki or { };
+      in {
+        enable = u.enable or false;
+        keyFile = u.keyFile or null;
+        certFile = u.certFile or null;
+        refuseInstallIfNotEnforcing = u.refuseInstallIfNotEnforcing or false;
+      };
+    # Install-time per-generation ML-DSA signing policy. Same `or`-default
+    # posture so non-secure-boot configs keep installing without signing.
+    genSigning =
+      let s = cfg.signing or { };
+      in {
+        enable = s.enable or false;
+        keyFile = s.generationKeyFile or null;
+        sigPathSuffix = s.sigPathSuffix or ".sig";
+      };
+  }}
 
   # Create /init symlink for NixOS stage-1
   # After kexec, the NixOS kernel's stage-1 will look for /init (or /sbin/init)

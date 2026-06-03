@@ -5,12 +5,21 @@ use serde::Deserialize;
 use crate::error::{NmblError, Result};
 
 pub(crate) mod bootstrap;
+mod driver_image;
 mod entries;
+mod fragment;
 mod general;
 mod paths;
 mod rescue_cfg;
+#[cfg(feature = "secure-boot")]
+mod secure_boot;
+#[cfg(feature = "secure-boot")]
+mod signing;
 mod splash;
+#[cfg(feature = "staged-boot")]
+mod staged;
 mod stateful_cfg;
+mod tpm;
 mod tui;
 
 #[cfg(test)]
@@ -22,23 +31,39 @@ mod tui;
 )]
 mod tests;
 
+#[cfg(feature = "staged-boot")]
+pub use bootstrap::BootstrapStaged;
 pub use bootstrap::{
     BootstrapBootFs, BootstrapConfig, BootstrapKernelModules, BootstrapRescue, BootstrapSection,
     BootstrapStateMount, resolve_full_config_path,
 };
+pub use driver_image::{DriverImageSpec, DriverImagesConfig};
 pub use entries::{Activation, ActivationKind, FilesystemEntry};
 pub use general::{General, KernelModules};
 pub use paths::Paths;
 pub use rescue_cfg::{EmergencyShellConfig, RescueConfig};
+pub use tpm::{SealedSecret, TpmConfig};
 pub use tui::Tui;
+
+#[cfg(feature = "secure-boot")]
+pub use secure_boot::{PriorityVolume, SecureBootConfig};
+
+#[cfg(feature = "secure-boot")]
+pub use signing::{SigningConfig, UkiSigningConfig};
 
 #[cfg(feature = "image-splash")]
 pub use splash::{Splash, SplashBackgroundLocation};
 
+#[cfg(feature = "staged-boot")]
+pub use fragment::{ConfigFragment, load_fragment};
+
+#[cfg(feature = "staged-boot")]
+pub use staged::StagedConfig;
+
 #[cfg(feature = "stateful")]
 pub use stateful_cfg::StatefulConfig;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
@@ -77,6 +102,59 @@ pub struct Config {
     #[cfg(feature = "stateful")]
     #[serde(default)]
     pub stateful: Option<StatefulConfig>,
+
+    // ───────────────────── secure/staged-boot config anchor ─────────────────
+    // INSERTION ANCHOR (FIX-60): the F1 security slices add their config
+    // tables here, each a `#[serde(default)] pub <name>: <Cfg>,` line gated
+    // as applicable. Inserting at this marker keeps the parallel slices from
+    // colliding on the struct-field list. Add the matching default in
+    // `recovery_default()` at its twin anchor.
+    //   #6  signing : #[cfg(feature="secure-boot")] pub signing: SigningConfig,
+    //   #7  tpm     : pub tpm: TpmConfig,            (always-compiled — FIX-09)
+    //   #8  driver  : pub driver_images: DriverImageConfig,
+    //   #9  staged  : #[cfg(feature="staged-boot")] pub staged: Option<StagedConfig>,
+    //   #10 secureB : #[cfg(feature="secure-boot")] pub secure_boot: SecureBootConfig,
+    // ─────────────────────────────────────────────────────────────────────────
+    /// `[driver_images]` group (#8): verified out-of-tree driver squashfs
+    /// blobs NMBL loop-mounts and `finit_module`s before kexec. Always
+    /// compiled; the Nix side rejects `enable = true` without an active
+    /// secure-boot table (FIX-05) so an unverified image is never honoured.
+    #[serde(default)]
+    pub driver_images: DriverImagesConfig,
+
+    /// `[tpm]` measured-boot config (#7). ALWAYS compiled (FIX-09): the
+    /// knobs live in the base schema regardless of the `secure-boot`
+    /// feature, so a `[tpm]` table parses on every build.
+    #[serde(default)]
+    pub tpm: TpmConfig,
+
+    /// `[signing]` table — signature-enforcement POLICY (secure-boot
+    /// builds only). Carries enforcement posture only; the trust-anchor
+    /// public keys are baked into the binary, never parsed from TOML
+    /// (R-5/FIX-04). See [`SigningConfig`].
+    #[cfg(feature = "secure-boot")]
+    #[serde(default)]
+    pub signing: SigningConfig,
+
+    /// `[secure_boot]` table (#10) — the top-level secure-boot policy:
+    /// the ONE [`PriorityVolume`] concept (R-3), the refuse-screen
+    /// countdown, the rescue sentinel, and the enforcement/TPM posture.
+    /// Secure-boot builds only; the Nix emit gate is `secureBootActive`
+    /// (FIX-16), so a feature-free binary never receives a `[secure_boot]`
+    /// table its `deny_unknown_fields` parser would reject.
+    #[cfg(feature = "secure-boot")]
+    #[serde(default)]
+    pub secure_boot: SecureBootConfig,
+
+    /// Top-level `[staged]` table naming the priority-volume image plus
+    /// the signed config fragment + signature paths within it. Absent in
+    /// non-staged builds and in staged builds whose Nix config did not
+    /// enable `boot.nmbl.staged.enable`; the Nix emit gate is the same
+    /// `staged-boot` boolean as this `#[cfg]` (FIX-40), so a build without
+    /// the feature never receives a `[staged]` table it cannot parse.
+    #[cfg(feature = "staged-boot")]
+    #[serde(default)]
+    pub staged: Option<StagedConfig>,
 
     /// Populated by Phase 0.5 with the runtime mountpoint of the boot
     /// partition. `None` in legacy embedded-config mode. Never parsed
@@ -205,16 +283,25 @@ impl Config {
         Ok(())
     }
 
+    /// Parse a raw TOML string into a `Config`, WITHOUT the `validate()`
+    /// pass or any I/O. Factored out of [`Config::load`] so the same parse
+    /// step can be reused (e.g. by the staged-boot fragment loader, which
+    /// shares this `deny_unknown_fields` decode but layers its own merge).
+    /// `path` is carried only for the [`NmblError::Config`] diagnostic.
+    pub fn parse_toml(text: &str, path: &Path) -> Result<Config> {
+        toml::from_str(text).map_err(|source| NmblError::Config {
+            source,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path).map_err(|source| NmblError::Io {
             source,
             context: format!("reading config file {}", path.display()),
         })?;
 
-        let config: Config = toml::from_str(&text).map_err(|source| NmblError::Config {
-            source,
-            path: path.to_path_buf(),
-        })?;
+        let config = Config::parse_toml(&text, path)?;
 
         config.validate()?;
         Ok(config)
@@ -239,6 +326,30 @@ impl Config {
             emergency_shell: EmergencyShellConfig::default(),
             #[cfg(feature = "stateful")]
             stateful: None,
+            // ───────────── secure/staged-boot recovery_default anchor ─────────
+            // INSERTION ANCHOR (FIX-60): twin of the struct-field anchor. Each
+            // F1 security slice adds its field default here (e.g.
+            // `signing: SigningConfig::default(),`), gated to match its
+            // struct field. recovery_default must stay strict-shape (FIX-53):
+            // reaching recovery never relaxes the security posture.
+            // ──────────────────────────────────────────────────────────────────
+            driver_images: DriverImagesConfig::default(),
+            tpm: TpmConfig::default(),
+            // signing: enforce stays false in recovery (audit-neutral); the
+            // baked keys are unaffected, and reaching recovery never relaxes
+            // the cap/seal posture (FIX-53/FIX-04).
+            #[cfg(feature = "secure-boot")]
+            signing: SigningConfig::default(),
+            // secure_boot: default is disabled/audit-neutral — reaching
+            // recovery never relaxes the cap/seal posture (FIX-53). The
+            // priority gate is skipped (`enable = false`) but the sentinel
+            // path and countdown stay at their single-sourced defaults.
+            #[cfg(feature = "secure-boot")]
+            secure_boot: SecureBootConfig::default(),
+            // Recovery never self-mounts a staged fragment: `None` keeps
+            // the loader on the verified base config only (FIX-53).
+            #[cfg(feature = "staged-boot")]
+            staged: None,
             runtime_boot_mountpoint: None,
             #[cfg(feature = "stateful")]
             runtime_state_mountpoint: None,

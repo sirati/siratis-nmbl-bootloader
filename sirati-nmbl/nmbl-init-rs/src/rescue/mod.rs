@@ -22,6 +22,11 @@ pub mod child;
 pub mod disk;
 #[cfg(feature = "network-rescue")]
 pub mod net;
+// External-rescue squashfs signature verification (#21, R-1). Secure-boot
+// gated: a feature-free binary performs no rescue-image verification (the
+// legacy behaviour), and `config.signing` only exists under `secure-boot`.
+#[cfg(feature = "secure-boot")]
+pub mod verify;
 
 mod embedded;
 mod locate;
@@ -61,6 +66,21 @@ pub fn dispatch(
     console: Box<dyn Console>,
     cause: NmblError,
 ) -> Result<TerminalAction> {
+    // SEAL ON ENTRY (G4): every rescue mode hands the operator an
+    // interactive context (embedded `execve` into a shell, or a chrooted
+    // rescue system), so cap the lock PCR + close every TPM-unsealed
+    // mapper FIRST. This is the authoritative sentinel-seal point. A seal
+    // failure refuses all rescue interactivity — drop the console and route
+    // through the refuse terminus (M1): best-effort relock + sentinel +
+    // reboot into rescue, no shell. Runs blocking: `dispatch` is
+    // synchronous and (for the External arm) builds its own runtime.
+    if let Err(seal_err) = crate::policy::seal_secrets_blocking(config.tpm.require_tpm) {
+        drop(console);
+        return Ok(crate::policy::refuse_unsigned_blocking(
+            config,
+            seal_err.into_cause(),
+        ));
+    }
     // `console` is owned by this function and drops by normal scope
     // exit before the dispatcher in `main` fires any syscall. The
     // External arm threads it down into `dispatch_external` for the
@@ -81,6 +101,19 @@ fn dispatch_external(
     console: Box<dyn Console>,
     cause: NmblError,
 ) -> Result<TerminalAction> {
+    // Phase 0 (#21, R-1): VERIFY the on-disk rescue squashfs signature BEFORE
+    // it is loop-mounted/entered. A tampered or unsigned image must NEVER be
+    // entered: under enforcement a bad/missing/wrong-key signature is a refuse,
+    // NOT a silent halt and NOT a mount. Drop the console and route the cause
+    // through the SHARED `refuse_unsigned` terminus (cap → close-mappers →
+    // sentinel → relock → RebootIntoRescue). Audit mode warns + proceeds; the
+    // gate is `secure-boot`-only, so a feature-free build verifies nothing.
+    #[cfg(feature = "secure-boot")]
+    if let crate::sig::PolicyDecision::Refuse(sig_cause) = verify::verify_rescue_sfs_gated(config) {
+        drop(console);
+        return Ok(crate::policy::refuse_unsigned_blocking(config, sig_cause));
+    }
+
     // Phase 1: mount the rescue squashfs as a writable overlay. We hold
     // onto the console across this call so a mount failure can fall
     // through to the network-rescue UI without re-opening /dev/console.

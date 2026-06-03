@@ -46,10 +46,17 @@ pub enum PickerSessionOutcome {
 /// NMBL stays at PID 1 throughout. This is the deliberate departure
 /// from the legacy `EmergencyChoice::RawShell` -> execve path.
 pub async fn run_picker_session<E: ExecOps>(
+    sealed: crate::policy::Sealed,
     ops: &mut E,
     console: &mut dyn Console,
     config: &Config,
 ) -> Result<PickerSessionOutcome> {
+    // `sealed` is the unforgeable proof that `policy::seal_secrets` ran
+    // (lock PCR capped, TPM-unsealed mappers closed) BEFORE this fork/exec
+    // waist. Holding it by value here is what makes "no shell without a
+    // seal" a compile-time guarantee (re-audit C-1); we thread it down
+    // into both the overlap relay and the fire-and-forget spawn so the
+    // real `spawn_shell`/`spawn_shell_on_tty` waists demand it by type.
     let mut state = PickerState::build(config)?;
     if state.candidates.is_empty() {
         return Ok(PickerSessionOutcome::Cancelled);
@@ -61,19 +68,43 @@ pub async fn run_picker_session<E: ExecOps>(
         Some(PickerOutcome::Cancel) | None => return Ok(PickerSessionOutcome::Cancelled),
     };
     let display_target = display_target_for(console);
-    // The relay (overlap) branch routes the shell spawn through
-    // `ops.spawn_shell`; the fire-and-forget (no-overlap) branch uses
-    // `spawn_shell_on_tty`, which is not part of `ExecOps` and builds its
-    // own sync-only `FsOps` for the pre-fork presence check. The decision
-    // is the pure [`display_overlaps_targets`] predicate (directly
-    // unit-tested); the two arms below are trivial wrappers around the
-    // already-tested relay / fire-and-forget helpers.
-    if display_overlaps_targets(&display_target, &targets) {
-        crate::ui::console_relay::run_relay(ops, console, config, &targets, &display_target)
+    dispatch_spawn(sealed, ops, console, config, targets, &display_target).await
+}
+
+/// Post-commit dispatch: given the operator's spawn set and the
+/// picker's authoritative display-target path, route into either the
+/// relay loop (display overlap) or the fire-and-forget spawn (no
+/// overlap).
+///
+/// The relay (overlap) branch routes the shell spawn through the
+/// `ExecOps::spawn_shell` seam (so a dry-run can no-op it); the
+/// fire-and-forget (no-overlap) branch uses `spawn_shell_on_tty`, which is
+/// not part of `ExecOps` and builds its own sync-only `FsOps` for the
+/// pre-fork presence check. Both arms carry the `sealed` witness so the
+/// real fork/execve waist demands the seal by type (C-1). The decision is
+/// the pure [`display_overlaps_targets`] predicate (directly unit-tested).
+///
+/// The picker is the ONLY source of truth for `display_target`; this helper
+/// never re-derives it. See [`run_relay`]'s doc-comment for the historical
+/// bug that motivated this contract.
+///
+/// [`run_relay`]: crate::ui::console_relay::run_relay
+pub(super) async fn dispatch_spawn<E: ExecOps>(
+    sealed: crate::policy::Sealed,
+    ops: &mut E,
+    console: &mut dyn Console,
+    config: &Config,
+    targets: Vec<PathBuf>,
+    display_target: &Path,
+) -> Result<PickerSessionOutcome> {
+    if display_overlaps_targets(display_target, &targets) {
+        // The relay (overlap path) is async — it suspends the console,
+        // pumps the PTY relay loop, then resumes.
+        crate::ui::console_relay::run_relay(sealed, ops, console, config, &targets, display_target)
             .await?;
         Ok(PickerSessionOutcome::ShellRan)
     } else {
-        fire_and_forget_spawn(config, &targets)?;
+        fire_and_forget_spawn(sealed, config, &targets)?;
         Ok(PickerSessionOutcome::ShellDetached { targets })
     }
 }
@@ -102,14 +133,21 @@ pub(super) fn display_target_for(console: &dyn Console) -> PathBuf {
 /// Errors are logged but never propagated — the picker's caller still
 /// surfaces a success modal so the operator knows the spawn was
 /// attempted.
-fn fire_and_forget_spawn(config: &Config, targets: &[PathBuf]) -> Result<()> {
+fn fire_and_forget_spawn(
+    sealed: crate::policy::Sealed,
+    config: &Config,
+    targets: &[PathBuf],
+) -> Result<()> {
     // `spawn_shell_on_tty` is fire-and-forget and not part of `ExecOps`;
     // its only pre-fork fs work is the shell-presence preflight, which a
     // sender-less `RealSys` satisfies (the preflight is sync and never
-    // touches the poller). The fork/exec stays a genuine syscall.
+    // touches the poller). The `sealed` witness (threaded from
+    // `run_picker_session`) is required by type, so this fork cannot happen
+    // before the seal capped the PCR + closed every mapper. The fork/exec
+    // stays a genuine syscall.
     let fs = crate::sys::ops::RealSys::sync_only();
     for t in targets {
-        match crate::sys::pty::spawn_shell_on_tty(&fs, &config.paths.shell, t) {
+        match crate::sys::pty::spawn_shell_on_tty(&fs, sealed, &config.paths.shell, t) {
             Ok(_) => {}
             Err(e) => {
                 nmbl_warn!(

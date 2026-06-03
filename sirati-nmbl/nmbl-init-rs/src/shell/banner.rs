@@ -113,6 +113,10 @@ pub(super) fn suggested_action(err: &NmblError) -> String {
         NmblError::Rescue { stage, .. } => {
             format!("Rescue stage '{stage}' failed; check the rescue squashfs/network state.")
         }
+        NmblError::DriverImage { stage, .. } => format!(
+            "Driver-image stage '{stage}' failed; check the signed driver squashfs and its \
+             signature on the boot partition."
+        ),
         NmblError::Panicked { report_path } => format!(
             "Recovered from a panic; report at {}.",
             report_path.display()
@@ -138,6 +142,18 @@ pub(super) fn suggested_action(err: &NmblError) -> String {
         NmblError::DryRunShellPreflight => {
             "Dry-run shell preflight completed without forking — informational only.".to_string()
         }
+        NmblError::Signature { stage, detail } => format!(
+            "Signature verification failed at {stage}: {detail}. The image is unsigned, \
+             tampered, or signed by a non-baked key — boot refused."
+        ),
+        NmblError::TpmProto { context, reason } => format!(
+            "TPM operation '{context}' failed: {reason}. The lock PCR could not be \
+             confirmed capped; the boot fails closed."
+        ),
+        NmblError::PolicyRefused { cause } => format!(
+            "Boot refused by secure-boot policy ({cause}). The TPM is locked and the \
+             system reboots into rescue; fix the image or signature and reboot."
+        ),
     }
 }
 

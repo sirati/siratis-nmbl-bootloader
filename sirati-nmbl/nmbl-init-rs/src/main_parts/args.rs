@@ -9,6 +9,12 @@ pub(super) struct Args {
     pub(super) config_path: PathBuf,
     pub(super) errored_report: Option<PathBuf>,
     pub(super) validate_config: Option<PathBuf>,
+    /// `--validate-config-fragment=<toml>`: installer-side load+parse of a
+    /// staged-boot config fragment (a partial overlay). Mirrors
+    /// `--validate-config` but accepts a partial schema. Staged-boot builds
+    /// only; mutually exclusive with the other early-exit modes.
+    #[cfg(feature = "staged-boot")]
+    pub(super) validate_fragment: Option<PathBuf>,
     /// `--validate-hardware=<toml>`: read-only hardware check on the real
     /// target machine. Mutually exclusive with the other early-exit modes.
     pub(super) validate_hardware: Option<PathBuf>,
@@ -33,6 +39,13 @@ pub(super) struct Args {
     /// `--validate-initrm` dry-run presence-checks against. Absent ⇒ `/`
     /// (validate against the live initramfs). Also a MODIFIER, not counted.
     pub(super) initrm_closure: Option<PathBuf>,
+    /// `--print-gen-id=<toplevel>`: print the shared content-addressed
+    /// generation id (FIX-07) for the given system toplevel / profile-link
+    /// path and exit. The install signer (#53) uses this to compute the
+    /// `/boot/nmbl/sigs/<gen-id>/…` path the in-initramfs verifier scans, so
+    /// signer and verifier share ONE id derivation. Mutually exclusive with
+    /// the other early-exit modes.
+    pub(super) print_gen_id: Option<PathBuf>,
     /// Installer-side: initialise (or validate) state.bin under the
     /// given directory and exit. Mutually exclusive with
     /// `validate_config` and `boot_succeeded_dir`.
@@ -72,6 +85,8 @@ where
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut errored_report: Option<PathBuf> = None;
     let mut validate_config: Option<PathBuf> = None;
+    #[cfg(feature = "staged-boot")]
+    let mut validate_fragment: Option<PathBuf> = None;
     let mut validate_hardware: Option<PathBuf> = None;
     let mut validate_closure: Option<PathBuf> = None;
     let mut config_toml: Option<PathBuf> = None;
@@ -79,6 +94,7 @@ where
     let mut validate_initrm: Option<PathBuf> = None;
     let mut uki: Option<PathBuf> = None;
     let mut initrm_closure: Option<PathBuf> = None;
+    let mut print_gen_id: Option<PathBuf> = None;
     #[cfg(feature = "stateful")]
     let mut init_state_dir: Option<PathBuf> = None;
     #[cfg(feature = "stateful")]
@@ -105,6 +121,17 @@ where
             && let Some(v) = iter.next()
         {
             validate_config = Some(PathBuf::from(v));
+        } else if let Some(value) =
+            parse_fragment_flag(&arg, "--validate-config-fragment", &mut iter)?
+        {
+            #[cfg(feature = "staged-boot")]
+            {
+                validate_fragment = Some(value);
+            }
+            #[cfg(not(feature = "staged-boot"))]
+            {
+                let _ = value;
+            }
         } else if let Some(rest) = arg.strip_prefix("--validate-hardware=") {
             validate_hardware = Some(PathBuf::from(rest));
         } else if arg == "--validate-hardware"
@@ -147,6 +174,12 @@ where
             && let Some(v) = iter.next()
         {
             tools.insert_spec(&v.to_string_lossy())?;
+        } else if let Some(rest) = arg.strip_prefix("--print-gen-id=") {
+            print_gen_id = Some(PathBuf::from(rest));
+        } else if arg == "--print-gen-id"
+            && let Some(v) = iter.next()
+        {
+            print_gen_id = Some(PathBuf::from(v));
         } else if let Some(value) = parse_stateful_flag(&arg, "--init-state", &mut iter)? {
             #[cfg(feature = "stateful")]
             {
@@ -177,16 +210,22 @@ where
         u8::from(init_state_dir.is_some()) + u8::from(boot_succeeded_dir.is_some());
     #[cfg(not(feature = "stateful"))]
     let stateful_modes = 0u8;
+    #[cfg(feature = "staged-boot")]
+    let fragment_mode = u8::from(validate_fragment.is_some());
+    #[cfg(not(feature = "staged-boot"))]
+    let fragment_mode = 0u8;
     let early_exit_count = u8::from(validate_config.is_some())
         + u8::from(validate_hardware.is_some())
         + u8::from(validate_closure.is_some())
         + u8::from(validate_initrm.is_some())
+        + fragment_mode
+        + u8::from(print_gen_id.is_some())
         + stateful_modes;
     if early_exit_count > 1 {
         return Err(
-            "the early-exit modes (--validate-config, --validate-hardware, \
-             --validate-nix-filesystem-closure, --validate-initrm, --init-state, \
-             --boot-succeeded) are mutually exclusive"
+            "the early-exit modes (--validate-config, --validate-config-fragment, \
+             --validate-hardware, --validate-nix-filesystem-closure, --validate-initrm, \
+             --print-gen-id, --init-state, --boot-succeeded) are mutually exclusive"
                 .to_string(),
         );
     }
@@ -200,6 +239,8 @@ where
         config_path,
         errored_report,
         validate_config,
+        #[cfg(feature = "staged-boot")]
+        validate_fragment,
         validate_hardware,
         validate_closure,
         config_toml,
@@ -207,6 +248,7 @@ where
         validate_initrm,
         uki,
         initrm_closure,
+        print_gen_id,
         #[cfg(feature = "stateful")]
         init_state_dir,
         #[cfg(feature = "stateful")]
@@ -260,6 +302,57 @@ where
     Ok(None)
 }
 
+/// Recognise `--validate-config-fragment` in both `--flag=<v>` and
+/// `--flag <v>` forms. Returns `Ok(None)` when `arg` is not this flag,
+/// `Ok(Some(path))` when it matched (staged-boot builds), `Err` when the
+/// path argument is missing or — on a non-staged-boot build — the flag was
+/// used at all (so the operator is not silently handed a no-op).
+fn parse_fragment_flag<I>(
+    arg: &str,
+    flag: &'static str,
+    iter: &mut I,
+) -> std::result::Result<Option<PathBuf>, String>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    let equals_prefix = format!("{flag}=");
+    if let Some(rest) = arg.strip_prefix(&equals_prefix) {
+        #[cfg(feature = "staged-boot")]
+        {
+            return Ok(Some(PathBuf::from(rest)));
+        }
+        #[cfg(not(feature = "staged-boot"))]
+        {
+            let _ = rest;
+            return Err(format!(
+                "{flag} requires nmbl-init to be built with the `staged-boot` feature"
+            ));
+        }
+    }
+    if arg == flag {
+        #[cfg(feature = "staged-boot")]
+        {
+            let Some(v) = iter.next() else {
+                return Err(format!("{flag} requires a path argument"));
+            };
+            return Ok(Some(PathBuf::from(v)));
+        }
+        #[cfg(not(feature = "staged-boot"))]
+        {
+            let _ = iter;
+            return Err(format!(
+                "{flag} requires nmbl-init to be built with the `staged-boot` feature"
+            ));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "tests assert on contract failures"
+)]
 #[path = "args_tests.rs"]
 mod tests;

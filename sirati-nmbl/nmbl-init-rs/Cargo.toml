@@ -1,3 +1,14 @@
+# Explicit workspace (FIX-25): `nmbl-init` is the root package AND the workspace
+# root; `nmbl-host-tools` (the HOST-platform signer `nmbl-sign`) is a member that
+# reuses `nmbl_init::sig::{wire,alg}` via a path dependency. `nmbl-init` MUST
+# NEVER depend on `nmbl-host-tools` — the edge is strictly host-tools → init — so
+# the signer and verifier share ONE sidecar-format definition and can never
+# drift. The host tool is built by a SEPARATE crane `buildPackage` for the host
+# target, outside the initramfs `cargoArtifacts`.
+[workspace]
+members = ["nmbl-host-tools"]
+resolver = "2"
+
 [package]
 name = "nmbl-init"
 version = "0.1.0"
@@ -80,6 +91,27 @@ mocking = []
 # default build never compiles it. The tokio runtime + async migration
 # is the new base and is NOT gated.
 remote-tui = ["dep:futures-util"]
+# Opt-in secure/staged-boot (R-6 / FIX-16). Pulls the pure-Rust ML-DSA
+# signature verifier (`fips204`), the TPM 2.0 marshaler (`tpm2-protocol`),
+# and SHA-2 (`sha2`, shared with `network-rescue`). NO `dep:zeroize`:
+# zeroize is a non-optional dep, so listing it here would be a cargo error
+# (FIX-30); the host signer's `Zeroizing` lives in nmbl-host-tools instead.
+# When OFF the `src/sig` and `src/tpm/measure` trees are `#[cfg]`d out and
+# none of THESE optional deps compile. The default build is byte-for-byte
+# identical to a feature-free build EXCEPT for the always-compiled `src/tpm`
+# core (cap/transport/presence), which links the now-NON-optional
+# `tpm2-protocol` even with `secure-boot` OFF — the lock-on-rescue guard
+# needs the cap path regardless of the feature axis (FIX-09). That is the
+# accepted FIX-09 cost; `tpm2-protocol` is pure-Rust, zero-dep/no_std, so it
+# is cheap. `fips204` is pinned with explicit ML-DSA features (NOT
+# default-features-and-hope) so the pre-hash `Ph::SHA512` path and
+# ML-DSA-65/87 are guaranteed present (FIX-50). `staged-boot` depends on
+# `secure-boot`.
+secure-boot = ["dep:fips204", "dep:sha2"]
+# Opt-in staged boot (a signed config fragment + drivers on a verified
+# priority volume). Structurally implies `secure-boot`: there is no staged
+# path without signature verification (R-3 / R-6).
+staged-boot = ["secure-boot"]
 
 [dependencies]
 nix = { version = "0.29", default-features = false, features = ["mount", "fs", "process", "term", "user", "signal", "reboot", "feature"] }
@@ -150,10 +182,27 @@ alacritty_terminal = { version = "0.26", optional = true, default-features = fal
 oklab = { version = "1.1.2", optional = true, default-features = true }
 # Phase D rescue-fallback (optional; gated behind `network-rescue`).
 # dhcproto provides the DHCPv4 wire codec used by `src/net/dhcp.rs`
-# (D.2). sha2 provides SHA-256 used by `src/net/http.rs` (D.3) to
-# verify the rescue blob against the operator-pinned digest.
+# (D.2). sha2 provides SHA-256/512: pulled by BOTH `network-rescue`
+# (rescue-blob digest in `src/net/http.rs`) AND `secure-boot` (the
+# pre-hash digest for ML-DSA verify + the relock-poison hash). It stays
+# `optional`, so the default build is byte-identical (FIX-6 / FIX-23).
 dhcproto = { version = "0.13", optional = true, default-features = false }
 sha2     = { version = "0.10", optional = true, default-features = false }
+# Secure/staged-boot. fips204 is the pure-Rust FIPS-204 (ML-DSA) verifier
+# (optional; gated behind `secure-boot`); `default-features = false` drops
+# its `default-rng` (we verify, never sign, so no getrandom is forced) and
+# we EXPLICITLY enable `ml-dsa-65` + `ml-dsa-87` so the
+# `AlgId::{MlDsa65,MlDsa87}` code paths and the pre-hash `Ph::SHA512` entry
+# are guaranteed compiled in (FIX-50).
+fips204       = { version = "0.4.6", optional = true, default-features = false, features = ["ml-dsa-65", "ml-dsa-87"] }
+# tpm2-protocol is the pure-Rust TPM 2.0 marshaler/unmarshaler
+# (`default-features = false`). NON-OPTIONAL on purpose (FIX-09): the
+# always-compiled `src/tpm` core (cap/transport/presence) and the
+# lock-on-rescue guard need the cap path even when `secure-boot` is OFF, so
+# this links into EVERY build. It is pure-Rust, zero-dep/no_std, and pulls
+# no `*-sys`/`cc`/`openssl-sys` crate, so the no-C-FFI closure invariant
+# holds (FIX-43).
+tpm2-protocol = { version = "0.18", default-features = false }
 # Single 4-byte read for the DHCPv4 XID. We avoid pulling in a full RNG
 # crate (`rand`); `getrandom::fill` reads straight from `getrandom(2)`.
 getrandom = { version = "0.3", optional = true, default-features = false }

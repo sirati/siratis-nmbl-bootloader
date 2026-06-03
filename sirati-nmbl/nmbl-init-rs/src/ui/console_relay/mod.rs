@@ -112,6 +112,7 @@ fn open_target_nonblocking(path: &Path) -> Option<OwnedFd> {
 /// verdict and leave the operator staring at a frozen "Shell running"
 /// modal with the shell painting invisibly behind it.
 pub async fn run_relay<E: ExecOps>(
+    sealed: crate::policy::Sealed,
     ops: &mut E,
     console: &mut dyn Console,
     config: &Config,
@@ -153,8 +154,11 @@ pub async fn run_relay<E: ExecOps>(
     }
 
     // Now the shell. spawn_shell forks, sets up controlling terminal,
-    // execve's busybox; on return we own the master fd.
-    let child = ops.spawn_shell(&config.paths.shell, SHELL_COLS, SHELL_ROWS)?;
+    // execve's busybox; on return we own the master fd. The `sealed`
+    // witness (threaded from `run_picker_session`) is required by type and
+    // rides through the `ExecOps::spawn_shell` seam, so this overlap-relay
+    // fork cannot happen before the seal.
+    let child = ops.spawn_shell(sealed, &config.paths.shell, SHELL_COLS, SHELL_ROWS)?;
 
     if overlap {
         // Hand the framebuffer / kernel-VT back to the kernel for the

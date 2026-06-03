@@ -79,6 +79,23 @@
         nmbl-init-rs.legacyPackages.${system}.mkNmblInit
           or (_: nmblInit);
 
+      # The host-platform `nmbl-sign` ML-DSA image signer. Used by
+      # lib/modules/driver-image.nix to sign each driver-image squashfs at
+      # install time (`--domain driver-image`). `null` on an older sibling
+      # flake that predates the signer; driver-image.nix turns that into a
+      # hard eval error only WHEN driver images are enabled.
+      nmblSign =
+        nmbl-init-rs.packages.${system}.nmbl-sign or null;
+
+      # The host / install-time LUKS-to-TPM seal helper (`nmbl-tpm-enroll`). It
+      # reuses `systemd-cryptenroll` to write a LUKS2 systemd-tpm2 token that
+      # NMBL's boot-time `cryptsetup open --token-only` unlock consumes (no Rust
+      # TPM2_Unseal — master-plan §A SEALING-REUSE). Exposed as a package so the
+      # installer / operator can run it once after first boot; it is asserted
+      # ABSENT from the initramfs closure by lib/config.nix.
+      nmblTpmEnroll = import ./lib/tpm-enroll.nix { inherit pkgs lib; };
+      lib = nixpkgs.lib;
+
       # Import rescue-vm-test app directly
       rescueVmTestFlake = import ../rescue-vm-test/flake.nix;
       rescueVmTestApp =
@@ -245,6 +262,57 @@
             bash "$assertions/log-import.sh"
         '';
       };
+
+      # INSECURE TEST-ONLY signing keypair glue (#56). Exposes the committed
+      # fixed ML-DSA-87 keypair to the test harness, `signTestArtifact` to sign
+      # test artifacts with it, and `assertAbsentFromClosure` — the build check
+      # that the test PRIVATE key never enters a PRODUCTION NMBL closure.
+      testKeys = import ./testing/keys.nix { inherit pkgs lib nmblSign; };
+
+      # The PRODUCTION-closure absence guard (#56 / FIX-61): the insecure-test
+      # private key must NOT appear in a production NMBL initramfs closure.
+      # Built against test-gpt-uefi-grub's nmblInitramfs (a config that never
+      # imports testing/keys), so this PASSES; it FIRES if the key were ever
+      # baked into a production artifact. Mirrors the nmbl-tpm-enroll absence
+      # assert in lib/config.nix.
+      insecureKeyAbsentFromProd = testKeys.assertAbsentFromClosure {
+        name = "insecure-test-key-absent-from-prod-initramfs";
+        closurePath =
+          testing.mkTestConfigurations."test-gpt-uefi-grub".config.system.build.nmblInitramfs;
+      };
+
+      # Secure-Boot enforcement smoke test (#55 / R-10). Boots an UNSIGNED UKI
+      # under a Secure-Boot-ENFORCING OVMFFull and asserts the firmware refuses
+      # it (the #29 precondition). BUILT here; #57 runs the VM.
+      sbSmoke = import ./testing/sb-smoke.nix {
+        inherit
+          nixpkgs
+          system
+          testRunners
+          vmSerialMan
+          ;
+        config = testing.mkTestConfigurations."test-gpt-uefi-grub";
+      };
+
+      checkSbUnsignedUki = pkgs.writeShellApplication {
+        name = "check-sb-unsigned-uki";
+        runtimeInputs = [
+          vmSerialMan
+          pkgs.screen
+          pkgs.coreutils
+          pkgs.gnugrep
+          pkgs.gnused
+          pkgs.qemu_kvm
+          pkgs.OVMFFull
+          pkgs.swtpm
+        ];
+        text = ''
+          export NMBL_RUNNER=${sbSmoke.runner}
+          assertions=${./testing/assertions}
+          timeout "''${NMBL_WALL_TIMEOUT:-600}" \
+            bash "$assertions/sb-unsigned-uki.sh"
+        '';
+      };
     in
     {
       # The main NixOS module
@@ -274,7 +342,31 @@
           # is enabled — produces a /init with the `network-rescue`
           # Cargo feature compiled in.
           _module.args.mkNmblInit = mkNmblInit;
+          # The `nmbl-sign` ML-DSA image signer, used by the driver-image
+          # build to sign each squashfs at install time.
+          _module.args.nmblSign = nmblSign;
         };
+
+      # Installer-available host tools. `nmbl-tpm-enroll` seals a LUKS volume
+      # key to the TPM bound to NMBL's measured-boot PCRs (11+7); run it once,
+      # after the box has first-booted the installed system, against the LUKS
+      # header. It is asserted ABSENT from the initramfs closure (it never ships
+      # in NMBL's boot environment). Build with `nix build .#nmbl-tpm-enroll`.
+      packages.${system} = {
+        nmbl-tpm-enroll = nmblTpmEnroll;
+        # Build check (#56): the insecure-test signing key must be ABSENT from
+        # a production NMBL closure. `nix build .#insecure-test-key-absent`.
+        insecure-test-key-absent = insecureKeyAbsentFromProd;
+        # The unsigned-UKI Secure-Boot smoke-test disk (#55): a GPT/ESP image
+        # whose BOOTX64.EFI is an UNSIGNED UKI, for the SB-refusal harness.
+        sb-unsigned-uki-disk = sbSmoke.unsignedUkiDisk;
+      };
+
+      # Build-only validation gates surfaced for CI / `nix flake check`-style
+      # consumption: the insecure-test-key prod-absence guard (#56).
+      checks.${system} = {
+        insecure-test-key-absent = insecureKeyAbsentFromProd;
+      };
 
       # Test configurations
       nixosConfigurations = testing.mkTestConfigurations;
@@ -305,6 +397,12 @@
           type = "app";
           program = "${checkLogImport}/bin/check-log-import";
         };
+        # Secure-Boot enforcement smoke test (#55 / R-10): asserts the firmware
+        # refuses an unsigned UKI. Run by #57. `nix run .#check-sb-unsigned-uki`.
+        check-sb-unsigned-uki = {
+          type = "app";
+          program = "${checkSbUnsignedUki}/bin/check-sb-unsigned-uki";
+        };
       } // nixosAnywhereTestApps // testMatrix.apps // nixosAnywhereInstallAliases;
 
       # Reusable library: external flakes (the LUKS install orchestrator,
@@ -320,6 +418,12 @@
       # (e.g. as a release artefact) rather than `nix run` it.
       legacyPackages.${system} = {
         inherit testArtefact tmuxSerial;
+        # INSECURE TEST-ONLY signing keypair glue (#56): `signTestArtifact`,
+        # `assertAbsentFromClosure`, `bakedPublicKey`, and the raw key paths.
+        inherit testKeys;
+        # The Secure-Boot unsigned-UKI smoke harness (#55): the runner, the
+        # unsigned UKI, and the ESP disk image.
+        inherit sbSmoke;
         tmuxSerialRunners = builtins.mapAttrs (
           name: _cfg:
           let

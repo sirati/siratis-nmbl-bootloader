@@ -24,6 +24,27 @@ pub(super) fn handle_early_exit_modes(args: &Args) -> Option<ExitCode> {
         });
     }
 
+    // Installer-side staged-boot fragment check: load+parse a partial
+    // config overlay (NOT a full Config) and report OK/errors. The
+    // signature is verified separately at boot; this only catches schema
+    // mistakes (unknown keys, malformed TOML) before the fragment ships.
+    #[cfg(feature = "staged-boot")]
+    if let Some(path) = args.validate_fragment.as_deref() {
+        return Some(match nmbl_init::config::load_fragment(path) {
+            Ok(_) => {
+                println!("nmbl-init: config fragment OK: {}", path.display());
+                ExitCode::from(0)
+            }
+            Err(err) => {
+                eprintln!(
+                    "nmbl-init: config fragment invalid at {}: {err}",
+                    path.display()
+                );
+                ExitCode::from(1)
+            }
+        });
+    }
+
     // Target-machine hardware check (read-only, zero side effects). Loads
     // the toml, probes each declared device against the real hardware,
     // and ALWAYS hard-errors on any failure — the warn-vs-abort decision
@@ -91,6 +112,27 @@ pub(super) fn handle_early_exit_modes(args: &Args) -> Option<ExitCode> {
             }
             Err(err) => {
                 eprintln!("nmbl-init: config invalid at {}: {err}", path.display());
+                ExitCode::from(1)
+            }
+        });
+    }
+
+    // Shared generation-id computation (FIX-07): print the content-addressed
+    // `gen_id` for a system toplevel / profile-link path and exit. The install
+    // signer (#53) calls this to compute the `/boot/nmbl/sigs/<gen-id>/…` path
+    // the in-initramfs verifier scans, so signer and verifier share ONE
+    // derivation. Pure + side-effect-free (a canonicalize + basename).
+    if let Some(path) = args.print_gen_id.as_deref() {
+        return Some(match nmbl_init::generations::gen_id_of_path(path) {
+            Ok(id) => {
+                println!("{id}");
+                ExitCode::from(0)
+            }
+            Err(err) => {
+                eprintln!(
+                    "nmbl-init: --print-gen-id failed for {}: {err}",
+                    path.display()
+                );
                 ExitCode::from(1)
             }
         });

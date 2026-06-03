@@ -120,6 +120,11 @@ unsafe fn child_exec_on_pty(
 /// the slave as its controlling terminal. The parent receives the
 /// master fd (non-blocking) and the child Pid.
 ///
+/// Requires a [`crate::policy::Sealed`] by value: the type system — not
+/// just the `nmbl-init-must-seal` lint — guarantees this real fork/execve
+/// waist cannot be reached until `policy::seal_secrets` has capped the
+/// lock PCR and closed every TPM-unsealed mapper (re-audit C-1 / FIX-03).
+///
 /// `cols`/`rows` size the slave PTY's window so `$LINES`/`$COLUMNS`
 /// (and TIOCGWINSZ) report the dimensions of the bordered box we
 /// render the terminal into. The child inherits the parent's environment
@@ -127,10 +132,14 @@ unsafe fn child_exec_on_pty(
 /// applications work.
 pub fn spawn_shell(
     fs: &mut dyn FsOps,
+    sealed: crate::policy::Sealed,
     shell_path: &Path,
     cols: u16,
     rows: u16,
 ) -> Result<PtyChild> {
+    // The witness is consumed by value purely to gate this call site; it
+    // carries no runtime state.
+    let _sealed = sealed;
     // Fail loudly up-front if the shell binary is missing/non-exec so
     // the operator gets a real error instead of a shell that silently
     // dies in the post-fork child (the "Raw Shell does nothing" bug).

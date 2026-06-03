@@ -9,7 +9,7 @@ use crate::rescue::RescueMode;
 /// path of `nmbl-rescue.sfs`. The network-rescue fields (Phase E.1)
 /// supply the disk-rescue fallback that fetches `nmbl-rescue.sfs`
 /// from an operator-pinned HTTP URL.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RescueConfig {
     /// Which rescue path [`crate::rescue::dispatch`] takes. Defaults to
@@ -101,7 +101,7 @@ impl Default for RescueConfig {
 /// At picker time the dialog joins `extra_consoles` with the resolved
 /// `/dev/console` target so the operator sees the full candidate list;
 /// nothing is auto-added behind their back.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmergencyShellConfig {
     /// Additional `/dev/<tty>` paths offered as multiplex targets in

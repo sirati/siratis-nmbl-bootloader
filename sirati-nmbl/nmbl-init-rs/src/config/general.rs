@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::log::Verbosity;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct General {
     #[serde(default)]
@@ -70,7 +70,7 @@ pub(super) fn default_panic_report_dir() -> PathBuf {
     PathBuf::from("/run")
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelModules {
     /// Modules loaded BEFORE the boot console is brought up. Reserved

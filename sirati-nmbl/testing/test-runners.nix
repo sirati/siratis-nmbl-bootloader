@@ -8,6 +8,7 @@
 
 let
   pkgs = nixpkgs.legacyPackages.${system};
+  lib = nixpkgs.lib;
 
   # Common help display function
   printHelp = vmSerialMan: ''
@@ -74,6 +75,15 @@ let
       config,
       vmSerialMan,
       bootMode ? null, # Optional: "gpt-bios", "gpt-uefi", or "direct-kernel" (derived from config if null)
+      # ADDITIVE measured-/secure-boot toggles (R-10), default OFF so an
+      # unset runner is byte-identical to before:
+      #   tpm        : null | "tis" | "crb" — attach an swtpm-backed TPM 2.0.
+      #                The per-run state dir is created under $WORK_DIR.
+      #   secureBoot : false — when true, boot under a Secure-Boot-enforcing
+      #                OVMFFull firmware (`smm=on` + db-enrolled VARS). A fresh
+      #                writable VARS copy is made per run.
+      tpm ? null,
+      secureBoot ? false,
     }:
     let
       # Derive bootMode from config if not explicitly provided (must be first)
@@ -118,6 +128,29 @@ let
           "UEFI"
         else
           "Unknown";
+
+      # ---- ADDITIVE TPM / Secure-Boot wiring (R-10) -----------------------
+      # The swtpm-backed TPM: a per-run state directory under $WORK_DIR and the
+      # `--tpm`/`--tpm-kind` flags. Empty string when no TPM is requested, so
+      # the launch command is unchanged.
+      tpmArgs =
+        if tpm == null then
+          ""
+        else
+          " --tpm \"$WORK_DIR/swtpm-state\" --tpm-kind ${tpm}";
+
+      # Secure-Boot OVMFFull: the SB-built code firmware (read-only) and a
+      # PER-RUN writable copy of the db-enrolled VARS (`OVMF_VARS.ms.fd`, which
+      # ships Microsoft's KEK/db so the firmware ENFORCES — it refuses an
+      # unsigned EFI binary). The `--sb-code`/`--sb-vars` flags flip the
+      # qemu seam to `-machine …,smm=on` + secure pflash.
+      sbCode = "${pkgs.OVMFFull.fd}/FV/OVMF_CODE.fd";
+      sbVarsTemplate = "${pkgs.OVMFFull.fd}/FV/OVMF_VARS.ms.fd";
+      sbArgs =
+        if secureBoot then
+          " --sb-code \"${sbCode}\" --sb-vars \"$WORK_DIR/sb-OVMF_VARS.fd\""
+        else
+          "";
     in
     pkgs.writeShellScript "run-${name}" ''
       set -e
@@ -217,6 +250,17 @@ let
           ""
       }
 
+      ${lib.optionalString secureBoot ''
+        # Secure-Boot OVMFFull: a FRESH writable copy of the db-enrolled VARS
+        # per run (so each run starts from the same enforcing variable store and
+        # the firmware refuses unsigned binaries). The qemu seam adds smm=on.
+        echo "Preparing Secure-Boot OVMF VARS (db-enrolled, enforcing)..."
+        cp "${sbVarsTemplate}" "$WORK_DIR/sb-OVMF_VARS.fd"
+        chmod 644 "$WORK_DIR/sb-OVMF_VARS.fd"
+        echo "✓ SB code: ${sbCode}"
+        echo "✓ SB vars: $WORK_DIR/sb-OVMF_VARS.fd"
+      ''}
+
       echo
       echo "Test artifacts:"
       ${
@@ -260,19 +304,19 @@ let
         if isDirectKernel then
           startVMAndWait {
             inherit name vmSerialMan;
-            screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}\" --disk \"${diskName}\" --memory 2048 --cores 4 direct-kernel --kernel \"$WORK_DIR/kernel\" --initrd \"$WORK_DIR/initrd\" --kernel-args \"$KERNEL_ARGS\"";
+            screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}\" --disk \"${diskName}\" --memory 2048 --cores 4${tpmArgs}${sbArgs} direct-kernel --kernel \"$WORK_DIR/kernel\" --initrd \"$WORK_DIR/initrd\" --kernel-args \"$KERNEL_ARGS\"";
             sessionName = name;
           }
         else if isUefi then
           startVMAndWait {
             inherit name vmSerialMan;
-            screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}\" --disk \"${diskName}\" --memory 2048 --cores 4 uefi --ovmf-code \"$OVMF_CODE\" --ovmf-vars \"$OVMF_VARS\"";
+            screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}\" --disk \"${diskName}\" --memory 2048 --cores 4${tpmArgs}${sbArgs} uefi --ovmf-code \"$OVMF_CODE\" --ovmf-vars \"$OVMF_VARS\"";
             sessionName = name;
           }
         else if isBios then
           startVMAndWait {
             inherit name vmSerialMan;
-            screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}\" --disk \"${diskName}\" --memory 2048 --cores 4 bios";
+            screenCommand = "${vmSerialMan}/bin/vm-serial-man manager --name \"${name}\" --disk \"${diskName}\" --memory 2048 --cores 4${tpmArgs}${sbArgs} bios";
             sessionName = name;
           }
         else

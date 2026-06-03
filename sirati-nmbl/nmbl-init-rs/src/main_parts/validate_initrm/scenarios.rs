@@ -37,6 +37,7 @@
 
 use nmbl_init::config::Config;
 use nmbl_init::error::NmblError;
+use nmbl_init::imageload::DriverImagesHandle;
 use nmbl_init::shell::drop_to_emergency;
 use nmbl_init::sys::ops::ExecOps;
 use nmbl_init::sys::ops::dryrun::{ClosureView, DryRunScenario, DryRunSys, MissingFile};
@@ -68,26 +69,43 @@ const DRYRUN_SHELL_ROWS: u16 = 24;
 pub(super) fn run_normal_boot(config: &Config, closure_root: &std::path::Path) -> Vec<MissingFile> {
     let closure = ClosureView::new(closure_root.to_path_buf());
     let mut dryrun = DryRunSys::new(closure, DryRunScenario::NormalBoot);
-    let result = block_on_tui_with_poller(|_sender| async move {
+    // Owned config: `run_phases_post_console` takes `&mut Config` (the
+    // staged-boot merge path); the dry-run never enables staged-boot, so the
+    // config is only ever read, but the signature requires `&mut`.
+    let mut config: Config = config.clone();
+    let result = block_on_tui_with_poller(|sender| async move {
         let session = SessionInteraction::new();
         let skip_selector = SkipSelector::new();
         // Headless: take the default-boot decision path, no keypress.
         skip_selector.set(true);
         let mut console = NoopConsole::new();
+        // No driver images in the dry run — the gate hooks are inert when
+        // signing is disabled (the validate-initrm config posture).
+        let mut driver_images = DriverImagesHandle::empty();
         // Headless supplier: returns a placeholder passphrase instantly,
         // never driving the NoopConsole's timeout-ignoring poll loop.
         let mut supplier = ScriptedPasswordSupplier;
-        if let Ok(injections) =
-            run_phases_post_console(&mut dryrun, config, &mut console, &mut supplier).await
+        if let Ok(injections) = run_phases_post_console(
+            &mut dryrun,
+            &mut config,
+            &mut console,
+            &mut supplier,
+            &session,
+            &skip_selector,
+            &sender,
+            &mut driver_images,
+        )
+        .await
         {
             // SWALLOW the TerminalAction — never execute it.
             let _ = select_and_act(
                 &mut dryrun,
-                config,
+                &config,
                 &mut console,
                 &injections,
                 &session,
                 &skip_selector,
+                &driver_images,
             )
             .await;
         }
@@ -109,11 +127,26 @@ pub(super) fn run_error_screen(
 ) -> Vec<MissingFile> {
     let closure = ClosureView::new(closure_root.to_path_buf());
     let mut dryrun = DryRunSys::new(closure, DryRunScenario::ErrorToErrorScreen);
+    // Owned config: see `run_normal_boot` — the post-console phase takes
+    // `&mut Config`; the dry-run only reads it.
+    let mut config: Config = config.clone();
     let result = block_on_tui_with_poller(|sender| async move {
         let session = SessionInteraction::new();
+        let skip_selector = SkipSelector::new();
+        let mut driver_images = DriverImagesHandle::empty();
         let mut noop = NoopConsole::new();
         let mut supplier = ScriptedPasswordSupplier;
-        let outcome = run_phases_post_console(&mut dryrun, config, &mut noop, &mut supplier).await;
+        let outcome = run_phases_post_console(
+            &mut dryrun,
+            &mut config,
+            &mut noop,
+            &mut supplier,
+            &session,
+            &skip_selector,
+            &sender,
+            &mut driver_images,
+        )
+        .await;
         // The scenario scripts an activation failure, so we expect Err;
         // either way, route to the emergency screen to exercise it.
         let err = outcome.err().unwrap_or_else(|| NmblError::Io {
@@ -123,7 +156,7 @@ pub(super) fn run_error_screen(
         // Enter selects the default Reboot item, exiting the menu loop
         // immediately. Reboot touches no ops, so nothing forks. SWALLOW.
         let console = ScriptedConsole::from_keys([KeyCode::Enter]);
-        let _ = drop_to_emergency(Box::new(console), config, err, &session, &sender).await;
+        let _ = drop_to_emergency(Box::new(console), &config, err, &session, &sender).await;
         dryrun.into_findings().items().to_vec()
     });
     findings_or_runtime_note(result, "ErrorToErrorScreen")
@@ -144,11 +177,22 @@ pub(super) fn run_pretty_shell_scenario(
     let mut dryrun = DryRunSys::new(closure, DryRunScenario::PrettyShell);
     let result = block_on_tui_with_poller(|_sender| async move {
         let mut console = NoopConsole::new();
+        // The shell-spawn seam demands a `Sealed` witness by type (C-1). The
+        // dry-run's `DryRunSys::spawn_shell` never reaches the real fork, so
+        // the witness gates no syscall here; mint the dry-run-only witness
+        // rather than running the real seal (which would attempt a cryptsetup
+        // close side effect that `--validate-initrm` must never perform).
+        let sealed = nmbl_init::policy::Sealed::dry_run_witness();
         // `DryRunShellPreflight` is the expected, success-equivalent error
         // (the preflight ran, no fork happened); any other error is left to
         // the report as the surfaced finding-or-note. SWALLOW the result.
-        let _ =
-            nmbl_init::ui::pretty_shell::run_pretty_shell(&mut dryrun, &mut console, config).await;
+        let _ = nmbl_init::ui::pretty_shell::run_pretty_shell(
+            sealed,
+            &mut dryrun,
+            &mut console,
+            config,
+        )
+        .await;
         dryrun.into_findings().items().to_vec()
     });
     findings_or_runtime_note(result, "PrettyShell")
@@ -165,9 +209,18 @@ pub(super) fn run_raw_shell_scenario(
 ) -> Vec<MissingFile> {
     let closure = ClosureView::new(closure_root.to_path_buf());
     let mut dryrun = DryRunSys::new(closure, DryRunScenario::RawShell);
-    // `spawn_shell` is synchronous; no runtime needed, but we keep the
-    // dry-run uniform and side-effect-free here regardless.
-    let _ = dryrun.spawn_shell(&config.paths.shell, DRYRUN_SHELL_COLS, DRYRUN_SHELL_ROWS);
+    // The shell-spawn seam demands a `Sealed` witness by type (C-1). The
+    // dry-run's `DryRunSys::spawn_shell` never reaches the real fork, so the
+    // witness gates no syscall here; mint the dry-run-only witness rather than
+    // running the real seal (no cryptsetup-close side effect). `spawn_shell` is
+    // synchronous; no runtime needed.
+    let sealed = nmbl_init::policy::Sealed::dry_run_witness();
+    let _ = dryrun.spawn_shell(
+        sealed,
+        &config.paths.shell,
+        DRYRUN_SHELL_COLS,
+        DRYRUN_SHELL_ROWS,
+    );
     dryrun.into_findings().items().to_vec()
 }
 

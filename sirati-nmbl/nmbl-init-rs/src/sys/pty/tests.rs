@@ -50,7 +50,11 @@ fn spawn_shell_basic_roundtrip() {
     if std::fs::metadata(&echo).is_err() {
         return;
     }
-    let child = match spawn_shell(&mut RealSys::sync_only(), &echo, 80, 24) {
+    // The spawn primitive now demands a `Sealed` by type; tests fabricate
+    // one via the test-only witness ctor. It also routes pre-fork fs work
+    // through the `FsOps` seam, so it takes a sync-only `RealSys`.
+    let sealed = crate::policy::guard::Sealed::test_witness();
+    let child = match spawn_shell(&mut RealSys::sync_only(), sealed, &echo, 80, 24) {
         Ok(c) => c,
         // Sandboxes that block fork or openpty return EPERM/ENOTTY.
         Err(_) => return,

@@ -5,7 +5,7 @@ use serde::Deserialize;
 /// Nix side enforces the operator-facing defaults so a typo'd TOML
 /// fails parsing instead of silently picking a value.
 #[cfg(feature = "stateful")]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatefulConfig {
     /// Maximum number of consecutive failed boots before the rollback

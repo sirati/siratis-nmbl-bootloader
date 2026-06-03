@@ -28,7 +28,7 @@ pub enum SplashBackgroundLocation {
 }
 
 #[cfg(feature = "image-splash")]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Splash {
     #[serde(default)]
