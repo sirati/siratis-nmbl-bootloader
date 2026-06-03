@@ -106,7 +106,11 @@ in
         description = lib.mdDoc ''
           Secure-Boot signing private key, read IMPURELY at install time.
           Never embedded in the store or emitted to config.toml. Required
-          when `signing.uki.enable` is set.
+          when `signing.uki.enable` is set. Pass it as a STRING path to an
+          on-disk secret (e.g. `"/run/secrets/nmbl-db.key"`), NOT a Nix path
+          literal like `./db.key` — a path literal would be imported into the
+          store, and `lib/install-signing.nix` FAILS the eval (closure-leak
+          assertion) if `keyFile`/`certFile` resolves under the store dir.
         '';
       };
 
@@ -117,6 +121,23 @@ in
           Secure-Boot signing certificate matching `keyFile` (the `db`
           certificate the firmware enforces against). Required when
           `signing.uki.enable` is set.
+        '';
+      };
+
+      refuseInstallIfNotEnforcing = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = lib.mdDoc ''
+          Install-time db-enrollment policy (FIX-11). When `false` (default)
+          the installer signs and installs the UKI but only WARNS LOUDLY if
+          the running firmware would not actually refuse an unsigned UKI
+          (Secure Boot off / setup-mode, or this cert not enrolled in `db`).
+          When `true` the install ABORTS in that case, so a machine where the
+          firmware->NMBL chain is not yet enforceable cannot be provisioned by
+          accident. The detection degrades gracefully (warns, never blocks) if
+          the firmware-state tools are unavailable. This is the INSTALL-TIME
+          check only; the RUNTIME PCR-7 / Secure-Boot-state read at the start
+          of the measured path is handled separately in NMBL's Rust init.
         '';
       };
     };

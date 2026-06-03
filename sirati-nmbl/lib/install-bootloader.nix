@@ -352,6 +352,17 @@ pkgs.writeScript "install-nmbl-bootloader" ''
       actualLoaderExtraArgs
       nmblUki
       ;
+    # Install-time UKI Secure-Boot signing policy. `cfg.signing` may be the
+    # bare skeleton on builds without the security slice; read with `or`
+    # defaults so non-secure-boot configs keep installing the unsigned PE.
+    ukiSigning =
+      let u = cfg.signing.uki or { };
+      in {
+        enable = u.enable or false;
+        keyFile = u.keyFile or null;
+        certFile = u.certFile or null;
+        refuseInstallIfNotEnforcing = u.refuseInstallIfNotEnforcing or false;
+      };
   }}
 
   # Create /init symlink for NixOS stage-1
