@@ -39,9 +39,20 @@ CONFIG_NAME="test-secure-boot-enroll"
 # luks-password activation shows an answerable modal; typing this opens
 # cryptroot so the boot can reach generation verify+kexec.
 LUKS_PASSPHRASE="${NMBL_LUKS_PASSPHRASE:-test}"
-# The luks-password passphrase modal NMBL renders when the cryptroot needs the
-# operator's passphrase. Seeing it means "type the passphrase", not a failure.
-PASSWORD_PROMPT_RE='Enter LUKS passphrase|passphrase for cryptroot'
+# A best-effort detector for NMBL's luks-password modal. Matches the enroll
+# twin's configurable prompt label AND the modal chrome NMBL always renders
+# (the "Passphrase" box title + the permanent "Select NixOS Generation"
+# checkbox row). This is ONLY a diagnostic / fast-path hint: the modal is a
+# full-screen ratatui repaint that is NOT newline-terminated, so vm-serial-man's
+# line-oriented history (read_line splits on '\n') may never flush the frame
+# while NMBL blocks awaiting input. We therefore DO NOT gate typing on seeing
+# it — we type the passphrase on a fixed cadence below regardless (a human at
+# the console types once the box is up; we simply can't reliably "see" it).
+PASSWORD_PROMPT_RE='Enter LUKS passphrase|passphrase for cryptroot|Select NixOS Generation|Passphrase'
+# The booted-system prompt (getty autologin). networking.hostName == the config
+# name (vm-config.nix), so the post-kexec shell prints "root@<config-name>".
+# Unlike the modal, this is a newline-terminated line and flushes to history.
+BOOTED_RE="root@${CONFIG_NAME}"
 
 # A REFUSAL (any form) on the happy path is a HARD FAIL: the signed generation
 # should verify. Covers the refuse countdown, the policy-refused terminus, and
@@ -63,8 +74,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/nmbl-sb-gen.XXXXXX")"
 
+# Best-effort dump of the VM's serial scrollback so a FAILED boot shows WHERE it
+# stalled (firmware? NMBL verify? the passphrase modal? the post-kexec system?).
+# Never let the dump itself error the script — the manager/socket may already be
+# gone, in which case we simply note that and move on.
+dump_serial_history() {
+  echo "=== VM serial history (best-effort diagnostic) ===" >&2
+  local -a sock_args
+  _socket_args sock_args
+  if vm-serial-man tail 400 "${sock_args[@]}" >&2 2>/dev/null; then
+    :
+  elif vm-serial-man lines 1 400 "${sock_args[@]}" >&2 2>/dev/null; then
+    :
+  else
+    echo "(no VM serial history available — manager socket gone or empty)" >&2
+  fi
+  echo "=== end VM serial history ===" >&2
+}
+
 cleanup() {
   local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    dump_serial_history || true
+  fi
   echo "=== cleanup ===" >&2
   vm-serial-man stop >/dev/null 2>&1 || true
   if screen -ls 2>/dev/null | grep -q "\.${CONFIG_NAME}\b"; then
@@ -92,38 +124,50 @@ if ! "$RUNNER"; then
 fi
 
 # Answer NMBL stage-0's LUKS passphrase modal so cryptroot opens and the boot
-# can proceed to generation verify+measure+kexec. The modal may take a moment
-# to render after the runner returns; feed the passphrase as soon as it shows
-# (and once more on first appearance below in case it rendered late).
+# can proceed to generation verify+measure+kexec.
+#
+# WHY WE TYPE BLIND (no wait-for-prompt gate): NMBL's passphrase modal is a
+# full-screen ratatui repaint that is NOT newline-terminated. vm-serial-man's
+# history is built by `read_line` (splits on '\n'), so while NMBL sits on the
+# modal awaiting input the un-terminated frame never flushes to the buffer —
+# `seen_in_history`/`trigger` for the modal text can hang/miss even though the
+# box is on screen. So we do what an operator does: give the boot a head-start
+# to reach the LUKS stage, then type the passphrase and Enter on a fixed cadence
+# until the system actually boots (or refuses). `send_cmd` appends the newline,
+# so each attempt submits. Extra Enters on an already-unlocked system are
+# harmless (blank shell prompts). The post-kexec markers we wait for ARE
+# newline-terminated and flush normally.
 echo "=== feeding the LUKS passphrase so cryptroot opens ===" >&2
-for _ in $(seq 1 24); do
-  if seen_in_history "$PASSWORD_PROMPT_RE"; then
-    send_cmd "$LUKS_PASSPHRASE"
-    break
-  fi
-  if seen_in_history "kexec|root@${CONFIG_NAME}"; then
-    break
-  fi
-  sleep 5
-done
+# A short head-start so the firmware → NMBL → activation path can paint the
+# modal before the first keystroke (typing into a pre-modal console is a no-op).
+sleep 10
+# Informational only (never gates the typing): if the modal text DID flush to
+# history, note it — helps a reader correlate the keystroke with the prompt.
+if seen_in_history "$PASSWORD_PROMPT_RE"; then
+  echo "=== luks-password modal text seen in history; answering ===" >&2
+fi
+send_cmd "$LUKS_PASSPHRASE"
 
-# Wait for the booted root shell. If a refusal appears at any point it is an
-# immediate failure (checked after, via history) — the signed generation must
-# verify and boot.
+# Wait for the booted root shell, re-typing the passphrase periodically in case
+# the first attempt raced the modal's appearance. A refusal at any point is an
+# immediate failure — the signed generation must verify and boot.
 echo "=== waiting up to ${SHELL_TIMEOUT}s for the post-kexec root shell ===" >&2
 booted=false
+i=0
 for _ in $(seq 1 "$((SHELL_TIMEOUT / 5))"); do
   if seen_in_history "$REFUSE_RE"; then
     echo "FAIL: NMBL REFUSED a correctly-signed generation (refusal marker seen)" >&2
     exit 1
   fi
-  if seen_in_history "root@${CONFIG_NAME}"; then
+  if seen_in_history "$BOOTED_RE"; then
     booted=true
     break
   fi
-  # Re-feed the passphrase if the modal is still up (slow/late render) and we
-  # have not yet kexec'd into the generation.
-  if seen_in_history "$PASSWORD_PROMPT_RE" && ! seen_in_history "kexec|root@${CONFIG_NAME}"; then
+  # Re-feed the passphrase periodically until we see a kexec/boot marker. We do
+  # this BLIND (not gated on seeing the modal — it may never flush, see above),
+  # every ~15s, so a slow/late modal still gets answered.
+  i=$((i + 1))
+  if [ $((i % 3)) -eq 0 ] && ! seen_in_history "kexec|${BOOTED_RE}"; then
     send_cmd "$LUKS_PASSPHRASE"
   fi
   sleep 5
