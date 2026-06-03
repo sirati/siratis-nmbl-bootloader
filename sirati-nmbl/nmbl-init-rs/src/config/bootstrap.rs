@@ -44,7 +44,7 @@ pub struct BootstrapSection {
 
     /// Optional staged-boot pointer set embedded in the bootstrap stage.
     /// Names the priority volume that carries the signed config fragment
-    /// + drivers so the pre-stage can mount and verify it before reading
+    /// and drivers, so the pre-stage can mount and verify it before reading
     /// the full per-generation config. Gated behind `staged-boot` (which
     /// implies `secure-boot`): without the verifier there is no staged
     /// path, so the field — and the table that fills it — only exist in
