@@ -33,6 +33,7 @@ fn tpm_from_config(config: &ManagerConfig) -> Option<TpmConfig> {
             TpmKindArg::Crb => TpmKind::Crb,
         },
         state_dir,
+        persist: config.tpm_persist,
     })
 }
 

@@ -3,6 +3,7 @@
 //! This module manages reading from and writing to the QEMU serial via Unix socket
 
 use anyhow::{Context, Result};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -10,6 +11,27 @@ use tokio::net::UnixStream;
 use tokio::sync::{broadcast, Mutex};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, trace, warn};
+
+/// Mirror one serial line to the manager's stdout without ever panicking.
+///
+/// `println!` aborts the whole process on any write error — in particular a
+/// `BrokenPipe` (EPIPE) when the downstream reader (the `screen` session's pty
+/// / a closed log pipe) has gone away. That used to kill the manager mid-run
+/// and truncate scenarios. We write directly and SWALLOW `BrokenPipe`: the
+/// daemon must keep buffering and broadcasting serial output even with no one
+/// reading stdout. Other I/O errors are logged once, not fatal.
+fn echo_line_to_stdout(line: &str) {
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    match lock.write_all(line.as_bytes()).and_then(|()| lock.write_all(b"\n")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+            // Downstream stdout closed; keep running headless.
+            trace!("stdout broken pipe, dropping console echo");
+        }
+        Err(e) => warn!("error echoing serial line to stdout: {e}"),
+    }
+}
 
 use crate::buffer::OutputBuffer;
 
@@ -74,8 +96,9 @@ impl SerialHandler {
                         let trimmed = line.trim_end().to_string();
                         if !trimmed.is_empty() {
                             trace!("Serial output: {}", trimmed);
-                            // Print to stdout for console visibility
-                            println!("{}", trimmed);
+                            // Mirror to stdout for console visibility, but never
+                            // panic if the downstream pipe is gone (EPIPE).
+                            echo_line_to_stdout(&trimmed);
                             // Add to buffer
                             buffer.lock().await.push(trimmed.clone());
                             // Broadcast to listeners
