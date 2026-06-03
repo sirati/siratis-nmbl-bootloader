@@ -22,8 +22,22 @@
 //! `BadOpcode` — every unsafe block has a SAFETY comment per the
 //! convention set in `sys::kexec`.
 
+mod bind;
 mod ops;
 mod types;
+
+// The factored read-only bind helper shared by the rescue, mount-by-loop, and
+// driver-image paths so the allocate→open→configure sequence lives in ONE
+// place. `pub(crate)` — only in-crate callers ever bind a loop device.
+// [`LoopBindError`] (the returned error type, naming the failed stage) is
+// re-exported alongside so the driver-image loader (#23) can name it.
+#[allow(
+    unused_imports,
+    reason = "named by the driver-image loader (#23); the rescue/mount callers \
+              consume it via closure inference"
+)]
+pub(crate) use bind::LoopBindError;
+pub(crate) use bind::loop_bind_ro;
 
 // Re-export the public API at the original path so callers are unchanged.
 pub use ops::{allocate_loop_device, configure_loop_device, detach_loop_device, open_loop_device};

@@ -15,6 +15,11 @@
   # features and returning the prebuilt `nmblInit` if the host flake
   # is older.
   mkNmblInit ? (_: nmblInit),
+  # The host `nmbl-sign` ML-DSA image signer, used by the driver-image build
+  # (lib/modules/driver-image.nix) to sign each squashfs at install time.
+  # `null` on an older host flake; driver-image.nix only errors WHEN driver
+  # images are enabled.
+  nmblSign ? null,
   ...
 }:
 
@@ -250,6 +255,16 @@ let
       # skips the modprobe + staging.
       moduleClosure = rescueModuleClosure;
     };
+  };
+
+  # Optional signed driver-image squashfs build (#25a). ADDITIVE: builds each
+  # `boot.nmbl.driverImages.images.<name>` into a pure squashfs (out-of-tree
+  # .ko + firmware, via the explicit-`firmwareName` module-closure factor —
+  # FIX-36) and emits the install-time `nmbl-sign --domain driver-image`
+  # shell. The rescue closure above is built inline and is left untouched
+  # (byte-identical store path — FIX-37); only the NEW images use the factor.
+  driverImageBuild = import ./modules/driver-image.nix {
+    inherit pkgs lib config cfg nmblSign rescueModulesTree;
   };
 
   # The emergency menu's "Raw Shell" forks `cfg.paths.shell` while NMBL is
@@ -509,6 +524,11 @@ in
     # `cfg.rescue.mode == "external"` — see install-bootloader.nix.
     system.build.nmblRescueSquashfs = nmblRescueSquashfs;
 
+    # Expose the pure driver-image squashfs derivations (#25a) for store-path
+    # introspection. Each record is `{ name; sfs; destPath; sigDest; }`; the
+    # `.sfs` is the unsigned, pure blob (signing happens at install).
+    system.build.nmblDriverImages = driverImageBuild.driverImages;
+
     # Debug output to verify module configuration
     system.build.nmblDebugInfo = pkgs.writeText "nmbl-debug-info" ''
       NMBL Bootloader Configuration Debug Info
@@ -606,6 +626,9 @@ in
         nmblRescueSquashfs
         ;
       nmblUki = config.system.build.nmblUki;
+      # Install-time driver-image staging + `nmbl-sign` signing shell (#25a).
+      # Empty string when no driver images are enabled.
+      driverImageInstallShell = driverImageBuild.driverImageInstallShell;
     };
 
     # Custom installation script (imported from module)
