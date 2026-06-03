@@ -8,6 +8,7 @@ use std::path::Path;
 
 use nmbl_init::config::Config;
 use nmbl_init::error::{NmblError, format_chain};
+use nmbl_init::imageload::{DriverImagesHandle, detach_all_driver_images, load_driver_images};
 use nmbl_init::modules::load_explicit_modules;
 use nmbl_init::panic::install_panic_hook;
 use nmbl_init::rescue::{self};
@@ -197,6 +198,32 @@ pub(crate) async fn run_boot_inside_runtime(
             return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
         }
     }
+    // Driver-image hook (#24 / FEATURE-#1): load every declared, signed
+    // out-of-tree driver image AFTER the early explicit-module load and
+    // BEFORE the generation kexec, so extra drivers (and their firmware) are
+    // available for the rest of boot. A no-op unless `driver_images.enable`
+    // (FIX-05 guarantees enable ⇒ secure-boot). A verify/load failure surfaces
+    // `NmblError::DriverImage`, which we route through the async
+    // `refuse_unsigned` terminus — cap → close-mappers → sentinel → relock,
+    // then `RebootIntoRescue` (R-1; NOT a halt). No console is open yet, so the
+    // non-interactive refuse countdown does not render here; the reboot fires
+    // in `execute_terminal_action` after the runtime unwinds.
+    let driver_images = match load_driver_images(&config) {
+        Ok(handle) => handle,
+        Err(err) => {
+            nmbl_warn!(
+                "driver-image load failed; relocking and rebooting into rescue: {}",
+                format_chain(&err as &dyn std::error::Error)
+            );
+            let action = nmbl_init::policy::refuse_unsigned(&config, err, &sender).await;
+            return BootOutcome::Done(Box::new(Ok(action)));
+        }
+    };
+    // Seam for #28 (Wave-4): `driver_images.images()` is the ORDERED set of
+    // loaded image refs that must feed TPM measure event #4. #28 threads them
+    // into `tpm::measure::extend_handoff` via the kexec handoff; we only make
+    // the ordered handle available here and tear it down below — no measure
+    // threading yet.
     let console: Box<dyn Console> = match open_console(&config, false) {
         Ok(c) => c,
         Err(err) => {
@@ -205,16 +232,46 @@ pub(crate) async fn run_boot_inside_runtime(
         }
     };
     if cmdline_has_key_echo_flag() {
+        // The key-echo diagnostic drops into the emergency shell, so the
+        // driver images are LEFT MOUNTED for inspection (FIX-55): they carry
+        // no secrets, so leaving them mounted into a shell is safe.
         return BootOutcome::Done(Box::new(
             run_key_echo_diagnostic(config, console, &sender).await,
         ));
     }
     let session = SessionInteraction::new();
-    BootOutcome::Done(Box::new(Ok(run_tui_session(
-        &mut config,
-        console,
-        &session,
-        &sender,
-    )
-    .await)))
+    let action = run_tui_session(&mut config, console, &session, &sender).await;
+    teardown_driver_images_if_normal(&action, &driver_images);
+    BootOutcome::Done(Box::new(Ok(action)))
+}
+
+/// Whether the driver images should be torn down for `action` (FIX-55).
+///
+/// `true` for every terminus that reboots or hands the machine off
+/// (`Kexec` normal boot, `Reboot`, `RebootIntoRescue`, `HaltWithBanner`) so
+/// the loop devices + mounts do not leak across the cutover. `false` ONLY for
+/// the capped emergency shell ([`TerminalAction::Execve`]): the images are
+/// deliberately LEFT MOUNTED there so the operator can inspect them, which is
+/// safe because driver images carry no secret material.
+pub(crate) fn should_teardown_driver_images(action: &TerminalAction) -> bool {
+    !matches!(action, TerminalAction::Execve { .. })
+}
+
+/// Tear down the loaded driver images on the NORMAL pre-kexec path, but LEAVE
+/// them mounted when the boot diverted into the capped emergency shell
+/// ([`TerminalAction::Execve`]) — FIX-55.
+fn teardown_driver_images_if_normal(action: &TerminalAction, handle: &DriverImagesHandle) {
+    if handle.is_empty() {
+        return;
+    }
+    if !should_teardown_driver_images(action) {
+        nmbl_info!(
+            "driver images: leaving {} image(s) mounted for the emergency shell (no secrets — FIX-55)",
+            handle.len()
+        );
+        return;
+    }
+    if let Err(err) = detach_all_driver_images(handle) {
+        nmbl_warn!("driver-image teardown reported an error (continuing): {err}");
+    }
 }

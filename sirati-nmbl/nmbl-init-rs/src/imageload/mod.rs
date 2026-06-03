@@ -45,15 +45,17 @@
 //! signed driver closures). Teardown is therefore only invoked on the normal
 //! load-then-kexec path, never before dropping into the capped shell.
 //!
-//! ## Where the boot-runtime hook lands (#24, Wave-3)
+//! ## Where the boot-runtime hook lands (#24)
 //!
 //! This module exposes ONLY the loader + its teardown. The call site that runs
-//! [`load_driver_images`] during boot — and that, on a verify failure, routes
-//! the [`crate::error::NmblError::DriverImage`] through `policy::refuse_unsigned`
-//! and on success threads the ordered image refs into the TPM handoff — is
-//! task #24 in `src/main_parts/boot_runtime.rs` (after early-module load,
-//! before kexec). #24 also decides teardown-vs-leave-mounted per the FIX-55
-//! note above. Nothing here is wired into `boot_runtime`/`phases` yet.
+//! [`load_driver_images`] during boot lives in `src/main_parts/boot_runtime.rs`
+//! (`run_boot_inside_runtime`, after the early-module load and before the
+//! generation kexec). On a verify/load failure it routes the
+//! [`crate::error::NmblError::DriverImage`] through `policy::refuse_unsigned`
+//! → `RebootIntoRescue` (R-1), and on the normal path it decides
+//! teardown-vs-leave-mounted per the FIX-55 note above. The ordered image refs
+//! the loader returns are the seam #28 will thread into the TPM measure
+//! handoff (`tpm::measure::extend_handoff`); that threading is not done here.
 
 mod handle;
 
