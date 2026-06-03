@@ -27,6 +27,11 @@
 //! sites (`rescue::dispatch`, `run_force_rescue`, the `dispatch_execve`
 //! backstop) that run after the runtime has unwound.
 
+// The signed priority-file boot gate (#31). Gated on `secure-boot`: it binds
+// the verify pipeline + the `PriorityVolume` config, neither of which compiles
+// without the feature.
+#[cfg(feature = "secure-boot")]
+pub mod gate;
 pub mod guard;
 pub mod refuse_screen;
 pub mod registry;
@@ -43,6 +48,8 @@ pub mod sentinel;
 )]
 mod tests;
 
+#[cfg(feature = "secure-boot")]
+pub use gate::{AttestedVolume, GatePhase, run_priority_gate, run_priority_gate_at};
 pub use guard::{SealFailed, Sealed, seal_secrets, seal_secrets_blocking};
 pub use refuse_screen::run_refuse_screen;
 pub use registry::{MapperEntry, register_tpm_mapper};

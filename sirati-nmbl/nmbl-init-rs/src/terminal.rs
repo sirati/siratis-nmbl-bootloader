@@ -156,15 +156,22 @@ impl TerminalAction {
     ///
     /// The type-gate is compile-level: there is no way to obtain a
     /// [`Sealed`] outside the `policy` module's seal functions, so building
-    /// the refuse terminus by hand does not compile —
+    /// the refuse terminus by hand does not compile. The doctest below
+    /// isolates the REAL gate — it supplies the `sealed` field but tries to
+    /// construct the `Sealed` witness itself (`Sealed(())`), which fails
+    /// because `Sealed`'s sole field is private to the `policy::guard`
+    /// module. (A test that merely omitted `sealed` would only prove the
+    /// field is required, not that `Sealed` is unconstructible.)
     ///
     /// ```compile_fail
     /// use nmbl_init::error::NmblError;
+    /// use nmbl_init::policy::Sealed;
     /// use nmbl_init::terminal::TerminalAction;
-    /// // No public `Sealed` constructor exists, so neither the literal nor
-    /// // the constructor can be reached without a real seal:
     /// let cause = NmblError::Signature { stage: "x", detail: String::new() };
-    /// let _ = TerminalAction::RebootIntoRescue { cause }; // missing `sealed`, and `Sealed` is unconstructible
+    /// // `Sealed`'s unit field is private: this line does not compile, which
+    /// // is the whole point — the witness cannot be forged outside `policy`.
+    /// let forged = Sealed(());
+    /// let _ = TerminalAction::RebootIntoRescue { cause, sealed: forged };
     /// ```
     pub fn reboot_into_rescue(sealed: Sealed, cause: NmblError) -> Self {
         TerminalAction::RebootIntoRescue { cause, sealed }
