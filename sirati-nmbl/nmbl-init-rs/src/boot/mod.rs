@@ -67,9 +67,11 @@ pub fn kexec_into(
     cmdline_override: Option<&str>,
     key_injections: &[KeyInjection],
 ) -> Result<TerminalAction> {
-    // Build the cmdline, stage the log + key injections, then (in F4)
-    // verify + measure the generation before filling the kexec image
-    // slot. Behaviour-preserving wrapper around the load sequence.
+    // Build the cmdline, VERIFY the generation's signature, leave the
+    // PCR-11 measure seam (#27), then fill the kexec image slot — in that
+    // fixed order. An enforce-mode signature failure short-circuits with
+    // `NmblError::PolicyRefused`, which the `run_tui_session` Err arm maps
+    // to the RebootIntoRescue terminus (R-1) — no image is loaded.
     let cmdline =
         handoff::verify_measure_then_load(config, generation, cmdline_override, key_injections)?;
     nmbl_info!("kexec: image loaded ({} bytes cmdline)", cmdline.len());
