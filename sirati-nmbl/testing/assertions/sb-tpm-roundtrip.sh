@@ -32,11 +32,15 @@ CONFIG_NAME="test-secure-boot"
 # NMBL markers proving the TPM is present and the measured path ran. Any one
 # of these means /dev/tpmrm0 was found and NMBL talked to it.
 TPM_PRESENT_RE='tpmrm0|TPM present|measured boot|PCR 11|PCR-11|extend.*PCR|seal'
-# Auto-unseal SUCCESS: the cryptroot mapper opened from the TPM-sealed token
-# WITHOUT a password being answered. NMBL logs the unlock path it took.
-UNSEAL_OK_RE='unseal|TPM unlock|sealed token|cryptroot.*unlocked|tpm.*unlock'
+# Auto-unseal SUCCESS: a TPM-token-SPECIFIC marker NMBL emits ONLY on a genuine
+# `cryptsetup open --token-only` unseal (src/activation/mod.rs). `--token-only`
+# can NEVER fall back to a password keyslot, so this line proves the seal/unseal
+# roundtrip succeeded — it shares no substring with the generic "activation
+# luks-tpm completed" line, so a password fallback can never match it.
+UNSEAL_OK_RE='luks-tpm: unsealed .* via TPM token'
 # A password PROMPT means auto-unseal FAILED (fell back to the modal). Seeing
-# it without the unseal-ok marker is a FAIL for this happy-path scenario.
+# it is a FAIL for this happy-path scenario; we assert its ABSENCE below in
+# addition to requiring the unseal marker above.
 PASSWORD_PROMPT_RE='Enter LUKS passphrase|passphrase for cryptroot'
 
 SHELL_TIMEOUT="${NMBL_SHELL_TIMEOUT:-240}"
@@ -87,8 +91,8 @@ if ! wait_for "$TPM_PRESENT_RE" "$BOOT_WATCH"; then
 fi
 echo "=== PASS precondition: TPM present + measured boot ===" >&2
 
-# The TPM-sealed cryptroot must AUTO-unseal: NMBL opens it from the sealed
-# token with no password answered. A bare password prompt that is never
+# The TPM-sealed cryptroot must AUTO-unseal: NMBL emits the TPM-token-specific
+# marker above with no password answered. A bare password prompt that is never
 # satisfied means the seal/unseal roundtrip failed.
 echo "=== asserting TPM auto-unseal of cryptroot (no password) ===" >&2
 if ! wait_for "$UNSEAL_OK_RE" "$BOOT_WATCH"; then
@@ -99,7 +103,14 @@ if ! wait_for "$UNSEAL_OK_RE" "$BOOT_WATCH"; then
   fi
   exit 1
 fi
-echo "=== PASS: cryptroot auto-unsealed from the TPM ===" >&2
+# Belt-and-braces: even WITH the unseal marker, a password prompt anywhere in
+# the history means the seal degraded to a fallback — fail the happy path.
+if seen_in_history "$PASSWORD_PROMPT_RE"; then
+  echo "FAIL: a password prompt appeared despite the unseal marker — the TPM" >&2
+  echo "      auto-unseal is not clean (a fallback path was exercised)." >&2
+  exit 1
+fi
+echo "=== PASS: cryptroot auto-unsealed from the TPM (no password prompt) ===" >&2
 
 # Finally the box must reach the booted root shell — proving the measured boot
 # matched the seal policy end-to-end and the system came up unattended.

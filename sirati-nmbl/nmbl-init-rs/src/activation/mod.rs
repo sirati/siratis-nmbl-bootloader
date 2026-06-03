@@ -30,7 +30,7 @@ use helpers::{
     loaded_modules, wait_for_source_device, wrap_runner_error,
 };
 use luks::{WrongPasswordHandled, handle_wrong_password, run_luks_with_spinner};
-use seal::register_tpm_mapper_if_luks_tpm;
+use seal::{luks_tpm_mapper_name, register_tpm_mapper_if_luks_tpm};
 
 /// One passphrase to inject into the kexec'd initrd as a keyfile. The
 /// activation runner emits one of these per `luks-password` activation
@@ -259,6 +259,20 @@ async fn run_one_activation(
         // rather than failing. The LUKS volume is accessible either
         // way, so treat both as a clean break.
         if is_activation_success(outcome.exit_code) {
+            // DISTINCT TPM-unseal marker. A `luks-tpm` activation runs
+            // `cryptsetup open --token-only …`, which unseals the LUKS key
+            // from the TPM2-sealed token and CANNOT fall back to a password
+            // keyslot — so a success here is unambiguously a genuine TPM
+            // unseal, never a passphrase unlock. The roundtrip test keys on
+            // this line (and asserts no password prompt) so it can never
+            // false-pass on a fallback (shares no substring with the generic
+            // "activation … completed" line below).
+            if activation.kind == ActivationKind::LuksTpm {
+                nmbl_info!(
+                    "luks-tpm: unsealed {} via TPM token (cryptsetup --token-only)",
+                    luks_tpm_mapper_name(activation).unwrap_or("cryptroot"),
+                );
+            }
             // A TPM-unsealed LUKS mapper is now live. Record it on the
             // always-compiled seal registry so `policy::seal_secrets`
             // closes it (cryptsetup close) before any interactive context
