@@ -40,6 +40,7 @@ pub(crate) async fn run_phases_post_console(
     session: &SessionInteraction,
     skip_selector: &SkipSelector,
     sender: &nmbl_init::sys::poller::LocalSender,
+    driver_images: &mut nmbl_init::imageload::DriverImagesHandle,
 ) -> Result<Vec<KeyInjection>> {
     let mut reporter = BootReporter::new(console, "phase 2b: loading kernel modules");
     // Paint the first frame so the operator sees a populated screen
@@ -62,6 +63,7 @@ pub(crate) async fn run_phases_post_console(
         session,
         skip_selector,
         sender,
+        driver_images,
     )
     .await?;
 
@@ -110,6 +112,7 @@ pub(crate) async fn run_phases_post_console(
         session,
         skip_selector,
         sender,
+        driver_images,
     )
     .await?;
     injections.extend(staged);
@@ -140,6 +143,7 @@ async fn run_priority_gate_hook(
     session: &SessionInteraction,
     skip_selector: &SkipSelector,
     sender: &nmbl_init::sys::poller::LocalSender,
+    driver_images: &mut nmbl_init::imageload::DriverImagesHandle,
 ) -> Result<Vec<KeyInjection>> {
     let Some(attested) = nmbl_init::policy::run_priority_gate_at(phase, config)? else {
         return Ok(Vec::new());
@@ -148,6 +152,8 @@ async fn run_priority_gate_hook(
     {
         // Only the inside-LUKS (post-unlock) phase carries the staged fragment;
         // the pre-plain-boot witness is dropped (its volume owns no staged set).
+        // Staged-rerun driver images are appended to `driver_images` so they are
+        // measured + torn down alongside the base set (#28 / LOW-B).
         if matches!(phase, GatePhase::PostUnlock) {
             return nmbl_init::staged::apply_staged_boot(
                 attested,
@@ -156,13 +162,14 @@ async fn run_priority_gate_hook(
                 session,
                 skip_selector,
                 sender,
+                driver_images,
             )
             .await;
         }
     }
     // No staged-boot feature, or the pre-plain-boot phase: drop the witness.
     #[cfg(not(feature = "staged-boot"))]
-    let _ = (reporter, session, skip_selector, sender);
+    let _ = (reporter, session, skip_selector, sender, driver_images);
     drop(attested);
     Ok(Vec::new())
 }
@@ -179,6 +186,7 @@ async fn run_priority_gate_hook(
     _session: &SessionInteraction,
     _skip_selector: &SkipSelector,
     _sender: &nmbl_init::sys::poller::LocalSender,
+    _driver_images: &mut nmbl_init::imageload::DriverImagesHandle,
 ) -> Result<Vec<KeyInjection>> {
     Ok(Vec::new())
 }

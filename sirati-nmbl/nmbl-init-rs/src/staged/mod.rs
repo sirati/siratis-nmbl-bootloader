@@ -67,6 +67,8 @@ use crate::config::Config;
 #[cfg(feature = "staged-boot")]
 use crate::error::Result;
 #[cfg(feature = "staged-boot")]
+use crate::imageload::DriverImagesHandle;
+#[cfg(feature = "staged-boot")]
 use crate::policy::AttestedVolume;
 #[cfg(feature = "staged-boot")]
 use crate::sys::poller::LocalSender;
@@ -101,6 +103,7 @@ pub async fn apply_staged_boot(
     session: &SessionInteraction,
     skip_selector: &SkipSelector,
     sender: &LocalSender,
+    driver_images: &mut DriverImagesHandle,
 ) -> Result<Vec<KeyInjection>> {
     // `[staged]` disabled / absent ⇒ nothing to do (the attested volume is
     // dropped here, releasing its mount).
@@ -120,7 +123,17 @@ pub async fn apply_staged_boot(
     // collect the result and map a hard error to PolicyRefused so the merge's
     // transactional guarantee (base untouched) backs the refuse against the
     // pristine config (FIX-32/FIX-35).
-    match apply_inner(&attested, config, reporter, session, skip_selector, sender).await {
+    match apply_inner(
+        &attested,
+        config,
+        reporter,
+        session,
+        skip_selector,
+        sender,
+        driver_images,
+    )
+    .await
+    {
         Ok(injections) => {
             crate::nmbl_info!("staged-boot: fragment applied; merged config in effect");
             Ok(injections)
@@ -154,6 +167,7 @@ async fn apply_inner(
     session: &SessionInteraction,
     skip_selector: &SkipSelector,
     sender: &LocalSender,
+    driver_images: &mut DriverImagesHandle,
 ) -> Result<Vec<KeyInjection>> {
     // (a) SINGLE-fd verify the staged image AND the fragment — each over its
     // own pinned fd, before anything is loaded or merged.
@@ -165,8 +179,18 @@ async fn apply_inner(
     let fragment = crate::config::load_fragment(&fragment_path)?;
     merge::merge_fragment(config, fragment)?;
 
-    // (d) re-run the modules/activations the merged config now implies.
-    rerun::rerun_merged_effects(config, reporter, session, skip_selector, sender).await
+    // (d) re-run the modules/activations the merged config now implies. The
+    // staged driver images load into `driver_images` so they ride the base
+    // set's measure + teardown bookkeeping (#28 / LOW-B).
+    rerun::rerun_merged_effects(
+        config,
+        reporter,
+        session,
+        skip_selector,
+        sender,
+        driver_images,
+    )
+    .await
 }
 
 #[cfg(feature = "staged-boot")]
