@@ -185,6 +185,21 @@ async fn run_retry_boot_arm(
 ) -> Option<TerminalAction> {
     match retry_boot(config, console, app, supplier, sender).await {
         Ok(action) => Some(action),
+        // A refused retry (a generation/measure gate refused inside
+        // `kexec_into`) must RELOCK + reboot into rescue, not loop back to
+        // the shell-offering menu via a modal (FIX-35 residual). Route it
+        // through `run_refuse_screen` — cap → close-mappers → sentinel →
+        // relock + the non-interactive countdown — so the refuse relocks
+        // and the type-gated `RebootIntoRescue` terminus is returned. The
+        // TPM is already capped by G1 on this path, so this is not a
+        // fail-open today, but a refused retry must still refuse properly.
+        Err(NmblError::PolicyRefused { cause }) => {
+            nmbl_warn!(
+                "emergency retry-boot refused; relocking and rebooting into rescue: {}",
+                format_chain(cause.as_ref() as &dyn std::error::Error)
+            );
+            Some(crate::policy::run_refuse_screen(config, console, *cause, sender).await)
+        }
         Err(e) => {
             let title = abort_aware_title(&e, "Retry boot failed");
             nmbl_warn!(
