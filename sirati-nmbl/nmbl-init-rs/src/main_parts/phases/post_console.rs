@@ -72,6 +72,7 @@ pub(crate) async fn run_phases_post_console<S: SysOps>(
     // The attested volume is dropped here (the plain boot FS owns no staged
     // set; staged-boot is consumed only at the post-unlock hook below).
     let _ = run_priority_gate_hook(
+        ops,
         GatePhase::PrePlainBoot,
         config,
         &mut reporter,
@@ -119,6 +120,7 @@ pub(crate) async fn run_phases_post_console<S: SysOps>(
     // here, AFTER the gate attests the volume, so staged-boot can never consume
     // an unverified volume (FIX-26); its extra key injections join the base set.
     let staged = run_priority_gate_hook(
+        ops,
         GatePhase::PostUnlock,
         config,
         &mut reporter,
@@ -149,7 +151,12 @@ pub(crate) async fn run_phases_post_console<S: SysOps>(
         reason = "the await lives in the staged-boot-gated branch; the seam stays async so the call site is uniform across features"
     )
 )]
-async fn run_priority_gate_hook(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads the ops seam (gate verify + staged apply dry-run) alongside the security context"
+)]
+async fn run_priority_gate_hook<S: SysOps>(
+    ops: &mut S,
     phase: GatePhase,
     config: &mut Config,
     reporter: &mut BootReporter<'_, '_>,
@@ -158,7 +165,7 @@ async fn run_priority_gate_hook(
     sender: &nmbl_init::sys::poller::LocalSender,
     driver_images: &mut nmbl_init::imageload::DriverImagesHandle,
 ) -> Result<Vec<KeyInjection>> {
-    let Some(attested) = nmbl_init::policy::run_priority_gate_at(phase, config)? else {
+    let Some(attested) = nmbl_init::policy::run_priority_gate_at(ops, phase, config)? else {
         return Ok(Vec::new());
     };
     #[cfg(feature = "staged-boot")]
@@ -169,6 +176,7 @@ async fn run_priority_gate_hook(
         // measured + torn down alongside the base set (#28 / LOW-B).
         if matches!(phase, GatePhase::PostUnlock) {
             return nmbl_init::staged::apply_staged_boot(
+                ops,
                 attested,
                 config,
                 reporter,
@@ -192,7 +200,12 @@ async fn run_priority_gate_hook(
     clippy::unused_async,
     reason = "mirrors the secure-boot async hook for a uniform call site"
 )]
-async fn run_priority_gate_hook(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the secure-boot hook signature for a uniform call site"
+)]
+async fn run_priority_gate_hook<S: SysOps>(
+    _ops: &mut S,
     _phase: GatePhase,
     _config: &mut Config,
     _reporter: &mut BootReporter<'_, '_>,
