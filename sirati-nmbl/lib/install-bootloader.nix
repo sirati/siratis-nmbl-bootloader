@@ -27,6 +27,11 @@
   # Empty string when no driver images are enabled (default keeps older
   # callers evaluable).
   driverImageInstallShell ? "",
+  # Install-time staged-boot staging + `nmbl-sign` signing shell (FEATURE #2).
+  # Empty string when `boot.nmbl.staged.enable` is off. Unlike the driver-image
+  # shell (which writes onto /boot), this writes onto the install root `/` — the
+  # decrypted priority volume the boot-time gate later mounts read-only.
+  stagedInstallShell ? "",
   # The host-platform `nmbl-sign` ML-DSA signer (flake `_module.args.nmblSign`).
   # Threaded into install-signing.nix for per-generation signing; `null` on an
   # older host flake (only dereferenced when signing is enabled).
@@ -198,6 +203,13 @@ pkgs.writeScript "install-nmbl-bootloader" ''
   # `imageKeyFile`, so the `nmbl-sign` call would fail there — the real install
   # (deferInstallSigning = false) stages the key and signs in place.
   ${lib.optionalString (!deferInstallSigning) driverImageInstallShell}
+
+  # Optional staged-boot artifacts (FEATURE #2). Staged onto the priority
+  # volume's filesystem — the install root `/` (the decrypted cryptroot the
+  # boot-time priority gate mounts read-only after the LUKS activation) — and
+  # signed in place with `nmbl-sign` (impure ML-DSA key read at install time).
+  # Empty string when staged boot is off.
+  ${stagedInstallShell}
 
   ${lib.optionalString (cfg.splash.enable && cfg.splash.backgroundLocation == "boot-partition") (
     let
