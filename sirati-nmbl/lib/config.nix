@@ -274,6 +274,13 @@ let
     inherit pkgs lib config cfg nmblSign rescueModulesTree;
   };
 
+  # Staged-boot install-time staging + signing (test-matrix #2 / FEATURE #2).
+  # ADDITIVE + gated on `boot.nmbl.staged.enable`: when off it contributes an
+  # empty shell fragment and builds nothing, so a non-staged config is unchanged.
+  stagedInstallBuild = import ./staged-install.nix {
+    inherit pkgs lib config cfg nmblSign;
+  };
+
   # The emergency menu's "Raw Shell" forks `cfg.paths.shell` while NMBL is
   # PID 1 in the INITRAMFS (before any switch_root — see the Rust
   # `sys::pty::preflight_shell` and `shell::drop_to_emergency`). So a usable
@@ -746,6 +753,9 @@ in
       # Install-time driver-image staging + `nmbl-sign` signing shell (#25a).
       # Empty string when no driver images are enabled.
       driverImageInstallShell = driverImageBuild.driverImageInstallShell;
+      # Install-time staged-boot staging + signing shell (FEATURE #2). Empty
+      # string when `boot.nmbl.staged.enable` is off.
+      stagedInstallShell = stagedInstallBuild.stagedInstallShell;
       # The host-platform `nmbl-sign` signer, threaded through to
       # install-signing.nix for per-generation kernel/initrd signing (#53).
       inherit nmblSign;
