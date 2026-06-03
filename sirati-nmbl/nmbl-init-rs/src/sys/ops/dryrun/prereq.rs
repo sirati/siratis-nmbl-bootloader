@@ -181,8 +181,12 @@ mod tests {
         // staged but squashfs is not, so the driver image can never loop-mount.
         let root = closure_with_modules("no-squashfs", &["loop"]);
         let findings = driver_image_prereq_findings(&driver_config(true), &root);
-        assert_eq!(findings.len(), 1, "exactly squashfs is missing: {findings:?}");
-        let f = &findings[0];
+        assert_eq!(
+            findings.len(),
+            1,
+            "exactly squashfs is missing: {findings:?}"
+        );
+        let f = findings.first().expect("one finding present");
         assert_eq!(f.op, "driver_image_prereq");
         assert!(
             f.path.to_string_lossy().contains("squashfs"),
