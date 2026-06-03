@@ -64,6 +64,7 @@ let
         pkgs.netcat-openbsd
         pkgs.gawk
         pkgs.gnused
+        pkgs.gnugrep
         nixos-anywhere.packages.${system}.default
       ];
       text = ''
@@ -230,6 +231,18 @@ let
           echo "SSH reachable on port $PORT (after ''${i}s)"
         }
 
+        # Run nixos-anywhere with its kexec-installer download de-noised. Its
+        # kexec phase fetches a ~419MB tarball with `wget --progress=dot`, whose
+        # thousands of `.......... NN% …` rows otherwise flood stdout and trip a
+        # CI runner's excessive-output guard mid-install. Drop only those dot
+        # lines (every wget progress row carries a run of ten dots; no other
+        # nixos-anywhere output does), keeping all real progress and errors. The
+        # filter never exits non-zero, so under `set -o pipefail` the pipeline's
+        # status is nixos-anywhere's own — a failed install still fails here.
+        na_quiet() {
+          nixos-anywhere "$@" 2>&1 | { grep --line-buffered -vE '\.{10}' || true; }
+        }
+
         echo
         echo "===== STAGE 1: Boot rescue VM (SystemRescue) ====="
         KARGS="archisobasedir=sysresccd archisolabel=RESCUE1300 iomem=relaxed console=ttyS0,115200n8 ar_source=/dev/vdb ar_ignorefail nofirewall"
@@ -266,7 +279,7 @@ let
         # Split the run so we can stage the INSTALL-TIME signing keys into the
         # kexec-installer BEFORE installBootLoader runs. The keys are read by
         # PATH at install time — never imported into a derivation.
-        nixos-anywhere \
+        na_quiet \
           --store-paths "$DISKO_SCRIPT" "$NIXOS_SYSTEM" \
           --target-host "root@localhost" \
           --ssh-port "$PORT" \
@@ -303,7 +316,7 @@ let
 
         echo
         echo "===== STAGE 2c: nixos-anywhere install (NMBL signs UKI + sidecars in place) ====="
-        nixos-anywhere \
+        na_quiet \
           --store-paths "$DISKO_SCRIPT" "$NIXOS_SYSTEM" \
           --target-host "root@localhost" \
           --ssh-port "$PORT" \
