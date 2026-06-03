@@ -179,6 +179,17 @@ pub(super) async fn handle_wrong_password(
         WrongPasswordOutcome::Reboot => Ok(WrongPasswordHandled::Reboot),
         #[cfg(feature = "pretty-shell")]
         WrongPasswordOutcome::PrettyShell => {
+            // A `--validate-initrm` dry run that scripts an exit-2
+            // (wrong-password) luks step would otherwise run the REAL
+            // `seal_secrets` (cryptsetup close on a TPM host) and fork a REAL
+            // recovery shell here. Gate both behind the same dry-run seal seam
+            // the refuse terminus + cap/close path use: skip the real seal +
+            // real fork and report the shell as exited so the dry-run still
+            // exercises the post-shell control flow. Real boot never enters the
+            // scope, so this branch is dead on the real path.
+            if crate::policy::validate_initrm_active() {
+                return Ok(WrongPasswordHandled::ShellExited);
+            }
             // SEAL BEFORE SPAWN: a wrong-password recovery shell is reached
             // while an EARLIER luks-tpm mapper may still be live, so cap +
             // close-mappers first. A seal failure refuses the shell.
@@ -206,6 +217,14 @@ pub(super) async fn handle_wrong_password(
             Ok(WrongPasswordHandled::ShellExited)
         }
         WrongPasswordOutcome::RawShell => {
+            // Dry-run seam gate (see the PrettyShell arm above): a
+            // `--validate-initrm` run must not run the real seal nor fork the
+            // picker's real shell (its fire-and-forget arm forks regardless of
+            // any `ops`, which is why we gate at the seam rather than thread a
+            // dry-run `ExecOps` down here).
+            if crate::policy::validate_initrm_active() {
+                return Ok(WrongPasswordHandled::ShellExited);
+            }
             // SEAL BEFORE SPAWN (see the PrettyShell arm above).
             let sealed = match crate::policy::seal_secrets(config.tpm.require_tpm, sender).await {
                 Ok(s) => s,
