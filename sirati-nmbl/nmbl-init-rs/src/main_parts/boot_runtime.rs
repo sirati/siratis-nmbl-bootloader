@@ -176,7 +176,14 @@ pub(crate) async fn run_boot_inside_runtime(
             Err(err) => return BootOutcome::Done(Box::new(Err(Box::new((err, config))))),
         }
     }
-    if should_force_external_rescue(&config) {
+    // Force-rescue decision: the legacy `rescue.force_on_boot && external`
+    // trigger UNIONED with the rescue sentinel (FIX-49/MED-1). Routing through
+    // `should_force_rescue` is what actually READS the sentinel — without it an
+    // empty `/boot/nmbl/rescue` (e.g. dropped by a prior refuse→reboot) would
+    // never force rescue and the box could re-enter the failing boot. A
+    // sentinel-forced rescue takes the SAME `rescue::dispatch` path, whose G4
+    // seal keeps the TPM locked.
+    if nmbl_init::policy::should_force_rescue(should_force_external_rescue(&config), &config) {
         return BootOutcome::ForceRescue(Box::new(config));
     }
     #[cfg(feature = "stateful")]

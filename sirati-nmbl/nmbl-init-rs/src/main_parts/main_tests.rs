@@ -1,5 +1,6 @@
 use nmbl_init::config::Config;
 use nmbl_init::modules::load_explicit_modules;
+use nmbl_init::policy::should_force_rescue;
 use nmbl_init::rescue::RescueMode;
 use nmbl_init::ui::BootReporter;
 use nmbl_init::ui::console::NoopConsole;
@@ -40,6 +41,45 @@ fn external_mode_without_force_does_not_trigger() {
     cfg.rescue.force_on_boot = false;
     cfg.rescue.mode = RescueMode::External;
     assert!(!should_force_external_rescue(&cfg));
+}
+
+#[test]
+fn a_present_sentinel_forces_rescue_at_boot() {
+    // MED-1: the boot-runtime force-rescue decision is
+    // `should_force_rescue(should_force_external_rescue(cfg), cfg)` — the
+    // sentinel-aware union. A present sentinel must force rescue even when the
+    // legacy force-on-boot trigger is OFF; the old code called
+    // `should_force_external_rescue` directly and never read the sentinel.
+    let dir = std::env::temp_dir().join(format!(
+        "nmbl-med1-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("nmbl")).expect("sentinel dir");
+    std::fs::write(dir.join("nmbl/rescue"), b"").expect("write sentinel");
+
+    let mut cfg = Config::recovery_default();
+    cfg.runtime_boot_mountpoint = Some(dir.clone());
+    // Legacy trigger is OFF: only the sentinel should force rescue.
+    cfg.rescue.force_on_boot = false;
+    assert!(
+        !should_force_external_rescue(&cfg),
+        "the legacy trigger alone is off"
+    );
+    // The EXACT boot-runtime expression: sentinel ⇒ rescue.
+    assert!(
+        should_force_rescue(should_force_external_rescue(&cfg), &cfg),
+        "a present sentinel must force rescue at boot (MED-1 rewire)"
+    );
+
+    // And with the sentinel removed the decision is false again.
+    std::fs::remove_file(dir.join("nmbl/rescue")).expect("rm sentinel");
+    assert!(
+        !should_force_rescue(should_force_external_rescue(&cfg), &cfg),
+        "no sentinel + no legacy trigger ⇒ normal boot"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
