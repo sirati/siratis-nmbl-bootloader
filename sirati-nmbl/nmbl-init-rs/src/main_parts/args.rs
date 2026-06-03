@@ -9,6 +9,12 @@ pub(super) struct Args {
     pub(super) config_path: PathBuf,
     pub(super) errored_report: Option<PathBuf>,
     pub(super) validate_config: Option<PathBuf>,
+    /// `--validate-config-fragment=<toml>`: installer-side load+parse of a
+    /// staged-boot config fragment (a partial overlay). Mirrors
+    /// `--validate-config` but accepts a partial schema. Staged-boot builds
+    /// only; mutually exclusive with the other early-exit modes.
+    #[cfg(feature = "staged-boot")]
+    pub(super) validate_fragment: Option<PathBuf>,
     /// `--validate-hardware=<toml>`: read-only hardware check on the real
     /// target machine. Mutually exclusive with the other early-exit modes.
     pub(super) validate_hardware: Option<PathBuf>,
@@ -60,6 +66,8 @@ where
     let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
     let mut errored_report: Option<PathBuf> = None;
     let mut validate_config: Option<PathBuf> = None;
+    #[cfg(feature = "staged-boot")]
+    let mut validate_fragment: Option<PathBuf> = None;
     let mut validate_hardware: Option<PathBuf> = None;
     let mut validate_closure: Option<PathBuf> = None;
     let mut config_toml: Option<PathBuf> = None;
@@ -90,6 +98,17 @@ where
             && let Some(v) = iter.next()
         {
             validate_config = Some(PathBuf::from(v));
+        } else if let Some(value) =
+            parse_fragment_flag(&arg, "--validate-config-fragment", &mut iter)?
+        {
+            #[cfg(feature = "staged-boot")]
+            {
+                validate_fragment = Some(value);
+            }
+            #[cfg(not(feature = "staged-boot"))]
+            {
+                let _ = value;
+            }
         } else if let Some(rest) = arg.strip_prefix("--validate-hardware=") {
             validate_hardware = Some(PathBuf::from(rest));
         } else if arg == "--validate-hardware"
@@ -144,15 +163,20 @@ where
         u8::from(init_state_dir.is_some()) + u8::from(boot_succeeded_dir.is_some());
     #[cfg(not(feature = "stateful"))]
     let stateful_modes = 0u8;
+    #[cfg(feature = "staged-boot")]
+    let fragment_mode = u8::from(validate_fragment.is_some());
+    #[cfg(not(feature = "staged-boot"))]
+    let fragment_mode = 0u8;
     let early_exit_count = u8::from(validate_config.is_some())
         + u8::from(validate_hardware.is_some())
         + u8::from(validate_closure.is_some())
+        + fragment_mode
         + stateful_modes;
     if early_exit_count > 1 {
         return Err(
-            "the early-exit modes (--validate-config, --validate-hardware, \
-             --validate-nix-filesystem-closure, --init-state, --boot-succeeded) \
-             are mutually exclusive"
+            "the early-exit modes (--validate-config, --validate-config-fragment, \
+             --validate-hardware, --validate-nix-filesystem-closure, --init-state, \
+             --boot-succeeded) are mutually exclusive"
                 .to_string(),
         );
     }
@@ -166,6 +190,8 @@ where
         config_path,
         errored_report,
         validate_config,
+        #[cfg(feature = "staged-boot")]
+        validate_fragment,
         validate_hardware,
         validate_closure,
         config_toml,
@@ -223,193 +249,57 @@ where
     Ok(None)
 }
 
+/// Recognise `--validate-config-fragment` in both `--flag=<v>` and
+/// `--flag <v>` forms. Returns `Ok(None)` when `arg` is not this flag,
+/// `Ok(Some(path))` when it matched (staged-boot builds), `Err` when the
+/// path argument is missing or — on a non-staged-boot build — the flag was
+/// used at all (so the operator is not silently handed a no-op).
+fn parse_fragment_flag<I>(
+    arg: &str,
+    flag: &'static str,
+    iter: &mut I,
+) -> std::result::Result<Option<PathBuf>, String>
+where
+    I: Iterator<Item = std::ffi::OsString>,
+{
+    let equals_prefix = format!("{flag}=");
+    if let Some(rest) = arg.strip_prefix(&equals_prefix) {
+        #[cfg(feature = "staged-boot")]
+        {
+            return Ok(Some(PathBuf::from(rest)));
+        }
+        #[cfg(not(feature = "staged-boot"))]
+        {
+            let _ = rest;
+            return Err(format!(
+                "{flag} requires nmbl-init to be built with the `staged-boot` feature"
+            ));
+        }
+    }
+    if arg == flag {
+        #[cfg(feature = "staged-boot")]
+        {
+            let Some(v) = iter.next() else {
+                return Err(format!("{flag} requires a path argument"));
+            };
+            return Ok(Some(PathBuf::from(v)));
+        }
+        #[cfg(not(feature = "staged-boot"))]
+        {
+            let _ = iter;
+            return Err(format!(
+                "{flag} requires nmbl-init to be built with the `staged-boot` feature"
+            ));
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
     clippy::panic,
     reason = "tests assert on contract failures"
 )]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[cfg(feature = "stateful")]
-    #[test]
-    fn init_state_with_path_parses() {
-        let args =
-            parse_args_from(["--init-state", "/some/path"]).expect("--init-state should parse");
-        assert_eq!(
-            args.init_state_dir.as_deref(),
-            Some(Path::new("/some/path"))
-        );
-        assert!(args.boot_succeeded_dir.is_none());
-        assert!(args.validate_config.is_none());
-    }
-
-    #[cfg(feature = "stateful")]
-    #[test]
-    fn init_state_equals_form_parses() {
-        let args =
-            parse_args_from(["--init-state=/some/path"]).expect("--init-state=… should parse");
-        assert_eq!(
-            args.init_state_dir.as_deref(),
-            Some(Path::new("/some/path"))
-        );
-    }
-
-    #[cfg(feature = "stateful")]
-    #[test]
-    fn boot_succeeded_with_path_parses() {
-        let args = parse_args_from(["--boot-succeeded", "/some/path"])
-            .expect("--boot-succeeded should parse");
-        assert_eq!(
-            args.boot_succeeded_dir.as_deref(),
-            Some(Path::new("/some/path"))
-        );
-        assert!(args.init_state_dir.is_none());
-        assert!(args.validate_config.is_none());
-    }
-
-    #[cfg(feature = "stateful")]
-    #[test]
-    fn init_state_and_boot_succeeded_are_mutually_exclusive() {
-        let err = parse_args_from(["--init-state", "/a", "--boot-succeeded", "/b"])
-            .expect_err("both flags at once must be rejected");
-        assert!(err.contains("mutually exclusive"), "{err}");
-    }
-
-    #[cfg(feature = "stateful")]
-    #[test]
-    fn validate_config_and_init_state_are_mutually_exclusive() {
-        let err = parse_args_from(["--validate-config", "/c", "--init-state", "/a"])
-            .expect_err("validate-config + init-state must be rejected");
-        assert!(err.contains("mutually exclusive"), "{err}");
-    }
-
-    #[cfg(feature = "stateful")]
-    #[test]
-    fn init_state_without_argument_errors() {
-        let err =
-            parse_args_from(["--init-state"]).expect_err("--init-state without dir must error");
-        assert!(err.contains("requires a directory argument"), "{err}");
-    }
-
-    #[cfg(feature = "stateful")]
-    #[test]
-    fn boot_succeeded_without_argument_errors() {
-        let err = parse_args_from(["--boot-succeeded"])
-            .expect_err("--boot-succeeded without dir must error");
-        assert!(err.contains("requires a directory argument"), "{err}");
-    }
-
-    #[cfg(not(feature = "stateful"))]
-    #[test]
-    fn init_state_without_feature_errors() {
-        // The operator built nmbl-init without `stateful` but still
-        // passed `--init-state`; we must not silently ignore — that
-        // would leave state.bin uninitialised and bricked installers
-        // would be invisible at build time.
-        let err = parse_args_from(["--init-state", "/a"])
-            .expect_err("--init-state without feature must error");
-        assert!(err.contains("stateful"), "{err}");
-    }
-
-    #[cfg(not(feature = "stateful"))]
-    #[test]
-    fn boot_succeeded_without_feature_errors() {
-        let err = parse_args_from(["--boot-succeeded", "/a"])
-            .expect_err("--boot-succeeded without feature must error");
-        assert!(err.contains("stateful"), "{err}");
-    }
-
-    #[cfg(not(feature = "stateful"))]
-    #[test]
-    fn init_state_equals_without_feature_errors() {
-        let err = parse_args_from(["--init-state=/a"])
-            .expect_err("--init-state=… without feature must error");
-        assert!(err.contains("stateful"), "{err}");
-    }
-
-    #[test]
-    fn unknown_args_are_ignored() {
-        // PID 1 has no "usage" target; unknown flags must not abort.
-        let args = parse_args_from(["--no-such-flag", "garbage"])
-            .expect("unknown flags should be silently dropped");
-        assert_eq!(args.config_path, PathBuf::from(DEFAULT_CONFIG_PATH));
-        assert!(args.errored_report.is_none());
-        assert!(args.validate_config.is_none());
-    }
-
-    #[test]
-    fn validate_config_parses_in_default_build() {
-        let args = parse_args_from(["--validate-config", "/etc/nmbl/config.toml"])
-            .expect("--validate-config should parse without stateful feature");
-        assert_eq!(
-            args.validate_config.as_deref(),
-            Some(Path::new("/etc/nmbl/config.toml"))
-        );
-    }
-
-    #[test]
-    fn validate_hardware_parses_both_forms() {
-        let a = parse_args_from(["--validate-hardware=/c.toml"]).expect("equals form");
-        assert_eq!(a.validate_hardware.as_deref(), Some(Path::new("/c.toml")));
-        let b = parse_args_from(["--validate-hardware", "/c.toml"]).expect("space form");
-        assert_eq!(b.validate_hardware.as_deref(), Some(Path::new("/c.toml")));
-    }
-
-    #[test]
-    fn validate_hardware_collects_tool_paths() {
-        let a = parse_args_from([
-            "--validate-hardware=/c.toml",
-            "--tool=cryptsetup:/store/bin/cryptsetup",
-        ])
-        .expect("tool path should parse");
-        assert_eq!(
-            a.tools.cryptsetup(),
-            Some(PathBuf::from("/store/bin/cryptsetup"))
-        );
-    }
-
-    #[test]
-    fn bad_tool_spec_errors() {
-        let err = parse_args_from(["--tool=cryptsetup"]).expect_err("missing ':' must error");
-        assert!(err.contains("<kind>:<path>"), "{err}");
-    }
-
-    #[test]
-    fn validate_closure_requires_config_toml() {
-        let err = parse_args_from(["--validate-nix-filesystem-closure=/fs.json"])
-            .expect_err("closure without --config-toml must error");
-        assert!(err.contains("--config-toml"), "{err}");
-    }
-
-    #[test]
-    fn validate_closure_parses_with_config_toml() {
-        let a = parse_args_from([
-            "--validate-nix-filesystem-closure=/fs.json",
-            "--config-toml=/c.toml",
-        ])
-        .expect("closure + config-toml should parse");
-        assert_eq!(a.validate_closure.as_deref(), Some(Path::new("/fs.json")));
-        assert_eq!(a.config_toml.as_deref(), Some(Path::new("/c.toml")));
-    }
-
-    #[test]
-    fn validate_hardware_and_config_are_mutually_exclusive() {
-        let err = parse_args_from(["--validate-config=/a", "--validate-hardware=/b"])
-            .expect_err("two validate modes at once must be rejected");
-        assert!(err.contains("mutually exclusive"), "{err}");
-    }
-
-    #[test]
-    fn validate_hardware_and_closure_are_mutually_exclusive() {
-        let err = parse_args_from([
-            "--validate-hardware=/a",
-            "--validate-nix-filesystem-closure=/b",
-            "--config-toml=/c",
-        ])
-        .expect_err("hardware + closure at once must be rejected");
-        assert!(err.contains("mutually exclusive"), "{err}");
-    }
-}
+#[path = "args_tests.rs"]
+mod tests;
