@@ -19,6 +19,7 @@ use std::os::fd::BorrowedFd;
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::sig::{self, DOMAIN_DRIVER_IMAGE, PolicyDecision};
+use crate::sys::ops::FsOps;
 
 use super::locate::ResolvedImage;
 
@@ -44,24 +45,39 @@ use super::locate::ResolvedImage;
 /// [`NmblError::DriverImage`] (`stage = "verify"`) when enforcement refuses the
 /// image's signature.
 pub(super) fn verify_driver_image(
+    fs: &dyn FsOps,
     image_fd: BorrowedFd<'_>,
     resolved: &ResolvedImage,
     config: &Config,
 ) -> Result<[u8; 64]> {
     let desc = resolved.image_path.display().to_string();
 
-    // Run the frozen fd-only verify pipeline under the driver-image role
-    // domain — a signature minted for any other role cannot verify here
-    // (domain-cross-reject, FIX-01). The digest variant hands back the SHA-512
-    // the verify already streamed over the single pinned fd so the PCR-11
-    // measure reuses it (FIX-02 — one hash, verify + measure).
-    let verify_result = sig::verify_image_fd_digest(
-        image_fd,
-        &desc,
-        Some(&resolved.sig_path),
-        DOMAIN_DRIVER_IMAGE,
-        config,
-    );
+    // Read the sidecar through the ops seam so a `--validate-initrm` dry-run
+    // verifies the closure copy (build mode: closure ≠ `/`), matching how the
+    // blob fd was opened (`locate::open_image_ro` → `FsOps::open_ro`). The
+    // path-based `verify_image_fd_digest` would instead read the sidecar off the
+    // LIVE host fs, mismatching the closure-sourced blob. A sidecar-read failure
+    // folds into the SAME enforce/audit gate as a verify failure below.
+    let verify_result = fs
+        .read_file(&resolved.sig_path)
+        .map_err(|source| NmblError::Io {
+            source,
+            context: format!("read driver-image sidecar {}", resolved.sig_path.display()),
+        })
+        .and_then(|sig_bytes| {
+            // Run the frozen fd-only verify pipeline under the driver-image role
+            // domain — a signature minted for any other role cannot verify here
+            // (domain-cross-reject, FIX-01). The digest variant hands back the
+            // SHA-512 the verify already streamed over the single pinned fd so
+            // the PCR-11 measure reuses it (FIX-02 — one hash, verify + measure).
+            sig::verify_image_fd_digest_bytes(
+                image_fd,
+                &desc,
+                &sig_bytes,
+                DOMAIN_DRIVER_IMAGE,
+                config,
+            )
+        });
 
     // On a verified pass we already hold the digest; reuse it (FIX-02 — no
     // re-hash). On a failure, hand the error to the enforce/audit gate — NO
@@ -95,6 +111,17 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::sys::ops::dryrun::{ClosureView, DryRunScenario, DryRunSys};
+
+    /// A real-FS-backed [`FsOps`] for these tests: a [`DryRunSys`] rooted at
+    /// `/`, so `read_file` is an identity `std::fs::read` over the absolute
+    /// tempdir sidecar paths — the same bytes the real boot would read.
+    fn runtime_fs() -> DryRunSys {
+        DryRunSys::new(
+            ClosureView::new(PathBuf::from("/")),
+            DryRunScenario::NormalBoot,
+        )
+    }
 
     /// A secure-boot config with the given enable/enforce posture.
     fn config_with_posture(enable: bool, enforce: bool) -> Config {
@@ -124,7 +151,8 @@ mod tests {
         let cfg = config_with_posture(true, true);
 
         let file = std::fs::File::open(&img).expect("open image");
-        let err = verify_driver_image(file.as_fd(), &res, &cfg)
+        let fs = runtime_fs();
+        let err = verify_driver_image(&fs, file.as_fd(), &res, &cfg)
             .expect_err("enforce + bad sig must refuse");
         match err {
             NmblError::DriverImage { stage, .. } => assert_eq!(stage, "verify"),
@@ -143,7 +171,44 @@ mod tests {
         let cfg = config_with_posture(true, false);
 
         let file = std::fs::File::open(&img).expect("open image");
-        verify_driver_image(file.as_fd(), &res, &cfg)
+        let fs = runtime_fs();
+        verify_driver_image(&fs, file.as_fd(), &res, &cfg)
             .expect("audit mode proceeds on a bad signature");
+    }
+
+    #[test]
+    fn dry_run_reads_sidecar_from_closure_not_host() {
+        // A build-mode dry-run (closure root ≠ `/`): the sidecar lives ONLY in
+        // the closure, never under the host-absolute `sig_path`. Routing the
+        // sidecar read through `FsOps::read_file` (closure-aware) means a bad
+        // closure sidecar is REACHED and refused under enforce — proving the
+        // read no longer escapes to the live host fs. Here there is no closure
+        // sidecar either, so enforce refuses on the closure-relative read.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let img = dir.path().join("d.sfs");
+        std::fs::write(&img, b"not-a-real-squashfs").expect("write image");
+        // A closure-relative sidecar path the closure-rooted ops graft under the
+        // (empty) closure root — so it is absent there, NOT read from the host.
+        let res = resolved(img.clone(), PathBuf::from("/boot/d.sfs.sig"));
+        let cfg = config_with_posture(true, true);
+
+        let closure_root = tempfile::tempdir().expect("closure root");
+        let fs = DryRunSys::new(
+            ClosureView::new(closure_root.path().to_path_buf()),
+            DryRunScenario::NormalBoot,
+        );
+        let file = std::fs::File::open(&img).expect("open image");
+        let err = verify_driver_image(&fs, file.as_fd(), &res, &cfg)
+            .expect_err("missing closure sidecar must refuse under enforce");
+        assert!(
+            matches!(
+                err,
+                NmblError::DriverImage {
+                    stage: "verify",
+                    ..
+                }
+            ),
+            "expected a verify-stage DriverImage refusal, got {err:?}",
+        );
     }
 }

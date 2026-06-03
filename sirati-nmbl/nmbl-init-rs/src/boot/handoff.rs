@@ -120,32 +120,29 @@ fn build_cmdline(
 /// so the file is reachable here even when the dispatcher flush in
 /// `main` hasn't run yet (it runs after `kexec_into` returns).
 ///
-/// The directory creation and read-back are routed through the [`FsOps`] seam
-/// so a `--validate-initrm` dry-run stages the log without touching the live
-/// filesystem (the dry-run no-ops the mkdir and reads through its closure).
+/// The directory creation AND the log flush are routed through the [`FsOps`]
+/// seam so a `--validate-initrm` dry-run stages the log without touching the
+/// live filesystem: the dry-run no-ops the mkdir and the write. The buffered
+/// transcript is materialised via [`log::snapshot_flush_bytes`] (the SAME
+/// header+body bytes a direct `log::flush_to` would persist) and written via
+/// [`FsOps::write_file`]; on a real boot the file content is byte-identical to
+/// the old `flush_to` path. The returned bytes are what the cpio fragment
+/// injects into the next kernel's initramfs.
 fn stage_log_for_kexec<S: FsOps>(ops: &mut S) -> Vec<u8> {
     let log_path = Path::new(NMBL_LOG_PATH);
     if let Some(parent) = log_path.parent() {
-        // EEXIST is benign; any harder failure surfaces through flush_to.
+        // EEXIST is benign; a harder failure surfaces through write_file below.
         let _ = ops.ensure_dir(parent);
     }
-    if let Err(err) = log::flush_to(log_path) {
+    let bytes = log::snapshot_flush_bytes();
+    if let Err(err) = ops.write_file(log_path, &bytes) {
         nmbl_warn!(
             "kexec: failed to flush log to {} for staging: {err}",
             log_path.display()
         );
         return Vec::new();
     }
-    match ops.read_file(log_path) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            nmbl_warn!(
-                "kexec: failed to read flushed log at {} for staging: {err}",
-                log_path.display()
-            );
-            Vec::new()
-        }
-    }
+    bytes
 }
 
 /// The byte-exact handoff inputs that bind verify, measure, and load.

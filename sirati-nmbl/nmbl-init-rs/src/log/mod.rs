@@ -16,7 +16,7 @@ mod tests;
 /// kexec staging path (`boot.rs`).
 pub const NMBL_LOG_PATH: &str = "/nmbl-log/nmbl.log";
 
-pub use byte_ring::{flush_to, snapshot_full};
+pub use byte_ring::{flush_to, snapshot_flush_bytes, snapshot_full};
 pub use kmsg::emit_kmsg;
 #[cfg(test)]
 pub(crate) use kmsg_read::set_raw_reader_for_test;

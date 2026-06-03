@@ -3,22 +3,20 @@
 //!
 //! It mirrors the SHAPE of [`super::RealSys`] method-for-method, but
 //! replaces every side effect with a presence check against a
-//! [`ClosureView`] over an extracted initramfs (or `/` at runtime). When
-//! an op needs a file the closure lacks, it records a [`MissingFile`]
-//! instead of performing the syscall; the `--validate-initrm` mode (next
-//! phase) lists every finding and exits non-zero.
+//! [`ClosureView`] over an extracted initramfs (or `/` at runtime). When an
+//! op needs a file the closure lacks, it records a [`MissingFile`] instead of
+//! performing the syscall; the `--validate-initrm` mode lists every finding
+//! and exits non-zero.
 //!
 //! Nothing here forks, mounts, mknods, loads a module, kexecs, or opens a
-//! device. Async methods return immediately (never block on a real
-//! device). The dispatch is the same generic `<S: SysOps>` seam the real
-//! impl uses — `DryRunSys` is a concrete type, never `dyn SysOps`.
+//! device. Async methods return immediately (never block on a real device).
 //!
 //! Findings are recorded on `&mut self` at the op level wherever the
-//! trait method takes `&mut self`. The two `&self` methods on
-//! [`FsOps`] (`exists`, `read_file`) do NOT record findings: `exists`
-//! is a pure predicate, and `read_file` propagates the `io::Error` so
-//! the genuine caller's fallback (optional splash assets degrade; the
-//! `&mut self` op that drove the read records the finding) decides.
+//! trait method takes `&mut self`. The `&self` methods on [`FsOps`]
+//! (`exists`, `read_file`, `open_ro`, `canonicalize`) do NOT record
+//! findings — `exists` is a pure predicate and the reads propagate their
+//! `io::Error` so the driving `&mut self` op (or the caller's optional-read
+//! fallback) decides whether the absence is a finding.
 
 mod closure;
 mod report;
@@ -59,11 +57,11 @@ pub struct DryRunSys {
     /// Accumulated findings; listed + non-zero exit by the mode.
     findings: Findings,
     /// Device nodes the boot WOULD create (via `ensure_dev_node` /
-    /// `populate_disk_symlinks`); a later `wait_for_device` on one of
-    /// these passes because the boot itself produces it.
+    /// `populate_disk_symlinks`); a later `wait_for_device` on one passes
+    /// because the boot itself produces it.
     synthetic_devices: HashSet<PathBuf>,
-    /// Monotonic counter handing out fake `/dev/loopN` paths so
-    /// `setup_loop` is deterministic and side-effect-free.
+    /// Monotonic counter handing out fake `/dev/loopN` paths so `setup_loop`
+    /// is deterministic and side-effect-free.
     loop_counter: u32,
 }
 
@@ -153,10 +151,9 @@ impl FsOps for DryRunSys {
                 format!("mount source for fstype {fstype} not in initrd"),
             ));
         }
-        // fstype driver resolution is intentionally lenient: pseudo-fs are
-        // built-in, and a real fstype's module was already validated via
-        // load_module*. Recording it here would risk a false negative, so
-        // we pass. NEVER calls mount(2).
+        // fstype driver resolution is intentionally lenient (pseudo-fs are
+        // built-in, a real fstype's module is validated via load_module*), so we
+        // pass. NEVER calls mount(2).
         Ok(())
     }
 
@@ -165,24 +162,21 @@ impl FsOps for DryRunSys {
     }
 
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
-        // Propagate the error; the &mut self op that drove this read (or
-        // the genuine caller's optional-read fallback) decides whether
-        // the absence is a finding.
+        // Propagate the error; the driving op (or the caller's optional-read
+        // fallback) decides whether the absence is a finding.
         self.closure.read_file(path)
     }
 
     fn open_ro(&self, path: &Path) -> io::Result<std::fs::File> {
-        // Open the CLOSURE-mapped path read-only: a side-effect-free real
-        // read of the shipped bytes, so the secure-boot verify pipeline's
-        // stream-hash runs against what would actually ship. An absent file
-        // surfaces as an `io::Error` the driving `&mut self` op records.
+        // Open the CLOSURE-mapped path read-only — a side-effect-free real read
+        // of the shipped bytes, so the verify stream-hash runs against what would
+        // ship. Absent ⇒ `io::Error` the driving `&mut self` op records.
         std::fs::File::open(self.closure.resolve_path(path))
     }
 
     fn write_file(&mut self, path: &Path, _contents: &[u8]) -> io::Result<()> {
-        // NEVER write: a sysfs firmware-load trigger / registry / sentinel
-        // write is a real side effect. Record + succeed so the boot flow
-        // continues exactly as if the write landed.
+        // NEVER write (sysfs trigger / registry / sentinel is a real side
+        // effect). Record + succeed so the boot flow continues as if it landed.
         self.findings.push(MissingFile::new(
             "write_file",
             path,
@@ -192,7 +186,7 @@ impl FsOps for DryRunSys {
     }
 
     fn remove_file(&mut self, path: &Path) -> io::Result<()> {
-        // NEVER unlink: registry / sentinel cleanup is a real side effect.
+        // NEVER unlink (registry / sentinel cleanup is a real side effect).
         // Record + succeed so the cleanup-then-continue flow proceeds.
         self.findings.push(MissingFile::new(
             "remove_file",
@@ -200,6 +194,19 @@ impl FsOps for DryRunSys {
             "dry-run: remove suppressed (no real side effect)",
         ));
         Ok(())
+    }
+
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        // Resolve WITHIN the closure (prefix-graft then real canonicalize) so a
+        // build-mode dry-run follows the toplevel's symlinks inside the extracted
+        // tree, not the host fs. Absent ⇒ `io::Error` (no finding recorded).
+        self.closure.canonicalize(path)
+    }
+
+    fn is_dry_run(&self) -> bool {
+        // No real mount happens, so `AttestedVolume::Drop` (which cannot route
+        // through ops) reads this to skip its real `umount(2)` (Property-6).
+        true
     }
 }
 
@@ -211,9 +218,9 @@ impl BlockOps for DryRunSys {
         operation: &str,
         _progress: Option<&mut dyn ProgressSink>,
     ) -> Result<()> {
-        // Trivially ready — NEVER block on a real device. Pass if the
-        // closure has it, the boot seeds it, or it is a kernel-created
-        // /dev node; otherwise record an informational finding.
+        // Trivially ready — NEVER block on a real device. Pass if the closure
+        // has it, the boot seeds it, or it is a kernel-created /dev node;
+        // otherwise record an informational finding.
         if !self.device_available(device) {
             self.findings.push(MissingFile::new(
                 "wait_for_device",
@@ -240,11 +247,10 @@ impl BlockOps for DryRunSys {
     }
 
     async fn populate_disk_symlinks(&mut self) -> Result<Vec<PathBuf>> {
-        // The genuine pass execs `blkid` then writes by-* symlinks. We
-        // cannot enumerate real disks in a sandbox, so: verify the blkid
-        // binary is shippable, then return an empty btrfs list. Any
-        // by-partlabel/by-uuid path the config later awaits is seeded by
-        // the device-availability `/dev/*` prefix rule, not here.
+        // The genuine pass execs `blkid` then writes by-* symlinks. We cannot
+        // enumerate real disks in a sandbox, so verify the blkid binary is
+        // shippable, then return an empty btrfs list. Any by-* path the config
+        // awaits is seeded by the device-availability `/dev/*` rule, not here.
         self.require_binary(
             "run",
             Path::new(BLKID_BINARY),
@@ -353,14 +359,13 @@ impl ExecOps for DryRunSys {
         _cols: u16,
         _rows: u16,
     ) -> Result<PtyChild> {
-        // PtyChild owns a real master OwnedFd + child Pid; it cannot be
-        // faked without an actual fork, which the dry-run must NOT do. So
-        // we run the SAME preflight the genuine path does (shell presence
-        // + devpts mount + ptmx) recording findings, then return the typed
-        // `NmblError::DryRunShellPreflight` signal. The Phase-5
-        // RawShell/PrettyShell drivers treat `matches!(err,
-        // NmblError::DryRunShellPreflight)` as "shell preflight complete,
-        // no fork performed", i.e. success.
+        // PtyChild owns a real master OwnedFd + child Pid; it cannot be faked
+        // without an actual fork, which the dry-run must NOT do. So we run the
+        // SAME preflight the genuine path does (shell presence + devpts mount +
+        // ptmx), recording findings, then return the typed
+        // `NmblError::DryRunShellPreflight` signal — which the RawShell/
+        // PrettyShell drivers treat as "preflight complete, no fork", i.e.
+        // success.
         if !self.closure.exists(shell_path) {
             self.findings.push(MissingFile::new(
                 "spawn_shell",
@@ -390,9 +395,8 @@ impl KexecOps for DryRunSys {
         _flags: u32,
     ) -> Result<()> {
         // Presence-check the image(s); NO-OP the sync()+settle; NEVER
-        // kexec/reboot. The deep PE-section UKI validation is a separate
-        // check (validate/initrm via sys/uki) done next phase — here we
-        // only presence-check the UKI path.
+        // kexec/reboot. Deep PE-section UKI validation is a separate check
+        // (validate/initrm via sys/uki) — here we only presence-check.
         match target {
             KexecTarget::MultiFile { kernel, initrd } => {
                 if !self.closure.exists(&kernel) {

@@ -73,11 +73,17 @@ pub struct SidecarResolution {
 
 /// Resolve the per-generation sidecar directory `<boot>/nmbl/sigs/<gen-id>/`.
 ///
-/// `<gen-id>` is the shared [`gen_id`] (FIX-07). Fails if there is no writable
-/// boot mountpoint recorded (Phase 0.5 sets `runtime_boot_mountpoint`) or the
+/// `<gen-id>` is the shared [`gen_id`] (FIX-07), derived by canonicalizing the
+/// toplevel through `fs` so a closure-rooted `--validate-initrm` dry-run
+/// resolves within the extracted tree. Fails if there is no writable boot
+/// mountpoint recorded (Phase 0.5 sets `runtime_boot_mountpoint`) or the
 /// generation's toplevel has no resolvable store basename — either is a hard
 /// "cannot locate sidecars" error, never a silent allow-all.
-pub fn generation_sig_dir(config: &Config, generation: &Generation) -> Result<PathBuf> {
+pub fn generation_sig_dir(
+    fs: &dyn FsOps,
+    config: &Config,
+    generation: &Generation,
+) -> Result<PathBuf> {
     let boot = config
         .runtime_boot_mountpoint
         .as_deref()
@@ -85,7 +91,7 @@ pub fn generation_sig_dir(config: &Config, generation: &Generation) -> Result<Pa
             stage: "gen-sig-dir",
             detail: "no runtime boot mountpoint to locate generation sidecars".to_string(),
         })?;
-    let id = gen_id(generation)?;
+    let id = gen_id(fs, generation)?;
     Ok(boot.join(SIGS_SUBDIR).join(id))
 }
 
@@ -104,7 +110,7 @@ pub fn resolve_sig_sidecar(
     generation: &Generation,
     blob: GenBlob,
 ) -> Result<SidecarResolution> {
-    let dir = generation_sig_dir(config, generation)?;
+    let dir = generation_sig_dir(fs, config, generation)?;
     let suffix = config.signing.sig_path_suffix.as_str();
     let path = dir.join(format!("{}{suffix}", blob.stem()));
 
@@ -201,12 +207,12 @@ mod tests {
         let g = generation_with_toplevel(&top);
 
         // Write both sidecars under the resolved per-generation dir.
-        let dir = generation_sig_dir(&cfg, &g).expect("dir");
+        let fs = runtime_fs();
+        let dir = generation_sig_dir(&fs, &cfg, &g).expect("dir");
         std::fs::create_dir_all(&dir).expect("sig dir");
         std::fs::write(dir.join("kernel.sig"), b"k").expect("kernel sig");
         std::fs::write(dir.join("initrd.sig"), b"i").expect("initrd sig");
 
-        let fs = runtime_fs();
         let k = resolve_sig_sidecar(&fs, &cfg, &g, GenBlob::Kernel).expect("kernel resolve");
         let i = resolve_sig_sidecar(&fs, &cfg, &g, GenBlob::Initrd).expect("initrd resolve");
         assert!(k.present && i.present);
@@ -244,10 +250,10 @@ mod tests {
         let top = make_toplevel(tmp.path(), "jkl012-nixos-system");
         let cfg = config_with_boot(&boot);
         let g = generation_with_toplevel(&top);
-        let dir = generation_sig_dir(&cfg, &g).expect("dir");
+        let fs = runtime_fs();
+        let dir = generation_sig_dir(&fs, &cfg, &g).expect("dir");
         std::fs::create_dir_all(dir.join("kernel.sig")).expect("dir-as-sidecar");
 
-        let fs = runtime_fs();
         let res = resolve_sig_sidecar(&fs, &cfg, &g, GenBlob::Kernel).expect("resolve");
         assert!(
             res.present,
@@ -286,6 +292,10 @@ mod tests {
         // Point toplevel at the LINK; gen_id must still resolve to the store
         // basename (rollback-stability property).
         g.toplevel = link;
-        assert_eq!(gen_id(&g).expect("gen_id"), "wxyz999-nixos-system-host");
+        let fs = runtime_fs();
+        assert_eq!(
+            gen_id(&fs, &g).expect("gen_id"),
+            "wxyz999-nixos-system-host"
+        );
     }
 }
