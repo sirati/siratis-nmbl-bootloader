@@ -113,13 +113,19 @@ in
   };
 
   config = {
-    # R-8: when measuring, the TPM transport modules must be live before
-    # the measured-boot path runs — INDEPENDENT of any luks-tpm
-    # activation (which adds them to the `explicit`/phase-2b list only).
+    # R-8: when measuring — OR on a secure-boot box — the TPM transport
+    # modules must be live before the measured-boot / seal-on-rescue path
+    # runs, INDEPENDENT of any luks-tpm activation (which adds them to the
+    # `explicit`/phase-2b list only). A secure-boot config may measure
+    # nothing yet still needs `/dev/tpmrm0` to exist so the lock-on-rescue
+    # guard can cap the PCR, so broaden the predicate to include
+    # `secureBoot.enable` (the `or false` keeps it evaluable before slice
+    # #10 contributes that option, mirroring `requireTpmDefault`).
     # Extending `earlyKernelModules` here means `earlyExplicitKernelModules`
     # (and thus `kernel_modules.early`) picks them up with the blacklist
-    # applied. `mkIf` keeps the list untouched when not measuring.
-    boot.nmbl.earlyKernelModules = lib.mkIf tpm.measure [ "tpm_crb" "tpm_tis" ];
+    # applied. `mkIf` keeps the list untouched otherwise.
+    boot.nmbl.earlyKernelModules =
+      lib.mkIf (tpm.measure || (cfg.secureBoot.enable or false)) [ "tpm_crb" "tpm_tis" ];
 
     # Threat-model guard: a sane sealing policy binds both NMBL's lock
     # PCR and PCR 7 (firmware / secure-boot state) — the set {pcrIndex,
