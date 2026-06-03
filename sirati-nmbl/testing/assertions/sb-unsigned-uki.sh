@@ -85,6 +85,13 @@ if ! "$RUNNER"; then
   exit 1
 fi
 
+# Pin VM_SOCKET to THIS scenario's own manager so every history/trigger read
+# below scopes to our VM — never a foreign manager a concurrent peer may run.
+if ! pin_vm_socket "$CONFIG_NAME"; then
+  echo "FAIL: could not pin VM_SOCKET to the ${CONFIG_NAME} manager" >&2
+  exit 1
+fi
+
 # Watch the firmware's decision. Two outcomes must be distinguished:
 #   - firmware REFUSED  ⇒ a SB violation banner / UEFI shell appears, and NMBL
 #     never runs  ⇒ PASS.

@@ -6,7 +6,10 @@
 # not execute it. The single running manager's control socket is found
 # automatically by the client (it scans /tmp for vm-serial-man-*.sock and
 # skips stale ones); set VM_SOCKET to pin a specific socket if more than
-# one manager is alive, otherwise leave it empty.
+# one manager is alive, otherwise leave it empty. When a peer may be running
+# OTHER managers concurrently (so auto-detection could latch onto a foreign
+# VM), call `pin_vm_socket <config_name>` right after the runner starts the VM
+# to pin VM_SOCKET to THIS scenario's own manager — see that helper below.
 #
 # CAVEAT baked in here: `vm-serial-man trigger` exits 0 even on timeout,
 # printing "=== Trigger Timeout ===" / "did not match". So wait_for treats
@@ -33,6 +36,100 @@ _socket_args() {
   if [ -n "${VM_SOCKET:-}" ]; then
     _out=(--socket "$VM_SOCKET")
   fi
+}
+
+# pin_vm_socket <config_name>
+# Finds the vm-serial-man MANAGER process started for `--name <config_name>`,
+# derives its control socket (/tmp/vm-serial-man-<pid>.sock — see manager/
+# core.rs), waits for the socket to exist, and exports VM_SOCKET to it so every
+# helper below (via _socket_args → `--socket <path>`) talks to THIS scenario's
+# own VM rather than auto-detecting whichever lone manager happens to be alive.
+#
+# WHY: auto-detection only works when EXACTLY ONE manager is alive (see header).
+# When a peer runs other VMs concurrently, each is a live manager whose serial
+# buffer carries real NMBL output (`nmbl-init starting`, `phase 1:`), so an
+# unpinned `find`/`trigger` can false-match a FOREIGN manager. Pinning the socket
+# scopes every read+write to the scenario's own VM.
+#
+# DISAMBIGUATION (two traps avoided):
+#   * the SCREEN wrapper — the manager runs as `screen -dmS <name> vm-serial-man
+#     manager --name <name> …`, so BOTH the screen wrapper and the real manager
+#     carry `--name <name>` in their argv. We only accept a process whose argv[0]
+#     BASENAME is exactly `vm-serial-man` (the real manager); the wrapper's
+#     argv[0] basename is `screen`/`SCREEN`, so it is skipped — and only the real
+#     manager's PID names a socket anyway.
+#   * the prefix trap — `test-secure-boot` must NOT match `test-secure-boot-
+#     enroll`. We read /proc/<pid>/cmdline as NUL-separated argv and require an
+#     argv ELEMENT equal to the WHOLE name (`--name` / `-n` then an exact-match
+#     token), never a substring, so a longer config name can never be matched by
+#     a shorter one.
+# Errors loudly (return 1) unless EXACTLY ONE manager matches, so a real problem
+# never silently falls back to auto-detecting a foreign manager.
+pin_vm_socket() {
+  local config_name="$1"
+  if [ -z "$config_name" ]; then
+    echo "pin_vm_socket: FAIL — empty config name" >&2
+    return 1
+  fi
+
+  local pid cmd_file argv0 base
+  local -a pids=()
+  for cmd_file in /proc/[0-9]*/cmdline; do
+    [ -r "$cmd_file" ] || continue
+    # Read the NUL-separated argv into an array; exact-token matching below.
+    local -a argv=()
+    mapfile -d '' -t argv <"$cmd_file" 2>/dev/null || continue
+    [ "${#argv[@]}" -gt 0 ] || continue
+    # The REAL manager has argv[0] basename `vm-serial-man`; the screen wrapper
+    # has `screen`/`SCREEN`, so this rejects the wrapper.
+    argv0="${argv[0]}"
+    base="${argv0##*/}"
+    [ "$base" = "vm-serial-man" ] || continue
+    # Must be the `manager` subcommand with `--name <exact>` / `-n <exact>`.
+    local is_manager=false matched=false i
+    for ((i = 1; i < ${#argv[@]}; i++)); do
+      case "${argv[i]}" in
+      manager) is_manager=true ;;
+      --name | -n)
+        if [ "${argv[i + 1]:-}" = "$config_name" ]; then
+          matched=true
+        fi
+        ;;
+      esac
+    done
+    if [ "$is_manager" = true ] && [ "$matched" = true ]; then
+      pid="${cmd_file#/proc/}"
+      pid="${pid%/cmdline}"
+      pids+=("$pid")
+    fi
+  done
+
+  if [ "${#pids[@]}" -eq 0 ]; then
+    echo "pin_vm_socket: FAIL — no vm-serial-man manager found for --name '${config_name}'" >&2
+    return 1
+  fi
+  if [ "${#pids[@]}" -gt 1 ]; then
+    echo "pin_vm_socket: FAIL — ${#pids[@]} managers match --name '${config_name}' (pids: ${pids[*]})" >&2
+    return 1
+  fi
+
+  local sock="/tmp/vm-serial-man-${pids[0]}.sock"
+  # The manager binds its socket a moment after fork/exec; wait briefly for it
+  # to appear AND be a connectable socket node before pinning.
+  for _ in $(seq 1 50); do
+    if [ -S "$sock" ]; then
+      break
+    fi
+    sleep 0.2
+  done
+  if [ ! -S "$sock" ]; then
+    echo "pin_vm_socket: FAIL — socket '${sock}' (manager pid ${pids[0]}) never appeared" >&2
+    return 1
+  fi
+
+  export VM_SOCKET="$sock"
+  echo "pin_vm_socket: pinned VM_SOCKET=${VM_SOCKET} (manager pid ${pids[0]} for '${config_name}')" >&2
+  return 0
 }
 
 # wait_for <pattern> [match_timeout_seconds]

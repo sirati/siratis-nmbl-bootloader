@@ -233,6 +233,13 @@ if ! "$ENROLL_RUNNER"; then
   exit 1
 fi
 
+# Pin VM_SOCKET to the PHASE-1 (enroll) manager. The enroll twin and the real
+# config have different --name values and different sockets, so we pin per phase.
+if ! pin_vm_socket "$ENROLL_CONFIG_NAME"; then
+  echo "FAIL: could not pin VM_SOCKET to the ${ENROLL_CONFIG_NAME} manager (phase 1)" >&2
+  exit 1
+fi
+
 # NMBL's stage-1 luks-password activation shows a passphrase modal; type the
 # fixed install passphrase so the enroll twin unlocks cryptroot and kexecs. The
 # system initrd then unlocks from the injected key (passToStage1), not a
@@ -354,6 +361,15 @@ fi
 echo "=== Phase 2: power-cycling into the tpm-unlock config (same swtpm) ===" >&2
 if ! "$RUNNER"; then
   echo "FAIL: unseal runner exited non-zero" >&2
+  exit 1
+fi
+
+# RE-PIN VM_SOCKET to the PHASE-2 (real tpm-unlock) manager. Phase 2 is a fresh
+# manager with a NEW pid+socket and --name "${CONFIG_NAME}". The exact-token
+# match also guards the prefix trap: pinning "test-secure-boot" can never latch
+# onto a not-yet-reaped phase-1 "test-secure-boot-enroll" manager.
+if ! pin_vm_socket "$CONFIG_NAME"; then
+  echo "FAIL: could not pin VM_SOCKET to the ${CONFIG_NAME} manager (phase 2)" >&2
   exit 1
 fi
 
