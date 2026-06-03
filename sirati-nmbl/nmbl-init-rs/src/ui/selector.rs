@@ -338,6 +338,7 @@ mod tests {
         Generation {
             number,
             profile_link: std::path::PathBuf::from(format!("/p/system-{number}-link")),
+            toplevel: std::path::PathBuf::from(format!("/p/toplevel-{number}")),
             kernel: std::path::PathBuf::from("/p/kernel"),
             initrd: std::path::PathBuf::from("/p/initrd"),
             init_path: std::path::PathBuf::from(format!("/p/system-{number}-link/init")),

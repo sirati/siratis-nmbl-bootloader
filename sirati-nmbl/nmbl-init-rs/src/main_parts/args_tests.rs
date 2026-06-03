@@ -195,6 +195,21 @@ fn validate_hardware_and_config_are_mutually_exclusive() {
 }
 
 #[test]
+fn print_gen_id_parses_both_forms() {
+    let a = parse_args_from(["--print-gen-id=/nix/store/top"]).expect("equals form");
+    assert_eq!(a.print_gen_id.as_deref(), Some(Path::new("/nix/store/top")));
+    let b = parse_args_from(["--print-gen-id", "/nix/store/top"]).expect("space form");
+    assert_eq!(b.print_gen_id.as_deref(), Some(Path::new("/nix/store/top")));
+}
+
+#[test]
+fn print_gen_id_is_mutually_exclusive_with_validate_config() {
+    let err = parse_args_from(["--print-gen-id=/a", "--validate-config=/b"])
+        .expect_err("print-gen-id + validate-config at once must be rejected");
+    assert!(err.contains("mutually exclusive"), "{err}");
+}
+
+#[test]
 fn validate_hardware_and_closure_are_mutually_exclusive() {
     let err = parse_args_from([
         "--validate-hardware=/a",
