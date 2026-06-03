@@ -104,6 +104,33 @@ in
       '';
     };
 
+    generationKeyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = lib.mdDoc ''
+        ML-DSA signing PRIVATE key, read IMPURELY at install time to sign each
+        bootable NixOS generation's kernel and initrd (`nmbl-sign sign --domain
+        gen-kernel` / `--domain gen-initrd`). The detached sidecars are written
+        to the writable boot partition at
+        `/boot/nmbl/sigs/<gen-id>/kernel<sigPathSuffix>` and `…/initrd…`, where
+        `<gen-id>` is the content-addressed id NMBL computes at runtime via
+        `nmbl-init --print-gen-id`; without these sidecars an ENFORCING install
+        would refuse every generation at boot (the pre-kexec verify guard has
+        nothing to check). This must be the PRIVATE half of a baked
+        `publicKeys` entry (the operator is responsible for that pairing — the
+        public key the in-initramfs verifier trusts is whichever `publicKeys`
+        entry was baked into `nmbl-init`).
+
+        Never embedded in the store or emitted to config.toml: pass it as a
+        STRING path to an on-disk secret (e.g. `"/run/secrets/nmbl-gen.key"`),
+        NOT a Nix path literal like `./gen.key` — a path literal would be
+        imported into the store, and `lib/install-signing.nix` FAILS the eval
+        (closure-leak assertion) if it resolves under the store dir. Required
+        when `signing.enable` is set on a build that has bootable generations
+        to sign.
+      '';
+    };
+
     uki = {
       enable = lib.mkOption {
         type = lib.types.bool;

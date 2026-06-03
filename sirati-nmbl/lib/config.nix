@@ -622,6 +622,9 @@ in
       # Install-time driver-image staging + `nmbl-sign` signing shell (#25a).
       # Empty string when no driver images are enabled.
       driverImageInstallShell = driverImageBuild.driverImageInstallShell;
+      # The host-platform `nmbl-sign` signer, threaded through to
+      # install-signing.nix for per-generation kernel/initrd signing (#53).
+      inherit nmblSign;
     };
 
     # Custom installation script (imported from module)

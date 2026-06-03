@@ -23,6 +23,7 @@
 {
   lib,
   pkgs,
+  config,
   bootstrapper,
   actualLoader,
   actualLoaderExtraArgs,
@@ -36,6 +37,20 @@
     certFile = null;
     refuseInstallIfNotEnforcing = false;
   },
+  # Install-time per-generation ML-DSA signing policy
+  # (config.boot.nmbl.signing.{enable,generationKeyFile,sigPathSuffix}). The
+  # host-platform `nmbl-sign` signer (threaded from the flake) signs each
+  # bootable generation's kernel + initrd so the in-initramfs verify guard has
+  # sidecars to check. Defaults keep this a no-op for non-secure-boot configs.
+  genSigning ? {
+    enable = false;
+    keyFile = null;
+    sigPathSuffix = ".sig";
+  },
+  # The host-platform `nmbl-sign` derivation (flake `_module.args.nmblSign`).
+  # `null` on an older host flake; only dereferenced when generation signing is
+  # enabled (the eval-time assert below requires it then).
+  nmblSign ? null,
 }:
 
 let
@@ -224,9 +239,21 @@ let
     cp -f ${nmblUki} ${ukiEspDest}
     echo "✓ NMBL UKI installed at ${ukiEspDest}"
   '';
-in
 
-lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "efi-stub") ''
+  # ---- install-time per-generation signing (#53 — boot-guard sidecars) ------
+  # Sign EVERY bootable NixOS generation's kernel + initrd at install time so
+  # NMBL's in-initramfs verify guard (#18/#20) has sidecars to check; without
+  # them an ENFORCING install would refuse every generation. Factored into its
+  # own module (loader-INDEPENDENT, and to keep this file under the size cap).
+  # Returns "" when `signing.enable` is unset.
+  genSignShell = import ./install-gen-signing.nix {
+    inherit lib config genSigning nmblSign;
+  };
+
+  # The efi-stub UKI install/sign fragment (loader-specific; UEFI direct boot
+  # only). Bound here so the module can also emit the loader-INDEPENDENT
+  # generation-signing fragment alongside it.
+  ukiInstallShell = lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "efi-stub") ''
     # UEFI direct boot. The ESP holds a single NMBL UKI PE (kernel + initrd
     # embedded; systemd-stub passes the .initrd section to the kernel). No
     # separate nmbl-kernel/nmbl-initrd files (those copies are skipped above
@@ -280,4 +307,12 @@ lib.optionalString (bootstrapper.bootMode == "uefi" && actualLoader == "efi-stub
         echo "        efibootmgr -c -d <ESP-disk> -p <ESP-part#> -L NMBL -l '${efiStubLoaderBackslash}'"
       ''
     )}
-  ''
+  '';
+in
+
+# Generation signing runs for EVERY loader (the sidecars live on the writable
+# boot partition the runtime reads regardless of how NMBL itself is booted),
+# so it is emitted independently of the efi-stub-only UKI fragment.
+# `genSignShell` is already "" when signing is disabled (see the imported
+# install-gen-signing.nix).
+genSignShell + ukiInstallShell
