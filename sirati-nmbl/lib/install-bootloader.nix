@@ -27,6 +27,10 @@
   # Empty string when no driver images are enabled (default keeps older
   # callers evaluable).
   driverImageInstallShell ? "",
+  # The host-platform `nmbl-sign` ML-DSA signer (flake `_module.args.nmblSign`).
+  # Threaded into install-signing.nix for per-generation signing; `null` on an
+  # older host flake (only dereferenced when signing is enabled).
+  nmblSign ? null,
 }:
 
 let
@@ -357,10 +361,12 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     inherit
       lib
       pkgs
+      config
       bootstrapper
       actualLoader
       actualLoaderExtraArgs
       nmblUki
+      nmblSign
       ;
     # Install-time UKI Secure-Boot signing policy. `cfg.signing` may be the
     # bare skeleton on builds without the security slice; read with `or`
@@ -372,6 +378,15 @@ pkgs.writeScript "install-nmbl-bootloader" ''
         keyFile = u.keyFile or null;
         certFile = u.certFile or null;
         refuseInstallIfNotEnforcing = u.refuseInstallIfNotEnforcing or false;
+      };
+    # Install-time per-generation ML-DSA signing policy. Same `or`-default
+    # posture so non-secure-boot configs keep installing without signing.
+    genSigning =
+      let s = cfg.signing or { };
+      in {
+        enable = s.enable or false;
+        keyFile = s.generationKeyFile or null;
+        sigPathSuffix = s.sigPathSuffix or ".sig";
       };
   }}
 
