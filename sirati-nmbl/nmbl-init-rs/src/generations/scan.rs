@@ -104,6 +104,7 @@ pub fn scan_generations(
             kernel_params: read_kernel_params(&toplevel),
             label: read_label(&toplevel),
             profile_link,
+            toplevel,
             kernel,
             initrd,
             init_path,

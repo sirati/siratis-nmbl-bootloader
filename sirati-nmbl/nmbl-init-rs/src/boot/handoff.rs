@@ -194,6 +194,7 @@ mod tests {
         Generation {
             number: 42,
             profile_link: PathBuf::from("/mnt/system/nix/var/nix/profiles/system-42-link"),
+            toplevel: PathBuf::from("/mnt/system/nix/store/abc123-nixos-system-42"),
             kernel: PathBuf::from("/mnt/system/boot/vmlinuz"),
             initrd: PathBuf::from("/mnt/system/boot/initrd"),
             init_path: PathBuf::from("/mnt/system/nix/var/nix/profiles/system-42-link/init"),
