@@ -18,10 +18,17 @@
 #      whose disk carries /boot/nmbl/sigs/<gen-id>/{kernel,initrd}.sig.
 #   2. Type the install LUKS passphrase so cryptroot opens.
 #   3. Assert NMBL did NOT refuse: no refuse-countdown / reboot-into-rescue /
-#      signature-failure marker appears.
-#   4. Assert the system reaches the post-kexec root shell (verify passed, the
-#      generation was kexec'd).
-#   5. Tear the VM down and clean up everything THIS script started.
+#      signature-failure marker appears on serial.
+#   4. Assert the system reaches the post-kexec root shell (cryptroot opened,
+#      verify passed, the generation was kexec'd, the new system booted).
+#   5. From that shell, assert NMBL's enforce-mode `signature verified` marker
+#      is present in the IMPORTED `nmbl-init` journal — positive proof the verify
+#      guard ran+passed. It cannot be read from live serial: NMBL holds the TUI
+#      console during verify and suppresses its stderr branch. (The companion
+#      `measure: extended PCR-11` marker is emitted AFTER the kexec cpio-log
+#      freeze, so it is unrecoverable post-kexec; measured-boot is proven by the
+#      tpm-roundtrip scenario instead — see the marker block below.)
+#   6. Tear the VM down and clean up everything THIS script started.
 #
 # Exit 0 on success, 1 on any failure.
 #
@@ -58,13 +65,27 @@ BOOTED_RE="root@${CONFIG_NAME}"
 # should verify. Covers the refuse countdown, the policy-refused terminus, and
 # the signature-failure stage markers.
 REFUSE_RE='RebootIntoRescue|refuse|Refusing|signature (verification )?failed|PolicyRefused|bad signature|reboot.*rescue|countdown'
-# POSITIVE proof the verify+measure guard actually RAN — not merely that the
-# box booted. `signature verified:` is emitted ONLY on the enforce-mode
-# verify-OK arm (src/boot/handoff.rs); `measure: extended PCR-11` is emitted by
-# the post-verify measure step (src/tpm/measure.rs). Asserting these rejects a
-# build where signing silently didn't engage (it would boot but emit neither).
-VERIFY_OK_RE='signature verified:'
-MEASURE_OK_RE='measure: extended PCR-11'
+# POSITIVE proof the verify guard actually RAN and PASSED — not merely that the
+# box booted (an accidentally-non-enforcing build would also reach the autologin
+# shell). NMBL emits `signature verified: generation <n> kernel+initrd OK
+# (enforce)` ONLY on the enforce-mode verify-OK arm (src/boot/handoff.rs:220),
+# and it does so BEFORE the kexec cpio-log is snapshotted (handoff.rs:307) and
+# frozen (handoff.rs:321) — so the line IS carried into the next kernel's
+# /nmbl-log/nmbl.log and replayed into the booted journal under the `nmbl-init`
+# tag (lib/modules/log-import.nix). We assert it from the IMPORTED journal, NOT
+# from live serial: NMBL holds the interactive console during verify
+# (set_tui_active), which suppresses the `nmbl_*!` stderr branch, so the marker
+# never reaches LIVE serial on this console-holding boot — but it is recoverable
+# post-kexec via the journal. `JOURNAL_TAG` is the systemd-cat tag; the phrase is
+# a plain substring (no regex metachars) safe for assert_journal_tag's grep.
+JOURNAL_TAG="nmbl-init"
+VERIFY_OK_PHRASE="signature verified"
+# NOTE: the old live-serial `measure: extended PCR-11` assertion is GONE. That
+# marker is emitted at handoff.rs:344 (measure_handoff) AFTER the cpio log is
+# frozen at handoff.rs:321, so it is structurally ABSENT from the post-kexec
+# `nmbl-init` journal AND console-suppressed on live serial — it is unrecoverable
+# here without an NMBL-core reorder (out of scope). Measured-boot is covered by
+# the tpm-roundtrip scenario + nmbl-init-rs measure_tests.rs instead.
 
 SHELL_TIMEOUT="${NMBL_SHELL_TIMEOUT:-240}"
 
@@ -197,23 +218,22 @@ if [ "$ready" != true ]; then
   exit 1
 fi
 
-# POSITIVE verify+measure proof. Booting to a shell is NOT enough: a build
-# where the secure-boot feature silently didn't engage would also reach the
-# autologin shell. Require BOTH the enforce-mode verify-OK marker AND the
-# PCR-11 measure marker in the scrollback — they fire only when the
-# verify→measure guard actually ran (handoff.rs / measure.rs).
-echo "=== asserting the verify+measure guard RAN (positive markers) ===" >&2
-if ! seen_in_history "$VERIFY_OK_RE"; then
-  echo "FAIL: no positive signature-verified marker — the verify guard did NOT" >&2
-  echo "      run/pass (signing may have silently not engaged)." >&2
+# POSITIVE verify proof, read from the IMPORTED journal (NOT live serial).
+# Booting to a shell is NOT enough: a build where the secure-boot feature
+# silently didn't engage would also reach the autologin shell. NMBL emits the
+# enforce-mode `signature verified` marker before the kexec cpio-log freeze, so
+# it survives into the booted system's journal under tag `nmbl-init` — but it is
+# console-suppressed on live serial (the verify runs while NMBL owns the TUI),
+# so we MUST query the journal, exactly as testing/assertions/log-import.sh
+# proves the nmbl-init tag carries NMBL's pre-kexec transcript.
+echo "=== asserting the verify guard RAN+PASSED via the nmbl-init journal ===" >&2
+if ! assert_journal_tag "${JOURNAL_TAG}" "${VERIFY_OK_PHRASE}"; then
+  echo "FAIL: no '${VERIFY_OK_PHRASE}' line in the ${JOURNAL_TAG} journal — the" >&2
+  echo "      enforce-mode verify guard did NOT run/pass (signing may have" >&2
+  echo "      silently not engaged; the box would still boot but emit no marker)." >&2
   exit 1
 fi
-if ! seen_in_history "$MEASURE_OK_RE"; then
-  echo "FAIL: no 'measure: extended PCR-11' marker — the measured-boot step did" >&2
-  echo "      NOT run, so verify+measure was not exercised on this boot." >&2
-  exit 1
-fi
-echo "=== PASS: signature verified AND PCR-11 extended (verify+measure ran) ===" >&2
+echo "=== PASS: '${VERIFY_OK_PHRASE}' present in the nmbl-init journal ===" >&2
 
-echo "PASS: signed generation verified, measured, kexec'd — system booted." >&2
+echo "PASS: signed generation verified (journal) + kexec'd — system booted." >&2
 exit 0

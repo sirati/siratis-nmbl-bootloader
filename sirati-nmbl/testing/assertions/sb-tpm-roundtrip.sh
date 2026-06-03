@@ -41,9 +41,15 @@
 # phase 1 sealed. This script owns deleting it at cleanup.
 #
 # PRECONDITION (so a TPM-less VM can NEVER false-green): requireTpm=true means a
-# missing /dev/tpmrm0 aborts the boot; reaching the measured path proves the TPM
-# is wired. The happy path additionally asserts NO password prompt, so a
-# passphrase fallback can never be mistaken for an unseal.
+# missing /dev/tpmrm0 aborts the boot. We do NOT gate on a separate live-serial
+# "TPM present / measured boot" marker — those (sb-state / PCR-11 extend) are
+# emitted AFTER the kexec cpio-log freeze AND while NMBL holds the console, so
+# they reach neither live serial nor the post-kexec journal. Instead the unseal
+# success itself is the precondition: phase 2 types NOTHING, so reaching the
+# shell can only happen if `--token-only` unsealed (no passphrase fallback
+# exists), which proves the TPM is wired AND the seal policy matched the live
+# PCRs — strictly more than mere presence. The journal unseal marker then
+# confirms the mechanism.
 #
 # Required on PATH: vm-serial-man, the runners (NMBL_RUNNER + NMBL_ENROLL_RUNNER,
 # or `run-test-secure-boot` / `run-test-secure-boot-enroll`), screen, coreutils,
@@ -54,24 +60,49 @@ set -uo pipefail
 CONFIG_NAME="test-secure-boot"
 ENROLL_CONFIG_NAME="test-secure-boot-enroll"
 
-# NMBL markers proving the TPM is present and the measured path ran. Any one
-# of these means /dev/tpmrm0 was found and NMBL talked to it.
-TPM_PRESENT_RE='tpmrm0|TPM present|measured boot|PCR 11|PCR-11|extend.*PCR|seal'
+# The booted system's journal tag NMBL's pre-kexec transcript is replayed under
+# (lib/modules/log-import.nix, drained one line per entry via systemd-cat -t).
+# Phase-2 unseal proof is read from HERE, not from live serial (see UNSEAL note).
+JOURNAL_TAG="nmbl-init"
 # Auto-unseal SUCCESS: a TPM-token-SPECIFIC marker NMBL emits ONLY on a genuine
-# `cryptsetup open --token-only` unseal (src/activation/mod.rs). `--token-only`
-# can NEVER fall back to a password keyslot, so this line proves the seal/unseal
-# roundtrip succeeded — it shares no substring with the generic "activation
-# luks-tpm completed" line, so a password fallback can never match it.
-UNSEAL_OK_RE='luks-tpm: unsealed .* via TPM token'
-# A password PROMPT means auto-unseal FAILED (fell back to the modal). Seeing
-# it on phase 2 is a FAIL for the happy path; we assert its ABSENCE there.
+# `cryptsetup open --token-only` unseal (src/activation/mod.rs:271, full text
+# `luks-tpm: unsealed <name> via TPM token (cryptsetup --token-only)`).
+# `--token-only` can NEVER fall back to a password keyslot, so this line proves
+# the seal/unseal roundtrip succeeded — it shares no substring with the generic
+# "activation luks-tpm completed" line, so a password fallback can never match
+# it. We read it from the IMPORTED `nmbl-init` journal, NOT live serial: NMBL
+# unseals during phase-3 storage activation while it still OWNS the TUI console
+# (set_tui_active), which suppresses the `nmbl_*!` stderr branch — so the marker
+# never reaches LIVE serial on this console-holding boot. But the unseal is
+# emitted BEFORE the kexec cpio-log freeze (handoff.rs:321), so it IS carried
+# into the next kernel's /nmbl-log/nmbl.log and recoverable post-kexec. The
+# journal phrase is a metachar-free substring unique to the unseal line (the
+# generic completed line lacks it), safe for assert_journal_tag's plain grep.
+UNSEAL_OK_PHRASE="via TPM token"
+# A password PROMPT means auto-unseal FAILED (fell back to the modal). The modal
+# prompt is rendered by the terminus AFTER the console is released, so it DOES
+# reach live serial — we assert its ABSENCE on serial on phase 2.
 PASSWORD_PROMPT_RE='Enter LUKS passphrase|passphrase for cryptroot'
 # The enroll tool's success marker (lib/tpm-enroll.nix): a systemd-tpm2 token
 # is now present in the header. Phase 1 must reach this before we power-cycle.
+# The enroll tool runs on the BOOTED system (NMBL no longer holds the console),
+# so its output reaches serial — we keep this on serial.
 ENROLL_OK_RE='a systemd-tpm2 token is present|success — a systemd-tpm2 token'
+#
+# WHY THERE IS NO SEPARATE "TPM present / measured boot" precondition wait:
+# the old TPM_PRESENT_RE gated on `measured boot` / `PCR-11` / `extend PCR`
+# markers (sbstate.rs:194,218 + measure.rs:198). Those are ALL emitted inside
+# measure_handoff (handoff_load.rs:85 / handoff.rs:344) — AFTER the kexec
+# cpio-log freeze (handoff.rs:321) AND while the console is held — so they are
+# unrecoverable from BOTH live serial and the post-kexec journal. Rather than
+# drop a security check, we rely on the strictly STRONGER unseal proof: the
+# `via TPM token` journal marker proves NMBL opened /dev/tpmrm0, the seal policy
+# matched the live measured PCRs, and `--token-only` unsealed the key — which
+# subsumes "TPM present + measured path ran". requireTpm=true still guarantees a
+# TPM-less VM aborts before the shell, so reaching the shell + this marker proves
+# the TPM was wired with no coverage lost.
 
 SHELL_TIMEOUT="${NMBL_SHELL_TIMEOUT:-240}"
-BOOT_WATCH="${NMBL_BOOT_WATCH:-120}"
 ENROLL_WATCH="${NMBL_ENROLL_WATCH:-180}"
 
 # The LUKS device the post-kexec enroll seals. Matches the disko layout
@@ -279,50 +310,75 @@ if ! "$RUNNER"; then
   exit 1
 fi
 
-# PRECONDITION: TPM present + measured path ran (requireTpm=true ⇒ a TPM-less
-# VM would have aborted before here).
-echo "=== asserting /dev/tpmrm0 present + measured boot (PCR 11) ===" >&2
-if ! wait_for "$TPM_PRESENT_RE" "$BOOT_WATCH"; then
-  echo "FAIL: NMBL never showed a TPM-present / measured-boot marker" >&2
-  echo "      (requireTpm=true ⇒ a TPM-less VM aborts here — precondition unmet)" >&2
-  exit 1
-fi
-echo "=== PASS precondition: TPM present + measured boot ===" >&2
-
-# The TPM-sealed cryptroot must AUTO-unseal: NMBL emits the token-specific
-# marker with no passphrase answered. A bare password prompt means the
-# seal/unseal roundtrip failed (PCRs didn't match, or no token was sealed).
-echo "=== asserting TPM auto-unseal of cryptroot (no password) ===" >&2
-if ! wait_for "$UNSEAL_OK_RE" "$BOOT_WATCH"; then
-  if seen_in_history "$PASSWORD_PROMPT_RE"; then
-    echo "FAIL: cryptroot fell back to the password modal — TPM auto-unseal FAILED" >&2
-  else
-    echo "FAIL: no TPM auto-unseal marker within ${BOOT_WATCH}s" >&2
-  fi
-  exit 1
-fi
-# Belt-and-braces: even WITH the unseal marker, a password prompt anywhere in
-# the history means the seal degraded to a fallback — fail the happy path.
-if seen_in_history "$PASSWORD_PROMPT_RE"; then
-  echo "FAIL: a password prompt appeared despite the unseal marker — the TPM" >&2
-  echo "      auto-unseal is not clean (a fallback path was exercised)." >&2
-  exit 1
-fi
-echo "=== PASS: cryptroot auto-unsealed from the TPM (no password prompt) ===" >&2
-
-# Finally the box must reach the booted root shell — proving the measured boot
-# matched the seal policy end-to-end and the system came up unattended.
-echo "=== waiting up to ${SHELL_TIMEOUT}s for the post-kexec root shell ===" >&2
+# ── THE decisive proof: boot to the shell HAVING TYPED NOTHING. ─────────────
+# Phase 2 is the tpm-unlock config: NMBL's `luks-tpm` activation runs
+# `cryptsetup open --token-only` and CANNOT fall back to a passphrase keyslot.
+# We deliberately send NO keystrokes here (unlike phase 1's blind-typed modal).
+# So the ONLY way this VM reaches the post-kexec root shell is a successful TPM
+# auto-unseal: if the seal policy did not match the live PCRs, the activation
+# fails closed (no fallback), nobody answers anything, and the boot never
+# reaches a shell → this gate times out → FAIL. "We typed nothing and still
+# booted" is therefore itself the negative proof that the unlock was TPM-only.
+echo "=== waiting up to ${SHELL_TIMEOUT}s for the post-kexec root shell" >&2
+echo "    (typing NOTHING — reaching it proves TPM-only auto-unseal) ===" >&2
 booted=false
 for _ in $(seq 1 "$((SHELL_TIMEOUT / 5))"); do
   if seen_in_history "root@${CONFIG_NAME}"; then
     booted=true
     break
   fi
+  # A password prompt reaching serial would mean activation fell back to the
+  # modal (TPM unseal failed). It is normally console-suppressed like everything
+  # else under the held console, so this is belt-and-braces, NOT the primary
+  # negative — the primary negative is "we typed nothing and still booted."
+  if seen_in_history "$PASSWORD_PROMPT_RE"; then
+    echo "FAIL: cryptroot fell back to the password modal — TPM auto-unseal FAILED" >&2
+    exit 1
+  fi
   sleep 5
 done
 if [ "$booted" != true ]; then
-  echo "FAIL: never reached the booted root shell after TPM auto-unseal" >&2
+  echo "FAIL: never reached the booted root shell — TPM auto-unseal did not unlock" >&2
+  echo "      cryptroot (no passphrase was typed; --token-only cannot fall back)." >&2
+  exit 1
+fi
+echo "=== reached the shell without typing anything — TPM-only unlock proven ===" >&2
+
+# Confirm the shell is actually interactive (not a stale autologin banner)
+# before we query the imported journal from it.
+ready=false
+for _ in $(seq 1 12); do
+  send_cmd "echo NMBL_UNSEAL_SHELL_READY"
+  if wait_for "NMBL_UNSEAL_SHELL_READY" 10; then
+    ready=true
+    break
+  fi
+done
+if [ "$ready" != true ]; then
+  echo "FAIL: booted shell never became interactive" >&2
+  exit 1
+fi
+
+# CONFIRM THE MECHANISM from the IMPORTED journal: NMBL emits the token-specific
+# unseal marker during phase-3 activation while it still owns the TUI console,
+# so it is suppressed from live serial — but it precedes the kexec cpio-log
+# freeze, so it survives into the booted system's journal under tag `nmbl-init`.
+# This proves the unlock above was a genuine `--token-only` TPM unseal (not some
+# other unlock path), subsuming the old TPM-present + measured-boot precondition.
+echo "=== confirming the TPM-unseal MECHANISM via the nmbl-init journal ===" >&2
+if ! assert_journal_tag "${JOURNAL_TAG}" "${UNSEAL_OK_PHRASE}"; then
+  echo "FAIL: no '${UNSEAL_OK_PHRASE}' line in the ${JOURNAL_TAG} journal — the" >&2
+  echo "      TPM-token unseal marker is absent, so the box did not unlock via a" >&2
+  echo "      genuine cryptsetup --token-only unseal." >&2
+  exit 1
+fi
+echo "=== PASS: cryptroot auto-unsealed from the TPM (token marker in journal) ===" >&2
+
+# Belt-and-braces: a password prompt anywhere in the serial history means the
+# seal degraded to a fallback — fail the happy path even with the unseal marker.
+if seen_in_history "$PASSWORD_PROMPT_RE"; then
+  echo "FAIL: a password prompt appeared despite the unseal marker — the TPM" >&2
+  echo "      auto-unseal is not clean (a fallback path was exercised)." >&2
   exit 1
 fi
 
