@@ -6,6 +6,28 @@
 
 use crate::config::{Activation, ActivationKind};
 
+/// The mapper `<name>` a `luks-tpm` activation opens, for logging the
+/// distinct TPM-token-unseal marker. Prefers a `/dev/mapper/<name>` node
+/// from `produces_devices`, else the last positional of the
+/// `cryptsetup open … <name>` argv. `None` only for a malformed argv.
+///
+/// Used solely to label the success marker emitted on a genuine
+/// `--token-only` unseal; it never widens the seal-registry behaviour.
+pub(super) fn luks_tpm_mapper_name(activation: &Activation) -> Option<&str> {
+    if activation.kind != ActivationKind::LuksTpm {
+        return None;
+    }
+    for produced in &activation.produces_devices {
+        if let Some(name) = produced
+            .to_str()
+            .and_then(|p| p.strip_prefix("/dev/mapper/"))
+        {
+            return Some(name);
+        }
+    }
+    mapper_name_from_open_argv(&activation.argv)
+}
+
 /// On a successful `luks-tpm` activation, push the unsealed mapper onto
 /// the always-compiled seal registry (FIX-03). The mapper name is the
 /// `/dev/mapper/<name>` node the activation produces; we strip the
