@@ -7,7 +7,7 @@
 
 use std::convert::Infallible;
 use std::ffi::CString;
-use std::os::fd::OwnedFd;
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
@@ -53,7 +53,7 @@ fn build_cmdline_cstring(
 /// `flags` automatically and `-1` is passed as the initrd fd. Both file
 /// descriptors are opened `O_RDONLY | O_CLOEXEC` and closed at drop.
 pub fn load(kernel: &Path, initrd: Option<&Path>, cmdline: &str, flags: u32) -> Result<()> {
-    load_with_initrd_fd(kernel, initrd, None, cmdline, flags)
+    load_with_initrd_fd(kernel, None, initrd, None, cmdline, flags)
 }
 
 /// Like [`load`], but the initrd is supplied as a `memfd`-style
@@ -64,21 +64,43 @@ pub fn load(kernel: &Path, initrd: Option<&Path>, cmdline: &str, flags: u32) -> 
 /// passed through as-is so the operator sees the same path they'd see
 /// without injection.
 ///
+/// When `kernel_fd` is `Some`, that PINNED, already-open kernel fd is loaded
+/// directly and the `kernel` PATH is NEVER re-opened — this is the secure-boot
+/// path closing the verify→measure→load TOCTOU (FIX-02 / MED-1): the bytes
+/// loaded are byte-identical to the bytes verified+measured. When `kernel_fd`
+/// is `None` (the non-secure-boot path, where no verify fd exists), the kernel
+/// is opened by path here as before — `kernel` then doubles as the load source.
+///
 /// Internal helper for [`load_with_extra_initrd_cpio`]. Prefer that
 /// for the common case.
 fn load_with_initrd_fd(
     kernel: &Path,
+    kernel_fd: Option<BorrowedFd<'_>>,
     initrd_path_for_errors: Option<&Path>,
     initrd_fd: Option<&OwnedFd>,
     cmdline: &str,
     flags: u32,
 ) -> Result<()> {
-    let kernel_fd = rustix::fs::open(kernel, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-        .map_err(|e| NmblError::KexecLoad {
-            kernel: kernel.to_path_buf(),
-            initrd: initrd_path_for_errors.map(Path::to_path_buf),
-            source: nix::Error::from_raw(e.raw_os_error()),
-        })?;
+    // Reuse the verified, pinned kernel fd when supplied; only open-by-path on
+    // the non-secure-boot path where no such fd exists (FIX-02 / MED-1).
+    let opened_kernel: Option<OwnedFd> = match kernel_fd {
+        Some(_) => None,
+        None => Some(
+            rustix::fs::open(kernel, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).map_err(
+                |e| NmblError::KexecLoad {
+                    kernel: kernel.to_path_buf(),
+                    initrd: initrd_path_for_errors.map(Path::to_path_buf),
+                    source: nix::Error::from_raw(e.raw_os_error()),
+                },
+            )?,
+        ),
+    };
+    let kernel_raw: libc::c_int = match (kernel_fd, &opened_kernel) {
+        (Some(fd), _) => fd.as_raw_fd(),
+        (None, Some(fd)) => fd.as_raw_fd(),
+        // Unreachable: exactly one of the two arms above is always set.
+        (None, None) => -1,
+    };
 
     // Open the initrd file if no caller-supplied fd was provided.
     let opened_initrd: Option<OwnedFd> = if initrd_fd.is_none() {
@@ -113,15 +135,17 @@ fn load_with_initrd_fd(
     //     the loader; `rustix` 0.38 has no covering API in the `system`
     //     or `process` modules; `libkexec` is a C library we refuse to
     //     link from PID 1.
-    //   * Why this is safe: `kernel_fd` and (when present) `initrd_fd`
-    //     are live `OwnedFd`s held by this function for the duration
-    //     of the call. `cmdline_buf` is a Vec we own that outlives the
-    //     syscall. The kernel reads, never writes, our buffers; the
-    //     return value + errno report failure.
+    //   * Why this is safe: the kernel fd (`kernel_raw`) is either the
+    //     caller's pinned `BorrowedFd` — kept live by the caller across
+    //     this call — or the `opened_kernel` `OwnedFd` held by this
+    //     function for the duration of the call; `initrd_fd` (when present)
+    //     is likewise a live fd. `cmdline_buf` is a Vec we own that
+    //     outlives the syscall. The kernel reads, never writes, our
+    //     buffers; the return value + errno report failure.
     let rc = unsafe {
         libc::syscall(
             libc::SYS_kexec_file_load,
-            kernel_fd.as_raw_fd() as libc::c_int,
+            kernel_raw,
             initrd_raw,
             cmdline_len as libc::c_ulong,
             cmdline_buf.as_ptr() as *const libc::c_char,
@@ -149,6 +173,49 @@ fn load_with_initrd_fd(
 /// references), and the buffer drops + zeroes the moment we return.
 pub fn load_with_extra_initrd_cpio(
     kernel: &Path,
+    initrd: &Path,
+    extra_cpio: &[u8],
+    cmdline: &str,
+    flags: u32,
+) -> Result<()> {
+    // Non-secure-boot path: no verified fd to pin, so the kernel is opened by
+    // path inside `load_with_initrd_fd`.
+    load_cpio_core(kernel, None, initrd, extra_cpio, cmdline, flags)
+}
+
+/// Like [`load_with_extra_initrd_cpio`], but loads the PINNED, already-verified
+/// kernel fd directly (FIX-02 / MED-1) instead of re-opening the kernel by
+/// path. `kernel_fd` is the fd the signature verifier opened, hashed, and
+/// verified; `kernel_path` is carried only for error context. The initrd is
+/// still read from `initrd` (its pristine bytes were verified by digest and
+/// measured), combined with `extra_cpio` in a memfd, and that memfd is the
+/// initrd fd handed to `kexec_file_load(2)` — so the kernel the new image runs
+/// is byte-identical to the one that was verified and measured.
+pub fn load_with_kernel_fd_and_extra_initrd_cpio(
+    kernel_path: &Path,
+    kernel_fd: BorrowedFd<'_>,
+    initrd: &Path,
+    extra_cpio: &[u8],
+    cmdline: &str,
+    flags: u32,
+) -> Result<()> {
+    load_cpio_core(
+        kernel_path,
+        Some(kernel_fd),
+        initrd,
+        extra_cpio,
+        cmdline,
+        flags,
+    )
+}
+
+/// Shared body of the cpio-injecting load: read the initrd, append the cpio
+/// fragment into a memfd, and hand it (plus the kernel fd / path) to
+/// [`load_with_initrd_fd`]. `kernel_fd` is `Some` for the verified secure-boot
+/// path (pin the verified fd — FIX-02) and `None` otherwise (open by path).
+fn load_cpio_core(
+    kernel: &Path,
+    kernel_fd: Option<BorrowedFd<'_>>,
     initrd: &Path,
     extra_cpio: &[u8],
     cmdline: &str,
@@ -199,7 +266,14 @@ pub fn load_with_extra_initrd_cpio(
         source: nix::Error::from_raw(e.raw_os_error()),
     })?;
 
-    load_with_initrd_fd(kernel, Some(initrd), Some(&memfd), cmdline, flags)
+    load_with_initrd_fd(
+        kernel,
+        kernel_fd,
+        Some(initrd),
+        Some(&memfd),
+        cmdline,
+        flags,
+    )
 }
 
 /// Execute the previously loaded kexec image.
@@ -238,6 +312,67 @@ mod tests {
             build_cmdline_cstring("", kernel, None).expect("empty cmdline must succeed");
         assert_eq!(len, 1, "len must be 1 (the NUL)");
         assert_eq!(buf.as_slice(), b"\0");
+    }
+
+    /// FIX-02 / MED-1 fd-pin: when a kernel fd IS supplied, the kernel PATH is
+    /// NEVER re-opened. Proof: a bogus, nonexistent kernel path with a pinned
+    /// kernel fd + a real initrd fd must NOT fail with ENOENT (it gets past the
+    /// open and fails only at the syscall with some OTHER errno). The same bogus
+    /// path WITHOUT a fd fails with ENOENT — the open happened. The contrast is
+    /// the assertion: the verified fd is consumed in place of a path re-open, so
+    /// there is no second path-open between verify and load.
+    #[test]
+    fn supplied_kernel_fd_is_not_reopened_by_path() {
+        use std::io::Write;
+        use std::os::fd::AsFd;
+
+        let bogus = Path::new("/nonexistent/nmbl/kexec/kernel/does/not/exist");
+
+        // A real, open kernel fd standing in for the verified one, plus a real
+        // initrd fd, so the function reaches the syscall (which then fails — we
+        // are not in a position to actually load — but with a NON-ENOENT errno).
+        let mut kfile = tempfile::NamedTempFile::new().expect("kernel tempfile");
+        kfile
+            .write_all(b"\x7fELF fake kernel")
+            .expect("write kernel");
+        let mut ifile = tempfile::NamedTempFile::new().expect("initrd tempfile");
+        ifile.write_all(b"fake initrd").expect("write initrd");
+        let initrd_fd: OwnedFd = ifile.reopen().expect("reopen initrd").into();
+
+        let with_fd = load_with_initrd_fd(
+            bogus,
+            Some(kfile.as_file().as_fd()),
+            Some(bogus),
+            Some(&initrd_fd),
+            "init=/x",
+            0,
+        );
+        // The syscall fails (we cannot really kexec under test), but the failure
+        // must NOT be the ENOENT of opening `bogus` — the fd was used instead.
+        match with_fd {
+            Err(NmblError::KexecLoad { source, .. }) => {
+                assert_ne!(
+                    source,
+                    nix::Error::ENOENT,
+                    "with a pinned fd the kernel path must NOT be opened (no ENOENT)",
+                );
+            }
+            other => panic!("expected KexecLoad (syscall) error, got {other:?}"),
+        }
+
+        // Control: NO fd ⇒ the bogus path IS opened ⇒ ENOENT.
+        let without_fd =
+            load_with_initrd_fd(bogus, None, Some(bogus), Some(&initrd_fd), "init=/x", 0);
+        match without_fd {
+            Err(NmblError::KexecLoad { source, .. }) => {
+                assert_eq!(
+                    source,
+                    nix::Error::ENOENT,
+                    "without a fd the kernel path must be opened (ENOENT on a bogus path)",
+                );
+            }
+            other => panic!("expected KexecLoad ENOENT, got {other:?}"),
+        }
     }
 
     #[test]

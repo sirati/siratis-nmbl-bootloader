@@ -21,7 +21,7 @@
 //! trust path verifies an already-open, pinned fd.
 
 use std::fs;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use crate::config::Config;
@@ -195,6 +195,22 @@ pub fn verify_image_fd(
     domain: &'static [u8],
     config: &Config,
 ) -> Result<()> {
+    verify_image_fd_digest(fd, image_desc, sig, domain, config).map(|_digest| ())
+}
+
+/// Like [`verify_image_fd`] but RETURNS the SHA-512 digest it streamed over the
+/// pinned fd, so a caller that also needs to MEASURE the image reuses the SAME
+/// hash rather than re-streaming it (FIX-02 — one hash, verify + measure).
+///
+/// Identical verify semantics to [`verify_image_fd`]; the only difference is the
+/// digest is handed back instead of dropped.
+pub fn verify_image_fd_digest(
+    fd: BorrowedFd<'_>,
+    image_desc: &str,
+    sig: Option<&Path>,
+    domain: &'static [u8],
+    config: &Config,
+) -> Result<[u8; 64]> {
     // The fd-only contract needs an explicit sidecar path; a borrowed fd has
     // no path to derive a sibling convention from.
     let sig_path = sig.ok_or_else(|| NmblError::Signature {
@@ -219,7 +235,8 @@ pub fn verify_image_fd(
 
     let baked = keys::parse_baked_keys()?;
     let policy = VerifyPolicy::from_config(config);
-    verify_digest(&digest, domain, &sidecar, &baked, policy)
+    verify_digest(&digest, domain, &sidecar, &baked, policy)?;
+    Ok(digest)
 }
 
 /// Ensure a generation's kernel AND initrd both carry a valid signature.
@@ -267,4 +284,105 @@ fn verify_generation_blob(
         context: format!("open {desc} {} for verify", blob.display()),
     })?;
     verify_image_fd(file.as_fd(), desc, Some(sig_path), domain, config)
+}
+
+/// A generation whose kernel+initrd were verified over PINNED fds, carrying the
+/// artefacts every downstream step must REUSE rather than recompute (FIX-02).
+///
+/// Closing the verify→measure→load TOCTOU (MED-1) requires that the SAME bytes
+/// be verified, measured, AND loaded. This witness holds:
+///
+/// * `kernel_fd` — the kernel's OWN, still-open `O_RDONLY` fd. The verifier
+///   opened the kernel ONCE, hashed it over this fd, and verified its
+///   signature; the loader hands THIS fd to `kexec_file_load(2)` (never
+///   re-opening the path), so the loaded kernel is byte-identical to the
+///   verified+measured one.
+/// * `kernel_digest` / `initrd_digest` — the SHA-512 digests the verifier
+///   already streamed over the pinned fds. The PCR-11 measure reuses these
+///   verbatim (no second hash — FIX-02).
+///
+/// Holding the fd in the witness keeps it alive for the whole verify→measure
+/// →load window: dropping the witness closes the fd, so the loader must consume
+/// it within that window.
+#[derive(Debug)]
+pub struct VerifiedGeneration {
+    /// The kernel's pinned fd — opened once for verify, reused for load.
+    pub kernel_fd: OwnedFd,
+    /// SHA-512 of the kernel, reused by the measure step (no re-hash).
+    pub kernel_digest: [u8; 64],
+    /// SHA-512 of the (pristine) initrd, reused by the measure step.
+    pub initrd_digest: [u8; 64],
+}
+
+/// Verify a generation's kernel+initrd AND return the pinned kernel fd + reused
+/// digests (FIX-02 / MED-1).
+///
+/// Unlike [`ensure_generation_signed`] (which drops every fd once it has a
+/// verdict), this opens the kernel ONCE and KEEPS that fd, streams it through
+/// SHA-512 (the digest the sidecar verify uses AND the measure reuses), then
+/// verifies the signature over that one fd. The initrd is opened, hashed, and
+/// verified the same way; its fd is not retained (the loader re-reads the
+/// pristine initrd into a memfd to splice the NMBL cpio fragment — the initrd
+/// digest is what binds it, and it is measured, not the fragment — FIX-42).
+///
+/// On success the returned [`VerifiedGeneration`] owns the live kernel fd; the
+/// caller loads THAT fd. On any verify failure the fd is dropped and the error
+/// propagates (the gate maps audit-vs-enforce).
+pub fn verify_generation_pinned(
+    config: &Config,
+    generation: &Generation,
+) -> Result<VerifiedGeneration> {
+    let sig_dir = generation_sig_dir(config, generation)?;
+    let suffix = config.signing.sig_path_suffix.as_str();
+
+    // Open the kernel ONCE and keep its fd for the load (FIX-02). Verify +
+    // hash both happen over this exact fd.
+    let kernel_file = fs::File::open(&generation.kernel).map_err(|source| NmblError::Io {
+        source,
+        context: format!(
+            "open generation kernel {} for verify+load",
+            generation.kernel.display()
+        ),
+    })?;
+    let kernel_sig = sig_dir.join(format!("kernel{suffix}"));
+    // ONE hash over the pinned fd serves both verify and measure (FIX-02).
+    let kernel_digest = verify_image_fd_digest(
+        kernel_file.as_fd(),
+        "generation kernel",
+        Some(&kernel_sig),
+        DOMAIN_GEN_KERNEL,
+        config,
+    )?;
+
+    // The initrd is verified over its own pinned fd; its digest is captured for
+    // the measure. Its fd is not retained (see the doc comment).
+    let initrd_digest = verify_generation_blob_digest(
+        config,
+        &generation.initrd,
+        &sig_dir.join(format!("initrd{suffix}")),
+        "generation initrd",
+        DOMAIN_GEN_INITRD,
+    )?;
+
+    Ok(VerifiedGeneration {
+        kernel_fd: kernel_file.into(),
+        kernel_digest,
+        initrd_digest,
+    })
+}
+
+/// Like [`verify_generation_blob`], but also returns the SHA-512 digest the
+/// verify computed over the pinned fd, so the measure step reuses it (FIX-02).
+fn verify_generation_blob_digest(
+    config: &Config,
+    blob: &Path,
+    sig_path: &Path,
+    desc: &str,
+    domain: &'static [u8],
+) -> Result<[u8; 64]> {
+    let file = fs::File::open(blob).map_err(|source| NmblError::Io {
+        source,
+        context: format!("open {desc} {} for verify", blob.display()),
+    })?;
+    verify_image_fd_digest(file.as_fd(), desc, Some(sig_path), domain, config)
 }
