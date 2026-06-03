@@ -56,6 +56,21 @@ pub struct TpmConfig {
     /// Per-run directory for the swtpm state and control socket. Created on
     /// start and removed on teardown; must be unique per concurrent VM.
     pub state_dir: PathBuf,
+    /// Persist the swtpm STATE across the manager's lifetime instead of
+    /// wiping it on start and removing it on teardown.
+    ///
+    /// The default (`false`) keeps the historical "fresh PCRs every run"
+    /// behaviour: the state dir is recreated on start and deleted on stop,
+    /// so each run begins on a clean TPM. Set to `true` for a measured-boot
+    /// SEAL/UNSEAL ROUNDTRIP across a power-cycle: a first VM seals a secret
+    /// to the TPM, the manager stops WITHOUT deleting the state, and a second
+    /// manager run reuses the SAME `state_dir`. swtpm reloads the persisted
+    /// non-volatile state (hierarchy/SRK/sealed object) while a fresh QEMU
+    /// power-on issues `TPM2_Startup(CLEAR)` — so the PCRs reset to their
+    /// reset value and NMBL re-extends the SAME deterministic event sequence,
+    /// reproducing the exact PCR value the seal was bound to. The caller owns
+    /// removing the dir when the roundtrip is done.
+    pub persist: bool,
 }
 
 /// Secure-Boot firmware configuration: a Secure-Boot-enforcing OVMF build plus
@@ -103,17 +118,30 @@ impl SecureBoot {
 pub struct SwtpmSidecar {
     child: Child,
     state_dir: PathBuf,
+    /// When `true`, the state dir is NOT removed on shutdown/drop so the next
+    /// run can reload the persisted (sealed) TPM state — only the swtpm
+    /// process is terminated. See [`TpmConfig::persist`].
+    persist: bool,
 }
 
 impl SwtpmSidecar {
     /// Terminate the swtpm process and remove its per-run state directory.
     /// Best-effort: errors are logged, not propagated, so teardown never
-    /// blocks VM shutdown.
+    /// blocks VM shutdown. When [`TpmConfig::persist`] was set, the state
+    /// directory is KEPT (only the process is killed) so the next run can
+    /// reload the persisted TPM state for a seal/unseal roundtrip.
     pub async fn shutdown(mut self) {
         if let Err(e) = self.child.start_kill() {
             warn!("failed to signal swtpm: {e}");
         }
         let _ = self.child.wait().await;
+        if self.persist {
+            debug!(
+                "keeping swtpm state dir {} for the next (roundtrip) run",
+                self.state_dir.display()
+            );
+            return;
+        }
         if let Err(e) = fs::remove_dir_all(&self.state_dir).await {
             debug!(
                 "swtpm state dir {} already gone or unremovable: {e}",
@@ -126,24 +154,36 @@ impl SwtpmSidecar {
 impl Drop for SwtpmSidecar {
     fn drop(&mut self) {
         // Synchronous fallback for the drop-without-shutdown path: signal the
-        // child and remove the state dir so nothing is left behind even if the
-        // async `shutdown` was never awaited.
+        // child, and remove the state dir UNLESS persistence was requested
+        // (a roundtrip's second phase still needs the sealed state). Nothing
+        // is left behind on the default (non-persistent) path.
         let _ = self.child.start_kill();
-        let _ = std::fs::remove_dir_all(&self.state_dir);
+        if !self.persist {
+            let _ = std::fs::remove_dir_all(&self.state_dir);
+        }
     }
 }
 
 /// Spawn a `swtpm socket` sidecar for `tpm`, appending QEMU's TPM
 /// `-chardev`/`-tpmdev`/`-device` triple to `cmd`.
 ///
-/// Creates a fresh per-run state directory and a Unix socket inside it
-/// (`--tpm2` ⇒ a TPM 2.0), then points QEMU at that socket. The returned
-/// [`SwtpmSidecar`] owns the process and the directory; dropping or
-/// shutting it down terminates swtpm and removes the directory.
+/// Creates (or, with [`TpmConfig::persist`], reuses) a per-run state directory
+/// and a Unix socket inside it (`--tpm2` ⇒ a TPM 2.0), then points QEMU at that
+/// socket. The returned [`SwtpmSidecar`] owns the process and the directory;
+/// dropping or shutting it down terminates swtpm and removes the directory —
+/// UNLESS persistence was requested, in which case the directory is kept so a
+/// follow-up run can reload the sealed TPM state for a seal/unseal roundtrip.
 pub async fn spawn_swtpm(tpm: &TpmConfig, cmd: &mut Command) -> Result<SwtpmSidecar> {
-    // Fresh state dir per run ⇒ clean PCRs; recreate from scratch so a stale
-    // directory can never carry measurements between runs.
-    if tpm.state_dir.exists() {
+    // Default: fresh state dir per run ⇒ clean PCRs; recreate from scratch so
+    // a stale directory can never carry measurements between runs.
+    //
+    // Persist: do NOT wipe an existing state dir — swtpm reloads the persisted
+    // non-volatile state (the sealed object the previous phase enrolled) while
+    // `--flags startup-clear` (below) still issues a CLEAR power-on so PCRs
+    // reset and NMBL re-extends the same deterministic sequence. We `create_
+    // dir_all` either way: it is a no-op if the dir already exists (phase 2)
+    // and creates it on the very first phase.
+    if tpm.state_dir.exists() && !tpm.persist {
         fs::remove_dir_all(&tpm.state_dir)
             .await
             .with_context(|| format!("clearing swtpm state dir {}", tpm.state_dir.display()))?;
@@ -186,5 +226,6 @@ pub async fn spawn_swtpm(tpm: &TpmConfig, cmd: &mut Command) -> Result<SwtpmSide
     Ok(SwtpmSidecar {
         child,
         state_dir: tpm.state_dir.clone(),
+        persist: tpm.persist,
     })
 }
