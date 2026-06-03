@@ -123,6 +123,17 @@ impl VmManager {
             .context("Failed to create SIGTERM handler")?;
         let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .context("Failed to create SIGINT handler")?;
+        // Handle (and ignore) SIGHUP. The manager runs inside a detached `screen`
+        // session whose pty is its controlling terminal; if that pty hangs up —
+        // e.g. under the high-volume full-screen TUI repaint stream NMBL emits
+        // while holding the console — the DEFAULT SIGHUP disposition would
+        // TERMINATE the daemon mid-boot, orphaning QEMU and leaving a stale
+        // control socket so the test can no longer drive or observe the VM.
+        // Registering a handler overrides that default; we just drain it and keep
+        // running headless (stdout echo is already EPIPE-safe). SIGHUP is a
+        // terminal hangup, never a shutdown request, so it must NOT break the loop.
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("Failed to create SIGHUP handler")?;
 
         // Main accept loop
         loop {
@@ -172,6 +183,13 @@ impl VmManager {
                 _ = sigint.recv() => {
                     debug!("SIGINT received, shutting down gracefully");
                     break;
+                }
+
+                // Drain SIGHUP without dying. A `screen` pty hangup must NOT
+                // terminate the daemon — keep serving the control socket and
+                // buffering serial so the test can still drive the boot.
+                _ = sighup.recv() => {
+                    warn!("SIGHUP received (terminal hangup); ignoring and continuing headless");
                 }
 
                 // Check if QEMU exited

@@ -7,6 +7,7 @@ use tokio::net::UnixStream;
 use tracing::{debug, trace, warn};
 
 use crate::protocol::{CommandResponse, CommandType, TriggerRequest};
+use crate::stdout_safe::{write_stdout_line, write_stdout_newline};
 
 use super::utils::find_socket;
 
@@ -52,16 +53,16 @@ pub async fn trigger_on_pattern(
     writer.flush().await?;
     trace!("Trigger request sent and flushed");
 
-    println!("=== Waiting for trigger: {} ===", pattern);
+    write_stdout_line(&format!("=== Waiting for trigger: {} ===", pattern));
     if lines_before > 0 {
-        println!("Will capture {} lines before match", lines_before);
+        write_stdout_line(&format!("Will capture {} lines before match", lines_before));
     }
-    println!("Will capture {} lines after match", lines_after);
-    println!(
+    write_stdout_line(&format!("Will capture {} lines after match", lines_after));
+    write_stdout_line(&format!(
         "Match timeout: {}s, Line timeout: {}s",
         match_timeout, line_timeout
-    );
-    println!();
+    ));
+    write_stdout_newline();
 
     // Receive responses
     let mut line = String::new();
@@ -94,12 +95,15 @@ pub async fn trigger_on_pattern(
             CommandResponse::TriggerMatch(captured) => {
                 // Stream output as it arrives
                 for output_line in captured {
-                    println!("{}", output_line);
+                    write_stdout_line(&output_line);
                 }
             }
             CommandResponse::TriggerTimeout => {
-                println!("=== Trigger Timeout ===");
-                println!("Pattern did not match within {} seconds", match_timeout);
+                write_stdout_line("=== Trigger Timeout ===");
+                write_stdout_line(&format!(
+                    "Pattern did not match within {} seconds",
+                    match_timeout
+                ));
             }
             CommandResponse::Complete => {
                 break;

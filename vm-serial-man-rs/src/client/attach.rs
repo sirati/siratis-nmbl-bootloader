@@ -10,6 +10,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::protocol::{AttachRequest, CommandResponse, CommandType};
+use crate::stdout_safe::{write_stdout_line, write_stdout_newline};
 
 use super::utils::find_socket;
 
@@ -69,20 +70,20 @@ pub async fn attach_console(socket: Option<PathBuf>) -> Result<()> {
 
         match response {
             CommandResponse::AttachInfo(timestamp, total_lines) => {
-                println!("=== Attaching to VM Console ===");
-                println!("Last output: {}", timestamp);
-                println!("Total lines: {}", total_lines);
-                println!("Showing last 100 lines:");
-                println!("---");
+                write_stdout_line("=== Attaching to VM Console ===");
+                write_stdout_line(&format!("Last output: {}", timestamp));
+                write_stdout_line(&format!("Total lines: {}", total_lines));
+                write_stdout_line("Showing last 100 lines:");
+                write_stdout_line("---");
             }
             CommandResponse::OutputLine(output) => {
                 // Output lines have newlines stripped, add them back
-                println!("{}", output);
+                write_stdout_line(&output);
             }
             CommandResponse::Attached => {
-                println!("---");
-                println!("=== Attached (Press Ctrl-D or type 'exit' + Enter to detach) ===");
-                println!();
+                write_stdout_line("---");
+                write_stdout_line("=== Attached (Press Ctrl-D or type 'exit' + Enter to detach) ===");
+                write_stdout_newline();
                 attached = true;
                 break;
             }
@@ -166,12 +167,12 @@ pub async fn attach_console(socket: Option<PathBuf>) -> Result<()> {
                         match response {
                             CommandResponse::OutputLine(output) => {
                                 // Output lines have newlines stripped, add them back
-                                println!("{}", output);
+                                write_stdout_line(&output);
                                 io::stdout().flush().ok();
                             }
                             CommandResponse::Detached => {
-                                println!();
-                                println!("=== Detached from VM Console ===");
+                                write_stdout_newline();
+                                write_stdout_line("=== Detached from VM Console ===");
                                 break;
                             }
                             _ => {
