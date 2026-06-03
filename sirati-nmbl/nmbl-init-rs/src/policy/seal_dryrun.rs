@@ -81,6 +81,17 @@ pub(super) fn dry_run_seal_active() -> bool {
     DRY_RUN_SEAL.with(Cell::get)
 }
 
+/// `true` when a `--validate-initrm` run holds a [`DryRunSealScope`]. The
+/// public sibling of [`dry_run_seal_active`] for callers OUTSIDE the `policy`
+/// module (the LUKS wrong-password recovery seam in
+/// [`crate::activation`]), which must skip its real seal + real shell fork on
+/// the dry-run path the same way the refuse terminus and the cap/close seam
+/// do. Real boot never enters the scope, so this is always `false` there.
+#[must_use]
+pub fn validate_initrm_active() -> bool {
+    DRY_RUN_SEAL.with(Cell::get)
+}
+
 /// Number of REAL hardware seal ops (TPM cap + `cryptsetup close`) attempted
 /// on this thread since the last [`reset_real_seal_ops`]. The Property-6 test
 /// asserts a dry-run `--validate-initrm` run leaves this at zero.

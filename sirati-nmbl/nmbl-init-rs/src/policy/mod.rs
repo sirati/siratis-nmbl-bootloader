@@ -73,6 +73,7 @@ pub use relock::{
     relock_and_refuse_blocking, relock_argv,
 };
 pub use seal_dryrun::{
-    DryRunSealScope, real_seal_ops, real_terminus_ops, reset_real_seal_ops, reset_real_terminus_ops,
+    DryRunSealScope, real_seal_ops, real_terminus_ops, reset_real_seal_ops,
+    reset_real_terminus_ops, validate_initrm_active,
 };
 pub use sentinel::{sentinel_present, should_force_rescue, write_sentinel};

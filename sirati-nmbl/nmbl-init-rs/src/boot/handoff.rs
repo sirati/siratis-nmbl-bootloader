@@ -300,11 +300,12 @@ pub(crate) fn verify_measure_then_load<S: SysOps>(
     // The byte ring lives in RAM and the current tmpfs at NMBL_LOG_PATH
     // does not survive `reboot(LINUX_REBOOT_CMD_KEXEC)` — only what we
     // splice into the cpio fragment kexec_file_load(2) consumes reaches
-    // the next kernel. We flush the ring to NMBL_LOG_PATH first (so the
-    // helper that reads it back gets a header-aware snapshot identical
-    // to the non-kexec terminal-action paths) and then read it back to
-    // append as a cpio entry. Read failures degrade silently — the log
-    // is best-effort and must never block the boot handoff.
+    // the next kernel. `stage_log_for_kexec` takes one header-aware
+    // snapshot of the ring (identical to the non-kexec terminal-action
+    // paths), writes it to NMBL_LOG_PATH via `ops.write_file` for parity,
+    // and returns those SAME bytes — which we append directly as a cpio
+    // entry below (no read-back). A write failure degrades silently to an
+    // empty log; staging is best-effort and must never block the handoff.
     let log_bytes: Vec<u8> = stage_log_for_kexec(ops);
     let log_path = Path::new(NMBL_LOG_PATH);
 
