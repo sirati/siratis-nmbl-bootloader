@@ -51,6 +51,12 @@
   # `null` on an older host flake; only dereferenced when generation signing is
   # enabled (the eval-time assert below requires it then).
   nmblSign ? null,
+  # BUILD-TIME-ONLY: when true the install SKIPS every signing step (UNSIGNED
+  # UKI installed, NO generation sidecars written) so a sealed image builder
+  # that cannot read the impure keys still completes. Runtime enforcement is
+  # untouched; the boot partition must be signed out of band afterwards. See
+  # `boot.nmbl.signing.deferInstallSigning`.
+  deferInstallSigning ? false,
 }:
 
 let
@@ -246,8 +252,13 @@ let
   # them an ENFORCING install would refuse every generation. Factored into its
   # own module (loader-INDEPENDENT, and to keep this file under the size cap).
   # Returns "" when `signing.enable` is unset.
+  # Deferred installs sign nothing in-place (the keys are unreadable in the
+  # sealed builder); pass a disabled policy so install-gen-signing.nix emits the
+  # empty fragment AND its impure-key asserts never fire for this build.
+  effectiveGenSigning = if deferInstallSigning then genSigning // { enable = false; } else genSigning;
   genSignShell = import ./install-gen-signing.nix {
-    inherit lib config genSigning nmblSign;
+    inherit lib config nmblSign;
+    genSigning = effectiveGenSigning;
   };
 
   # The efi-stub UKI install/sign fragment (loader-specific; UEFI direct boot
@@ -272,7 +283,12 @@ let
     # time with the operator's db-enrolled key (R-9); otherwise the pure
     # unsigned PE is installed unchanged.
     echo "Installing NMBL UKI (UEFI efi-stub mode) to ${ukiEspDest}..."
-    ${if ukiSignEnable then ukiSignShell else ukiUnsignedShell}
+    ${
+      # Deferred build: install the UNSIGNED PE here; the host-side step
+      # sbsigns it in place afterwards (the impure SB key is unreadable in a
+      # sealed image builder).
+      if ukiSignEnable && !deferInstallSigning then ukiSignShell else ukiUnsignedShell
+    }
 
     ${lib.optionalString (!efiStubIsFallback) (
       if efiStubCanTouchEfi then ''

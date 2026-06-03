@@ -388,6 +388,10 @@ pkgs.writeScript "install-nmbl-bootloader" ''
         keyFile = s.generationKeyFile or null;
         sigPathSuffix = s.sigPathSuffix or ".sig";
       };
+    # Build-time-only: skip in-installer signing (unsigned UKI, no sidecars) so
+    # a sealed image builder that cannot read the impure keys still completes.
+    # Runtime enforcement is unchanged; the boot partition is signed out of band.
+    deferInstallSigning = cfg.signing.deferInstallSigning or false;
   }}
 
   # Create /init symlink for NixOS stage-1

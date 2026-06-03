@@ -39,32 +39,54 @@ proves the firmware enforces.
 boot rather than degrading, so a negative can never false-green on a box
 without `/dev/tpmrm0`.
 
+## How the test disk is signed (read this — the keys are NOT staged at build)
+
+The `test-secure-boot` **disk image** is produced by disko/`make-disk-image`,
+which runs `nixos-install` (and thus the NMBL `installBootLoader`) inside a
+SEALED build VM whose only filesystem is the Nix store. The install-time-impure
+signing keys (`generationKeyFile`, `signing.uki.{keyFile,certFile}`) DO NOT
+EXIST inside that VM, so `nmbl-sign`/`sbsign` cannot read them — staging them on
+the host (`/run/nmbl-test-keys/…` or `$NMBL_GEN_KEY_FILE`) does nothing for the
+build VM, and attempting to sign there KILLS the build (init `exit_group(1)` →
+kernel panic).
+
+The image build therefore DEFERS in-installer signing
+(`boot.nmbl.signing.deferInstallSigning = true`, set automatically for the disko
+path in `testing/vm-config.nix`): it installs the UNSIGNED UKI and writes NO
+generation sidecars, but the runtime POLICY is untouched — the baked trust
+anchor (`publicKeys`) and `config.toml`'s `[signing].enable/enforce` still make
+the booted NMBL ENFORCE signatures.
+
+The signing is then finished HOST-SIDE by `flake.nix`'s
+`secureBootSignedDisk` derivation (`nix build .#test-secure-boot-disk`), where
+the committed INSECURE-TEST keys are available: it `sbsign`s the NMBL UKI with
+`insecure-test-sb-db.{key,crt}` and signs each generation's kernel/initrd with
+`insecure-test-ml-dsa-87.key` (per-role `gen-kernel`/`gen-initrd` domains),
+writing `EFI/BOOT/BOOTX64.EFI` and `/nmbl/sigs/<gen-id>/{kernel,initrd}.sig`
+onto the disk's UNENCRYPTED ESP. The `gen-id` is the content-addressed store
+basename of the system toplevel — the SAME id `nmbl-init` computes at boot.
+
+The store-imported keys are fine HERE because this is a TEST disk, not a
+production NMBL closure; the production closure-leak guard
+(`nix build .#insecure-test-key-absent`) still holds for prod configs, and the
+in-installer `lib/install-{signing,gen-signing}.nix` asserts still reject a
+store-path key for any non-deferred (real) install.
+
 ## Runner prerequisites (set by the flake apps, but listed for #57)
 
-* `$NMBL_RUNNER` — exported by each app to the per-scenario runner.
-* **`$NMBL_GEN_KEY_FILE`** — the impure on-disk path to the INSECURE-TEST
-  *private* key used to sign generations at install time. The config defaults
-  it to `/run/nmbl-test-keys/insecure-test-gen.key`. Before building the
-  `test-secure-boot` **disk image**, the runner MUST stage the committed key
-  there (or export the env), e.g.:
-
-  ```
-  sudo install -Dm600 \
-    sirati-nmbl/testing/keys/insecure-test-ml-dsa-87.key \
-    /run/nmbl-test-keys/insecure-test-gen.key
-  # or: export NMBL_GEN_KEY_FILE=$PWD/sirati-nmbl/testing/keys/insecure-test-ml-dsa-87.key
-  #     and build the disk image with --impure
-  ```
-
-  The key is PUBLICLY KNOWN test material (`testing/keys/README.md`); it only
-  ever signs TEST artifacts. It is read impurely and never enters the store
-  (the closure-leak assert in `lib/install-gen-signing.nix` rejects a store
-  path). Without the staged key the disk image still BUILDS but the generation
-  sidecars are unsigned/absent, so an enforcing boot refuses every generation —
-  i.e. the happy-path scenarios need the key staged.
-
-* `$NMBL_SB_DISK` — exported by the bad-sig app to the `test-secure-boot`
-  `vmDiskImage` `nixos.qcow2`; the bad-sig script tampers a copy of it.
+* `$NMBL_RUNNER` — exported by each app to the per-scenario runner. The runner
+  copies the HOST-SIGNED `vmDiskImage` (`secureBootSignedConfig`, i.e.
+  `.#test-secure-boot-disk`) `nixos.qcow2`, so the booted disk already carries
+  the sbsign'd UKI and the generation sidecars.
+* **No key staging is needed.** `$NMBL_GEN_KEY_FILE` /
+  `$NMBL_SB_DB_{KEY,CERT}_FILE` are still honoured by the config's
+  `generationKeyFile`/`uki.{keyFile,certFile}` defaults for a REAL
+  (non-deferred) install, but the disk-image build path ignores them (signing
+  is deferred to the host-side step above). The build needs `--impure` only
+  because those `getEnv` defaults are evaluated, not read.
+* `$NMBL_SB_DISK` — exported by the bad-sig app to the HOST-SIGNED
+  `secureBootSignedConfig` `vmDiskImage` `nixos.qcow2`; the bad-sig script
+  tampers a copy of it (removing a signed `initrd.sig` sidecar).
 
 ## CORE scenarios — FULLY WIRED
 
