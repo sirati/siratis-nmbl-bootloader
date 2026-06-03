@@ -214,6 +214,12 @@ async fn close_all_best_effort_async(sender: &LocalSender) {
 fn cap_step(require_tpm: bool) -> Result<(), SealFailed> {
     match cap_lock_pcr_seam() {
         CapOutcome::Capped => Ok(()),
+        // cap-exempt: NO TPM is present, so there is no lock PCR to cap and no
+        // TPM-sealed secret to poison — the cap is vacuous, not skipped. The
+        // posture is the operator's `requireTpm`: degrade-open when unset
+        // (luks-tpm box with no TPM), fail-closed when set (FIX-28). A
+        // present-but-uncappable TPM is `Failed`, never `NoTpm`, and ALWAYS
+        // fails closed below — this arm can only widen on a provably TPM-less box.
         CapOutcome::NoTpm => {
             if require_tpm {
                 Err(SealFailed::new(NmblError::TpmProto {

@@ -57,6 +57,9 @@ use crate::sig::{self, DOMAIN_RESCUE_SFS, PolicyDecision};
 /// or constructs a `TerminalAction`.
 #[must_use]
 pub fn verify_rescue_sfs_gated(config: &Config) -> PolicyDecision {
+    // signing safety: signing-disabled is the operator declining the feature,
+    // NOT an allow-unsigned bypass of an enabled one (FIX-04). The legacy
+    // (feature-free) rescue verifies nothing; this matches that posture.
     if !config.signing.enable {
         crate::nmbl_info!(
             "rescue: signature verification disabled (signing.enable = false); skipping gate"

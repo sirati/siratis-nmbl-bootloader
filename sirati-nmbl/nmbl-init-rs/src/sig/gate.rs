@@ -113,6 +113,11 @@ pub fn apply_policy(config: &Config, verify_result: Result<()>) -> PolicyDecisio
         Ok(()) => PolicyDecision::Proceed,
         Err(err) => match VerifyPolicy::from_config(config) {
             VerifyPolicy::Enforce => PolicyDecision::Refuse(err),
+            // signing safety: the ONE audit-mode downgrade. Reachable only
+            // behind the two-flag `enable && !enforce`, itself gated by the
+            // Nix-side `allowAuditModeInsecure` (FIX-16/FIX-31) — never a
+            // default. Warns loudly; a failed verify still proceeds because the
+            // operator explicitly opted into insecure audit observation.
             VerifyPolicy::Audit => {
                 nmbl_warn!(
                     "signature AUDIT mode: verification failed but boot proceeds (insecure): {err}"
@@ -137,6 +142,9 @@ pub fn apply_policy(config: &Config, verify_result: Result<()>) -> PolicyDecisio
 /// of an enabled one (FIX-04).
 #[must_use]
 pub fn ensure_generation_signed_gated(config: &Config, generation: &Generation) -> PolicyDecision {
+    // signing safety: signing-disabled is the operator declining the feature,
+    // NOT an allow-unsigned bypass of an enabled one (FIX-04). No keys, no
+    // posture, nothing to verify against; proceed without pretending to verify.
     if !config.signing.enable {
         nmbl_info!("signature verification disabled (signing.enable = false); skipping gate");
         return PolicyDecision::Proceed;
