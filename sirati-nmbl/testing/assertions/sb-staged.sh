@@ -76,6 +76,14 @@ STAGED_OK_PHRASE="fragment applied"
 #     Its presence proves the merged config's effects ran (not just that the
 #     fragment parsed); the module-load itself happens immediately after.
 STAGED_RERUN_PHRASE="re-loading explicit kernel modules"
+# (d) DIRECT proof the merged-config module ACTUALLY loaded — the marker the
+#     rerun emits ONLY AFTER `load_explicit_modules` RETURNED Ok (rerun.rs,
+#     "staged rerun: loaded N explicit module(s) [..]"). Unlike the (c) phase
+#     marker (which only proves the phase was entered), this fires post-load, and
+#     it names the modules — so we additionally assert the fragment-added module
+#     `dummy` appears ON that post-load line.
+STAGED_LOADED_PHRASE="staged rerun: loaded"
+STAGED_LOADED_DUMMY_RE="staged rerun: loaded.*dummy"
 
 # The staged path is heavier than a plain boot (priority-gate mount + two
 # single-fd verifies + transactional merge + module re-load + activation re-run
@@ -237,6 +245,24 @@ if ! assert_journal_tag "${JOURNAL_TAG}" "${STAGED_RERUN_PHRASE}"; then
   exit 1
 fi
 echo "=== PASS: staged re-run re-loaded the merged config's explicit modules ===" >&2
+
+# (d) DIRECT proof: the post-load marker fired AND it names `dummy`. The (c)
+# phase marker above proves only that the rerun entered the module-load phase;
+# this asserts `load_explicit_modules` actually RETURNED Ok (the marker is
+# emitted right after it) and that the fragment-added `dummy` is on that line.
+echo "=== asserting the staged re-run actually LOADED the fragment's module ===" >&2
+if ! assert_journal_tag "${JOURNAL_TAG}" "${STAGED_LOADED_PHRASE}"; then
+  echo "FAIL: no '${STAGED_LOADED_PHRASE}' line in the ${JOURNAL_TAG} journal —" >&2
+  echo "      load_explicit_modules did NOT return Ok for the merged config (the" >&2
+  echo "      module-load proof marker never fired)." >&2
+  exit 1
+fi
+if ! assert_journal_tag "${JOURNAL_TAG}" "${STAGED_LOADED_DUMMY_RE}"; then
+  echo "FAIL: the staged module-load marker does not name 'dummy' — the" >&2
+  echo "      fragment-added module was NOT in the loaded set." >&2
+  exit 1
+fi
+echo "=== PASS: staged re-run LOADED the fragment's 'dummy' module ===" >&2
 
 echo "PASS: staged boot — priority gate attested, signed fragment verified +" >&2
 echo "      merged, merged effects re-run, system kexec'd + booted." >&2
