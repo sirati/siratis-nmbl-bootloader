@@ -188,8 +188,14 @@
               ) publicKeys)}
             '';
 
+            # `-p nmbl-init` scopes the build to the init package only: the
+            # workspace now also holds `nmbl-host-tools` (the HOST signer), which
+            # MUST NOT enter the musl initramfs build/closure (FIX-25). Feature
+            # flags follow the package selector.
+            featureArgs' =
+              if featureArgs == "" then "-p nmbl-init" else "-p nmbl-init " + featureArgs;
             argsWithFeatures = commonArgs // {
-              cargoExtraArgs = featureArgs;
+              cargoExtraArgs = featureArgs';
             } // pkgs.lib.optionalAttrs (publicKeys != [ ]) {
               src = srcWithKeys;
             };
@@ -209,10 +215,18 @@
             }
           );
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        # `-p nmbl-init` keeps every initramfs build scoped to the init package;
+        # the sibling `nmbl-host-tools` workspace member (the host signer) is
+        # built separately below for the HOST target and never enters this
+        # musl/initramfs closure (FIX-25).
+        initArgs = commonArgs // {
+          cargoExtraArgs = "-p nmbl-init";
+        };
+
+        cargoArtifacts = craneLib.buildDepsOnly initArgs;
 
         nmbl-init = craneLib.buildPackage (
-          commonArgs
+          initArgs
           // {
             inherit cargoArtifacts;
             pname = "nmbl-init";
@@ -223,11 +237,49 @@
         # (drm + png + fontdue + alacritty_terminal). Kept as a separate
         # package so users who don't want the splash never pull those deps.
         nmbl-init-splash = craneLib.buildPackage (
-          commonArgs
+          initArgs
           // {
             inherit cargoArtifacts;
             pname = "nmbl-init-splash";
-            cargoExtraArgs = "--features image-splash";
+            cargoExtraArgs = "-p nmbl-init --features image-splash";
+          }
+        );
+
+        # ---- Host-tools: the `nmbl-sign` signer (HOST target — FIX-25) --------
+        #
+        # A SEPARATE crane buildPackage for the host platform (NOT musl): it
+        # produces the NMBLSIG1 sidecars the in-initramfs verifier checks, so it
+        # must run on the operator's build host. It reuses `nmbl_init::sig`'s
+        # frozen wire format via a path dep, but is built OUTSIDE the initramfs
+        # `cargoArtifacts` and never appears in any nmbl-init/UKI/initramfs
+        # closure. The host triple drops the `+crt-static`/musl rustflags; the
+        # `.cargo/config.toml` musl default is overridden by `CARGO_BUILD_TARGET`.
+        hostTarget = pkgs.stdenv.hostPlatform.rust.rustcTarget;
+        hostToolchain = fenix.packages.${system}.combine [
+          (fenix.packages.${system}.stable.withComponents [
+            "cargo"
+            "rustc"
+            "rustfmt"
+            "clippy"
+          ])
+          fenix.packages.${system}.targets.${hostTarget}.stable.rust-std
+        ];
+        hostCraneLib = (crane.mkLib pkgs).overrideToolchain hostToolchain;
+        hostCommonArgs = {
+          src = commonArgs.src;
+          strictDeps = true;
+          cargoExtraArgs = "-p nmbl-host-tools";
+          CARGO_BUILD_TARGET = hostTarget;
+          # No musl/static rustflags here: this is a normal dynamic host binary.
+          CARGO_BUILD_RUSTFLAGS = "";
+          doCheck = false;
+        };
+        hostArtifacts = hostCraneLib.buildDepsOnly hostCommonArgs;
+        nmbl-sign = hostCraneLib.buildPackage (
+          hostCommonArgs
+          // {
+            cargoArtifacts = hostArtifacts;
+            pname = "nmbl-sign";
           }
         );
       in
@@ -241,6 +293,9 @@
           default = nmbl-init;
           nmbl-init = nmbl-init;
           nmbl-init-splash = nmbl-init-splash;
+          # The host-platform ML-DSA image signer (FIX-25). A separate
+          # buildPackage on the host target, outside the initramfs closure.
+          nmbl-sign = nmbl-sign;
         };
 
         # Useful for hand-testing: just runs the binary in your shell. It will
@@ -311,16 +366,48 @@
             '';
 
           nmbl-init-clippy = craneLib.cargoClippy (
-            commonArgs
+            initArgs
             // {
               inherit cargoArtifacts;
-              cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+              cargoClippyExtraArgs = "-p nmbl-init --all-targets -- --deny warnings";
             }
           );
 
+          # `cargo fmt --check` over the whole source tree (covers both the
+          # init crate and the host-tools member).
           nmbl-init-fmt = craneLib.cargoFmt {
             src = commonArgs.src;
           };
+
+          # ---- Host-tools (nmbl-sign) gate: build + clippy + test (FIX-25) ----
+          # The signer is built/linted/tested under the HOST target (clippy
+          # 1.95.0 -D warnings via the pinned fenix toolchain), separate from the
+          # musl initramfs gate.
+          inherit nmbl-sign;
+
+          nmbl-sign-clippy = hostCraneLib.cargoClippy (
+            hostCommonArgs
+            // {
+              cargoArtifacts = hostArtifacts;
+              cargoClippyExtraArgs = "-p nmbl-host-tools --all-targets -- --deny warnings";
+            }
+          );
+
+          # The cross-crate round-trip KAT (FIX-25/FIX-52): `nmbl-sign` signs and
+          # `nmbl_init::sig::verify_digest` verifies on the same bytes, plus the
+          # wrong-key / wrong-domain / truncated-sidecar negatives. Run on the
+          # host target so both crates' code executes natively.
+          nmbl-sign-test = hostCraneLib.cargoTest (
+            hostCommonArgs
+            // {
+              cargoArtifacts = hostArtifacts;
+              cargoExtraArgs = "-p nmbl-host-tools";
+              # `hostCommonArgs` sets `doCheck = false` for the build/clippy
+              # derivations; the test check MUST actually RUN the KATs, so flip
+              # it back on here (else the test binary is built but never run).
+              doCheck = true;
+            }
+          );
 
           # Replacing our own process (execve) or spawning one
           # (std::process::Command) is only sound at a handful of sites:
