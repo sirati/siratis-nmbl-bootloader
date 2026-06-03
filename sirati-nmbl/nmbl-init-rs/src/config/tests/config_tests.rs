@@ -698,3 +698,91 @@ enable = true
         "rejection should mention the unknown secure_boot table, got: {msg}",
     );
 }
+
+#[test]
+fn parse_toml_round_trips_a_full_config_unchanged() {
+    // The factored `parse_toml` must produce exactly what the old inline
+    // `toml::from_str::<Config>` produced: a non-trivial config decodes
+    // through both paths to the same observable fields. Guards that the
+    // factoring did not change the existing load path's parse behaviour.
+    let toml = r#"
+[general]
+timeout_ms = 7000
+
+[[filesystems]]
+device     = "/dev/disk/by-label/root"
+mountpoint = "/"
+fstype     = "ext4"
+is_root    = true
+"#;
+    let direct: Config = toml::from_str(toml).expect("direct parse must succeed");
+    let viaapi = Config::parse_toml(toml, std::path::Path::new("/etc/nmbl/config.toml"))
+        .expect("parse_toml");
+    assert_eq!(viaapi.general.timeout_ms, direct.general.timeout_ms);
+    assert_eq!(viaapi.filesystems.len(), direct.filesystems.len());
+    let fs = viaapi.filesystems.first().expect("one filesystem entry");
+    assert_eq!(fs.device, "/dev/disk/by-label/root");
+    assert!(fs.is_root);
+}
+
+#[test]
+fn parse_toml_surfaces_a_config_error_on_garbage() {
+    // Malformed TOML must come back as NmblError::Config carrying the path
+    // (the same diagnostic the old inline parse produced).
+    let err = Config::parse_toml("this = = not toml", std::path::Path::new("/x/bad.toml"))
+        .expect_err("garbage TOML must error");
+    assert!(matches!(err, NmblError::Config { .. }), "{err}");
+}
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn load_fragment_accepts_a_partial_overlay() {
+    // A fragment that sets only a subset of fields must parse: unlike a
+    // full Config it does not require any mandatory section.
+    use crate::config::ConfigFragment;
+    let toml = "[general]\ntimeout_ms = 4200\n";
+    let frag =
+        ConfigFragment::parse_toml(toml, std::path::Path::new("/frag.toml")).expect("partial frag");
+    let general = frag.general.expect("general overlay present");
+    assert_eq!(general.timeout_ms, 4200);
+    // Unmentioned tables stay absent so the merge leaves the base alone.
+    assert!(frag.filesystems.is_none());
+    assert!(frag.tpm.is_none());
+}
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn load_fragment_accepts_an_empty_overlay() {
+    // The empty fragment is valid (sets nothing); every field is None.
+    use crate::config::ConfigFragment;
+    let frag =
+        ConfigFragment::parse_toml("", std::path::Path::new("/frag.toml")).expect("empty frag");
+    assert!(frag.general.is_none());
+    assert!(frag.activations.is_none());
+}
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn load_fragment_rejects_unknown_keys() {
+    // deny_unknown_fields must carry over to the fragment: an unknown
+    // table is a hard parse error, never a silent no-op.
+    use crate::config::ConfigFragment;
+    let toml = "[general]\ntimeout_ms = 1000\n\n[mystery]\nfoo = 1\n";
+    let err = ConfigFragment::parse_toml(toml, std::path::Path::new("/frag.toml"))
+        .expect_err("unknown table must be rejected");
+    assert!(err.to_string().contains("mystery"), "{err}");
+}
+
+#[cfg(feature = "staged-boot")]
+#[test]
+fn load_fragment_reads_from_disk() {
+    // The on-disk loader round-trips through the file system and the parse.
+    use crate::config::load_fragment;
+    let dir = std::env::temp_dir().join(format!("nmbl-frag-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mk tmp dir");
+    let path = dir.join("fragment.toml");
+    std::fs::write(&path, "[general]\ntimeout_ms = 9000\n").expect("write frag");
+    let frag = load_fragment(&path).expect("load_fragment must succeed");
+    assert_eq!(frag.general.expect("general").timeout_ms, 9000);
+    let _ = std::fs::remove_dir_all(&dir);
+}

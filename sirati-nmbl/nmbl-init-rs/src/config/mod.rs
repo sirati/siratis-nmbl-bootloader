@@ -7,6 +7,7 @@ use crate::error::{NmblError, Result};
 pub(crate) mod bootstrap;
 mod driver_image;
 mod entries;
+mod fragment;
 mod general;
 mod paths;
 mod rescue_cfg;
@@ -52,6 +53,9 @@ pub use signing::{SigningConfig, UkiSigningConfig};
 
 #[cfg(feature = "image-splash")]
 pub use splash::{Splash, SplashBackgroundLocation};
+
+#[cfg(feature = "staged-boot")]
+pub use fragment::{ConfigFragment, load_fragment};
 
 #[cfg(feature = "staged-boot")]
 pub use staged::StagedConfig;
@@ -279,16 +283,25 @@ impl Config {
         Ok(())
     }
 
+    /// Parse a raw TOML string into a `Config`, WITHOUT the `validate()`
+    /// pass or any I/O. Factored out of [`Config::load`] so the same parse
+    /// step can be reused (e.g. by the staged-boot fragment loader, which
+    /// shares this `deny_unknown_fields` decode but layers its own merge).
+    /// `path` is carried only for the [`NmblError::Config`] diagnostic.
+    pub fn parse_toml(text: &str, path: &Path) -> Result<Config> {
+        toml::from_str(text).map_err(|source| NmblError::Config {
+            source,
+            path: path.to_path_buf(),
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path).map_err(|source| NmblError::Io {
             source,
             context: format!("reading config file {}", path.display()),
         })?;
 
-        let config: Config = toml::from_str(&text).map_err(|source| NmblError::Config {
-            source,
-            path: path.to_path_buf(),
-        })?;
+        let config = Config::parse_toml(&text, path)?;
 
         config.validate()?;
         Ok(config)
