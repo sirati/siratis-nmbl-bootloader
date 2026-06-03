@@ -211,8 +211,17 @@ fn verify_generation_signature(
 
         match verify_generation_pinned(config, generation) {
             // Verified: keep the pinned kernel fd + reused digests for
-            // measure+load.
-            Ok(verified) => Ok(Some(verified)),
+            // measure+load. Emit a POSITIVE marker so a happy-path test can
+            // assert the verify guard actually RAN and PASSED — not merely
+            // that the box booted (which an accidentally-non-enforcing build
+            // would also do). Distinct from the disabled/audit lines.
+            Ok(verified) => {
+                nmbl_info!(
+                    "signature verified: generation {} kernel+initrd OK (enforce)",
+                    generation.number,
+                );
+                Ok(Some(verified))
+            }
             // A verify failure: map through the audit-vs-enforce posture.
             Err(err) => match VerifyPolicy::from_config(config) {
                 // Enforce: hand the cause to the shared refuse terminus via
