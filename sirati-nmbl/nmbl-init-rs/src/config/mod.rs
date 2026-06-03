@@ -283,6 +283,36 @@ impl Config {
         Ok(())
     }
 
+    /// Resolve the runtime mountpoint of the boot partition — the writable
+    /// FAT/ESP that carries the per-generation signature sidecars
+    /// (`<boot>/nmbl/sigs/<gen-id>/…`), the rescue sentinel, and the rescue
+    /// squashfs.
+    ///
+    /// Phase 0.5 (bootstrap mode) mounts the boot fs out-of-band and records
+    /// its mountpoint in [`Self::runtime_boot_mountpoint`], which is
+    /// authoritative when present. In legacy embedded-config mode there is no
+    /// Phase 0.5: the boot partition is just one of [`Self::filesystems`],
+    /// mounted under `system_root` at its `/boot` mountpoint by
+    /// [`crate::devices::mount_system_filesystems`]. We then derive the same
+    /// `<system_root>/boot` path from that entry so the signature verify can
+    /// locate the sidecars the install signer wrote to the boot partition.
+    ///
+    /// The boot entry is the non-root filesystem whose configured mountpoint
+    /// is `/boot` — the SAME location the install-time generation signer
+    /// hard-codes (`/boot/nmbl/sigs`). Returns `None` only when neither a
+    /// runtime mountpoint nor a `/boot` filesystem entry exists.
+    #[must_use]
+    pub fn resolve_boot_mountpoint(&self) -> Option<PathBuf> {
+        if let Some(mp) = self.runtime_boot_mountpoint.as_deref() {
+            return Some(mp.to_path_buf());
+        }
+        let system_root = self.paths.system_root.as_path();
+        self.filesystems
+            .iter()
+            .find(|fs| !fs.is_root && fs.mountpoint == Path::new("/boot"))
+            .map(|fs| crate::devices::resolve_mountpoint(system_root, fs))
+    }
+
     /// Parse a raw TOML string into a `Config`, WITHOUT the `validate()`
     /// pass or any I/O. Factored out of [`Config::load`] so the same parse
     /// step can be reused (e.g. by the staged-boot fragment loader, which
