@@ -40,7 +40,7 @@ use crate::generations::Generation;
 use crate::imageload::DriverImagesHandle;
 use crate::log;
 use crate::sys::cpio::{InjectionEntry, build_fragment};
-use crate::sys::ops::SysOps;
+use crate::sys::ops::{FsOps, SysOps};
 use crate::{nmbl_info, nmbl_warn};
 
 #[cfg(feature = "secure-boot")]
@@ -119,11 +119,15 @@ fn build_cmdline(
 /// parent matches the same step in `execute_terminal_action`'s flush
 /// so the file is reachable here even when the dispatcher flush in
 /// `main` hasn't run yet (it runs after `kexec_into` returns).
-fn stage_log_for_kexec() -> Vec<u8> {
+///
+/// The directory creation and read-back are routed through the [`FsOps`] seam
+/// so a `--validate-initrm` dry-run stages the log without touching the live
+/// filesystem (the dry-run no-ops the mkdir and reads through its closure).
+fn stage_log_for_kexec<S: FsOps>(ops: &mut S) -> Vec<u8> {
     let log_path = Path::new(NMBL_LOG_PATH);
     if let Some(parent) = log_path.parent() {
         // EEXIST is benign; any harder failure surfaces through flush_to.
-        let _ = std::fs::create_dir_all(parent);
+        let _ = ops.ensure_dir(parent);
     }
     if let Err(err) = log::flush_to(log_path) {
         nmbl_warn!(
@@ -132,7 +136,7 @@ fn stage_log_for_kexec() -> Vec<u8> {
         );
         return Vec::new();
     }
-    match std::fs::read(log_path) {
+    match ops.read_file(log_path) {
         Ok(bytes) => bytes,
         Err(err) => {
             nmbl_warn!(
@@ -297,7 +301,7 @@ pub(crate) fn verify_measure_then_load<S: SysOps>(
     // to the non-kexec terminal-action paths) and then read it back to
     // append as a cpio entry. Read failures degrade silently — the log
     // is best-effort and must never block the boot handoff.
-    let log_bytes: Vec<u8> = stage_log_for_kexec();
+    let log_bytes: Vec<u8> = stage_log_for_kexec(ops);
     let log_path = Path::new(NMBL_LOG_PATH);
 
     let mut entries: Vec<InjectionEntry<'_>> = key_injections
@@ -335,6 +339,7 @@ pub(crate) fn verify_measure_then_load<S: SysOps>(
     // measure-required build fails CLOSED (routes to refuse, never an unmeasured
     // boot — FIX-27).
     super::handoff_load::measure_handoff(
+        ops,
         config,
         generation,
         verified.as_ref(),

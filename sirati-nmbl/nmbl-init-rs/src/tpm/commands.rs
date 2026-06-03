@@ -172,13 +172,13 @@ pub(crate) fn build_pcr_read_request(pcr_index: u32) -> Result<Vec<u8>> {
     marshal("pcr_read", &command, TpmSt::NoSessions, &[])
 }
 
-/// `TPM2_PCR_Read` of a single PCR `pcr_index` (SHA-256 bank). Returns the
-/// concatenation of the returned PCR values (one 32-byte digest for a single
-/// allocated bank, empty if the bank/PCR is not allocated). No session
-/// (`TpmSt::NoSessions`).
-pub fn pcr_read(dev: &TpmDevice, pcr_index: u32) -> Result<Vec<u8>> {
-    let request = build_pcr_read_request(pcr_index)?;
-    let body = transact_checked(dev, "pcr_read", TpmCc::PcrRead, &request)?;
+/// Parses a raw `TPM2_PCR_Read` response frame into the concatenated PCR
+/// values, ENFORCING the response code (FIX-27). Split out of [`pcr_read`] so a
+/// caller that transacts the request through the [`TpmOps`](crate::sys::ops::TpmOps)
+/// seam (the SB-state PCR-7 read) can reuse the identical parse without owning a
+/// [`TpmDevice`] — the dry-run's empty no-op response then degrades cleanly.
+pub(crate) fn parse_pcr_read_response(response: &[u8]) -> Result<Vec<u8>> {
+    let body = parse_checked_response("pcr_read", TpmCc::PcrRead, response)?;
     let read = body.PcrRead().map_err(|_| NmblError::TpmProto {
         context: "pcr_read".to_string(),
         reason: "unexpected response body for PcrRead".to_string(),
@@ -188,6 +188,16 @@ pub fn pcr_read(dev: &TpmDevice, pcr_index: u32) -> Result<Vec<u8>> {
         out.extend_from_slice(value.as_ref());
     }
     Ok(out)
+}
+
+/// `TPM2_PCR_Read` of a single PCR `pcr_index` (SHA-256 bank). Returns the
+/// concatenation of the returned PCR values (one 32-byte digest for a single
+/// allocated bank, empty if the bank/PCR is not allocated). No session
+/// (`TpmSt::NoSessions`).
+pub fn pcr_read(dev: &TpmDevice, pcr_index: u32) -> Result<Vec<u8>> {
+    let request = build_pcr_read_request(pcr_index)?;
+    let response = dev.transact(&request)?;
+    parse_pcr_read_response(&response)
 }
 
 /// Builds a `TpmsPcrSelection` selecting exactly `pcr_index` in the SHA-256

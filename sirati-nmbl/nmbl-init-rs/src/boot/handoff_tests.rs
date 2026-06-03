@@ -5,6 +5,18 @@
 use super::*;
 use std::path::PathBuf;
 
+use crate::sys::ops::dryrun::{ClosureView, DryRunScenario, DryRunSys};
+
+/// A side-effect-free `SysOps` for the measure-handoff tests. Both tested
+/// paths (measure-off no-op, measure-required-but-unverified refuse) return
+/// before any TPM op, so the closure root is never probed.
+fn dryrun_ops() -> DryRunSys {
+    DryRunSys::new(
+        ClosureView::new(PathBuf::from("/")),
+        DryRunScenario::NormalBoot,
+    )
+}
+
 fn gen_for(params: &[&str]) -> Generation {
     Generation {
         number: 42,
@@ -132,8 +144,9 @@ fn measure_off_is_a_noop() {
     );
     let g = gen_for(&["root=/dev/sda1"]);
     let no_images = crate::imageload::DriverImagesHandle::empty();
+    let mut ops = dryrun_ops();
     assert!(
-        measure_handoff(&cfg, &g, None, "init=/sbin/init", &no_images).is_ok(),
+        measure_handoff(&mut ops, &cfg, &g, None, "init=/sbin/init", &no_images).is_ok(),
         "measure-off must be a no-op even with no verified generation",
     );
 }
@@ -252,7 +265,8 @@ mod secure_boot {
         );
         let g = gen_for(&["root=/dev/sda1"]);
         let no_images = crate::imageload::DriverImagesHandle::empty();
-        let err = measure_handoff(&cfg, &g, None, "init=/sbin/init", &no_images)
+        let mut ops = super::dryrun_ops();
+        let err = measure_handoff(&mut ops, &cfg, &g, None, "init=/sbin/init", &no_images)
             .expect_err("measure required + unverified ⇒ refuse");
         assert!(
             matches!(err, NmblError::PolicyRefused { .. }),

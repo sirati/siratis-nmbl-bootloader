@@ -34,10 +34,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{NmblError, Result};
+use crate::sys::ops::TpmOps;
 use crate::{nmbl_info, nmbl_warn};
-
-use super::presence::tpm_present;
-use super::transport::TpmDevice;
 
 /// efivarfs mount root. The kernel exposes each UEFI variable as a file named
 /// `<Name>-<GUID>` under here; reading it returns the 4-byte attribute header
@@ -130,24 +128,34 @@ pub fn read_secure_boot_efivar() -> SbEfiState {
     read_secure_boot_efivar_at(Path::new(EFIVARS_DIR))
 }
 
-/// Reads PCR-7 (the SB-state PCR) via the TPM transport, returning the raw
-/// digest bytes on success. Degrades to `None` when no TPM is present or the
+/// Reads PCR-7 (the SB-state PCR) through the [`TpmOps`] seam, returning the
+/// raw digest bytes on success. Degrades to `None` when no TPM is present or the
 /// read fails — PCR-7 here is informational (logged for correlation), so a
 /// read failure must NOT abort the boot; the enforce decision is driven by the
 /// efivar. A non-`None` result is the SHA-256-bank PCR-7 value.
-#[must_use]
-pub fn read_pcr7() -> Option<Vec<u8>> {
-    if !tpm_present() {
+///
+/// Routing through `TpmOps` keeps a `--validate-initrm` dry-run side-effect-free:
+/// `DryRunSys::tpm_present` is synthetic and `tpm_transmit` is a recorded no-op
+/// (its empty response degrades to `None` here, exactly as an absent TPM would).
+fn read_pcr7<S: TpmOps>(ops: &mut S) -> Option<Vec<u8>> {
+    if !ops.tpm_present() {
         return None;
     }
-    let dev = match TpmDevice::open() {
-        Ok(dev) => dev,
+    let request = match super::commands::build_pcr_read_request(SB_STATE_PCR) {
+        Ok(request) => request,
         Err(e) => {
-            nmbl_warn!("sb-state: PCR-{SB_STATE_PCR} read skipped (TPM open failed: {e})");
+            nmbl_warn!("sb-state: PCR-{SB_STATE_PCR} read skipped (request build failed: {e})");
             return None;
         }
     };
-    match super::commands::pcr_read(&dev, SB_STATE_PCR) {
+    let response = match ops.tpm_transmit(&request) {
+        Ok(response) => response,
+        Err(e) => {
+            nmbl_warn!("sb-state: PCR-{SB_STATE_PCR} read skipped (transmit failed: {e})");
+            return None;
+        }
+    };
+    match super::commands::parse_pcr_read_response(&response) {
         Ok(value) if !value.is_empty() => Some(value),
         Ok(_) => {
             nmbl_warn!("sb-state: PCR-{SB_STATE_PCR} not allocated in the SHA-256 bank");
@@ -195,10 +203,15 @@ pub fn decide_sb_action(state: SbEfiState, enforce: bool) -> SbAction {
 ///
 /// `enforce` is the operator's fail-closed posture (`secure_boot.enforce`);
 /// pass it pre-resolved so this stays config-shape-agnostic and unit-testable.
-pub fn enforce_secure_boot_state(enforce: bool) -> Result<()> {
-    let state = read_secure_boot_efivar();
+///
+/// The authoritative `SecureBoot` read and the informational PCR-7 read are
+/// both routed through the [`TpmOps`] seam so a `--validate-initrm` dry-run
+/// reads the closure/synthetic state instead of the live efivars/TPM; `RealSys`
+/// performs the byte-identical live reads.
+pub fn enforce_secure_boot_state<S: TpmOps>(ops: &mut S, enforce: bool) -> Result<()> {
+    let state = ops.read_sb_state();
     // Read PCR-7 for correlation only; never gates the decision (logged below).
-    let pcr7 = read_pcr7();
+    let pcr7 = read_pcr7(ops);
     log_sb_state(state, pcr7.as_deref());
 
     match decide_sb_action(state, enforce) {
