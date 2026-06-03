@@ -1,11 +1,11 @@
 //! Signature-verification subsystem (secure/staged-boot) — FROZEN public API.
 //!
-//! This module is the facade that publishes the FROZEN signature-verification
-//! contract (master-plan-v2 §B.3). Every #4/#5 consumer (generation guard,
-//! rescue-image verify, driver-image load, staged merge, priority gate) binds
-//! to the signatures here, so they are KEYSTONE-stable: the bodies are stubbed
-//! for F2 #14/#15 (and return `Err(NmblError::Signature{stage:"stub-f2", …})`),
-//! but the SHAPES below are final.
+//! This module publishes the FROZEN signature-verification contract
+//! (master-plan-v2 §B.3). Every #4/#5 consumer (generation guard, rescue-image
+//! verify, driver-image load, staged merge, priority gate) binds to the
+//! signatures re-exported here, so they are KEYSTONE-stable. The verify BODIES
+//! are now REAL (F2 #14/#15): the fail-closed any-of ML-DSA pipeline in
+//! [`verify`], backed by the parsed trust anchor in [`keys`]/[`baked_keys`].
 //!
 //! ## Module layout
 //!
@@ -15,8 +15,9 @@
 //! - [`alg`] / [`sidecar`] — the typed `AlgId`/`HashId` + the borrowed
 //!   `SigSidecar` view; `secure-boot`-gated (only the verify path needs them).
 //!
-//! The verify pipeline (`keys.rs`/`verify.rs`/`gate.rs`/`tests/*` per §B.1) and
-//! the real bodies land in F2 #14/#15; this commit FREEZES the contract.
+//! The verify pipeline (`keys.rs`/`verify.rs`/`baked_keys.rs`/`tests/*` per
+//! §B.1) holds the REAL ML-DSA fail-closed bodies (F2 #14/#15); the frozen
+//! contract re-exported here is unchanged.
 
 // The wire leaf is ALWAYS compiled (FIX-25): it is the single sidecar-format
 // definition shared with `nmbl-sign`, and it must link in the default build.
@@ -28,23 +29,37 @@ pub mod wire;
 #[cfg(feature = "secure-boot")]
 pub mod sidecar;
 
+// The baked trust anchor + the parsed-key/verify pipeline are secure-boot
+// gated. `baked_keys` is the committed-empty, Nix-regenerated trust material
+// (R-5); `keys` parses it whole-set fail-closed (FIX-45); `verify` is the
+// real any-of ML-DSA pipeline (FIX-01/46/50/51).
 #[cfg(feature = "secure-boot")]
-mod facade;
+pub mod baked_keys;
+#[cfg(feature = "secure-boot")]
+pub mod keys;
+#[cfg(feature = "secure-boot")]
+pub mod verify;
+
+// Cross-cutting KATs (round-trip, domain-cross-reject, whole-set fail-closed).
+#[cfg(all(test, feature = "secure-boot"))]
+mod tests;
 
 // `AlgId`/`HashId` are part of the always-compiled leaf so the wire codec and
 // the host signer share one definition.
 pub use alg::{AlgId, HashId};
 
-// Re-export the frozen verify surface (FIX-62 file-set). The verify entry
-// points, policy/key types, and helpers all live behind the facade.
+// Re-export the frozen verify surface (FIX-62 file-set).
 #[cfg(feature = "secure-boot")]
 pub use sidecar::{SidecarError, SigSidecar};
 
 #[cfg(feature = "secure-boot")]
-pub use facade::{
-    BakedKey, DOMAIN_DRIVER_IMAGE, DOMAIN_GEN_INITRD, DOMAIN_GEN_KERNEL, DOMAIN_PRIORITY_FILE,
-    DOMAIN_RESCUE_SFS, DOMAIN_STAGED_FRAGMENT, FullFp, VerifyPolicy, ensure_generation_signed, fp,
-    resolve_allowed_keys, verify_digest, verify_image_fd,
+pub use keys::{BakedKey, FullFp, VerifyingKeyEnum, fp, parse_baked_keys, resolve_allowed_keys};
+
+#[cfg(feature = "secure-boot")]
+pub use verify::{
+    DOMAIN_DRIVER_IMAGE, DOMAIN_GEN_INITRD, DOMAIN_GEN_KERNEL, DOMAIN_PRIORITY_FILE,
+    DOMAIN_RESCUE_SFS, DOMAIN_STAGED_FRAGMENT, VerifyPolicy, ensure_generation_signed,
+    verify_digest, verify_image_fd,
 };
 
 // ---- Always-compiled feature-presence probes (carried from the F1 stub) ----

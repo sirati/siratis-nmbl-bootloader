@@ -19,6 +19,9 @@ use sha2::{Digest, Sha256, Sha512};
 
 use crate::error::{NmblError, Result};
 
+#[cfg(feature = "secure-boot")]
+use std::os::fd::BorrowedFd;
+
 /// Chunk size for the streaming read loop. 64 KiB matches the typical pipe
 /// buffer and keeps the working set tiny while amortizing syscall overhead.
 const CHUNK: usize = 64 * 1024;
@@ -50,6 +53,41 @@ pub fn sha512_file(path: &Path) -> Result<[u8; 64]> {
         context: format!("sha512_file: open {}", path.display()),
     })?;
     sha512_reader(file)
+}
+
+/// Stream an already-open file descriptor through SHA-512 over a SINGLE pinned
+/// fd, returning the 64-byte digest AND the exact number of bytes hashed
+/// (FIX-02/FIX-51).
+///
+/// Seeks `fd` to offset 0 first so a previously-read fd hashes its WHOLE
+/// contents (never a tail), then reads in fixed-size chunks via `rustix::io`
+/// directly off the borrowed fd — it never reopens the path (no TOCTOU) and
+/// never slurps the image into RAM. The returned `bytes_hashed` lets the caller
+/// assert it equals the file length (FIX-51), catching a short read or a racing
+/// truncation before trusting the digest.
+#[cfg(feature = "secure-boot")]
+pub fn sha512_fd(fd: BorrowedFd<'_>) -> Result<([u8; 64], u64)> {
+    rustix::fs::seek(fd, rustix::fs::SeekFrom::Start(0)).map_err(|e| NmblError::Io {
+        source: std::io::Error::from_raw_os_error(e.raw_os_error()),
+        context: "sha512_fd: seek to 0".to_string(),
+    })?;
+
+    let mut hasher = Sha512::new();
+    let mut buf = [0u8; CHUNK];
+    let mut total: u64 = 0;
+    loop {
+        let n = rustix::io::read(fd, &mut buf).map_err(|e| NmblError::Io {
+            source: std::io::Error::from_raw_os_error(e.raw_os_error()),
+            context: "sha512_fd: read".to_string(),
+        })?;
+        if n == 0 {
+            break;
+        }
+        let chunk = buf.get(..n).unwrap_or(&buf);
+        hasher.update(chunk);
+        total = total.saturating_add(n as u64);
+    }
+    Ok((hasher.finalize().into(), total))
 }
 
 /// Stream `reader` through a SHA-256 hasher, returning the 32-byte digest.
@@ -175,5 +213,31 @@ mod tests {
     fn sha512_file_missing_path_errors() {
         let path = Path::new("/nonexistent/nmbl/hash/kat/should/not/exist");
         assert!(sha512_file(path).is_err());
+    }
+
+    /// `sha512_fd` must seek to 0 and hash the WHOLE file even when the fd is
+    /// already positioned at EOF, and report `bytes_hashed == file length`
+    /// (FIX-51).
+    #[cfg(feature = "secure-boot")]
+    #[test]
+    fn sha512_fd_seeks_and_reports_len() {
+        use std::io::{Read, Seek};
+        use std::os::fd::AsFd;
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("nmbl-hash-fd-{}.bin", std::process::id()));
+        std::fs::write(&path, b"abc").unwrap();
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        // Advance the fd to EOF so a non-seeking hasher would read nothing.
+        let mut sink = Vec::new();
+        let _ = file.read_to_end(&mut sink).unwrap();
+        assert_eq!(file.stream_position().unwrap(), 3);
+
+        let (digest, n) = sha512_fd(file.as_fd()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(n, 3, "must report the full byte count");
+        assert_eq!(hex_lower(&digest), SHA512_ABC);
     }
 }
