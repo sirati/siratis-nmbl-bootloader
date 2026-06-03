@@ -16,6 +16,7 @@ use std::path::Path;
 
 use crate::config::{Config, DriverImageSpec};
 use crate::error::{NmblError, Result};
+use crate::sys::ops::ModuleOps;
 
 /// Subdirectory of the mounted image that holds the kernel modules tree, i.e.
 /// `<mountpoint>/lib/modules` (so `<…>/lib/modules/<release>/modules.dep`
@@ -37,6 +38,7 @@ const IMAGE_MODULES_SUBDIR: &str = "lib/modules";
 /// kernel refusals / already-loaded / file-missing are handled non-fatally
 /// INSIDE the shared loader, so they do not surface here.
 pub(super) fn load_image_modules(
+    ops: &mut impl ModuleOps,
     config: &Config,
     spec: &DriverImageSpec,
     mountpoint: &Path,
@@ -55,12 +57,13 @@ pub(super) fn load_image_modules(
     let mut blacklist: Vec<String> = config.kernel_modules.blacklist.clone();
     blacklist.extend(spec.blacklist.iter().cloned());
 
-    crate::modules::load_modules(&modules_dir, &spec.modules, &blacklist).map_err(|source| {
-        NmblError::DriverImage {
+    // Route through the ModuleOps seam (reuses crate::modules::load_modules on
+    // RealSys); --validate-initrm presence-checks the image's modules tree.
+    ops.load_modules(&modules_dir, &spec.modules, &blacklist)
+        .map_err(|source| NmblError::DriverImage {
             stage: "load",
             source: Box::new(source),
-        }
-    })
+        })
 }
 
 #[cfg(test)]
@@ -88,7 +91,8 @@ mod tests {
         // A firmware-only image declares no modules; load is a clean no-op even
         // with a bogus mountpoint (the loader is never invoked).
         let cfg = Config::recovery_default();
-        load_image_modules(&cfg, &spec(&[], &[]), Path::new("/nonexistent"))
+        let mut ops = crate::sys::ops::RealSys::sync_only();
+        load_image_modules(&mut ops, &cfg, &spec(&[], &[]), Path::new("/nonexistent"))
             .expect("empty modules list loads nothing");
     }
 
@@ -99,7 +103,8 @@ mod tests {
         // <dir>/<release>/modules.dep fails).
         let dir = tempfile::tempdir().expect("tempdir");
         let cfg = Config::recovery_default();
-        let err = load_image_modules(&cfg, &spec(&["nvidia"], &["nouveau"]), dir.path())
+        let mut ops = crate::sys::ops::RealSys::sync_only();
+        let err = load_image_modules(&mut ops, &cfg, &spec(&["nvidia"], &["nouveau"]), dir.path())
             .expect_err("missing modules.dep must error");
         match err {
             NmblError::DriverImage { stage, .. } => assert_eq!(stage, "load"),

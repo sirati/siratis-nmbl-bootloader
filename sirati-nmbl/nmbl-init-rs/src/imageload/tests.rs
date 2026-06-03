@@ -31,7 +31,8 @@ fn cfg_from(toml_text: &str) -> Config {
 fn disabled_feature_is_a_noop_empty_handle() {
     // The default config never opted in: no work, empty handle.
     let cfg = Config::recovery_default();
-    let handle = load_driver_images(&cfg).expect("disabled load is a no-op");
+    let mut ops = crate::sys::ops::RealSys::sync_only();
+    let handle = load_driver_images(&mut ops, &cfg).expect("disabled load is a no-op");
     assert!(handle.is_empty());
     assert_eq!(handle.len(), 0);
 }
@@ -39,14 +40,16 @@ fn disabled_feature_is_a_noop_empty_handle() {
 #[test]
 fn enabled_but_no_images_is_a_noop_empty_handle() {
     let cfg = cfg_from("[driver_images]\nenable = true\n");
-    let handle = load_driver_images(&cfg).expect("no images is a no-op");
+    let mut ops = crate::sys::ops::RealSys::sync_only();
+    let handle = load_driver_images(&mut ops, &cfg).expect("no images is a no-op");
     assert!(handle.is_empty());
 }
 
 #[test]
 fn teardown_of_empty_handle_is_ok() {
     let handle = DriverImagesHandle::empty();
-    detach_all_driver_images(&handle).expect("empty teardown is a no-op Ok");
+    let mut ops = crate::sys::ops::RealSys::sync_only();
+    detach_all_driver_images(&mut ops, &handle).expect("empty teardown is a no-op Ok");
 }
 
 #[test]
@@ -139,7 +142,8 @@ fn enforce_bad_signature_refuses_before_mount() {
     // file and `d.sfs.sig` to a missing sidecar.
     cfg.runtime_boot_mountpoint = Some(dir.path().to_path_buf());
 
-    let err = load_driver_images(&cfg).expect_err("enforce + bad sig must refuse");
+    let mut ops = crate::sys::ops::RealSys::sync_only();
+    let err = load_driver_images(&mut ops, &cfg).expect_err("enforce + bad sig must refuse");
     match err {
         NmblError::DriverImage { stage, .. } => assert_eq!(
             stage, "verify",
@@ -172,7 +176,8 @@ fn multiple_images_first_refusal_short_circuits() {
 
     // The first image fails verify; the run aborts there (the second image's
     // missing sidecar is never reached).
-    let err = load_driver_images(&cfg).expect_err("first bad image aborts the run");
+    let mut ops = crate::sys::ops::RealSys::sync_only();
+    let err = load_driver_images(&mut ops, &cfg).expect_err("first bad image aborts the run");
     assert!(
         matches!(
             err,
@@ -200,6 +205,7 @@ fn missing_image_file_is_open_stage_error() {
     );
     cfg.runtime_boot_mountpoint = Some(dir.path().to_path_buf());
 
-    let err = load_driver_images(&cfg).expect_err("absent image must error");
+    let mut ops = crate::sys::ops::RealSys::sync_only();
+    let err = load_driver_images(&mut ops, &cfg).expect_err("absent image must error");
     assert!(matches!(err, NmblError::DriverImage { stage: "open", .. }));
 }

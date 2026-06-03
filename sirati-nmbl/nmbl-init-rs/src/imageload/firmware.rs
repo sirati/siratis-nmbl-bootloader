@@ -22,6 +22,7 @@
 use std::path::Path;
 
 use crate::nmbl_verbose;
+use crate::sys::ops::FsOps;
 
 /// The sysfs knob the kernel reads for an extra firmware search directory.
 const FIRMWARE_CLASS_PATH: &str = "/sys/module/firmware_class/parameters/path";
@@ -31,7 +32,7 @@ const FIRMWARE_CLASS_PATH: &str = "/sys/module/firmware_class/parameters/path";
 /// Best-effort: a missing sysfs knob, a missing `lib/firmware` in the image, or
 /// a non-UTF-8 path are all logged at verbose level and ignored. Never fails the
 /// driver-image load.
-pub(super) fn add_firmware_search_path(mountpoint: &Path) {
+pub(super) fn add_firmware_search_path(ops: &mut impl FsOps, mountpoint: &Path) {
     let fw_dir = mountpoint.join("lib/firmware");
     if !fw_dir.is_dir() {
         nmbl_verbose!(
@@ -49,7 +50,10 @@ pub(super) fn add_firmware_search_path(mountpoint: &Path) {
         return;
     };
 
-    match std::fs::write(FIRMWARE_CLASS_PATH, fw_str) {
+    // Route the sysfs firmware-load trigger through the FsOps seam: the real
+    // boot writes the knob, while `--validate-initrm` records + suppresses the
+    // write (no real side effect). Best-effort either way.
+    match ops.write_file(Path::new(FIRMWARE_CLASS_PATH), fw_str.as_bytes()) {
         Ok(()) => nmbl_verbose!("driver-image: registered firmware search path {}", fw_str),
         Err(e) => nmbl_verbose!(
             "driver-image: could not write firmware search path to {} ({}); \
@@ -71,7 +75,8 @@ mod tests {
         // returns. (We can't assert on the sysfs write here without root, so we
         // exercise the no-firmware-dir early return, which never writes.)
         let dir = tempfile::tempdir().expect("tempdir");
-        add_firmware_search_path(dir.path());
+        let mut ops = crate::sys::ops::RealSys::sync_only();
+        add_firmware_search_path(&mut ops, dir.path());
     }
 
     #[test]
@@ -81,6 +86,7 @@ mod tests {
         // it does not panic and the early return is NOT taken.
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(dir.path().join("lib/firmware")).expect("mk firmware dir");
-        add_firmware_search_path(dir.path());
+        let mut ops = crate::sys::ops::RealSys::sync_only();
+        add_firmware_search_path(&mut ops, dir.path());
     }
 }
