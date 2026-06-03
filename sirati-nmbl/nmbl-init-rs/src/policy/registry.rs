@@ -64,6 +64,24 @@ fn persist_path() -> PathBuf {
     PERSIST_PATH.with(|p| p.borrow().clone())
 }
 
+/// Whether the registry's on-disk persistence must be suppressed because a
+/// `--validate-initrm` dry-run is in progress. A dry-run drives the GENUINE
+/// activation flow, and a successful `luks-tpm` activation registers its mapper
+/// — which would otherwise create `/run/nmbl` and append to the real registry
+/// file. The validate-initrm scenario drivers hold a `DryRunSealScope` for the
+/// whole run, so the seal-dry-run flag is the single signal for "perform no real
+/// registry I/O". Real boot never sets it, so its persistence path is
+/// byte-identical. Under `cfg(test)` the unit tests use a tempdir `persist_path`,
+/// so there is nothing to suppress.
+#[cfg(not(test))]
+fn dry_run_suppress_persist() -> bool {
+    super::seal_dryrun::dry_run_seal_active()
+}
+#[cfg(test)]
+fn dry_run_suppress_persist() -> bool {
+    false
+}
+
 /// Record a successfully-opened TPM-unsealed LUKS mapper so the seal
 /// path will close it (FIX-03). Called from the `luks-tpm` activation
 /// success site. Idempotent on `name`: re-registering the same mapper
@@ -87,6 +105,11 @@ pub fn register_tpm_mapper(entry: MapperEntry) {
 /// mapper, never the in-process close, so it is logged and swallowed
 /// rather than failing the activation.
 fn persist_append(entry: &MapperEntry) {
+    // A `--validate-initrm` dry-run must touch no real FS: skip the on-disk
+    // append (the in-memory registration still happens at the caller).
+    if dry_run_suppress_persist() {
+        return;
+    }
     let path = persist_path();
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -164,6 +187,11 @@ pub fn mark_closed(name: &str) {
 /// failure leaves the line intact, which is the fail-closed direction
 /// (the seal already gated on the close confirming).
 fn persist_remove(name: &str) {
+    // A `--validate-initrm` dry-run must touch no real FS: the dry-run seal
+    // no-ops the mapper close, so there is nothing on disk to rewrite/remove.
+    if dry_run_suppress_persist() {
+        return;
+    }
     let path = persist_path();
     let Ok(text) = std::fs::read_to_string(&path) else {
         return;
