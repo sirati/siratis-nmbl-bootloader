@@ -41,21 +41,35 @@ pub(crate) async fn dispatch_emergency_choice(
             Some(TerminalAction::Reboot)
         }
         EmergencyChoice::RawShell => {
-            // The picker's spawn paths route through `ExecOps::spawn_shell`.
-            // This live emergency session has a real poller `sender`, so
-            // build the genuine in-runtime `RealSys` for it. (spawn_shell
-            // is sync and never touches the sender; only the borrow shape
-            // matters here.)
-            let mut ops = RealSys::new(sender);
-            run_raw_shell_choice(&mut ops, console, app, error_count, config).await;
-            // Picker session done (shell exited, detached, or cancelled); re-show menu.
-            None
+            // SEAL BEFORE SPAWN (G3): cap the lock PCR + close every
+            // TPM-unsealed mapper, then hand the spawn helper the unforgeable
+            // witness. On a seal failure there is no `Sealed`, so we cannot —
+            // and must not — open a shell: divert to refuse. The picker's spawn
+            // paths route through `ExecOps::spawn_shell`; this live emergency
+            // session has a real poller `sender`, so build the genuine
+            // in-runtime `RealSys` for it (spawn_shell is sync and never
+            // touches the sender; only the borrow shape matters here).
+            match crate::policy::seal_secrets(config.tpm.require_tpm, sender).await {
+                Ok(sealed) => {
+                    let mut ops = RealSys::new(sender);
+                    run_raw_shell_choice(sealed, &mut ops, console, app, error_count, config).await;
+                    // Picker session done (shell exited, detached, or cancelled); re-show menu.
+                    None
+                }
+                Err(e) => Some(refuse_on_seal_failure(e, config, sender).await),
+            }
         }
         #[cfg(feature = "pretty-shell")]
         EmergencyChoice::PrettyShell => {
-            let mut ops = RealSys::new(sender);
-            run_pretty_shell_choice(&mut ops, console, app, error_count, config).await;
-            None
+            match crate::policy::seal_secrets(config.tpm.require_tpm, sender).await {
+                Ok(sealed) => {
+                    let mut ops = RealSys::new(sender);
+                    run_pretty_shell_choice(sealed, &mut ops, console, app, error_count, config)
+                        .await;
+                    None
+                }
+                Err(e) => Some(refuse_on_seal_failure(e, config, sender).await),
+            }
         }
         EmergencyChoice::RetryBoot => {
             // Rescue retry always shows the selector (the operator
@@ -73,17 +87,45 @@ pub(crate) async fn dispatch_emergency_choice(
     }
 }
 
+/// Divert to a NON-INTERACTIVE refuse when the seal fails (FIX-27): a
+/// present-but-uncappable TPM, a `requireTpm` box with no TPM, or a mapper
+/// that will not close. NEVER offer a shell.
+///
+/// Routes through [`crate::policy::refuse_unsigned`] (M1): even on a
+/// `SealFailed`, `relock_and_refuse` runs (BEST-EFFORT cap, then
+/// close-mappers + relock + sentinel) and yields the type-gated
+/// [`TerminalAction::RebootIntoRescue`] — the correct safe outcome (the
+/// imminent reboot is the real lock boundary). The `Sealed` witness is
+/// minted by the best-effort seal inside `relock_and_refuse`, so the
+/// refuse countdown is reachable only after that teardown.
+pub(crate) async fn refuse_on_seal_failure(
+    err: crate::policy::SealFailed,
+    config: &Config,
+    sender: &LocalSender,
+) -> TerminalAction {
+    nmbl_warn!(
+        "seal-on-rescue failed; refusing to open a shell, relocking and rebooting into rescue: {}",
+        format_chain(err.cause() as &dyn std::error::Error)
+    );
+    crate::policy::refuse_unsigned(config, err.into_cause(), sender).await
+}
+
 /// Handle the [`EmergencyChoice::RawShell`] picker arm: run the in-process
 /// console picker session and show a toast or error modal over the emergency
 /// menu so the operator knows what happened before re-entering the loop.
+///
+/// Takes the `Sealed` witness by value: a shell cannot be reached on this
+/// arm without proof that [`crate::policy::seal_secrets`] ran (G3). The
+/// spawn is routed through the `ExecOps` seam (`ops`).
 async fn run_raw_shell_choice<E: ExecOps>(
+    sealed: crate::policy::Sealed,
     ops: &mut E,
     console: &mut dyn Console,
     app: &mut App<'static>,
     error_count: &mut u32,
     config: &Config,
 ) {
-    match crate::ui::console_picker::run_picker_session(ops, console, config).await {
+    match crate::ui::console_picker::run_picker_session(sealed, ops, console, config).await {
         Ok(crate::ui::console_picker::PickerSessionOutcome::ShellDetached { targets }) => {
             // Fire-and-forget regime: tell the operator their shell(s) have
             // been started elsewhere so they don't wonder why the menu
@@ -120,13 +162,14 @@ async fn run_raw_shell_choice<E: ExecOps>(
 /// pty terminal and show an error modal if it fails to start.
 #[cfg(feature = "pretty-shell")]
 async fn run_pretty_shell_choice<E: ExecOps>(
+    sealed: crate::policy::Sealed,
     ops: &mut E,
     console: &mut dyn Console,
     app: &mut App<'static>,
     error_count: &mut u32,
     config: &Config,
 ) {
-    if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(ops, console, config).await {
+    if let Err(e) = crate::ui::pretty_shell::run_pretty_shell(sealed, ops, console, config).await {
         let chain = format_chain(&e as &dyn std::error::Error);
         nmbl_warn!("pretty-shell session failed: {chain}");
         let _ = crate::ui::show_modal_error_over(
@@ -153,6 +196,21 @@ async fn run_retry_boot_arm(
 ) -> Option<TerminalAction> {
     match retry_boot(config, console, app, supplier, sender).await {
         Ok(action) => Some(action),
+        // A refused retry (a generation/measure gate refused inside
+        // `kexec_into`) must RELOCK + reboot into rescue, not loop back to
+        // the shell-offering menu via a modal (FIX-35 residual). Route it
+        // through `run_refuse_screen` — cap → close-mappers → sentinel →
+        // relock + the non-interactive countdown — so the refuse relocks
+        // and the type-gated `RebootIntoRescue` terminus is returned. The
+        // TPM is already capped by G1 on this path, so this is not a
+        // fail-open today, but a refused retry must still refuse properly.
+        Err(NmblError::PolicyRefused { cause }) => {
+            nmbl_warn!(
+                "emergency retry-boot refused; relocking and rebooting into rescue: {}",
+                format_chain(cause.as_ref() as &dyn std::error::Error)
+            );
+            Some(crate::policy::run_refuse_screen(config, console, *cause, sender).await)
+        }
         Err(e) => {
             let title = abort_aware_title(&e, "Retry boot failed");
             nmbl_warn!(

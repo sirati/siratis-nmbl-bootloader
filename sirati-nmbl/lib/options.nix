@@ -94,6 +94,10 @@ in
     ./modules/activation.nix
     ./modules/log-import.nix
     ./modules/stateful.nix
+    # Self-registering hub for the security/staged-boot slices (#6–#10):
+    # auto-imports every ./modules/security/*.nix so each slice drops a file
+    # with no shared-line edit here (FIX-60).
+    ./modules/default.nix
   ];
 
   options.boot.nmbl = {

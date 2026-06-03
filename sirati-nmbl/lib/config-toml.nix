@@ -41,7 +41,25 @@
 let
   cfg = config.boot.nmbl;
 
+  # Single source of the `secureBootActive` IMPLICATION boolean (FIX-16),
+  # shared with `lib/signing-build.nix`'s `nmblFeatures` derive. The binding
+  # contract is "any per-table security emit-gate ⇒ `secure-boot` ∈
+  # nmblFeatures". `secureBootActive` is exactly the condition under which
+  # the `secure-boot` Cargo feature is compiled into /init, so gating the
+  # security tables on it makes the TOML emit track the Rust
+  # `#[cfg(feature="secure-boot")]` struct fields precisely: a `[signing]`
+  # table is emitted iff the struct that parses it (with `deny_unknown_fields`)
+  # exists in the binary.
+  securityConsts = import ./security-consts.nix { inherit lib; };
+  secureBootActive = securityConsts.mkSecureBootActive config;
+
   tomlFormat = pkgs.formats.toml { };
+
+  # Single source of the staged-boot emit/feature gate (FIX-40): the SAME
+  # boolean drives the `staged-boot` Cargo feature in lib/signing-build.nix
+  # and the `[staged]` emit below, so a feature-free binary never receives
+  # a `[staged]` table it cannot parse.
+  stagedBootActive = (import ./security-consts.nix { inherit lib; }).mkStagedBootActive config;
 
   # Absolute path the emergency shell forks at runtime (NMBL PID 1, in the
   # initramfs). Mirrors the Rust `paths.shell` / preflight_shell check.
@@ -180,6 +198,27 @@ let
     emergency_shell = {
       extra_consoles = cfg.emergencyShell.extraConsoles;
     };
+
+    # `[tpm]` measured-boot table consumed by the Rust `TpmConfig`
+    # struct (#7). ALWAYS emitted (FIX-09): the struct is compiled into
+    # every build regardless of the `secure-boot` Cargo feature, so the
+    # table is part of the base wire shape. `requireTpm` is derived in
+    # tpm.nix (true when measuring / secure boot is on — FIX-28).
+    # `sealed_secrets` is omitted when empty so the common-case wire
+    # shape stays minimal and the Rust serde default (`[]`) applies.
+    tpm = {
+      measure = cfg.tpm.measure;
+      pcr_index = cfg.tpm.pcrIndex;
+      require_tpm = cfg.tpm.requireTpm;
+      device = toString cfg.tpm.device;
+    }
+    // lib.optionalAttrs (cfg.tpm.sealedSecrets != [ ]) {
+      sealed_secrets = map (s: {
+        name = s.name;
+        sealed_path = s.sealedPath;
+        unseal_to = toString s.unsealTo;
+      }) cfg.tpm.sealedSecrets;
+    };
   }
   # Splash rendering. Emitted only when the graphical splash is enabled
   # so the validator (`deny_unknown_fields`) accepts the TOML on builds
@@ -212,6 +251,92 @@ let
     stateful = {
       max_recovery_attempts = cfg.stateful.maxRecoveryAttempts;
       success_target = cfg.stateful.successTarget;
+    };
+  }
+  # Driver-image group (#8): verified out-of-tree driver squashfs blobs.
+  # Emitted only when enabled so non-driver builds keep the existing wire
+  # shape (the Rust `DriverImagesConfig` serde default is the empty,
+  # disabled config). The per-image `firmware` packages are a BUILD-TIME
+  # input baked into the squashfs — they are NOT part of the runtime struct,
+  # so they are deliberately not emitted here (`deny_unknown_fields` would
+  # otherwise reject them). The image table mirrors the `filesystems` /
+  # `activations` array-of-tables precedent (Rust field `images`).
+  // lib.optionalAttrs cfg.driverImages.enable {
+    driver_images = {
+      enable = true;
+      images = map (img: {
+        path = img.path;
+        sig_path = img.sigPath;
+        modules = img.modules;
+        blacklist = img.blacklist;
+      }) (lib.attrValues cfg.driverImages.images);
+    };
+  }
+  # Signature-enforcement POLICY (#6). Emitted only when the `secure-boot`
+  # feature is compiled in (`secureBootActive`, FIX-16), so a non-security
+  # build's TOML never carries a `[signing]` table the Rust struct
+  # (`#[cfg(feature="secure-boot")]`, `deny_unknown_fields`) wouldn't accept.
+  #
+  # POLICY ONLY — `publicKeys` are NEVER emitted (R-5/FIX-04). They are the
+  # trust anchor and are `include_bytes!`-baked into the binary, not read
+  # from this writable-boot artifact. We emit `enable`/`enforce`/`algorithm`/
+  # `sig_path_suffix` and the `[signing.uki]` policy sub-table only.
+  // lib.optionalAttrs secureBootActive {
+    signing = {
+      enable = cfg.signing.enable;
+      enforce = cfg.signing.enforce;
+      algorithm = cfg.signing.algorithm;
+      sig_path_suffix = cfg.signing.sigPathSuffix;
+      uki = {
+        # Install-time UKI signing policy only. keyFile/certFile are
+        # install-time-impure and NEVER reach config.toml.
+        enable = cfg.signing.uki.enable;
+      };
+    };
+  }
+  # Secure-boot policy (#10): the ONE priority-volume concept (R-3) plus
+  # the refuse countdown, sentinel and enforcement posture. Emitted ONLY
+  # when the `secure-boot` feature is compiled in (`secureBootActive`,
+  # FIX-16) so a non-security build's TOML never carries a `[secure_boot]`
+  # table the Rust struct (`#[cfg(feature="secure-boot")]`,
+  # `deny_unknown_fields`) wouldn't accept. The `[secure_boot.priority_volume]`
+  # sub-table is itself emitted only when a device is configured, matching
+  # the Rust `Option<PriorityVolume>` (absent ⇒ `None`). `allowed_key_ids`
+  # are full key fingerprints the gate narrows to (R-3/FIX-08).
+  // lib.optionalAttrs secureBootActive {
+    secure_boot =
+      {
+        enable = cfg.secureBoot.enable;
+        signed_file_path = cfg.secureBoot.signedFilePath;
+        allowed_key_ids = cfg.secureBoot.allowedKeyIds;
+        sentinel_path = cfg.secureBoot.sentinelPath;
+        enforce = cfg.secureBoot.enforce;
+        require_tpm = cfg.secureBoot.requireTpm;
+        refuse_countdown_seconds = cfg.secureBoot.refuseCountdownSeconds;
+        allow_audit_mode_insecure = cfg.secureBoot.allowAuditModeInsecure;
+      }
+      // lib.optionalAttrs (cfg.secureBoot.priorityVolume.device != null) {
+        priority_volume = {
+          device = cfg.secureBoot.priorityVolume.device;
+          mountpoint = cfg.secureBoot.priorityVolume.mountpoint;
+          fstype = cfg.secureBoot.priorityVolume.fstype;
+          options = cfg.secureBoot.priorityVolume.options;
+          inside_luks = cfg.secureBoot.priorityVolume.insideLuks;
+        };
+      };
+  }
+  # Staged-boot pointer set. Emitted ONLY when staged boot is active so a
+  # build WITHOUT the `staged-boot` feature (whose binary `#[cfg]`s the
+  # `[staged]` field out) never sees a table its `deny_unknown_fields`
+  # parser would reject (FIX-40). The gate is the SAME `stagedBootActive`
+  # boolean that pulls the Cargo feature in. No `has_config_fragment` key
+  # (FIX-56) — the Rust side checks fragment existence at runtime.
+  // lib.optionalAttrs stagedBootActive {
+    staged = {
+      enable = cfg.staged.enable;
+      image = cfg.staged.image;
+      fragment = cfg.staged.fragment;
+      sig = cfg.staged.sig;
     };
   };
 

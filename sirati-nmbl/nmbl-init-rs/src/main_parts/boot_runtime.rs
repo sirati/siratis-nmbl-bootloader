@@ -8,6 +8,7 @@ use std::path::Path;
 
 use nmbl_init::config::Config;
 use nmbl_init::error::{NmblError, format_chain};
+use nmbl_init::imageload::{DriverImagesHandle, detach_all_driver_images, load_driver_images};
 use nmbl_init::modules::load_explicit_modules;
 use nmbl_init::panic::install_panic_hook;
 use nmbl_init::rescue::{self};
@@ -40,6 +41,22 @@ pub(crate) fn run_force_rescue(
     noop: &mut NoopConsole,
 ) -> std::result::Result<TerminalAction, Box<(NmblError, Config)>> {
     nmbl_info!("force_on_boot: entering external rescue");
+    // SEAL ON ENTRY (G5): force-on-boot rescue drops the operator into an
+    // interactive rescue system, so cap the lock PCR + close every
+    // TPM-unsealed mapper FIRST (blocking — this runs after the runtime
+    // exits). `rescue::dispatch` re-seals idempotently. On a seal failure
+    // route through the refuse terminus (M1): best-effort relock + sentinel
+    // + reboot into rescue, instead of entering an interactive rescue.
+    if let Err(seal_err) = nmbl_init::policy::seal_secrets_blocking(config.tpm.require_tpm) {
+        nmbl_warn!(
+            "force_on_boot: seal-on-rescue failed; relocking and rebooting into rescue: {}",
+            format_chain(seal_err.cause() as &dyn std::error::Error)
+        );
+        return Ok(nmbl_init::policy::refuse_unsigned_blocking(
+            &config,
+            seal_err.into_cause(),
+        ));
+    }
     // The network-rescue NIC drivers + `af_packet` are added to
     // `config.kernel_modules.explicit` for `rescue.network &&
     // rescue.mode == external` (see lib/config.nix `rescueNicModules`/
@@ -168,7 +185,14 @@ pub(crate) async fn run_boot_inside_runtime(
             Err(err) => return BootOutcome::Done(Box::new(Err(Box::new((err, config))))),
         }
     }
-    if should_force_external_rescue(&config) {
+    // Force-rescue decision: the legacy `rescue.force_on_boot && external`
+    // trigger UNIONED with the rescue sentinel (FIX-49/MED-1). Routing through
+    // `should_force_rescue` is what actually READS the sentinel — without it an
+    // empty `/boot/nmbl/rescue` (e.g. dropped by a prior refuse→reboot) would
+    // never force rescue and the box could re-enter the failing boot. A
+    // sentinel-forced rescue takes the SAME `rescue::dispatch` path, whose G4
+    // seal keeps the TPM locked.
+    if nmbl_init::policy::should_force_rescue(should_force_external_rescue(&config), &config) {
         return BootOutcome::ForceRescue(Box::new(config));
     }
     #[cfg(feature = "stateful")]
@@ -182,6 +206,32 @@ pub(crate) async fn run_boot_inside_runtime(
             return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
         }
     }
+    // Driver-image hook (#24 / FEATURE-#1): load every declared, signed
+    // out-of-tree driver image AFTER the early explicit-module load and
+    // BEFORE the generation kexec, so extra drivers (and their firmware) are
+    // available for the rest of boot. A no-op unless `driver_images.enable`
+    // (FIX-05 guarantees enable ⇒ secure-boot). A verify/load failure surfaces
+    // `NmblError::DriverImage`, which we route through the async
+    // `refuse_unsigned` terminus — cap → close-mappers → sentinel → relock,
+    // then `RebootIntoRescue` (R-1; NOT a halt). No console is open yet, so the
+    // non-interactive refuse countdown does not render here; the reboot fires
+    // in `execute_terminal_action` after the runtime unwinds.
+    let mut driver_images = match load_driver_images(&config) {
+        Ok(handle) => handle,
+        Err(err) => {
+            nmbl_warn!(
+                "driver-image load failed; relocking and rebooting into rescue: {}",
+                format_chain(&err as &dyn std::error::Error)
+            );
+            let action = nmbl_init::policy::refuse_unsigned(&config, err, &sender).await;
+            return BootOutcome::Done(Box::new(Ok(action)));
+        }
+    };
+    // #28 (Wave-4): `driver_images` is the ORDERED accumulator of every loaded
+    // driver image (this base set, plus any staged-rerun additions the session
+    // appends). It is threaded `&mut` into `run_tui_session` so the staged path
+    // can extend it, and its verified `measure_refs()` feed TPM measure event #4
+    // through the kexec handoff. It is torn down below on the normal terminus.
     let console: Box<dyn Console> = match ops.open_console(&config, false) {
         Ok(c) => c,
         Err(err) => {
@@ -190,13 +240,54 @@ pub(crate) async fn run_boot_inside_runtime(
         }
     };
     if cmdline_has_key_echo_flag() {
+        // The key-echo diagnostic drops into the emergency shell, so the
+        // driver images are LEFT MOUNTED for inspection (FIX-55): they carry
+        // no secrets, so leaving them mounted into a shell is safe.
         return BootOutcome::Done(Box::new(
             run_key_echo_diagnostic(config, console, &sender).await,
         ));
     }
     let session = SessionInteraction::new();
-    BootOutcome::Done(Box::new(Ok(run_tui_session(
-        &mut ops, &config, console, &session, &sender,
+    let action = run_tui_session(
+        &mut ops,
+        &mut config,
+        console,
+        &session,
+        &sender,
+        &mut driver_images,
     )
-    .await)))
+    .await;
+    teardown_driver_images_if_normal(&action, &driver_images);
+    BootOutcome::Done(Box::new(Ok(action)))
+}
+
+/// Whether the driver images should be torn down for `action` (FIX-55).
+///
+/// `true` for every terminus that reboots or hands the machine off
+/// (`Kexec` normal boot, `Reboot`, `RebootIntoRescue`, `HaltWithBanner`) so
+/// the loop devices + mounts do not leak across the cutover. `false` ONLY for
+/// the capped emergency shell ([`TerminalAction::Execve`]): the images are
+/// deliberately LEFT MOUNTED there so the operator can inspect them, which is
+/// safe because driver images carry no secret material.
+pub(crate) fn should_teardown_driver_images(action: &TerminalAction) -> bool {
+    !matches!(action, TerminalAction::Execve { .. })
+}
+
+/// Tear down the loaded driver images on the NORMAL pre-kexec path, but LEAVE
+/// them mounted when the boot diverted into the capped emergency shell
+/// ([`TerminalAction::Execve`]) — FIX-55.
+fn teardown_driver_images_if_normal(action: &TerminalAction, handle: &DriverImagesHandle) {
+    if handle.is_empty() {
+        return;
+    }
+    if !should_teardown_driver_images(action) {
+        nmbl_info!(
+            "driver images: leaving {} image(s) mounted for the emergency shell (no secrets — FIX-55)",
+            handle.len()
+        );
+        return;
+    }
+    if let Err(err) = detach_all_driver_images(handle) {
+        nmbl_warn!("driver-image teardown reported an error (continuing): {err}");
+    }
 }

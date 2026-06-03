@@ -314,7 +314,13 @@ impl ExecOps for DryRunSys {
         Ok((self.scenario.scripted_outcome(ExecRole::Probe), Vec::new()))
     }
 
-    fn spawn_shell(&mut self, shell_path: &Path, _cols: u16, _rows: u16) -> Result<PtyChild> {
+    fn spawn_shell(
+        &mut self,
+        _sealed: crate::policy::Sealed,
+        shell_path: &Path,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<PtyChild> {
         // PtyChild owns a real master OwnedFd + child Pid; it cannot be
         // faked without an actual fork, which the dry-run must NOT do. So
         // we run the SAME preflight the genuine path does (shell presence
@@ -346,6 +352,7 @@ impl KexecOps for DryRunSys {
     fn kexec_load(
         &mut self,
         target: KexecTarget,
+        _verified_fds: super::VerifiedKexecFds<'_>,
         _extra_cpio: &[u8],
         _cmdline: &str,
         _flags: u32,

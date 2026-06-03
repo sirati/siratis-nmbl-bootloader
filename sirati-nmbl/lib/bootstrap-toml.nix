@@ -25,6 +25,12 @@ let
 
   tomlFormat = pkgs.formats.toml { };
 
+  # Single source of the staged-boot emit/feature gate (FIX-40): the SAME
+  # boolean drives the `staged-boot` Cargo feature in lib/signing-build.nix
+  # and the `[bootstrap.staged]` emit below, so a feature-free binary never
+  # receives a `[bootstrap.staged]` table it cannot parse.
+  stagedBootActive = (import ./security-consts.nix { inherit lib; }).mkStagedBootActive config;
+
   # `rescue` is optional in the Rust schema (`#[serde(default)]`).
   # Only emit the sub-table when one of its fields is non-empty so the
   # generated TOML matches the "both empty" path of `BootstrapConfig::validate`
@@ -55,6 +61,18 @@ let
     } // lib.optionalAttrs cfg.stateful.enable {
       state = {
         mountpoint = toString cfg.stateful.rwMountpoint;
+      };
+    } // lib.optionalAttrs stagedBootActive {
+      # Staged-boot pointer set for the frozen bootstrap stage. Emitted
+      # ONLY when staged boot is active so a binary built WITHOUT
+      # `staged-boot` (which `#[cfg]`s the `staged` field off
+      # `BootstrapSection`) never parses a table its `deny_unknown_fields`
+      # rejects (FIX-40). Same `stagedBootActive` gate as the Cargo
+      # feature. No `has_config_fragment` key (FIX-56).
+      staged = {
+        mountpoint = toString bootstrap.staged.mountpoint;
+        fragment = bootstrap.staged.fragment;
+        sig = bootstrap.staged.sig;
       };
     };
   };

@@ -73,6 +73,7 @@ pub(super) async fn select_and_act<S: nmbl_init::sys::ops::SysOps>(
     key_injections: &[nmbl_init::activation::KeyInjection],
     session: &SessionInteraction,
     skip_selector: &SkipSelector,
+    driver_images: &nmbl_init::imageload::DriverImagesHandle,
 ) -> Result<TerminalAction> {
     nmbl_info!("phase 4: scan generations");
     let generations = {
@@ -127,6 +128,7 @@ pub(super) async fn select_and_act<S: nmbl_init::sys::ops::SysOps>(
                 target,
                 cmdline_override.as_deref(),
                 key_injections,
+                driver_images,
             )
         }
         Decision::Shell => Err(NmblError::Io {
@@ -188,7 +190,39 @@ pub(super) fn execute_terminal_action(action: TerminalAction) -> ! {
             env,
             banner,
             rescue_handoff,
-        } => dispatch_execve(path, argv, env, banner, rescue_handoff),
+        } => {
+            // SEAL BACKSTOP (G10): the LAST line of defense before the
+            // execve syscall hands PID 1 to a shell. An `Execve` action is
+            // only ever produced AFTER a G-site seal (G4 `rescue::dispatch`
+            // is the authoritative, `requireTpm`-aware seal), so this hits
+            // the idempotent latch and returns instantly. If — by some
+            // future refactor — an unsealed `Execve` reaches here, this
+            // caps fail-closed (`require_tpm=false`: degrade-open on no-TPM,
+            // but a present-but-uncappable TPM still halts). `dispatch_execve`
+            // REQUIRES the witness by type, so it cannot run without a seal.
+            match nmbl_init::policy::seal_secrets_blocking(false) {
+                Ok(sealed) => dispatch_execve(sealed, path, argv, env, banner, rescue_handoff),
+                Err(seal_err) => {
+                    print_halt_banner(&seal_err.into_cause());
+                    halt_final("seal-on-execve failed; halting")
+                }
+            }
+        }
+        TerminalAction::RebootIntoRescue { cause, sealed } => {
+            // The untrusted-image / policy refuse terminus (R-1/R-13). By
+            // the time we reach here `relock_and_refuse` has already capped
+            // the lock PCR, closed every TPM-unsealed mapper, relocked LUKS,
+            // and written the rescue sentinel, and the non-interactive
+            // refuse countdown has run to its Enter/timeout. The `Sealed`
+            // witness rode along inside the value as the type-level proof
+            // that the seal happened before this terminus was built; drop it
+            // here — its job (gating construction) is done.
+            let _: nmbl_init::policy::Sealed = sealed;
+            print_halt_banner(&cause);
+            eprintln!("[nmbl] policy refuse: rebooting into rescue (sentinel set, TPM locked)");
+            let _ = reboot(RebootMode::RB_AUTOBOOT);
+            halt_final("reboot(RB_AUTOBOOT) returned after refuse; halting")
+        }
         TerminalAction::Kexec => {
             nmbl_info!("kexec: handing off to new kernel");
             // sys::kexec::execute returns Result<Infallible>; either
@@ -213,12 +247,17 @@ pub(super) fn execute_terminal_action(action: TerminalAction) -> ! {
 /// parent match arms short (the Execve arm alone carried 35 source
 /// lines of redirect + safety comment + execve call).
 fn dispatch_execve(
+    sealed: nmbl_init::policy::Sealed,
     path: std::ffi::CString,
     argv: Vec<std::ffi::CString>,
     env: Vec<std::ffi::CString>,
     banner: Option<nmbl_init::terminal::EmergencyBanner>,
     rescue_handoff: bool,
 ) -> ! {
+    // The `Sealed` witness proves the lock PCR was capped and every
+    // TPM-unsealed mapper closed before this single PID1 execve waist
+    // (re-audit C-1). Required by type so the execve cannot run unsealed.
+    let _sealed = sealed;
     if let Some(b) = banner {
         print_banner(&b);
     }
@@ -277,10 +316,11 @@ pub(super) fn halt_final(reason: &str) -> ! {
 /// `block_on`'d once for the local console here.
 pub(super) async fn run_tui_session<S: nmbl_init::sys::ops::SysOps>(
     ops: &mut S,
-    config: &Config,
+    config: &mut Config,
     console: Box<dyn Console>,
     session: &SessionInteraction,
     sender: &nmbl_init::sys::poller::LocalSender,
+    driver_images: &mut nmbl_init::imageload::DriverImagesHandle,
 ) -> TerminalAction {
     // Wrap the live boot console in the central interaction-latch layer
     // for the whole session. Every consumer below — the early-boot
@@ -306,8 +346,23 @@ pub(super) async fn run_tui_session<S: nmbl_init::sys::ops::SysOps>(
     // Phases 2b/3/3b run here too: their syscalls (modules, cryptsetup,
     // mount) are plain synchronous calls inside this async fn, and the
     // passphrase prompt / wrong-password modal `.await` the same
-    // console — no nested runtime anywhere.
-    let outcome = match run_phases_post_console(ops, config, &mut *console, &mut supplier).await {
+    // console — no nested runtime anywhere. The phases run through the
+    // `ops` seam (so a dry-run can no-op their side effects) and still carry
+    // the security params (priority gate hooks + staged-boot apply).
+    let outcome = match run_phases_post_console(
+        ops,
+        config,
+        &mut *console,
+        &mut supplier,
+        session,
+        &skip_selector,
+        sender,
+        driver_images,
+    )
+    .await
+    {
+        // The post-console phases may have appended staged-rerun driver images
+        // to `driver_images` (#33); reborrow it as shared for the measure.
         Ok(injections) => {
             select_and_act(
                 ops,
@@ -316,6 +371,7 @@ pub(super) async fn run_tui_session<S: nmbl_init::sys::ops::SysOps>(
                 &injections,
                 session,
                 &skip_selector,
+                driver_images,
             )
             .await
         }
@@ -335,6 +391,20 @@ pub(super) async fn run_tui_session<S: nmbl_init::sys::ops::SysOps>(
         Err(NmblError::OperatorChoseReboot { .. }) => {
             drop(console);
             TerminalAction::Reboot
+        }
+        // Policy refuse (R-1/R-13): an untrusted image / failed gate
+        // surfaced `PolicyRefused`. This is the ONE shared refuse-render
+        // entry — NEVER the shell-offering emergency menu (FIX-35). The
+        // security teardown (cap → close → sentinel → relock) and the
+        // non-interactive countdown both happen inside `run_refuse_screen`,
+        // which returns the type-gated `RebootIntoRescue` terminus. The
+        // console drops on return, restoring the VT before the reboot
+        // syscall fires in `execute_terminal_action`.
+        Err(NmblError::PolicyRefused { cause }) => {
+            let action =
+                nmbl_init::policy::run_refuse_screen(config, &mut *console, *cause, sender).await;
+            drop(console);
+            action
         }
         Err(err) => {
             // Hand the live boot console down to the emergency screen so

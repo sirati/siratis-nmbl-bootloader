@@ -1,0 +1,13 @@
+# Auto-import namespace for NMBL security/staged-boot NixOS modules.
+#
+# `../default.nix` imports every `*.nix` dropped here. The later vertical
+# slices land their option modules in this directory and self-register with
+# zero shared-line edits (FIX-60):
+#   #6  signing.nix       boot.nmbl.signing.{enable,enforce,publicKeys,…}
+#   #7  tpm.nix           boot.nmbl.tpm.{measure,requireTpm,…} + early-load
+#   #8  driver-image.nix  boot.nmbl.driverImages.*
+#   #9  staged-boot.nix   boot.nmbl.staged.*
+#   #10 secure-boot.nix   boot.nmbl.secureBoot.*
+#
+# This placeholder keeps the directory present so the skeleton builds with no
+# modules yet. Remove once at least one real module lives here (optional).

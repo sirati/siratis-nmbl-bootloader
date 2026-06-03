@@ -15,6 +15,11 @@
   # features and returning the prebuilt `nmblInit` if the host flake
   # is older.
   mkNmblInit ? (_: nmblInit),
+  # The host `nmbl-sign` ML-DSA image signer, used by the driver-image build
+  # (lib/modules/driver-image.nix) to sign each squashfs at install time.
+  # `null` on an older host flake; driver-image.nix only errors WHEN driver
+  # images are enabled.
+  nmblSign ? null,
   ...
 }:
 
@@ -22,29 +27,30 @@ let
   cfg = config.boot.nmbl;
   bootstrapper = cfg.bootstrapper;
 
-  # Cargo features to enable in the /init binary. Gated on splash and
-  # rescue options so feature-free builds (default) stay byte-identical
-  # to today's binary. When only `image-splash` is requested we prefer
-  # the prebuilt `nmblInitSplash` to keep the existing CI cache hot;
-  # when only `network-rescue` is requested we use `mkNmblInit`. When
-  # both are requested we build a combined binary via `mkNmblInit`.
-  nmblFeatures =
-    lib.optional cfg.splash.enable "image-splash"
-    ++ lib.optional cfg.rescue.network "network-rescue"
-    ++ lib.optional cfg.stateful.enable "stateful";
-
-  # Resolved /init binary used by the initramfs builder. Identity-equal
-  # to the prebuilt `nmblInit` / `nmblInitSplash` in the single-feature
-  # cases so Nix's store-path dedup keeps the existing CI cache hot.
-  selectedNmblInit =
-    if nmblFeatures == [ ] then
+  # UKI build wiring + /init binary selection, extracted into
+  # ./signing-build.nix. Produces the SAME `system.build.nmblUki` /
+  # `system.build.nmblInit` derivations as before — `selectedNmblInit`
+  # is the resolved /init binary, `nmblUki` the EFI-stub PE.
+  signingBuild = import ./signing-build.nix {
+    inherit
+      pkgs
+      lib
+      config
+      cfg
       nmblInit
-    else if nmblFeatures == [ "image-splash" ] then
       nmblInitSplash
-    else if nmblFeatures == [ "stateful" ] then
-      mkNmblInit { features = [ "stateful" ]; }
-    else
-      mkNmblInit { features = nmblFeatures; };
+      mkNmblInit
+      ;
+  };
+  selectedNmblInit = signingBuild.selectedNmblInit;
+
+  # `nmbl-tpm-enroll` — the HOST / install-time LUKS-to-TPM seal helper. It is a
+  # `writeShellApplication` (reuses `systemd-cryptenroll` + the boot path's
+  # `cryptsetup --token-only`, no Rust TPM2_Unseal — master-plan §A). It MUST
+  # NEVER ship inside the initramfs (boot only ever UNSEALS, never enrolls). We
+  # build it here purely to compute its store path for the absence check below;
+  # the package output proper is exposed by the host flake.
+  nmblTpmEnroll = import ./tpm-enroll.nix { inherit pkgs lib; };
 
   # Activation options are contributed by ./modules/activation.nix. Read
   # defensively so this file still evaluates if that module hasn't been
@@ -156,21 +162,6 @@ let
     (lib.getOutput "modules" cfg.kernelPackage)
   ];
 
-  # makeModulesClosure expects `firmware` to be a SINGLE store path it can
-  # `cd` into (it reads `$firmware/lib/firmware/<blob>`), not a list. The
-  # `boot.nmbl.rescue.fullSystem.firmware` option is a plain
-  # `listOf package` (no NixOS-style `apply`), so join it into one
-  # buildEnv exposing `/lib/firmware` — exactly as NixOS's
-  # `hardware.firmware` option does internally. An empty list still yields
-  # a valid (empty) `/lib/firmware`, so the closure builds cleanly when no
-  # firmware is configured (e.g. the VM test, where no driver needs blobs).
-  rescueFirmwareEnv = pkgs.buildEnv {
-    name = "nmbl-rescue-firmware";
-    paths = cfg.rescue.fullSystem.firmware;
-    pathsToLink = [ "/lib/firmware" ];
-    ignoreCollisions = true;
-  };
-
   # Module closure for the rescue squashfs, built against NMBL's exact
   # kernel so `uname -r` after switch_root matches `/lib/modules/<kver>`.
   # `firmware` pulls in only the blobs the staged modules reference
@@ -178,16 +169,24 @@ let
   # a big package like linux-firmware stays scoped. `allowMissing` keeps
   # the build green if a named driver is built into the kernel. Only built
   # when there are rescue modules to stage.
-  rescueModuleClosure =
-    if rescueFullSystemModules != [ ] then
-      pkgs.makeModulesClosure {
-        rootModules = rescueFullSystemModules;
-        kernel = rescueModulesTree;
-        firmware = rescueFirmwareEnv;
-        allowMissing = true;
-      }
-    else
-      null;
+  #
+  # De-duplicated (#25b) onto the shared `module-closure.nix` factor (#25a)
+  # the driver-image build also uses. The factor joins the firmware list into
+  # the SINGLE store path makeModulesClosure expects (the `nmbl-rescue-
+  # firmware` buildEnv — exactly NixOS's `hardware.firmware` pattern), unique-s
+  # the root modules (already unique here), and returns `null` when there is
+  # nothing to stage — so this is store-path-identical to the prior inline
+  # `makeModulesClosure` call (verified byte-for-byte against
+  # `system.build.nmblRescueSquashfs` per FIX-37). The EXPLICIT `firmwareName`
+  # keeps the rescue closure's firmware env from colliding with a driver-image
+  # one (FIX-36).
+  rescueModuleClosure = import ./modules/module-closure.nix { inherit pkgs lib; } {
+    rootModules = rescueFullSystemModules;
+    kernel = rescueModulesTree;
+    firmware = cfg.rescue.fullSystem.firmware;
+    firmwareName = "nmbl-rescue-firmware";
+    allowMissing = true;
+  };
 
   # Import kernel modules management module. The rescue full-system
   # modules are deliberately NOT in extraExplicitModules: NMBL must not
@@ -263,6 +262,16 @@ let
       # skips the modprobe + staging.
       moduleClosure = rescueModuleClosure;
     };
+  };
+
+  # Optional signed driver-image squashfs build (#25a). ADDITIVE: builds each
+  # `boot.nmbl.driverImages.images.<name>` into a pure squashfs (out-of-tree
+  # .ko + firmware, via the explicit-`firmwareName` module-closure factor —
+  # FIX-36) and emits the install-time `nmbl-sign --domain driver-image`
+  # shell. The rescue closure above is built inline and is left untouched
+  # (byte-identical store path — FIX-37); only the NEW images use the factor.
+  driverImageBuild = import ./modules/driver-image.nix {
+    inherit pkgs lib config cfg nmblSign rescueModulesTree;
   };
 
   # The emergency menu's "Raw Shell" forks `cfg.paths.shell` while NMBL is
@@ -374,6 +383,42 @@ in
       else
         pkgs.writeText "nmbl-assertions-ok" "All NMBL assertions passed\n";
 
+    # ABSENT-FROM-INITRAMFS ASSERT (#51). `nmbl-tpm-enroll` is a HOST / install
+    # tool: it ENROLLS (seals) a LUKS key to the TPM AFTER the box has booted.
+    # The NMBL boot path only ever UNSEALS (`cryptsetup open --token-only`) and
+    # NEVER enrolls, so the enroll tool — and the heavy systemd-cryptenroll /
+    # systemd closure it drags in — MUST NOT enter the initramfs / nmbl-init
+    # closure. This mirrors the closure-leak / absence asserts used for the
+    # signing keys and host signer: it computes the transitive closure of the
+    # built initramfs and FAILs the build if the enroll tool's store path
+    # appears in it. The ENFORCING copy of this check is `builtins.seq`'d into
+    # the `nmblInitramfs` return below (over the LOCAL `initramfs` value — never
+    # the public `system.build.nmblInitramfs`, which would be a cycle), so it
+    # runs on every build that produces an initramfs (toplevel / UKI / install).
+    # It would FIRE if the tool were ever staged into the initramfs.
+    #
+    # This `system.build.*` attribute is the directly-BUILDABLE mirror of that
+    # enforcing check (`nix build …#…nmblTpmEnrollAbsenceCheck`), useful for CI /
+    # audits; it computes the same closure over the public initramfs.
+    system.build.nmblTpmEnrollAbsenceCheck =
+      let
+        enrollPath = "${nmblTpmEnroll}";
+        initrdClosure = pkgs.closureInfo { rootPaths = [ config.system.build.nmblInitramfs ]; };
+      in
+      pkgs.runCommand "nmbl-tpm-enroll-absent-from-initramfs" { } ''
+        # `store-paths` lists every store path in the initramfs's transitive
+        # closure. The enroll tool must NOT be among them.
+        if grep -qxF ${lib.escapeShellArg enrollPath} ${initrdClosure}/store-paths; then
+          echo "FAIL: nmbl-tpm-enroll (${enrollPath})" >&2
+          echo "      leaked into the NMBL initramfs closure. It is a HOST/install" >&2
+          echo "      tool — the boot path only UNSEALS via 'cryptsetup --token-only'," >&2
+          echo "      it NEVER enrolls. Keep nmbl-tpm-enroll out of the initramfs." >&2
+          exit 1
+        fi
+        echo "OK: nmbl-tpm-enroll is absent from the NMBL initramfs closure."
+        touch "$out"
+      '';
+
     # Build the minimal initramfs around the Rust /init binary.
     #
     # Contents are deliberately small:
@@ -484,10 +529,35 @@ in
           contents = baseContents ++ splashContents ++ activationExtraContents;
           compressor = "gzip -9";
         };
+
+        # Absence-from-initramfs assert over the LOCAL `initramfs` (NOT
+        # `config.system.build.nmblInitramfs`, which would be a cycle): fails the
+        # build if `nmbl-tpm-enroll`'s store path is in the initramfs closure.
+        # Seq'd into the return so it runs on every build that produces an
+        # initramfs (toplevel / UKI / install).
+        enrollAbsenceCheck =
+          let
+            enrollPath = "${nmblTpmEnroll}";
+            initrdClosure = pkgs.closureInfo { rootPaths = [ initramfs ]; };
+          in
+          pkgs.runCommand "nmbl-tpm-enroll-absent-from-initramfs" { } ''
+            if grep -qxF ${lib.escapeShellArg enrollPath} ${initrdClosure}/store-paths; then
+              echo "FAIL: nmbl-tpm-enroll (${enrollPath}) leaked into the NMBL" >&2
+              echo "      initramfs closure. It is a HOST/install tool — the boot" >&2
+              echo "      path only UNSEALS via 'cryptsetup --token-only', it NEVER" >&2
+              echo "      enrolls. Keep nmbl-tpm-enroll out of the initramfs." >&2
+              exit 1
+            fi
+            echo "OK: nmbl-tpm-enroll is absent from the NMBL initramfs closure."
+            touch "$out"
+          '';
       in
-      # Force assertion checking before returning initramfs
-      # builtins.seq forces evaluation of the first argument before returning the second
-      builtins.seq config.system.build.nmblAssertionCheck initramfs;
+      # Force assertion checking AND the enroll-absence check before returning
+      # the initramfs. builtins.seq forces evaluation of the first argument
+      # before returning the second; nest so BOTH run.
+      builtins.seq config.system.build.nmblAssertionCheck (
+        builtins.seq enrollAbsenceCheck initramfs
+      );
 
     # Build the bootloader kernel
     system.build.nmblKernel = cfg.kernelPackage;
@@ -504,30 +574,7 @@ in
     # systemd-stub reliably passes the embedded `.initrd` section, so no
     # on-disk initrd is needed. Always evaluable (cheap when unreferenced);
     # only built when the efi-stub install path consumes it.
-    system.build.nmblUki =
-      let
-        kernel = config.system.build.nmblKernel;
-        initrd = config.system.build.nmblInitramfs;
-        cmdline = lib.concatStringsSep " " (
-          cfg.kernelParams ++ lib.optional (cfg.serialConsole != null) "console=${cfg.serialConsole}"
-        );
-      in
-      pkgs.runCommand "nmbl-uki.efi"
-        {
-          nativeBuildInputs = [ pkgs.systemdUkify ];
-        }
-        ''
-          # ukify defaults to reading /usr/lib/os-release for the .osrel
-          # section, which does not exist in the Nix sandbox. Pass an
-          # explicit minimal os-release so the build is hermetic.
-          printf 'NAME=NMBL\nID=nmbl\nPRETTY_NAME="NMBL Bootloader"\n' > os-release
-          ukify build \
-            --linux=${kernel}/bzImage \
-            --initrd=${initrd}/initrd \
-            --cmdline=${lib.escapeShellArg cmdline} \
-            --os-release=@os-release \
-            --output=$out
-        '';
+    system.build.nmblUki = signingBuild.nmblUki;
 
     # Expose the actually-selected /init binary for downstream tooling
     # (debug scripts, manual nix builds). Mirrors nmblKernel/nmblInitramfs.
@@ -586,6 +633,11 @@ in
     # regardless of mode), but only staged onto the boot partition when
     # `cfg.rescue.mode == "external"` — see install-bootloader.nix.
     system.build.nmblRescueSquashfs = nmblRescueSquashfs;
+
+    # Expose the pure driver-image squashfs derivations (#25a) for store-path
+    # introspection. Each record is `{ name; sfs; destPath; sigDest; }`; the
+    # `.sfs` is the unsigned, pure blob (signing happens at install).
+    system.build.nmblDriverImages = driverImageBuild.driverImages;
 
     # Debug output to verify module configuration
     system.build.nmblDebugInfo = pkgs.writeText "nmbl-debug-info" ''
@@ -691,6 +743,12 @@ in
         ;
       nmblUki = config.system.build.nmblUki;
       nmblInitrmCheck = config.system.build.nmblInitrmCheck;
+      # Install-time driver-image staging + `nmbl-sign` signing shell (#25a).
+      # Empty string when no driver images are enabled.
+      driverImageInstallShell = driverImageBuild.driverImageInstallShell;
+      # The host-platform `nmbl-sign` signer, threaded through to
+      # install-signing.nix for per-generation kernel/initrd signing (#53).
+      inherit nmblSign;
     };
 
     # Custom installation script (imported from module)
@@ -698,8 +756,15 @@ in
 
     # Add install-nmbl to system packages. kexec-tools is no longer required:
     # the Rust /init drives kexec via the kexec_file_load(2) syscall directly.
+    #
+    # `nmbl-tpm-enroll` ships on the INSTALLED system (never the initramfs — it
+    # is asserted absent from the initramfs closure above): TPM enrolment must
+    # happen AFTER first boot, from the running NixOS, against the on-disk LUKS
+    # header. The operator runs it once to seal the volume key to PCRs 11+7 so
+    # subsequent measured boots auto-unlock via NMBL's `--token-only` path.
     environment.systemPackages = [
       installScriptModule.installNmbl
+      nmblTpmEnroll
     ];
   };
 }

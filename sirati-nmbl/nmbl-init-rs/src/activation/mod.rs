@@ -10,6 +10,7 @@
 
 mod helpers;
 mod luks;
+mod seal;
 mod source_wait;
 
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ use crate::config::{Activation, ActivationKind, Config};
 use crate::error::{NmblError, Result};
 use crate::nmbl_info;
 use crate::sys::ops::SysOps;
+use crate::sys::poller::LocalSender;
 use crate::ui::BootReporter;
 use crate::ui::console::Console;
 
@@ -29,6 +31,7 @@ use helpers::{
     loaded_modules, wrap_runner_error,
 };
 use luks::{WrongPasswordHandled, handle_wrong_password, run_luks_with_spinner};
+use seal::register_tpm_mapper_if_luks_tpm;
 use source_wait::wait_for_source_device;
 
 /// One passphrase to inject into the kexec'd initrd as a keyfile. The
@@ -78,6 +81,7 @@ pub async fn run_all_activations<S: SysOps>(
     config: &Config,
     reporter: &mut BootReporter<'_, '_>,
     mut password_supplier: Option<&mut dyn PasswordSupplier>,
+    sender: &LocalSender,
 ) -> Result<Vec<KeyInjection>> {
     let mut injections: Vec<KeyInjection> = Vec::new();
     if config.activations.is_empty() {
@@ -116,6 +120,7 @@ pub async fn run_all_activations<S: SysOps>(
             activation,
             &mut *reporter.console,
             supplier_ref,
+            sender,
         )
         .await?;
 
@@ -201,6 +206,7 @@ async fn run_one_activation<S: SysOps>(
     activation: &Activation,
     console: &mut dyn Console,
     mut supplier: Option<&mut dyn PasswordSupplier>,
+    sender: &LocalSender,
 ) -> Result<Option<Zeroizing<Vec<u8>>>> {
     // 1-indexed attempt counter for the wrong-password modal title
     // ("Wrong password (attempt N)"). Resets per activation so a
@@ -244,6 +250,12 @@ async fn run_one_activation<S: SysOps>(
         // rather than failing. The LUKS volume is accessible either
         // way, so treat both as a clean break.
         if is_activation_success(outcome.exit_code) {
+            // A TPM-unsealed LUKS mapper is now live. Record it on the
+            // always-compiled seal registry so `policy::seal_secrets`
+            // closes it (cryptsetup close) before any interactive context
+            // is reached — a refuse/rescue/shell must leave no readable
+            // TPM-unsealed plaintext device behind (FIX-03 / re-audit C-1).
+            register_tpm_mapper_if_luks_tpm(activation);
             break stdin_owned;
         }
 
@@ -252,7 +264,7 @@ async fn run_one_activation<S: SysOps>(
         // other non-zero exit code is fatal as before.
         if activation.kind == ActivationKind::LuksPassword && outcome.exit_code == 2 {
             attempts = attempts.saturating_add(1);
-            match handle_wrong_password(config, console, activation, attempts).await? {
+            match handle_wrong_password(config, console, activation, attempts, sender).await? {
                 WrongPasswordHandled::TryAgain => continue,
                 WrongPasswordHandled::Reboot => {
                     return Err(NmblError::OperatorChoseReboot {

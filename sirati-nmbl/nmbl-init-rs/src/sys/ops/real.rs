@@ -27,7 +27,9 @@ use crate::sys::pty::PtyChild;
 use crate::ui::console::Console;
 use crate::ui::{BootReporter, ProgressSink};
 
-use super::{BlockOps, ConsoleOps, ExecOps, FsOps, KexecOps, KexecTarget, ModuleOps};
+use super::{
+    BlockOps, ConsoleOps, ExecOps, FsOps, KexecOps, KexecTarget, ModuleOps, VerifiedKexecFds,
+};
 
 /// Genuine system-operations impl. Borrows the poller's [`LocalSender`] so
 /// the async fork/exec and blkid forwarders can drive non-blocking
@@ -177,10 +179,17 @@ impl ExecOps for RealSys<'_> {
         crate::sys::activation::run_capture(binary, argv, self.sender()).await
     }
 
-    fn spawn_shell(&mut self, shell_path: &Path, cols: u16, rows: u16) -> Result<PtyChild> {
+    fn spawn_shell(
+        &mut self,
+        sealed: crate::policy::Sealed,
+        shell_path: &Path,
+        cols: u16,
+        rows: u16,
+    ) -> Result<PtyChild> {
         // `RealSys` is itself the `FsOps` the pre-fork mkdir/mount/exists
-        // route through; pass `self` so they dispatch through the seam.
-        crate::sys::pty::spawn_shell(self, shell_path, cols, rows)
+        // route through; pass `self` so they dispatch through the seam. The
+        // seal witness rides through to the real fork/execve waist (C-1).
+        crate::sys::pty::spawn_shell(self, sealed, shell_path, cols, rows)
     }
 }
 
@@ -188,6 +197,7 @@ impl KexecOps for RealSys<'_> {
     fn kexec_load(
         &mut self,
         target: KexecTarget,
+        verified_fds: VerifiedKexecFds<'_>,
         extra_cpio: &[u8],
         cmdline: &str,
         flags: u32,
@@ -195,10 +205,21 @@ impl KexecOps for RealSys<'_> {
         match target {
             KexecTarget::MultiFile { kernel, initrd } => {
                 // Load kernel + initrd with the caller's `extra_cpio`
-                // (keyfiles + log) spliced after the system initrd.
-                crate::sys::kexec::load_with_extra_initrd_cpio(
-                    &kernel, &initrd, extra_cpio, cmdline, flags,
-                )?;
+                // (keyfiles + log) spliced after the system initrd. On the
+                // secure-boot path the verify pipeline's PINNED kernel +
+                // initrd fds are handed straight to kexec_file_load(2)
+                // (FIX-02 / MED-1 / LOW-A) so the loaded image is
+                // byte-identical to the verified + measured one; otherwise
+                // both are opened by path.
+                if let Some((kernel_fd, initrd_fd)) = verified_fds {
+                    crate::sys::kexec::load_with_kernel_fd_and_extra_initrd_cpio(
+                        &kernel, kernel_fd, &initrd, initrd_fd, extra_cpio, cmdline, flags,
+                    )?;
+                } else {
+                    crate::sys::kexec::load_with_extra_initrd_cpio(
+                        &kernel, &initrd, extra_cpio, cmdline, flags,
+                    )?;
+                }
                 // Pre-kexec commit, kept synchronous on purpose: this is
                 // the deliberate flush right before the no-return handoff,
                 // not a runtime wait. We're single-threaded and about to

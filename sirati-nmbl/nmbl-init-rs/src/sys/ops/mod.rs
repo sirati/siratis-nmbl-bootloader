@@ -22,6 +22,7 @@ pub mod dryrun;
 pub mod real;
 
 use std::io;
+use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 
 use nix::mount::MntFlags;
@@ -166,8 +167,28 @@ pub trait ExecOps {
     ) -> Result<(ProcessOutcome, Vec<u8>)>;
     /// Fork a shell on a fresh PTY pair — see
     /// [`crate::sys::pty::spawn_shell`].
-    fn spawn_shell(&mut self, shell_path: &Path, cols: u16, rows: u16) -> Result<PtyChild>;
+    ///
+    /// Requires the [`Sealed`](crate::policy::Sealed) witness by value: the
+    /// real fork/execve waist this routes to cannot be reached until
+    /// `policy::seal_secrets` has capped the lock PCR and closed every
+    /// TPM-unsealed mapper (re-audit C-1). The witness is threaded THROUGH the
+    /// ops seam so routing the spawn through the abstraction cannot bypass the
+    /// seal; a dry-run impl consumes it but never forks.
+    fn spawn_shell(
+        &mut self,
+        sealed: crate::policy::Sealed,
+        shell_path: &Path,
+        cols: u16,
+        rows: u16,
+    ) -> Result<PtyChild>;
 }
+
+/// The PINNED, already-verified kernel + initrd source fds the secure-boot
+/// verify pipeline opened. When `Some`, [`KexecOps::kexec_load`] loads the
+/// image straight from these fds (FIX-02 / MED-1 / LOW-A) instead of
+/// re-opening either by path, so the kernel run + the initrd unpacked are
+/// byte-identical to the ones that were verified and measured.
+pub type VerifiedKexecFds<'a> = Option<(BorrowedFd<'a>, BorrowedFd<'a>)>;
 
 /// Kexec image load.
 pub trait KexecOps {
@@ -175,9 +196,16 @@ pub trait KexecOps {
     /// (keyfiles + log fragment) after the system initrd — see
     /// [`crate::sys::kexec`]. The genuine impl also performs the
     /// pre-handoff `sync(2)` + settle so a dry-run impl can no-op it.
+    ///
+    /// `verified_fds` carries the secure-boot verify pipeline's pinned
+    /// kernel+initrd fds (kernel, initrd) when present; the genuine impl
+    /// loads from those exact fds rather than re-opening by path so the
+    /// loaded image is byte-identical to the verified+measured one. A
+    /// dry-run impl ignores the fds and only presence-checks the paths.
     fn kexec_load(
         &mut self,
         target: KexecTarget,
+        verified_fds: VerifiedKexecFds<'_>,
         extra_cpio: &[u8],
         cmdline: &str,
         flags: u32,

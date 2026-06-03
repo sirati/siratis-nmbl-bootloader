@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{NmblError, Result};
 use crate::net::http::{self, HttpUrl};
-use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
+use crate::sys::loopdev::loop_bind_ro;
 
 use super::NetAttemptOutcome;
 use super::types::{DownloadStatus, RescueUi};
@@ -134,19 +134,12 @@ pub(super) fn mount_overlay_for_child(
 ) -> Result<&'static std::path::Path> {
     use std::path::{Path, PathBuf};
 
-    let index = allocate_loop_device().map_err(|source| NmblError::Rescue {
-        stage: "loop-alloc",
-        source: Box::new(source),
-    })?;
-
-    let loop_fd = open_loop_device(index, true).map_err(|source| NmblError::Rescue {
-        stage: "loop-open",
-        source: Box::new(source),
-    })?;
-
-    configure_loop_device(&loop_fd, backing, true).map_err(|source| NmblError::Rescue {
-        stage: "loop-configure",
-        source: Box::new(source),
+    // Shared allocate→open→configure dance (`sys::loopdev::loop_bind_ro`);
+    // re-wrap its stage tag verbatim so the network-rescue banner matches the
+    // disk path's (`loop-alloc` / `loop-open` / `loop-configure`).
+    let index = loop_bind_ro(backing).map_err(|e| NmblError::Rescue {
+        stage: e.stage,
+        source: e.source,
     })?;
 
     let loop_dev = PathBuf::from(format!("/dev/loop{index}"));
@@ -155,19 +148,11 @@ pub(super) fn mount_overlay_for_child(
     Ok(Path::new(RESCUE_MOUNT))
 }
 
-/// Lowercase hex encoder for SHA-256 digests. Avoids pulling in the
-/// `hex` crate for a 64-byte string.
-pub(super) fn hex_lower(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let hi = TABLE.get(usize::from(b >> 4)).copied().unwrap_or(b'?');
-        let lo = TABLE.get(usize::from(b & 0x0f)).copied().unwrap_or(b'?');
-        out.push(hi as char);
-        out.push(lo as char);
-    }
-    out
-}
+/// Re-export shim: `hex_lower` was lifted to the ungated `util::hex` module
+/// (FIX-23 / master-plan §B.1) so the network-rescue and secure-boot paths
+/// share one encoder. Kept here so `download::hex_lower` stays resolvable for
+/// the in-module call above and the `rescue::net::mod` test caller.
+pub(super) use crate::util::hex::hex_lower;
 
 /// Compute the lowercase-hex SHA-256 of `bytes`. Exposed so unit
 /// tests can pin the hasher behaviour against a known vector without

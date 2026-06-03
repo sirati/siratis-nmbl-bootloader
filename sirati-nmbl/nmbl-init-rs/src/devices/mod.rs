@@ -15,7 +15,7 @@ use nix::errno::Errno;
 use crate::config::{Config, FilesystemEntry};
 use crate::error::{NmblError, Result};
 use crate::nmbl_info;
-use crate::sys::loopdev::{allocate_loop_device, configure_loop_device, open_loop_device};
+use crate::sys::loopdev::loop_bind_ro;
 use crate::sys::ops::{FsOps, SysOps};
 use crate::ui::{BootReporter, ProgressSink, TickOutcome};
 
@@ -371,14 +371,15 @@ fn entry_is_loop_backed(entry: &FilesystemEntry, resolved_device: &Path) -> bool
 /// via `LOOP_CONFIGURE`. The kernel cleans up the binding automatically
 /// when the loop mount is lazily unmounted in the pre-kexec teardown.
 pub(crate) fn setup_loop_device(file: &Path) -> Result<PathBuf> {
-    let index = allocate_loop_device()?;
-    let loop_fd = open_loop_device(index, true)?;
     let backing_fd = rustix::fs::open(file, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
         .map_err(|e| NmblError::Io {
             source: std::io::Error::from_raw_os_error(e.raw_os_error()),
             context: format!("opening loop backing file {}", file.display()),
         })?;
-    configure_loop_device(&loop_fd, &backing_fd, true)?;
+    // Shared allocate→open→configure dance (`sys::loopdev::loop_bind_ro`).
+    // This path propagates the bare loop error (no stage wrapper), so unwrap
+    // `LoopBindError` back to its inner `NmblError` to preserve behaviour.
+    let index = loop_bind_ro(&backing_fd).map_err(|e| *e.source)?;
     Ok(PathBuf::from(format!("/dev/loop{index}")))
 }
 

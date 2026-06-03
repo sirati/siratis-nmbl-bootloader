@@ -291,6 +291,7 @@ fn demo_generation() -> crate::generations::Generation {
     crate::generations::Generation {
         number: 1,
         profile_link: std::path::PathBuf::from("/nix/var/nix/profiles/system-1-link"),
+        toplevel: std::path::PathBuf::from("/run/current-system"),
         kernel: std::path::PathBuf::from("/run/current-system/kernel"),
         initrd: std::path::PathBuf::from("/run/current-system/initrd"),
         init_path: std::path::PathBuf::from("/run/current-system/init"),

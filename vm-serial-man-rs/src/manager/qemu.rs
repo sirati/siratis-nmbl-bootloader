@@ -7,7 +7,10 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::fs;
 use tokio::process::{Child, Command};
-use tracing::{debug, trace};
+use tracing::debug;
+
+use super::firmware::{spawn_swtpm, SwtpmSidecar};
+pub use super::firmware::{SecureBoot, TpmConfig, TpmKind};
 
 /// Boot mode for QEMU
 #[derive(Debug, Clone)]
@@ -53,6 +56,12 @@ pub struct QemuConfig {
     pub cores: u32,
     pub socket_dir: PathBuf,
     pub display: Display,
+    /// Optional emulated TPM (swtpm sidecar). `None` ⇒ no TPM, and the QEMU
+    /// invocation is byte-identical to a TPM-less run.
+    pub tpm: Option<TpmConfig>,
+    /// Optional Secure-Boot OVMF firmware (`smm=on` + SB pflash). `None` ⇒
+    /// the historical UEFI/BIOS firmware path, byte-identical to before.
+    pub secure_boot: Option<SecureBoot>,
 }
 
 /// QEMU process with socket information
@@ -60,6 +69,9 @@ pub struct QemuProcess {
     pub child: Child,
     pub serial_socket: PathBuf,
     pub monitor_socket: PathBuf,
+    /// The swtpm sidecar, present iff a [`TpmConfig`] was requested. Held so
+    /// its lifetime (and state-dir cleanup) is bound to the VM's.
+    pub swtpm: Option<SwtpmSidecar>,
 }
 
 impl QemuConfig {
@@ -67,28 +79,7 @@ impl QemuConfig {
     pub async fn start(&self) -> Result<QemuProcess> {
         debug!("Starting QEMU VM: {}", self.name);
 
-        // Handle UEFI boot mode - ensure OVMF vars is writable
-        if let BootMode::Uefi {
-            ovmf_code,
-            ovmf_vars,
-        } = &self.boot_mode
-        {
-            if !ovmf_vars.exists() {
-                let vars_template = ovmf_code.parent().unwrap().join("OVMF_VARS.fd");
-                fs::copy(&vars_template, ovmf_vars)
-                    .await
-                    .context("Failed to create OVMF_VARS")?;
-
-                // Ensure the file is writable
-                let mut perms = fs::metadata(ovmf_vars).await?.permissions();
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    perms.set_mode(0o644);
-                }
-                fs::set_permissions(ovmf_vars, perms).await?;
-            }
-        }
+        self.prepare_ovmf_vars().await?;
 
         // Create socket paths for serial and monitor — per-PID to avoid
         // collisions when multiple managers run in parallel (matches the
@@ -107,8 +98,16 @@ impl QemuConfig {
 
         let mut cmd = Command::new("qemu-system-x86_64");
 
+        // `smm=on` is appended only when a Secure-Boot firmware is configured
+        // (SMM is required to protect the SB variable store); the no-SB string
+        // is byte-identical to before.
+        let machine = if self.secure_boot.is_some() {
+            "q35,accel=kvm:tcg,smm=on"
+        } else {
+            "q35,accel=kvm:tcg"
+        };
         cmd.arg("-machine")
-            .arg("q35,accel=kvm:tcg")
+            .arg(machine)
             .arg("-cpu")
             .arg("max")
             .arg("-m")
@@ -116,39 +115,7 @@ impl QemuConfig {
             .arg("-smp")
             .arg(self.cores.to_string());
 
-        // Add boot-mode-specific arguments
-        match &self.boot_mode {
-            BootMode::Uefi {
-                ovmf_code,
-                ovmf_vars,
-            } => {
-                debug!("Using UEFI boot mode");
-                cmd.arg("-drive")
-                    .arg(format!(
-                        "if=pflash,format=raw,readonly=on,file={}",
-                        ovmf_code.display()
-                    ))
-                    .arg("-drive")
-                    .arg(format!("if=pflash,format=raw,file={}", ovmf_vars.display()));
-            }
-            BootMode::DirectKernel {
-                kernel,
-                initrd,
-                kernel_args,
-            } => {
-                debug!("Using direct kernel boot mode");
-                cmd.arg("-kernel")
-                    .arg(kernel)
-                    .arg("-initrd")
-                    .arg(initrd)
-                    .arg("-append")
-                    .arg(kernel_args);
-            }
-            BootMode::Bios => {
-                debug!("Using legacy BIOS boot mode");
-                // No additional arguments needed - QEMU uses SeaBIOS by default
-            }
-        }
+        self.add_firmware_args(&mut cmd);
 
         cmd.arg("-drive")
             .arg(format!(
@@ -160,37 +127,22 @@ impl QemuConfig {
             .arg("-device")
             .arg("virtio-net-pci,netdev=net0");
 
-        // Dispatch on display backend.
-        match self.display {
-            Display::Serial => {
-                debug!("Using headless (serial) display");
-                cmd.arg("-nographic");
-            }
-            Display::Vnc { port } => {
-                let display_num = port
-                    .checked_sub(5900)
-                    .with_context(|| format!("VNC port {port} must be >= 5900"))?;
-                debug!("Using VNC display on port {port} (display :{display_num})");
-                cmd.arg("-display")
-                    .arg(format!("vnc=:{display_num}"))
-                    .arg("-vga")
-                    .arg("std");
-            }
-            Display::Sdl => {
-                debug!("Using SDL display");
-                cmd.arg("-display").arg("sdl").arg("-vga").arg("std");
-            }
-        }
+        self.add_display_args(&mut cmd)?;
 
         // Serial always goes to its Unix socket; the QEMU monitor gets its own
         // Unix socket so the `screenshot` subcommand can drive `screendump`.
         cmd.arg("-serial")
             .arg(format!("unix:{},server,nowait", serial_socket.display()))
             .arg("-monitor")
-            .arg(format!(
-                "unix:{},server,nowait",
-                monitor_socket.display()
-            ));
+            .arg(format!("unix:{},server,nowait", monitor_socket.display()));
+
+        // Spawn the swtpm sidecar (if requested) and append the TPM device
+        // triple BEFORE printing/launching QEMU, so the dumped command line is
+        // accurate and QEMU connects to a socket that already exists.
+        let swtpm = match &self.tpm {
+            Some(tpm) => Some(spawn_swtpm(tpm, &mut cmd).await?),
+            None => None,
+        };
 
         // Print the actual QEMU command for debugging
         eprintln!("=== QEMU Command ===");
@@ -218,6 +170,110 @@ impl QemuConfig {
             child,
             serial_socket,
             monitor_socket,
+            swtpm,
         })
+    }
+
+    /// Ensure the OVMF VARS file exists and is writable for a non-Secure-Boot
+    /// UEFI boot. The Secure-Boot path supplies its own (already writable,
+    /// db-enrolled) VARS copy, so this is skipped when `secure_boot` is set.
+    async fn prepare_ovmf_vars(&self) -> Result<()> {
+        if self.secure_boot.is_some() {
+            return Ok(());
+        }
+        let BootMode::Uefi {
+            ovmf_code,
+            ovmf_vars,
+        } = &self.boot_mode
+        else {
+            return Ok(());
+        };
+        if ovmf_vars.exists() {
+            return Ok(());
+        }
+        let vars_template = ovmf_code.parent().unwrap().join("OVMF_VARS.fd");
+        fs::copy(&vars_template, ovmf_vars)
+            .await
+            .context("Failed to create OVMF_VARS")?;
+
+        // Ensure the file is writable
+        let mut perms = fs::metadata(ovmf_vars).await?.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o644);
+        }
+        fs::set_permissions(ovmf_vars, perms).await?;
+        Ok(())
+    }
+
+    /// Append firmware/boot-mode arguments: the Secure-Boot pflash (if any),
+    /// then the boot-mode's own firmware/kernel arguments. A configured
+    /// Secure-Boot firmware takes over the pflash drives and suppresses the
+    /// boot-mode's non-SB UEFI pflash; everything else is unchanged.
+    fn add_firmware_args(&self, cmd: &mut Command) {
+        if let Some(sb) = &self.secure_boot {
+            sb.add_pflash_args(cmd);
+        }
+
+        match &self.boot_mode {
+            BootMode::Uefi {
+                ovmf_code,
+                ovmf_vars,
+            } => {
+                debug!("Using UEFI boot mode");
+                if self.secure_boot.is_none() {
+                    cmd.arg("-drive")
+                        .arg(format!(
+                            "if=pflash,format=raw,readonly=on,file={}",
+                            ovmf_code.display()
+                        ))
+                        .arg("-drive")
+                        .arg(format!("if=pflash,format=raw,file={}", ovmf_vars.display()));
+                }
+            }
+            BootMode::DirectKernel {
+                kernel,
+                initrd,
+                kernel_args,
+            } => {
+                debug!("Using direct kernel boot mode");
+                cmd.arg("-kernel")
+                    .arg(kernel)
+                    .arg("-initrd")
+                    .arg(initrd)
+                    .arg("-append")
+                    .arg(kernel_args);
+            }
+            BootMode::Bios => {
+                debug!("Using legacy BIOS boot mode");
+                // No additional arguments needed - QEMU uses SeaBIOS by default
+            }
+        }
+    }
+
+    /// Append the display-backend arguments (serial/VNC/SDL).
+    fn add_display_args(&self, cmd: &mut Command) -> Result<()> {
+        match self.display {
+            Display::Serial => {
+                debug!("Using headless (serial) display");
+                cmd.arg("-nographic");
+            }
+            Display::Vnc { port } => {
+                let display_num = port
+                    .checked_sub(5900)
+                    .with_context(|| format!("VNC port {port} must be >= 5900"))?;
+                debug!("Using VNC display on port {port} (display :{display_num})");
+                cmd.arg("-display")
+                    .arg(format!("vnc=:{display_num}"))
+                    .arg("-vga")
+                    .arg("std");
+            }
+            Display::Sdl => {
+                debug!("Using SDL display");
+                cmd.arg("-display").arg("sdl").arg("-vga").arg("std");
+            }
+        }
+        Ok(())
     }
 }

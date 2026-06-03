@@ -38,7 +38,7 @@ mod boot_runtime;
 mod dispatch;
 #[path = "main_parts/early_exit.rs"]
 mod early_exit;
-#[path = "main_parts/phases.rs"]
+#[path = "main_parts/phases/mod.rs"]
 mod phases;
 #[cfg(feature = "stateful")]
 #[path = "main_parts/stateful.rs"]

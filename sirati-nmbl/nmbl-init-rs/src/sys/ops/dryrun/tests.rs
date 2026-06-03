@@ -65,6 +65,7 @@ fn present_kexec_images_record_no_finding() {
             kernel: PathBuf::from("/boot/vmlinuz"),
             initrd: PathBuf::from("/boot/initrd"),
         },
+        None,
         &[],
         "ro",
         0,
@@ -87,6 +88,7 @@ fn absent_kexec_kernel_records_finding() {
             kernel: PathBuf::from("/boot/vmlinuz"),
             initrd: PathBuf::from("/boot/initrd"),
         },
+        None,
         &[],
         "ro",
         0,
@@ -103,7 +105,14 @@ fn absent_kexec_kernel_records_finding() {
 fn missing_shell_records_finding_and_preflight_errs() {
     let root = temp_closure("shell-missing", |_d| {});
     let mut s = sys(root.clone(), DryRunScenario::RawShell);
-    let r = s.spawn_shell(Path::new("/bin/sh"), 80, 24);
+    // seal-exempt: DryRunSys::spawn_shell never reaches the real fork (it
+    // returns DryRunShellPreflight), so the seal gates no syscall here.
+    let r = s.spawn_shell(
+        crate::policy::Sealed::test_witness(),
+        Path::new("/bin/sh"),
+        80,
+        24,
+    );
     // The contract: the typed preflight signal, NO fork performed.
     // (`PtyChild` is not `Debug`, so match instead of `expect_err`.)
     match r {
@@ -127,7 +136,14 @@ fn present_shell_records_no_finding_but_still_errs() {
         fs::write(d.join("bin/sh"), b"#!/x").expect("write");
     });
     let mut s = sys(root.clone(), DryRunScenario::PrettyShell);
-    let r = s.spawn_shell(Path::new("/bin/sh"), 80, 24);
+    // seal-exempt: DryRunSys::spawn_shell never reaches the real fork (it
+    // returns DryRunShellPreflight), so the seal gates no syscall here.
+    let r = s.spawn_shell(
+        crate::policy::Sealed::test_witness(),
+        Path::new("/bin/sh"),
+        80,
+        24,
+    );
     assert!(r.is_err(), "dry-run never forks, always Errs");
     assert!(s.findings().is_empty(), "{:?}", s.findings().items());
     fs::remove_dir_all(&root).ok();
