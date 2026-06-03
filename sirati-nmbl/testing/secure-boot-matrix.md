@@ -50,9 +50,9 @@ derivation that store-imports the keys.
 The `test-secure-boot` config already declares its signing keys as on-disk
 PATHs, not Nix path literals:
 
-* `signing.generationKeyFile = "/run/nmbl-test-keys/insecure-test-gen.key"`
-* `signing.uki.keyFile = "/run/nmbl-test-keys/insecure-test-sb-db.key"`
-* `signing.uki.certFile = "/run/nmbl-test-keys/insecure-test-sb-db.crt"`
+* `signing.generationKeyFile = "/var/lib/nmbl-test-keys/insecure-test-gen.key"`
+* `signing.uki.keyFile = "/var/lib/nmbl-test-keys/insecure-test-sb-db.key"`
+* `signing.uki.certFile = "/var/lib/nmbl-test-keys/insecure-test-sb-db.crt"`
 
 The signed disk is produced by the RUNTIME orchestrator
 `.#sb-install-test-secure-boot` (`testing/sb-install.nix`), which mirrors the
@@ -63,13 +63,18 @@ production `install-test-*` nixos-anywhere flow:
    out the disko LUKS layout) against the **install variant** of the config
    (`boot.nmbl.signing.deferInstallSigning = lib.mkForce false`, so in-installer
    signing actually runs).
-3. `scp`s the committed test keys into the kexec-installer at
-   `/run/nmbl-test-keys/insecure-test-{gen.key,sb-db.key,sb-db.crt}` — read from
-   a RUNTIME directory (`--keys-dir`, default `$NMBL_TEST_KEYS_DIR` else
-   `$PWD/testing/keys`), never imported into a derivation.
+3. `scp`s the committed test keys into the freshly-installed root fs (mounted at
+   `/mnt` after disko) at
+   `/mnt/var/lib/nmbl-test-keys/insecure-test-{gen.key,sb-db.key,sb-db.crt}` —
+   read from a RUNTIME directory (`--keys-dir`, default `$NMBL_TEST_KEYS_DIR`
+   else `$PWD/testing/keys`), never imported into a derivation. `/var/lib` (not
+   `/run`) because the install phase's `installBootLoader` runs inside the
+   `nixos-install` chroot, whose activation mounts a fresh tmpfs over `/run`
+   right before signing — a `/run`-staged key would be shadowed and unreadable.
 4. Runs `nixos-anywhere --phases install`. NMBL's `installBootLoader` runs in
-   the installer where the key paths now exist: `lib/install-signing.nix`
-   `sbsign`s the NMBL UKI with the staged `db` key/cert and writes
+   the install chroot where the `/var/lib/nmbl-test-keys/...` paths now exist:
+   `lib/install-signing.nix` `sbsign`s the NMBL UKI with the staged `db`
+   key/cert and writes
    `EFI/BOOT/BOOTX64.EFI`; `lib/install-gen-signing.nix` signs each generation's
    kernel/initrd with the staged ML-DSA key (per-role `gen-kernel`/`gen-initrd`)
    into `/nmbl/sigs/<gen-id>/{kernel,initrd}.sig`. All from PATHS, at runtime.

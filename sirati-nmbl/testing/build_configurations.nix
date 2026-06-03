@@ -349,8 +349,15 @@ let
     # README.md); it only ever signs TEST artifacts. generationKeyFile resolves
     # impurely (string path, never the store) so the closure-leak assert in
     # lib/install-gen-signing.nix passes: it reads $NMBL_GEN_KEY_FILE when set,
-    # else the documented default /run/nmbl-test-keys/insecure-test-gen.key the
-    # #57 runner stages the committed key to (see the matrix manifest).
+    # else the documented default /var/lib/nmbl-test-keys/insecure-test-gen.key
+    # the #57 runner stages the committed key to (see the matrix manifest).
+    #
+    # NOTE on the path: install-time signing runs inside nixos-anywhere's
+    # `nixos-install` chroot, whose activation mounts a FRESH tmpfs over /run
+    # (mounts.sh: specialMount "tmpfs" "/run") before installBootLoader runs —
+    # so a /run-staged key would be shadowed and unreadable. The key therefore
+    # lives under /var/lib (a normal persistent dir activation never overmounts),
+    # exactly where the orchestrator stages it into the chroot's root fs.
     test-secure-boot = {
       name = "test-secure-boot";
       bootstrapper = {
@@ -380,7 +387,7 @@ let
               let
                 e = builtins.getEnv "NMBL_GEN_KEY_FILE";
               in
-              if e != "" then e else "/run/nmbl-test-keys/insecure-test-gen.key";
+              if e != "" then e else "/var/lib/nmbl-test-keys/insecure-test-gen.key";
 
             # ---- install-time UKI Secure-Boot signing (F1) ----------------
             # sbsign the NMBL UKI at install with the INSECURE-TEST db cert so
@@ -400,12 +407,12 @@ let
                 let
                   e = builtins.getEnv "NMBL_SB_DB_KEY_FILE";
                 in
-                if e != "" then e else "/run/nmbl-test-keys/insecure-test-sb-db.key";
+                if e != "" then e else "/var/lib/nmbl-test-keys/insecure-test-sb-db.key";
               certFile =
                 let
                   e = builtins.getEnv "NMBL_SB_DB_CERT_FILE";
                 in
-                if e != "" then e else "/run/nmbl-test-keys/insecure-test-sb-db.crt";
+                if e != "" then e else "/var/lib/nmbl-test-keys/insecure-test-sb-db.crt";
             };
           };
 

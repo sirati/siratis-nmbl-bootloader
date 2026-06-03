@@ -325,10 +325,12 @@
       # NMBL's normal install-time path-based signing — NOT by a build-time
       # derivation that store-imports the keys. The `test-secure-boot` config
       # already declares `signing.uki.{keyFile,certFile}` and `generationKeyFile`
-      # as on-disk PATHs (`/run/nmbl-test-keys/…`); the `sb-install-*` orchestrator
-      # (testing/sb-install.nix) runs nixos-anywhere, stages the committed test
-      # keys at those paths in the rescue installer, and `installBootLoader`
-      # `sbsign`s the UKI + writes the ML-DSA generation sidecars in place. The
+      # as on-disk PATHs (`/var/lib/nmbl-test-keys/…`); the `sb-install-*`
+      # orchestrator (testing/sb-install.nix) runs nixos-anywhere, stages the
+      # committed test keys at those paths INSIDE the install chroot's root fs
+      # (/var/lib, not /run — activation overmounts /run with a tmpfs), and
+      # `installBootLoader` `sbsign`s the UKI + writes the ML-DSA generation
+      # sidecars in place. The
       # booted disk is signed by the real install-time code and NO key is in any
       # derivation closure.
       secureBootConfig = testing.mkTestConfigurations."test-secure-boot";
