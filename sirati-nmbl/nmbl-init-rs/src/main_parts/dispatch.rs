@@ -36,6 +36,7 @@ pub(super) async fn select_and_act(
     key_injections: &[nmbl_init::activation::KeyInjection],
     session: &SessionInteraction,
     skip_selector: &SkipSelector,
+    driver_images: &nmbl_init::imageload::DriverImagesHandle,
 ) -> Result<TerminalAction> {
     nmbl_info!("phase 4: scan generations");
     let generations = {
@@ -90,7 +91,13 @@ pub(super) async fn select_and_act(
                     context: "decision dispatch".to_string(),
                 });
             };
-            kexec_into(config, target, cmdline_override.as_deref(), key_injections)
+            kexec_into(
+                config,
+                target,
+                cmdline_override.as_deref(),
+                key_injections,
+                driver_images,
+            )
         }
         Decision::Shell => Err(NmblError::Io {
             source: std::io::Error::other("operator chose emergency shell"),
@@ -280,6 +287,7 @@ pub(super) async fn run_tui_session(
     console: Box<dyn Console>,
     session: &SessionInteraction,
     sender: &nmbl_init::sys::poller::LocalSender,
+    driver_images: &mut nmbl_init::imageload::DriverImagesHandle,
 ) -> TerminalAction {
     // Wrap the live boot console in the central interaction-latch layer
     // for the whole session. Every consumer below — the early-boot
@@ -301,15 +309,31 @@ pub(super) async fn run_tui_session(
     // mount) are plain synchronous calls inside this async fn, and the
     // passphrase prompt / wrong-password modal `.await` the same
     // console — no nested runtime anywhere.
-    let outcome =
-        match run_phases_post_console(&mut *config, &mut *console, session, &skip_selector, sender)
+    let outcome = match run_phases_post_console(
+        &mut *config,
+        &mut *console,
+        session,
+        &skip_selector,
+        sender,
+        driver_images,
+    )
+    .await
+    {
+        // The post-console phases may have appended staged-rerun driver images
+        // to `driver_images` (#33); reborrow it as shared for the measure.
+        Ok(injections) => {
+            select_and_act(
+                config,
+                &mut *console,
+                &injections,
+                session,
+                &skip_selector,
+                driver_images,
+            )
             .await
-        {
-            Ok(injections) => {
-                select_and_act(config, &mut *console, &injections, session, &skip_selector).await
-            }
-            Err(err) => Err(err),
-        };
+        }
+        Err(err) => Err(err),
+    };
     match outcome {
         Ok(action) => {
             // `console` falls out of scope on return, running

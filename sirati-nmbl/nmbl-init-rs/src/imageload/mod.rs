@@ -14,12 +14,13 @@
 //! order, over a SINGLE pinned fd of the squashfs:
 //!
 //! 1. **Verify** ([`verify::verify_driver_image`]): stream the fd through the
-//!    frozen ML-DSA pipeline ([`crate::sig::verify_image_fd`]) under the
+//!    frozen ML-DSA pipeline ([`crate::sig::verify_image_fd_digest`]) under the
 //!    [`crate::sig::DOMAIN_DRIVER_IMAGE`] role and apply the operator's signing
 //!    posture via [`crate::sig::apply_policy`]. An enforce-mode failure returns
 //!    a [`crate::error::NmblError::DriverImage`] the caller routes to
 //!    `policy::refuse_unsigned` (FIX-05 / R-1). The image is NEVER mounted on a
-//!    verify failure.
+//!    verify failure. The verified SHA-512 digest is captured on the handle for
+//!    the PCR-11 measure (#28 — no re-hash, FIX-02).
 //! 2. **Mount read-only** ([`mount::mount_squashfs_ro`]): bind the SAME fd to a
 //!    loop device read-only via [`crate::sys::loopdev::loop_bind_ro`] (#22) and
 //!    mount the squashfs `ro` at a per-image mountpoint. No reopen — the fd
@@ -146,8 +147,10 @@ fn load_one(
     // the loop device serves to the kernel.
     let image_fd = locate::open_image_ro(&resolved)?;
 
-    // (1) VERIFY first — never touch the loop/mount layer on a refusal.
-    verify::verify_driver_image(image_fd.as_fd(), &resolved, config)?;
+    // (1) VERIFY first — never touch the loop/mount layer on a refusal. The
+    // verify returns the SHA-512 it streamed over the pinned fd, which the
+    // handle carries for the PCR-11 measure (#28 — no re-hash, FIX-02).
+    let digest = verify::verify_driver_image(image_fd.as_fd(), &resolved, config)?;
 
     // (2) MOUNT the SAME fd read-only.
     let mounted = mount::mount_squashfs_ro(image_fd.as_fd(), index)?;
@@ -158,8 +161,15 @@ fn load_one(
     // (4) LOAD the declared modules (reuses crate::modules::load_modules).
     modules::load_image_modules(config, spec, &mounted.mountpoint)?;
 
+    // The measure event #4 name is the operator-declared boot-relative path
+    // (`spec.path`): a STABLE, off-box-reproducible identifier (the absolute
+    // `resolved.image_path` carries the runtime mountpoint prefix, so it is NOT
+    // used as the measured name). A host predictor folds the same string.
+    let name = spec.path.to_string_lossy().into_owned();
     Ok(DriverImageHandle::new(
+        name,
         resolved.image_path,
+        digest,
         mounted.loop_index,
         mounted.mountpoint,
     ))

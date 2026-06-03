@@ -413,4 +413,96 @@ mod tests {
     /// `golden_pcr11_matches_frozen`. Computed by `predict_handoff_pcr` and
     /// pinned; a host predictor reproduces it to seal.
     const FROZEN_PCR11: &str = "d9cf09b69aa5a7c669432d255f56f9758725d88118f24efb1b00728cad855421";
+
+    /// The fixed, ordered driver-image set the with-drivers golden vector pins
+    /// (#28). Two images with stable names + deterministic digests, in load
+    /// order: a host predictor folds these into measure event #4 identically.
+    fn golden_driver_images() -> Vec<DriverImageRef> {
+        vec![
+            DriverImageRef {
+                name: "nmbl/nic.sfs".to_string(),
+                digest: kdig(),
+            },
+            DriverImageRef {
+                name: "nmbl/gpu.sfs".to_string(),
+                digest: idig(),
+            },
+        ]
+    }
+
+    /// #28: the driver-image refs threaded into the measure are the loader's
+    /// VERIFIED digests, folded VERBATIM into event #4 — `event_digest` over
+    /// `name_len(be32) ‖ name ‖ digest`, never re-hashed. An independent manual
+    /// reconstruction of the full event list (incl. the two driver events) must
+    /// equal `predict_handoff_pcr` over the same ordered set.
+    #[test]
+    fn golden_pcr11_with_drivers_matches_independent_reconstruction() {
+        let images = golden_driver_images();
+        let mut manual: Vec<[u8; 32]> = Vec::new();
+        for (domain, body) in [
+            (&b"nmbl:measure:identity:v1"[..], &[][..]),
+            (&b"nmbl:measure:kernel:v1"[..], &kdig()[..]),
+            (&b"nmbl:measure:initrd:v1"[..], &idig()[..]),
+            (&b"nmbl:measure:cmdline:v1"[..], GOLDEN_CMDLINE.as_bytes()),
+        ] {
+            let mut h = Sha256::new();
+            h.update(domain);
+            h.update([0x00]);
+            h.update(body);
+            manual.push(h.finalize().into());
+        }
+        // The two driver events, hand-framed exactly as `handoff_events` does:
+        // `name_len(be32) ‖ name ‖ 64-byte digest` under the driver-image domain.
+        for img in &images {
+            let mut body: Vec<u8> = Vec::new();
+            let name = img.name.as_bytes();
+            body.extend_from_slice(&u32::try_from(name.len()).unwrap().to_be_bytes());
+            body.extend_from_slice(name);
+            body.extend_from_slice(&img.digest);
+            let mut h = Sha256::new();
+            h.update(b"nmbl:measure:driver-image:v1");
+            h.update([0x00]);
+            h.update(&body);
+            manual.push(h.finalize().into());
+        }
+        let mut pcr = [0u8; 32];
+        for e in &manual {
+            let mut h = Sha256::new();
+            h.update(pcr);
+            h.update(e);
+            pcr = h.finalize().into();
+        }
+        let got = predict_handoff_pcr(&kdig(), &idig(), GOLDEN_CMDLINE, &images);
+        assert_eq!(
+            got, pcr,
+            "with-drivers prediction must equal the independent reconstruction",
+        );
+        // The with-drivers value MUST differ from the no-drivers golden: the two
+        // driver events really moved PCR-11.
+        let none = predict_handoff_pcr(&kdig(), &idig(), GOLDEN_CMDLINE, &[]);
+        assert_ne!(got, none, "driver events must change the measured PCR");
+    }
+
+    /// #28: the golden PCR-11 hex for the frozen inputs WITH the two-image
+    /// ordered driver set, pinned as a literal. A drift in the driver-event
+    /// encoding, the name framing, the digest reuse, or the order moves this and
+    /// fails the test; a host predictor seals to exactly this value.
+    #[test]
+    fn golden_pcr11_with_drivers_matches_frozen() {
+        let pcr = predict_handoff_pcr(&kdig(), &idig(), GOLDEN_CMDLINE, &golden_driver_images());
+        let hexv = hex_lower(&pcr);
+        assert_eq!(hexv.len(), 64, "PCR-11 is a 32-byte SHA-256 value");
+        assert_eq!(
+            hexv, FROZEN_PCR11_WITH_DRIVERS,
+            "with-drivers golden PCR-11 drifted; if the encoding changed \
+             intentionally, update FROZEN_PCR11_WITH_DRIVERS (and any off-box \
+             predictor) to {hexv}"
+        );
+    }
+
+    /// The frozen golden PCR-11 for `golden_pcr11_with_drivers_matches_frozen`:
+    /// the same fixed kernel/initrd/cmdline plus the two-image ordered driver
+    /// set `golden_driver_images()`. Pinned; a host predictor reproduces it.
+    const FROZEN_PCR11_WITH_DRIVERS: &str =
+        "96c9a3d392bfff0b87f21084f7931c53061213d5a76a9d863183b82f02cf0cbf";
 }

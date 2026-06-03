@@ -14,16 +14,31 @@ use std::path::PathBuf;
 
 use crate::error::Result;
 
-/// What one loaded driver image left mounted, for teardown.
+/// What one loaded driver image left mounted, for teardown — PLUS the stable
+/// name + verified digest the PCR-11 measure event #4 binds (#28).
 ///
 /// Records the source image path (for logging), the bound loop minor, and the
 /// mountpoint the squashfs sits at. Dropping the handle does NOT auto-detach —
 /// teardown is explicit via [`detach_all_driver_images`] so the FIX-55
 /// leave-mounted-into-the-capped-shell path can simply skip the call.
+///
+/// The `name` (the operator-declared boot-relative path) and `digest` (the
+/// SHA-512 the verifier streamed over the single pinned fd — FIX-02) are the
+/// ordered driver-image refs the kexec handoff measures into PCR-11: an off-box
+/// host predictor reconstructs the same name‖digest event from the same config,
+/// so they must be the STABLE declared identifier and the verified digest, never
+/// the runtime-mountpoint-prefixed absolute path or a re-hash.
 #[derive(Debug, Clone)]
 pub struct DriverImageHandle {
+    /// Stable, off-box-reproducible image name: the operator-declared
+    /// boot-relative `path`, folded into the measure event so a rename or
+    /// reorder changes PCR-11.
+    name: String,
     /// Absolute on-disk path of the driver squashfs (for log/diagnostics).
     image_path: PathBuf,
+    /// The SHA-512 digest the verifier streamed over the single pinned fd
+    /// (FIX-02) — reused verbatim by the PCR-11 measure, never recomputed.
+    digest: [u8; 64],
     /// The `/dev/loopN` minor bound to the image.
     loop_index: u32,
     /// Where the squashfs is mounted read-only.
@@ -31,15 +46,37 @@ pub struct DriverImageHandle {
 }
 
 impl DriverImageHandle {
-    /// Construct a handle from the loop index + mountpoint a successful load
-    /// produced.
+    /// Construct a handle from the verified name + digest and the loop
+    /// index + mountpoint a successful load produced.
     #[must_use]
-    pub fn new(image_path: PathBuf, loop_index: u32, mountpoint: PathBuf) -> Self {
+    pub fn new(
+        name: String,
+        image_path: PathBuf,
+        digest: [u8; 64],
+        loop_index: u32,
+        mountpoint: PathBuf,
+    ) -> Self {
         Self {
+            name,
             image_path,
+            digest,
             loop_index,
             mountpoint,
         }
+    }
+
+    /// The stable, off-box-reproducible image name (the declared boot-relative
+    /// path) the PCR-11 measure event folds in.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The verified SHA-512 digest the PCR-11 measure reuses (FIX-02 — no
+    /// re-hash).
+    #[must_use]
+    pub fn digest(&self) -> &[u8; 64] {
+        &self.digest
     }
 
     /// The bound loop minor (`/dev/loop{N}`).
@@ -99,6 +136,26 @@ impl DriverImagesHandle {
     #[must_use]
     pub fn len(&self) -> usize {
         self.images.len()
+    }
+
+    /// The ordered PCR-11 measure refs for the loaded set (#28): one
+    /// `{name, digest}` per image, in load order, reusing the verified digest
+    /// (FIX-02 — no re-hash). Threaded through the kexec handoff into
+    /// `tpm::measure::extend_handoff` as measure event #4.
+    ///
+    /// `secure-boot`-gated because the measure type only exists under the
+    /// feature; an empty handle (the only thing a non-secure-boot build can
+    /// produce — FIX-05) yields an empty Vec anyway.
+    #[cfg(feature = "secure-boot")]
+    #[must_use]
+    pub fn measure_refs(&self) -> Vec<crate::tpm::measure::DriverImageRef> {
+        self.images
+            .iter()
+            .map(|img| crate::tpm::measure::DriverImageRef {
+                name: img.name().to_string(),
+                digest: *img.digest(),
+            })
+            .collect()
     }
 }
 

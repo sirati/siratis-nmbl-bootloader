@@ -37,6 +37,7 @@ use crate::activation::KeyInjection;
 use crate::config::Config;
 use crate::error::Result;
 use crate::generations::Generation;
+use crate::imageload::DriverImagesHandle;
 use crate::log;
 use crate::sys::cpio::{InjectionEntry, build_fragment};
 use crate::{nmbl_info, nmbl_warn};
@@ -260,6 +261,7 @@ pub(crate) fn verify_measure_then_load(
     generation: &Generation,
     cmdline_override: Option<&str>,
     key_injections: &[KeyInjection],
+    driver_images: &DriverImagesHandle,
 ) -> Result<String> {
     let handoff = Handoff {
         cmdline: build_cmdline(generation, cmdline_override, &config.paths.system_root),
@@ -318,14 +320,22 @@ pub(crate) fn verify_measure_then_load(
         );
     }
 
-    // (b) #27 MEASURE: extend PCR-11 with the verified handoff HERE — AFTER
+    // (b) #27/#28 MEASURE: extend PCR-11 with the verified handoff HERE — AFTER
     // verify, BEFORE load (FIX-14). The extend reuses the kernel+initrd
     // digests the verify already streamed over the pinned fds (FIX-02 — no
-    // re-hash) and binds `handoff.cmdline` (the byte-exact buffer the load
-    // below consumes). Gated on the measure posture: a NO-OP when measuring
-    // is off; a measure failure on a measure-required build fails CLOSED
-    // (routes to refuse, never an unmeasured boot — FIX-27).
-    super::handoff_load::measure_handoff(config, generation, verified.as_ref(), &handoff.cmdline)?;
+    // re-hash), binds `handoff.cmdline` (the byte-exact buffer the load below
+    // consumes), and folds the ORDERED driver-image refs the loader verified
+    // (#28 — name‖digest per loaded image, no re-hash). Gated on the measure
+    // posture: a NO-OP when measuring is off; a measure failure on a
+    // measure-required build fails CLOSED (routes to refuse, never an unmeasured
+    // boot — FIX-27).
+    super::handoff_load::measure_handoff(
+        config,
+        generation,
+        verified.as_ref(),
+        &handoff.cmdline,
+        driver_images,
+    )?;
 
     let Handoff { cmdline } = handoff;
 

@@ -22,15 +22,23 @@ use crate::sig::{self, DOMAIN_DRIVER_IMAGE, PolicyDecision};
 
 use super::locate::ResolvedImage;
 
-/// Verify the driver image referred to by `image_fd` against its sidecar and
-/// apply the signing policy.
+/// Verify the driver image referred to by `image_fd` against its sidecar, apply
+/// the signing policy, AND return the SHA-512 digest the verify streamed over
+/// the pinned fd (#28).
 ///
 /// `image_fd` is the single pinned fd opened by `locate::open_image_ro`; the
 /// bytes hashed here are exactly the bytes the loop device will serve to the
-/// kernel (FIX-02). On a [`PolicyDecision::Proceed`] returns `Ok(())`; on a
-/// [`PolicyDecision::Refuse`] returns the verify error wrapped as a
+/// kernel (FIX-02). On a [`PolicyDecision::Proceed`] returns `Ok(digest)` — the
+/// verified digest the caller threads into the PCR-11 measure ref (no re-hash);
+/// on a [`PolicyDecision::Refuse`] returns the verify error wrapped as a
 /// `verify`-stage [`NmblError::DriverImage`] so the caller can route it through
 /// `refuse_unsigned` (R-1).
+///
+/// In the (insecure, opt-in) audit posture a verify FAILURE is downgraded to a
+/// warning and the load proceeds; there is then no honest digest, so this hands
+/// back the SHA-512 it nonetheless streamed over the fd. An audit boot is not a
+/// measure-required boot (the gate refuses measure-required-but-unverified
+/// upstream — FIX-27), so that digest is never actually measured.
 ///
 /// # Errors
 /// [`NmblError::DriverImage`] (`stage = "verify"`) when enforcement refuses the
@@ -39,13 +47,15 @@ pub(super) fn verify_driver_image(
     image_fd: BorrowedFd<'_>,
     resolved: &ResolvedImage,
     config: &Config,
-) -> Result<()> {
+) -> Result<[u8; 64]> {
     let desc = resolved.image_path.display().to_string();
 
     // Run the frozen fd-only verify pipeline under the driver-image role
     // domain — a signature minted for any other role cannot verify here
-    // (domain-cross-reject, FIX-01).
-    let verify_result = sig::verify_image_fd(
+    // (domain-cross-reject, FIX-01). The digest variant hands back the SHA-512
+    // the verify already streamed over the single pinned fd so the PCR-11
+    // measure reuses it (FIX-02 — one hash, verify + measure).
+    let verify_result = sig::verify_image_fd_digest(
         image_fd,
         &desc,
         Some(&resolved.sig_path),
@@ -53,15 +63,23 @@ pub(super) fn verify_driver_image(
         config,
     );
 
-    // Map the verify result through the operator's enforce/audit posture. There
-    // is NO allow-unsigned branch (FIX-04): apply_policy only ever proceeds on a
-    // pass, or (audit only) downgrades a failure to a warning.
-    match sig::apply_policy(config, verify_result) {
-        PolicyDecision::Proceed => Ok(()),
-        PolicyDecision::Refuse(cause) => Err(NmblError::DriverImage {
-            stage: "verify",
-            source: Box::new(cause),
-        }),
+    // On a verified pass we already hold the digest; reuse it (FIX-02 — no
+    // re-hash). On a failure, hand the error to the enforce/audit gate — NO
+    // allow-unsigned branch (FIX-04): apply_policy only proceeds on a pass, or
+    // (audit only) downgrades a failure to a warning. For the audit-proceed case
+    // the verify consumed its digest into the error path, so re-stream the fd
+    // once to hand back a digest; that boot is never measure-required (FIX-27
+    // refuses measure-required-but-unverified upstream), so the value is never
+    // folded into PCR-11.
+    match verify_result {
+        Ok(digest) => Ok(digest),
+        Err(err) => match sig::apply_policy(config, Err(err)) {
+            PolicyDecision::Proceed => crate::util::hash::sha512_fd(image_fd).map(|(d, _len)| d),
+            PolicyDecision::Refuse(cause) => Err(NmblError::DriverImage {
+                stage: "verify",
+                source: Box::new(cause),
+            }),
+        },
     }
 }
 

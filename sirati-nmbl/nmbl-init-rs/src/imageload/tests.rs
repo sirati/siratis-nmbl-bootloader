@@ -55,12 +55,16 @@ fn handle_preserves_load_order() {
     // pin that push() preserves declared order.
     let mut handle = DriverImagesHandle::empty();
     handle.push(DriverImageHandle::new(
+        "a.sfs".to_string(),
         PathBuf::from("/run/nmbl-boot/a.sfs"),
+        [0xaau8; 64],
         7,
         PathBuf::from("/run/nmbl-driver-images/0"),
     ));
     handle.push(DriverImageHandle::new(
+        "b.sfs".to_string(),
         PathBuf::from("/run/nmbl-boot/b.sfs"),
+        [0xbbu8; 64],
         9,
         PathBuf::from("/run/nmbl-driver-images/1"),
     ));
@@ -69,12 +73,46 @@ fn handle_preserves_load_order() {
     let first = imgs.first().expect("first image");
     let second = imgs.get(1).expect("second image");
     assert_eq!(first.loop_index(), 7);
+    assert_eq!(first.name(), "a.sfs");
+    assert_eq!(first.digest(), &[0xaau8; 64]);
     assert_eq!(first.image_path(), PathBuf::from("/run/nmbl-boot/a.sfs"));
     assert_eq!(second.loop_index(), 9);
     assert_eq!(
         second.mountpoint(),
         PathBuf::from("/run/nmbl-driver-images/1")
     );
+}
+
+/// #28: `measure_refs()` projects the ordered handle into the PCR-11 measure
+/// refs — one `{name, digest}` per image, in LOAD order, reusing the verified
+/// digest (no re-hash). The name is the declared boot-relative path, not the
+/// runtime-prefixed absolute path.
+#[cfg(feature = "secure-boot")]
+#[test]
+fn measure_refs_carry_name_and_digest_in_order() {
+    let mut handle = DriverImagesHandle::empty();
+    handle.push(DriverImageHandle::new(
+        "nic.sfs".to_string(),
+        PathBuf::from("/run/nmbl-boot/nic.sfs"),
+        [0x11u8; 64],
+        7,
+        PathBuf::from("/run/nmbl-driver-images/0"),
+    ));
+    handle.push(DriverImageHandle::new(
+        "gpu.sfs".to_string(),
+        PathBuf::from("/run/nmbl-boot/gpu.sfs"),
+        [0x22u8; 64],
+        9,
+        PathBuf::from("/run/nmbl-driver-images/1"),
+    ));
+    let refs = handle.measure_refs();
+    assert_eq!(refs.len(), 2);
+    let first = refs.first().expect("first ref");
+    let second = refs.get(1).expect("second ref");
+    assert_eq!(first.name, "nic.sfs");
+    assert_eq!(first.digest, [0x11u8; 64]);
+    assert_eq!(second.name, "gpu.sfs");
+    assert_eq!(second.digest, [0x22u8; 64]);
 }
 
 /// The security keystone for #23: an enforce-mode image with a bad/absent
