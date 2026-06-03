@@ -547,6 +547,26 @@ let
             };
           };
 
+          # ---- bootstrap (external) config — REQUIRED by driver images -------
+          # The driver-image loader resolves the boot-relative image path against
+          # the RUNTIME boot mountpoint, which only exists once Phase 0.5
+          # (bootstrap mode) mounts /boot. In legacy embedded-config mode there is
+          # no runtime boot mountpoint, so the loader refuses ("driver images
+          # require bootstrap mode") and NMBL reboots into rescue. So this config
+          # MUST run external/bootstrap: the initramfs ships only bootstrap.toml,
+          # the full config.toml + the signed driver squashfs live on the ESP, and
+          # Phase 0.5 mounts it first. On the disko-luks layout the ESP is vda2
+          # (vda1 = BIOS-boot, vda3 = LUKS).
+          boot.nmbl.configLocation = "external";
+          boot.nmbl.bootstrap.bootFs.device = "/dev/vda2";
+          boot.nmbl.bootstrap.kernelModules.explicit = [
+            "virtio_pci"
+            "virtio_blk"
+            "vfat"
+            "nls_cp437"
+            "nls_iso8859_1"
+          ];
+
           # ---- cryptroot opened with the install PASSPHRASE -----------------
           # (so the boot reaches the post-kexec system the assertion queries —
           # the real config's tpm-unlock cryptroot would never open here).
