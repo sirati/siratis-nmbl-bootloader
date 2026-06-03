@@ -64,11 +64,32 @@ let
     # (FIX-40). `false` in the skeleton, so the default build is unchanged.
     ++ lib.optional stagedBootActive "staged-boot";
 
+  # Baked trust-anchor keys threaded into the /init binary (R-5/FIX-17).
+  # Each `boot.nmbl.signing.publicKeys` path is paired with the single
+  # configured `algorithm` (all baked keys share the algorithm; the
+  # per-key length is asserted Rust-side). Empty unless the operator
+  # configured keys — measure-only builds legitimately bake none.
+  signingCfg = config.boot.nmbl.signing or { enable = false; enforce = false; publicKeys = [ ]; algorithm = "ml-dsa-65"; };
+  algName =
+    if (signingCfg.algorithm or "ml-dsa-65") == "ml-dsa-87" then "MlDsa87" else "MlDsa65";
+  publicKeys = map (p: { path = p; alg = algName; }) (signingCfg.publicKeys or [ ]);
+
+  # Signature ENFORCEMENT is active ⇒ the baked-key set is MANDATORY, so a
+  # zero-key build is rejected (FIX-24). Measure-only / audit-only builds keep
+  # this false so they can build with no keys.
+  requireKeys = (signingCfg.enable or false) && (signingCfg.enforce or false);
+
   # Resolved /init binary used by the initramfs builder. Identity-equal
-  # to the prebuilt `nmblInit` / `nmblInitSplash` in the single-feature
-  # cases so Nix's store-path dedup keeps the existing CI cache hot.
+  # to the prebuilt `nmblInit` / `nmblInitSplash` in the single-feature,
+  # keyless cases so Nix's store-path dedup keeps the existing CI cache
+  # hot. STRUCTURED selection (FIX-17): whenever baked keys are configured
+  # we ALWAYS route through `mkNmblInit { publicKeys }`, regardless of the
+  # splash/stateful feature mix, so a splash or stateful build never silently
+  # drops the trust anchor.
   selectedNmblInit =
-    if nmblFeatures == [ ] then
+    if publicKeys != [ ] then
+      mkNmblInit { features = nmblFeatures; inherit publicKeys requireKeys; }
+    else if nmblFeatures == [ ] then
       nmblInit
     else if nmblFeatures == [ "image-splash" ] then
       nmblInitSplash
