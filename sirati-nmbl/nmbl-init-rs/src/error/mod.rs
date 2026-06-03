@@ -180,6 +180,16 @@ pub enum NmblError {
     /// `refuse_unsigned` turns it into a `RebootIntoRescue` (R-1).
     #[error("signature verification failed at {stage}: {detail}")]
     Signature { stage: &'static str, detail: String },
+
+    /// A TPM 2.0 transport or protocol failure: the `/dev/tpmrm0`
+    /// transact failed (IO), a marshal/unmarshal step rejected the
+    /// frame, or — critically — the TPM returned a NON-success response
+    /// code (FIX-27). `context` names the operation ("pcr_extend",
+    /// "pcr_read", "transact", …); `reason` carries the wire/RC detail.
+    /// The cap path treats every such failure as fail-closed
+    /// (`CapOutcome::Failed`), never as a benign no-TPM.
+    #[error("tpm protocol error ({context}): {reason}")]
+    TpmProto { context: String, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, NmblError>;

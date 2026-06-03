@@ -139,6 +139,10 @@ pub(super) fn suggested_action(err: &NmblError) -> String {
             "Signature verification failed at {stage}: {detail}. The image is unsigned, \
              tampered, or signed by a non-baked key — boot refused."
         ),
+        NmblError::TpmProto { context, reason } => format!(
+            "TPM operation '{context}' failed: {reason}. The lock PCR could not be \
+             confirmed capped; the boot fails closed."
+        ),
     }
 }
 

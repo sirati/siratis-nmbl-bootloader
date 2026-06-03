@@ -32,6 +32,12 @@ pub mod splash;
 pub mod state;
 pub mod sys;
 pub mod terminal;
+/// TPM 2.0 cap/transport/presence core. ALWAYS compiled (no `secure-boot`
+/// gate — FIX-09): the lock-on-rescue guard's PCR-cap and the deterministic
+/// `/dev/tpmrm0` presence latch are needed even when `secure-boot` is OFF.
+/// The cost is the non-optional, pure-Rust `tpm2-protocol` dep; the
+/// `secure-boot`-only measure path (`tpm/measure.rs`) lands later, gated.
+pub mod tpm;
 pub mod ui;
 /// Small shared primitives. `util::hex` is ungated; `util::hash` is gated
 /// `any(network-rescue, secure-boot)` (it `use`s the optional `sha2` dep).
