@@ -634,12 +634,25 @@
         installSubdir = "enroll";
         runner = secureBootEnrollRunner;
       };
+      # The clean NEGATIVE twin of signed-gen-happy. It boots the SAME
+      # passphrase-unlock ENROLL twin (same install-signed generation, cryptroot
+      # opens with the install passphrase) so the boot actually REACHES NMBL's
+      # generation verify — the only difference from signed-gen-happy is that the
+      # generation's signature is TAMPERED on the staged disk, so verify FAILS and
+      # NMBL refuses → reboot-into-rescue. Pointing at the real tpm-unlock config
+      # here would never enrol a token in this standalone scenario, so cryptroot
+      # would never open and verify would never run (the bad gen would not be
+      # refused — it would simply never be reached).
       checkSbBadSigRefused = mkSbScenarioCheck {
         scenario = "bad-sig-refused";
         script = "sb-bad-sig-refused.sh";
-        # The bad-sig scenario tampers a pristine disk copy (removes a sidecar
-        # off the FAT32 boot partition), so it needs libguestfs. NMBL_SB_DISK is
-        # set to the install-runtime-signed disk by mkSbScenarioCheck above.
+        installer = secureBootEnrollInstaller;
+        installBin = "sb-install-test-secure-boot-enroll";
+        installSubdir = "enroll";
+        runner = secureBootEnrollRunner;
+        # The bad-sig scenario tampers a staged disk copy (corrupts a sidecar on
+        # the FAT32 boot partition), so it needs libguestfs. NMBL_SB_DISK is set
+        # to the install-runtime-signed ENROLL disk by mkSbScenarioCheck above.
         extraInputs = [ pkgs.libguestfs-with-appliance ];
       };
     in
