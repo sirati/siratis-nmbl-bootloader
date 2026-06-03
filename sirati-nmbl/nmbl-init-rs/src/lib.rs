@@ -19,10 +19,12 @@ pub mod rescue;
 /// Always compiled so the Nix↔Rust round-trip test runs in every build.
 pub mod security_consts;
 pub mod shell;
-/// Signature-verification subsystem (secure/staged-boot). F1 skeleton: a
-/// no-op scaffold proving the `secure-boot` feature's deps link; the real
-/// verify pipeline lands in F2.
-#[cfg(feature = "secure-boot")]
+/// Signature-verification subsystem (secure/staged-boot). The module is
+/// ALWAYS compiled because its `wire` leaf — the sidecar wire format shared
+/// byte-for-byte with the host signer — must link in the default build
+/// (FIX-25). Everything else inside (`alg`/`sidecar`/the verify facade) is
+/// `#[cfg(feature = "secure-boot")]` and carries the frozen #12 API; the real
+/// verify bodies land in #14/#15.
 pub mod sig;
 #[cfg(feature = "image-splash")]
 pub mod splash;

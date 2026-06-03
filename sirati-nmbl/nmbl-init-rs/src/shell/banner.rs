@@ -135,6 +135,10 @@ pub(super) fn suggested_action(err: &NmblError) -> String {
             "state.bin at {} did not round-trip through encode/decode; refusing to overwrite.",
             path.display()
         ),
+        NmblError::Signature { stage, detail } => format!(
+            "Signature verification failed at {stage}: {detail}. The image is unsigned, \
+             tampered, or signed by a non-baked key — boot refused."
+        ),
     }
 }
 
