@@ -20,6 +20,12 @@
 //! later and is feature-gated; nothing here is.
 
 pub mod commands;
+/// PCR-11 measured-boot handoff (#27). `secure-boot`-gated — it depends on the
+/// streaming SHA-256 over the verified inputs and is only reachable from the
+/// signature-gated boot path. Everything else in this subtree is
+/// always-compiled (FIX-09); only this extend path is feature-gated.
+#[cfg(feature = "secure-boot")]
+pub mod measure;
 pub mod presence;
 pub mod transport;
 

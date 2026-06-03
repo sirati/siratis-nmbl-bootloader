@@ -120,6 +120,24 @@ fn verify_proceeds_when_signing_disabled() {
 }
 
 #[test]
+fn measure_off_is_a_noop() {
+    // tpm.measure = false (and, on secure-boot builds, secure_boot.enable =
+    // false) ⇒ measure_handoff is a NO-OP: it returns Ok without touching the
+    // TPM, regardless of whether a verified generation is present. This is the
+    // measure-OFF posture (R-8).
+    let cfg = config_signing_disabled();
+    assert!(
+        !measure_required(&cfg),
+        "measure must be off for a bare config"
+    );
+    let g = gen_for(&["root=/dev/sda1"]);
+    assert!(
+        measure_handoff(&cfg, &g, None, "init=/sbin/init").is_ok(),
+        "measure-off must be a no-op even with no verified generation",
+    );
+}
+
+#[test]
 fn handoff_cmdline_is_the_buffer_that_is_loaded() {
     // FIX-14: the cmdline the measure seam carries (Handoff::cmdline) is
     // built once and is the SAME buffer destructured for the load. This
@@ -215,6 +233,40 @@ mod secure_boot {
         assert!(
             verify_generation_signature(&cfg, &g).is_ok(),
             "audit mode must proceed past a missing signature",
+        );
+    }
+
+    /// FIX-27 fail-closed: a measure-REQUIRED build (`tpm.measure = true`) with
+    /// NO verified generation must REFUSE (PolicyRefused), never proceed to an
+    /// unmeasured boot. This is the "measure required but inputs not verified"
+    /// guard — it fires before any TPM access, so it is deterministic on a
+    /// TPM-less test box.
+    #[test]
+    fn measure_required_without_verified_generation_refuses() {
+        let cfg = toml::from_str::<Config>("[tpm]\nmeasure = true\n")
+            .expect("config with tpm.measure parses");
+        assert!(
+            measure_required(&cfg),
+            "tpm.measure = true ⇒ measure required"
+        );
+        let g = gen_for(&["root=/dev/sda1"]);
+        let err = measure_handoff(&cfg, &g, None, "init=/sbin/init")
+            .expect_err("measure required + unverified ⇒ refuse");
+        assert!(
+            matches!(err, NmblError::PolicyRefused { .. }),
+            "expected PolicyRefused for an unmeasurable required boot, got {err:?}",
+        );
+    }
+
+    /// The measure posture is also required when the secure-boot priority gate
+    /// is enabled (R-8), independent of `tpm.measure`.
+    #[test]
+    fn secure_boot_enable_requires_measure() {
+        let cfg = toml::from_str::<Config>("[secure_boot]\nenable = true\nenforce = true\n")
+            .expect("config with secure_boot.enable parses");
+        assert!(
+            measure_required(&cfg),
+            "secure_boot.enable = true ⇒ measure required",
         );
     }
 
