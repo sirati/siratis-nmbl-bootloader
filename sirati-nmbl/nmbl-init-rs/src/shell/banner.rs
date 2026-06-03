@@ -147,6 +147,10 @@ pub(super) fn suggested_action(err: &NmblError) -> String {
             "TPM operation '{context}' failed: {reason}. The lock PCR could not be \
              confirmed capped; the boot fails closed."
         ),
+        NmblError::PolicyRefused { cause } => format!(
+            "Boot refused by secure-boot policy ({cause}). The TPM is locked and the \
+             system reboots into rescue; fix the image or signature and reboot."
+        ),
     }
 }
 

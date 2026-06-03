@@ -50,7 +50,7 @@ pub(crate) async fn dispatch_emergency_choice(
                     // Picker session done (shell exited, detached, or cancelled); re-show menu.
                     None
                 }
-                Err(e) => Some(refuse_on_seal_failure(e)),
+                Err(e) => Some(refuse_on_seal_failure(e, config, sender).await),
             }
         }
         #[cfg(feature = "pretty-shell")]
@@ -60,7 +60,7 @@ pub(crate) async fn dispatch_emergency_choice(
                     run_pretty_shell_choice(sealed, console, app, error_count, config).await;
                     None
                 }
-                Err(e) => Some(refuse_on_seal_failure(e)),
+                Err(e) => Some(refuse_on_seal_failure(e, config, sender).await),
             }
         }
         EmergencyChoice::RetryBoot => {
@@ -79,24 +79,27 @@ pub(crate) async fn dispatch_emergency_choice(
     }
 }
 
-/// Divert to a NON-INTERACTIVE terminal action when the seal fails
-/// (FIX-27): a present-but-uncappable TPM, a `requireTpm` box with no
-/// TPM, or a mapper that will not close. NEVER offer a shell.
+/// Divert to a NON-INTERACTIVE refuse when the seal fails (FIX-27): a
+/// present-but-uncappable TPM, a `requireTpm` box with no TPM, or a mapper
+/// that will not close. NEVER offer a shell.
 ///
-/// SEAM: once `policy/relock.rs` lands (F4c), this becomes
-/// `policy::refuse_unsigned(config, cause) -> TerminalAction::RebootIntoRescue`,
-/// whose constructor itself takes/produces a `Sealed` so the refuse
-/// countdown is reachable only after a successful seal. Until then we
-/// fail closed with a halt banner carrying the seal-failure chain — no
-/// shell, no interactive context.
-pub(crate) fn refuse_on_seal_failure(err: crate::policy::SealFailed) -> TerminalAction {
+/// Routes through [`crate::policy::refuse_unsigned`] (M1): even on a
+/// `SealFailed`, `relock_and_refuse` runs (BEST-EFFORT cap, then
+/// close-mappers + relock + sentinel) and yields the type-gated
+/// [`TerminalAction::RebootIntoRescue`] — the correct safe outcome (the
+/// imminent reboot is the real lock boundary). The `Sealed` witness is
+/// minted by the best-effort seal inside `relock_and_refuse`, so the
+/// refuse countdown is reachable only after that teardown.
+pub(crate) async fn refuse_on_seal_failure(
+    err: crate::policy::SealFailed,
+    config: &Config,
+    sender: &LocalSender,
+) -> TerminalAction {
     nmbl_warn!(
-        "seal-on-rescue failed; refusing to open a shell: {}",
+        "seal-on-rescue failed; refusing to open a shell, relocking and rebooting into rescue: {}",
         format_chain(err.cause() as &dyn std::error::Error)
     );
-    TerminalAction::HaltWithBanner {
-        cause: err.into_cause(),
-    }
+    crate::policy::refuse_unsigned(config, err.into_cause(), sender).await
 }
 
 /// Handle the [`EmergencyChoice::RawShell`] picker arm: run the in-process
