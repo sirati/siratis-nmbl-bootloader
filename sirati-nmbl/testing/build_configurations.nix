@@ -567,6 +567,17 @@ let
             "nls_iso8859_1"
           ];
 
+          # ---- loop + squashfs — REQUIRED to loop-mount the driver image -----
+          # The driver-image loader binds the verified squashfs to a loop device
+          # (`/dev/loop-control`) and mounts it `squashfs`-typed. Unlike the rescue
+          # path it does NOT modprobe these on demand, so they must already be in
+          # the kernel. Load them EARLY (phase 2a) so they are present before the
+          # driver-image hook runs (which is right after the early-module load).
+          boot.nmbl.earlyKernelModules = [
+            "loop"
+            "squashfs"
+          ];
+
           # ---- cryptroot opened with the install PASSPHRASE -----------------
           # (so the boot reaches the post-kexec system the assertion queries —
           # the real config's tpm-unlock cryptroot would never open here).
