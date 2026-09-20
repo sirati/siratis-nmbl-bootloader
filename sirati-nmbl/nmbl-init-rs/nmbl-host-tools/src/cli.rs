@@ -8,7 +8,7 @@
 //! nmbl-sign sign-image …            (an alias of `sign`)
 //! ```
 //!
-//! `--domain <role>` selects one of the six frozen verifier roles (see
+//! `--domain <role>` selects one of the seven frozen verifier roles (see
 //! [`crate::domain::role_tokens`]). The parser is intentionally tiny and
 //! flag-order-independent; every malformed invocation returns a [`SignError::Usage`]
 //! that `main` prints alongside [`USAGE`].
@@ -31,7 +31,7 @@ USAGE:
 
 ALG:    ml-dsa-65 | ml-dsa-87
 ROLE:   gen-kernel | gen-initrd | driver-image | staged-fragment |
-        priority-file | rescue-sfs
+        priority-file | rescue-sfs | boot-config
 OUT:    sidecar path; defaults to <INPUT>.sig
 
 Writes detached NMBLSIG1 sidecars verified by nmbl-init's signature pipeline.";

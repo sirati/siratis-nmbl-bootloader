@@ -65,6 +65,8 @@ pub const DOMAIN_STAGED_FRAGMENT: &[u8] = b"nmbl:staged-fragment:v1";
 pub const DOMAIN_PRIORITY_FILE: &[u8] = b"nmbl:priority-file:v1";
 /// Domain for the rescue squashfs signature.
 pub const DOMAIN_RESCUE_SFS: &[u8] = b"nmbl:rescue-sfs:v1";
+/// Domain for the external full boot configuration.
+pub const DOMAIN_BOOT_CONFIG: &[u8] = b"nmbl:boot-config:v1";
 
 /// How strictly a verify call treats a missing or unparseable sidecar.
 ///

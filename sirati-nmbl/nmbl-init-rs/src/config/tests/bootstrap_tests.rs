@@ -254,6 +254,26 @@ mountpoint = "/mnt/boot"
     assert_eq!(cfg.bootstrap.boot_fs.device, "/dev/sda1");
 }
 
+#[cfg(feature = "secure-boot")]
+#[test]
+fn bootstrap_parses_external_config_signature_path() {
+    let toml = r#"
+[bootstrap]
+config_path = "/nmbl/config.toml"
+config_signature = "/nmbl/config.toml.sig"
+
+[bootstrap.boot_fs]
+device = "/dev/sda1"
+fstype = "vfat"
+mountpoint = "/mnt/boot"
+"#;
+    let config: BootstrapConfig = toml::from_str(toml).expect("valid bootstrap config");
+    assert_eq!(
+        config.bootstrap.config_signature,
+        Some(PathBuf::from("/nmbl/config.toml.sig")),
+    );
+}
+
 #[test]
 fn bootstrap_load_missing_file_is_bootstrap_load_toml_error() {
     use std::error::Error;
@@ -303,6 +323,8 @@ fn bootstrap_validate_rejects_url_without_sha() {
     let cfg = BootstrapConfig {
         bootstrap: BootstrapSection {
             config_path: default_bootstrap_config_path(),
+            #[cfg(feature = "secure-boot")]
+            config_signature: None,
             boot_fs: BootstrapBootFs {
                 device: "/dev/sda1".to_string(),
                 fstype: "vfat".to_string(),
@@ -334,6 +356,8 @@ fn bootstrap_validate_rejects_sha_without_url() {
     let cfg = BootstrapConfig {
         bootstrap: BootstrapSection {
             config_path: default_bootstrap_config_path(),
+            #[cfg(feature = "secure-boot")]
+            config_signature: None,
             boot_fs: BootstrapBootFs {
                 device: "/dev/sda1".to_string(),
                 fstype: "vfat".to_string(),
@@ -388,6 +412,8 @@ fn bootstrap_validate_accepts_both_empty_and_both_set() {
     let mk = |url: &str, sha: &str| BootstrapConfig {
         bootstrap: BootstrapSection {
             config_path: default_bootstrap_config_path(),
+            #[cfg(feature = "secure-boot")]
+            config_signature: None,
             boot_fs: BootstrapBootFs {
                 device: "/dev/sda1".to_string(),
                 fstype: "vfat".to_string(),

@@ -27,6 +27,12 @@ pub struct BootstrapSection {
     #[serde(default = "default_bootstrap_config_path")]
     pub config_path: PathBuf,
 
+    /// Detached signature for `config_path`. Its presence makes verification
+    /// mandatory before any bytes from the writable boot partition are parsed.
+    #[cfg(feature = "secure-boot")]
+    #[serde(default)]
+    pub config_signature: Option<PathBuf>,
+
     pub boot_fs: BootstrapBootFs,
 
     #[serde(default)]

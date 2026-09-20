@@ -130,6 +130,32 @@ pub(super) async fn run_bootstrap_phase(
         "phase 0.5: loading full config from {}",
         full_path.display()
     );
+    #[cfg(feature = "secure-boot")]
+    let mut config = if let Some(signature) = &section.config_signature {
+        let signature_path = resolve_full_config_path(&boot_fs.mountpoint, signature);
+        let text = nmbl_init::sig::boot_config::load_verified(&full_path, &signature_path)
+            .map_err(|source| NmblError::Bootstrap {
+                stage: "verify-config",
+                source: Box::new(source),
+            })?;
+        let config =
+            Config::parse_toml(&text, &full_path).map_err(|source| NmblError::Bootstrap {
+                stage: "read-config",
+                source: Box::new(source),
+            })?;
+        config.validate().map_err(|source| NmblError::Bootstrap {
+            stage: "read-config",
+            source: Box::new(source),
+        })?;
+        config
+    } else {
+        Config::load(&full_path).map_err(|source| NmblError::Bootstrap {
+            stage: "read-config",
+            source: Box::new(source),
+        })?
+    };
+
+    #[cfg(not(feature = "secure-boot"))]
     let mut config = Config::load(&full_path).map_err(|source| NmblError::Bootstrap {
         stage: "read-config",
         source: Box::new(source),
