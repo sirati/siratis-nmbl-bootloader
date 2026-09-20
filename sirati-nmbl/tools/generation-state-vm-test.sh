@@ -94,7 +94,7 @@ printf X | dd of="$work/tampered-tree/nmbl-generations/generations/$first/nix.er
   bs=1 seek=8192 conv=notrunc status=none
 make_disk "$work/tampered-tree" "$work/tampered.raw" NMBLSTORE
 cp -a "$work/store-tree" "$work/unsigned-tree"
-rm "$work/unsigned-tree/nmbl-generations/generations/$first/nix.erofs.sig"
+rm -f "$work/unsigned-tree/nmbl-generations/generations/$first/nix.erofs.sig"
 make_disk "$work/unsigned-tree" "$work/unsigned.raw" NMBLSTORE
 
 nix-store -qR "$artifacts" @signer@ @ctl@ @receive@ @deploy@ > "$work/closure-paths"
