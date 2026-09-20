@@ -165,71 +165,10 @@
       '';
       nmblErofsReceiveCheck = pkgs.runCommand "nmbl-erofs-receive-check" {
         nativeBuildInputs = [ pkgs.python3 ];
-      } ''
-        mkdir -p "$TMPDIR/keys" "$TMPDIR/incoming" "$TMPDIR/root"
-        ${nmblSign}/bin/nmbl-sign keygen --alg ml-dsa-65 \
-          --out-priv "$TMPDIR/keys/private" --out-pub "$TMPDIR/keys/public"
-        printf first > "$TMPDIR/first.erofs"
-        printf second > "$TMPDIR/second.erofs"
-        first=$(${nmblErofsCtl}/bin/nmbl-erofsctl prepare \
-          "$TMPDIR/first.erofs" "$TMPDIR/keys/private" "$TMPDIR/first")
-        second=$(${nmblErofsCtl}/bin/nmbl-erofsctl prepare \
-          "$TMPDIR/second.erofs" "$TMPDIR/keys/private" "$TMPDIR/second")
-        send() {
-          bundle=$1; config=$2; image_sig=$3; config_sig=$4; reboot=0
-          printf 'NMBL-EROFS-BUNDLE-2\n%s\n%s\n%s\n0\n%s\n%s\n%s\n%s\n' \
-            "$(cat "$bundle/generation")" "$(stat -c %s "$bundle/nix.erofs")" \
-            "$(stat -c %s "$image_sig")" "$(sha512sum "$config" | cut -d' ' -f1)" \
-            "$(stat -c %s "$config")" "$(stat -c %s "$config_sig")" "$reboot"
-          cat "$bundle/nix.erofs" "$image_sig" "$config" "$config_sig"
-        }
-        printf 'first config' > "$TMPDIR/first.config"
-        printf 'second config' > "$TMPDIR/second.config"
-        for name in first second; do
-          ${nmblSign}/bin/nmbl-sign sign --key "$TMPDIR/keys/private" --domain boot-config \
-            --out "$TMPDIR/$name.config.sig" "$TMPDIR/$name.config" >/dev/null
-        done
-        cp "$TMPDIR/second/nix.erofs.sig" "$TMPDIR/bad-image.sig"
-        cp "$TMPDIR/second.config.sig" "$TMPDIR/bad-config.sig"
-        chmod u+w "$TMPDIR/bad-image.sig" "$TMPDIR/bad-config.sig"
-        python3 - "$TMPDIR/bad-image.sig" "$TMPDIR/bad-config.sig" <<'PY'
-        import pathlib, sys
-        for name in sys.argv[1:]:
-            path = pathlib.Path(name)
-            value = bytearray(path.read_bytes())
-            value[40] ^= 0xff
-            path.write_bytes(value)
-        PY
-        send "$TMPDIR/first" "$TMPDIR/first.config" "$TMPDIR/first/nix.erofs.sig" \
-          "$TMPDIR/first.config.sig" | ${nmblErofsReceive}/bin/nmbl-erofs-receive \
-          "$TMPDIR/incoming" "$TMPDIR/root" "$TMPDIR/keys/public"
-        test "$(readlink "$TMPDIR/root/active")" = "generations/$first"
-        test "$(cat "$TMPDIR/root/active/config.toml")" = 'first config'
-        reject_unchanged() {
-          if ${nmblErofsReceive}/bin/nmbl-erofs-receive \
-            "$TMPDIR/incoming" "$TMPDIR/root" "$TMPDIR/keys/public"; then exit 1; fi
-          test "$(readlink "$TMPDIR/root/active")" = "generations/$first"
-          test "$(cat "$TMPDIR/root/active/config.toml")" = 'first config'
-        }
-        send "$TMPDIR/second" "$TMPDIR/second.config" "$TMPDIR/bad-image.sig" \
-          "$TMPDIR/second.config.sig" | reject_unchanged
-        send "$TMPDIR/second" "$TMPDIR/second.config" "$TMPDIR/second/nix.erofs.sig" \
-          "$TMPDIR/bad-config.sig" | reject_unchanged
-        send "$TMPDIR/second" "$TMPDIR/second.config" "$TMPDIR/second/nix.erofs.sig" \
-          "$TMPDIR/second.config.sig" | ${nmblErofsReceive}/bin/nmbl-erofs-receive \
-          "$TMPDIR/incoming" "$TMPDIR/root" "$TMPDIR/keys/public"
-        test "$(readlink "$TMPDIR/root/active")" = "generations/$second"
-        test "$(cat "$TMPDIR/root/active/config.toml")" = 'second config'
-        python3 - "$TMPDIR/keys/private" "$TMPDIR/root" ${nmblErofsReceive} <<'PY'
-        import pathlib, sys
-        secret = pathlib.Path(sys.argv[1]).read_bytes()
-        for root in map(pathlib.Path, sys.argv[2:]):
-            for path in ([root] if root.is_file() else root.rglob("*")):
-                if path.is_file() and secret in path.read_bytes():
-                    raise SystemExit(f"private key leaked into {path}")
-        PY
-        touch "$out"
-      '';
+      } (builtins.replaceStrings
+        [ "@sign@" "@ctl@" "@receive@" "@scanner@" ]
+        [ (toString nmblSign) (toString nmblErofsCtl) (toString nmblErofsReceive) "${./testing/scan-private-key.py}" ]
+        (builtins.readFile ./testing/erofs-receive-check.sh));
       lib = nixpkgs.lib;
       rootStoreEvalSystem = import ./testing/generation-state-vm/configuration.nix {
         inherit nixpkgs system;

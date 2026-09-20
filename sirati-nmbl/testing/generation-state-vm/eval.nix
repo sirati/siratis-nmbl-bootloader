@@ -1,4 +1,4 @@
-{ source, publicKeyPath, publicKeyHash }:
+{ source, publicKeyPath, publicKeyHash, rootStore ? false, variant ? 1 }:
 
 let
   flake = builtins.getFlake "path:${source}";
@@ -10,7 +10,7 @@ let
   system = import ./configuration.nix {
     nixpkgs = flake.inputs.nixpkgs;
     nmblModule = flake.nixosModules.default;
-    inherit publicKey;
+    inherit publicKey rootStore variant;
   };
   build = system.config.system.build;
   pkgs = flake.inputs.nixpkgs.legacyPackages.x86_64-linux;

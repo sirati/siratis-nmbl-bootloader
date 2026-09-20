@@ -13,11 +13,38 @@ head -c 64 /dev/urandom | base64 > "$marker"
 [[ "$private" != /nix/store/* && $(stat -f -c %T "$operator") = tmpfs ]]
 
 public_hash=$(nix hash path --type sha256 "$public")
-artifacts=$(nix build --no-link --print-out-paths \
-  --file @eval@ --argstr source @source@ \
-  --argstr publicKeyPath "$public" --argstr publicKeyHash "$public_hash")
+export NMBL_PUBLIC_KEY="$public"
+scan_targets=(@source@)
+closure_paths=(@signer@ @ctl@ @receive@ @deploy@)
 
-cat > "$work/flake.nix" <<'EOF'
+make_disk() {
+  local tree=$1 disk=$2 label=$3 size
+  size=$(( $(du -sm "$tree" | cut -f1) + 512 ))
+  truncate -s "${size}M" "$disk"
+  mkfs.ext4 -q -F -L "$label" -d "$tree" "$disk"
+  e2fsck -fn "$disk" >/dev/null
+}
+
+prepare_layout() {
+  local root_store=$2 dir="$work/$1"
+  local state_tree state_root invalid_label artifacts first second third
+  mkdir -p "$dir/boot-tree" "$dir/root-tree" "$dir/store-tree"
+  if [[ "$root_store" == true ]]; then
+    state_tree="$dir/root-tree"
+    invalid_label=NMBLROOT
+  else
+    state_tree="$dir/store-tree"
+    invalid_label=NMBLSTORE
+  fi
+  state_root="$state_tree/nmbl-generations"
+
+  artifacts=$(nix build --no-link --print-out-paths \
+    --file @eval@ --argstr source @source@ \
+    --argstr publicKeyPath "$public" --argstr publicKeyHash "$public_hash" \
+    --arg rootStore "$root_store")
+  ln -s "$artifacts" "$dir/artifacts"
+
+  cat > "$dir/flake.nix" <<EOF
 {
   inputs.nmbl.url = "path:@source@";
   inputs.nixpkgs.follows = "nmbl/nixpkgs";
@@ -27,87 +54,84 @@ cat > "$work/flake.nix" <<'EOF'
         path = builtins.getEnv "NMBL_PUBLIC_KEY";
         name = "nmbl-generation-state-vm-public.key";
       };
-      generation = import "${nmbl}/testing/generation-state-vm/configuration.nix" {
-        inherit publicKey;
+      generation = variant: import "\${nmbl}/testing/generation-state-vm/configuration.nix" {
+        inherit publicKey variant;
         nmblModule = nmbl.nixosModules.default;
         inherit nixpkgs;
+        rootStore = $root_store;
       };
-    in { nixosConfigurations.generation = generation; };
+    in { nixosConfigurations = {
+      first = generation 1;
+      second = generation 2;
+      third = generation 3;
+    }; };
 }
 EOF
-export NMBL_PUBLIC_KEY="$public"
-root="$work/store-tree/nmbl-generations"
-mkdir -p "$work/boot-tree/nmbl" "$work/store-tree"
-cat > "$work/test-ssh" <<EOF
+  cat > "$dir/test-ssh" <<EOF
 #!/bin/sh
 set -eu
 test "\$1" = --; shift
 test "\$1" = generation-test-target; shift
 test "\$1" = nmbl-erofs-receive
-exec @receive@/bin/nmbl-erofs-receive "$work/incoming" "$root" "$public"
+exec @receive@/bin/nmbl-erofs-receive "$dir/incoming" "$state_root" "$public"
 EOF
-chmod 0700 "$work/test-ssh"
-first=$(NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$work/test-ssh" \
-  @deploy@/bin/nmbl-erofs-deploy remote \
-  "path:$work#nixosConfigurations.generation" "$private" generation-test-target | tail -n1)
+  chmod 0700 "$dir/test-ssh"
+  first=$(NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
+    @deploy@/bin/nmbl-erofs-deploy remote \
+    "path:$dir#nixosConfigurations.first" "$private" generation-test-target | tail -n1)
+  second=$(NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
+    @deploy@/bin/nmbl-erofs-deploy remote \
+    "path:$dir#nixosConfigurations.second" "$private" generation-test-target | tail -n1)
+  third=$(NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
+    @deploy@/bin/nmbl-erofs-deploy remote \
+    "path:$dir#nixosConfigurations.third" "$private" generation-test-target | tail -n1)
+  test "$first" != "$second"
+  test "$second" != "$third"
+  test "$first" != "$third"
+  printf '%s\n' "$first" > "$dir/boot-tree/nmbl-test-first"
+  printf '%s\n' "$second" > "$dir/boot-tree/nmbl-test-second"
+  printf '%s\n' "$third" > "$dir/boot-tree/nmbl-test-third"
 
-make_extra_generation() {
-  local bytes=$1 name=$2
-  local image="$work/$name.erofs" bundle="$work/$name-bundle"
-  cp "$artifacts/generation.erofs" "$image"; chmod u+w "$image"; truncate -s "+$bytes" "$image"
-  @ctl@/bin/nmbl-erofsctl prepare "$image" "$private" "$bundle" | tail -n1
-  @ctl@/bin/nmbl-erofsctl install "$bundle" "$root" >/dev/null
+  @ctl@/bin/nmbl-erofsctl activate "$first" "$state_root" >/dev/null
+
+  make_disk "$dir/boot-tree" "$dir/boot.raw" NMBLBOOT
+  make_disk "$dir/root-tree" "$dir/root.raw" NMBLROOT
+  make_disk "$dir/store-tree" "$dir/store.raw" NMBLSTORE
+  cp -a "$state_tree" "$dir/tampered-tree"
+  chmod u+w "$dir/tampered-tree/nmbl-generations/generations/$first/nix.erofs"
+  printf X | dd of="$dir/tampered-tree/nmbl-generations/generations/$first/nix.erofs" \
+    bs=1 seek=8192 conv=notrunc status=none
+  make_disk "$dir/tampered-tree" "$dir/tampered.raw" "$invalid_label"
+  cp -a "$state_tree" "$dir/unsigned-tree"
+  rm -f "$dir/unsigned-tree/nmbl-generations/generations/$first/nix.erofs.sig"
+  make_disk "$dir/unsigned-tree" "$dir/unsigned.raw" "$invalid_label"
+
+  printf '%s\n' "$first" "$second" "$third" > "$dir/generation-ids"
+  scan_targets+=("$dir/flake.nix" "$artifacts" "$dir/boot-tree" "$dir/root-tree"
+    "$dir/store-tree" "$dir/boot.raw" "$dir/root.raw" "$dir/store.raw"
+    "$dir/tampered.raw" "$dir/unsigned.raw")
+  closure_paths+=("$artifacts")
 }
-second=$(make_extra_generation 4096 second)
-third=$(make_extra_generation 8192 third)
-printf '%s\n' "$first" > "$work/boot-tree/nmbl-test-first"
-printf '%s\n' "$second" > "$work/boot-tree/nmbl-test-second"
-printf '%s\n' "$third" > "$work/boot-tree/nmbl-test-third"
 
-cp "$root/active/config.toml" "$work/boot-tree/nmbl/config.toml"
-cp "$root/active/config.toml.sig" "$work/boot-tree/nmbl/config.toml.sig"
-cp "$artifacts/rescue.sfs" "$work/boot-tree/nmbl-rescue.sfs"
-chmod u+w "$work/boot-tree/nmbl-rescue.sfs"
-@signer@/bin/nmbl-sign sign --key "$private" --domain rescue-sfs \
-  "$work/boot-tree/nmbl-rescue.sfs" --out "$work/boot-tree/nmbl-rescue.sfs.sig"
-gen_id=$(basename "$(readlink -f "$artifacts/toplevel")")
-mkdir -p "$work/boot-tree/nmbl/sigs/$gen_id"
-@signer@/bin/nmbl-sign sign --key "$private" --domain gen-kernel \
-  "$artifacts/toplevel/kernel" --out "$work/boot-tree/nmbl/sigs/$gen_id/kernel.sig"
-@signer@/bin/nmbl-sign sign --key "$private" --domain gen-initrd \
-  "$artifacts/toplevel/initrd" --out "$work/boot-tree/nmbl/sigs/$gen_id/initrd.sig"
-
-make_disk() {
-  local tree=$1 disk=$2 label=$3 size
-  size=$(( $(du -sm "$tree" | cut -f1) + 512 ))
-  truncate -s "${size}M" "$disk"
-  mkfs.ext4 -q -F -L "$label" -d "$tree" "$disk"
-  e2fsck -fn "$disk" >/dev/null
+run_layout() {
+  local target=$2 dir="$work/$1"
+  readarray -t ids < "$dir/generation-ids"
+  python3 @harness@ --qemu @qemu@ --kernel "$dir/artifacts/kernel" \
+    --initrd "$dir/artifacts/initrd" --boot "$dir/boot.raw" \
+    --tampered "$dir/tampered.raw" --unsigned "$dir/unsigned.raw" \
+    --root "$dir/root.raw" --store "$dir/store.raw" --store-target "$target" \
+    --first "${ids[0]}" --second "${ids[1]}" --third "${ids[2]}" \
+    --transcript "$dir/happy.log"
 }
-mkdir "$work/root-tree"
-make_disk "$work/boot-tree" "$work/boot.raw" NMBLBOOT
-make_disk "$work/root-tree" "$work/root.raw" NMBLROOT
-make_disk "$work/store-tree" "$work/store.raw" NMBLSTORE
-cp -a "$work/store-tree" "$work/tampered-tree"
-chmod u+w "$work/tampered-tree/nmbl-generations/generations/$first/nix.erofs"
-printf X | dd of="$work/tampered-tree/nmbl-generations/generations/$first/nix.erofs" \
-  bs=1 seek=8192 conv=notrunc status=none
-make_disk "$work/tampered-tree" "$work/tampered.raw" NMBLSTORE
-cp -a "$work/store-tree" "$work/unsigned-tree"
-rm -f "$work/unsigned-tree/nmbl-generations/generations/$first/nix.erofs.sig"
-make_disk "$work/unsigned-tree" "$work/unsigned.raw" NMBLSTORE
 
-nix-store -qR "$artifacts" @signer@ @ctl@ @receive@ @deploy@ > "$work/closure-paths"
+prepare_layout persistent false
+prepare_layout root true
+
+nix-store -qR "${closure_paths[@]}" > "$work/closure-paths"
 mapfile -t closure < "$work/closure-paths"
-python3 @scanner@ "$private" "$marker" @source@ "$work/flake.nix" "$artifacts" \
-  "$work/boot-tree" "$work/boot.raw" "$work/root.raw" \
-  "$work/store-tree" "$work/store.raw" \
-  "$work/tampered.raw" "$work/unsigned.raw" "${closure[@]}"
+python3 @scanner@ "$private" "$marker" "${scan_targets[@]}" "${closure[@]}"
 test ! -e "$private"
 
-python3 @harness@ --qemu @qemu@ --kernel "$artifacts/kernel" --initrd "$artifacts/initrd" \
-  --boot "$work/boot.raw" --tampered "$work/tampered.raw" --unsigned "$work/unsigned.raw" \
-  --root "$work/root.raw" --store "$work/store.raw" \
-  --first "$first" --second "$second" --third "$third" \
-  --transcript "$work/happy.log"
-echo "NMBL generation state-machine production VM test passed"
+run_layout persistent store
+run_layout root root
+echo "NMBL generation state-machine production VM tests passed (persistent and root stores)"

@@ -10,6 +10,9 @@ import time
 from pathlib import Path
 
 
+CONFIG_LOAD = "loading full config from /mnt/boot/nmbl-generations/active/config.toml"
+
+
 def wait_for(proc, patterns, timeout, transcript):
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ)
@@ -61,7 +64,7 @@ def stop(proc):
 
 def normal_boot(args, marker, transcript):
     proc = start(args, transcript)
-    wait_for(proc, ["NMBL_TARGET_READY", marker], 300, transcript)
+    wait_for(proc, [CONFIG_LOAD, "NMBL_TARGET_READY", marker], 300, transcript)
     proc.wait(timeout=30)
     return proc
 
@@ -76,7 +79,9 @@ def happy_path(args):
             proc = normal_boot(args, "NMBL_TESTED_FAILED", transcript)
 
             proc = start(args, transcript)
-            text = wait_for(proc, ["[nmbl] external rescue: mounting"], 240, transcript)
+            text = wait_for(
+                proc, [CONFIG_LOAD, "[nmbl] external rescue: mounting"], 240, transcript
+            )
             if "NMBL_TARGET_READY" in text:
                 raise RuntimeError("tested failure booted the target instead of rescue")
         finally:
@@ -84,12 +89,15 @@ def happy_path(args):
 
 
 def invalid_path(args, label):
-    args.store = getattr(args, label)
+    if args.store_target == "root":
+        args.root = getattr(args, label)
+    else:
+        args.store = getattr(args, label)
     expected = "signature" if label == "tampered" else "incomplete bundle"
     with Path(f"{args.transcript}-{label}").open("wb") as transcript:
         proc = start(args, transcript)
         try:
-            text = wait_for(proc, [expected], 240, transcript)
+            text = wait_for(proc, [CONFIG_LOAD, expected], 240, transcript)
             if "NMBL_TARGET_READY" in text:
                 raise RuntimeError(f"{label} generation reached the target system")
         finally:
@@ -101,6 +109,7 @@ def main():
     for name in ("qemu", "kernel", "initrd", "boot", "store", "tampered", "unsigned", "root",
                  "first", "second", "third", "transcript"):
         parser.add_argument(f"--{name}", required=True)
+    parser.add_argument("--store-target", choices=("root", "store"), required=True)
     args = parser.parse_args()
     happy_path(args)
     invalid_path(args, "tampered")

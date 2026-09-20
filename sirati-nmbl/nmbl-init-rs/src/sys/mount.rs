@@ -118,6 +118,28 @@ pub fn mount_fs(source: Option<&Path>, target: &Path, fstype: &str, options: &st
     })
 }
 
+/// Reapply per-mount flags to an existing bind mount. Linux ignores flags
+/// such as `MS_RDONLY` and `MS_NOEXEC` on the initial `MS_BIND` operation;
+/// they take effect only through a bind remount.
+pub fn remount_bind(target: &Path, options: &str) -> Result<()> {
+    let (mut flags, data) = fold_options(options);
+    flags.insert(MsFlags::MS_BIND | MsFlags::MS_REMOUNT);
+    let data_opt: Option<&str> = if data.is_empty() { None } else { Some(&data) };
+    nix::mount::mount(
+        Option::<&Path>::None,
+        target,
+        Option::<&str>::None,
+        flags,
+        data_opt,
+    )
+    .map_err(|source| NmblError::Mount {
+        src: None,
+        dst: target.to_path_buf(),
+        fstype: "(remount-bind)".to_owned(),
+        source,
+    })
+}
+
 /// Mark an existing mount as a shared-subtree peer
 /// (`mount(NULL, target, NULL, MS_SHARED, NULL)`). The shared-subtree
 /// propagation calls take neither a source, an fstype, nor a data
@@ -200,6 +222,20 @@ mod tests {
     fn rbind_sets_bind_and_rec() {
         let (flags, _) = fold_options("rbind");
         assert_eq!(flags, MsFlags::MS_BIND | MsFlags::MS_REC);
+    }
+
+    #[test]
+    fn bind_security_flags_survive_option_folding() {
+        let (flags, data) = fold_options("bind,ro,noexec,nosuid,nodev");
+        assert_eq!(
+            flags,
+            MsFlags::MS_BIND
+                | MsFlags::MS_RDONLY
+                | MsFlags::MS_NOEXEC
+                | MsFlags::MS_NOSUID
+                | MsFlags::MS_NODEV
+        );
+        assert!(data.is_empty());
     }
 
     #[test]

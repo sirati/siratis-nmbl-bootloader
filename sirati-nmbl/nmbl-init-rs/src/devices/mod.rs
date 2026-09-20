@@ -232,6 +232,7 @@ pub async fn mount_system_filesystems(
     }
 
     for entry in &config.filesystems {
+        let bind_mount = entry_is_bind(entry);
         // Loop-backed entries (squashfs images etc.) name their backing
         // FILE as the device. That file lives on a filesystem mounted
         // earlier in this same cascade, so resolve an absolute device
@@ -246,20 +247,22 @@ pub async fn mount_system_filesystems(
         };
         let dev = resolved_dev.as_path();
 
-        let _ = reporter.set_phase(format!(
-            "phase 3b: waiting for {} -> {}",
-            dev.display(),
-            entry.mountpoint.display(),
-        ));
-        // Animate the wait so the operator sees the boot is alive (and an
-        // "elapsed / timeout" countdown) instead of a frozen phase label.
-        wait_for(
-            dev,
-            device_timeout,
-            "phase 3b: waiting for",
-            Some(&mut *reporter),
-        )
-        .await?;
+        if !bind_mount {
+            let _ = reporter.set_phase(format!(
+                "phase 3b: waiting for {} -> {}",
+                dev.display(),
+                entry.mountpoint.display(),
+            ));
+            // Animate the wait so the operator sees the boot is alive (and an
+            // "elapsed / timeout" countdown) instead of a frozen phase label.
+            wait_for(
+                dev,
+                device_timeout,
+                "phase 3b: waiting for",
+                Some(&mut *reporter),
+            )
+            .await?;
+        }
 
         let target = resolve_mountpoint(system_root, entry);
         ensure_dir(&target)?;
@@ -343,6 +346,9 @@ pub async fn mount_system_filesystems(
             }
             Err(e) => return Err(e),
         }
+        if bind_mount {
+            crate::sys::mount::remount_bind(&target, &mount_opts)?;
+        }
     }
 
     nmbl_info!("system filesystems mounted under {}", system_root.display());
@@ -366,6 +372,13 @@ fn entry_is_loop_backed(entry: &FilesystemEntry, resolved_device: &Path) -> bool
         ),
         Err(_) => false,
     }
+}
+
+fn entry_is_bind(entry: &FilesystemEntry) -> bool {
+    entry
+        .options
+        .split(',')
+        .any(|option| matches!(option, "bind" | "rbind"))
 }
 
 /// Allocate + configure a loop device backed by `file` (read-only) and
