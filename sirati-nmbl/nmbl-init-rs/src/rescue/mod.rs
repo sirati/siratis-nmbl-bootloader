@@ -30,6 +30,8 @@ pub mod verify;
 
 mod embedded;
 mod locate;
+#[cfg(feature = "secure-boot")]
+mod network_stage;
 mod types;
 
 pub use child::run_external_rescue_child;

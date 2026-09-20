@@ -121,7 +121,11 @@ let
   # `allKernelModules` -> `modulesClosure`) without entering NMBL's runtime
   # eager-load list.
   rescueDiskModules =
-    if cfg.rescue.mode == "external" then [ "loop" "squashfs" "overlay" ] else [ ];
+    if cfg.rescue.mode == "external" then
+      [ "loop" "squashfs" "overlay" ]
+      ++ lib.optional cfg.rescue.fullSystem.networkStage.enable "erofs"
+    else
+      [ ];
 
   # af_packet is required by the DHCP client (socket(AF_PACKET, SOCK_DGRAM,
   # ETH_P_IP)). Without this module the raw-socket DHCP exchange fails with
@@ -135,8 +139,9 @@ let
   # and af_packet (dhcpcd's AF_PACKET/BPF socket). These are NOT loaded
   # into NMBL's own kernel/initramfs — NMBL does not need them. Instead
   # they are built into a SEPARATE module closure against NMBL's exact
-  # kernel (`rescueModuleClosure` below) and shipped inside the rescue
-  # squashfs, where the rescue `/init` modprobes them itself after
+  # kernel (`rescueModuleClosure` below) and shipped in the signed networking
+  # EROFS when enabled (or the legacy rescue squashfs otherwise), where the
+  # rescue `/init` modprobes them itself after
   # switch_root (the running kernel is still NMBL's, so `uname -r`
   # matches the staged tree). ext4's deps (mbcache, jbd2) and each NIC
   # driver's transport deps are pulled into the closure automatically.
@@ -156,7 +161,8 @@ let
     (lib.getOutput "modules" cfg.kernelPackage)
   ];
 
-  # Module closure for the rescue squashfs, built against NMBL's exact
+  # Module closure for the rescue networking image (or legacy rescue squashfs),
+  # built against NMBL's exact
   # kernel so `uname -r` after switch_root matches `/lib/modules/<kver>`.
   # `firmware` pulls in only the blobs the staged modules reference
   # (makeModulesClosure extracts per-module firmware requests), so passing
@@ -181,6 +187,19 @@ let
     firmwareName = "nmbl-rescue-firmware";
     allowMissing = true;
   };
+
+  nmblNetworkStage = import ./network-stage.nix {
+    inherit pkgs lib cfg;
+    moduleClosure = rescueModuleClosure;
+  };
+
+  rescueStageInstaller =
+    if cfg.rescue.fullSystem.networkStage.enable then
+      import ./rescue-stage-installer.nix {
+        inherit pkgs lib cfg nmblRescueSquashfs nmblNetworkStage nmblSign;
+      }
+    else
+      null;
 
   # Import kernel modules management module. The rescue full-system
   # modules are deliberately NOT in extraExplicitModules: NMBL must not
@@ -241,7 +260,8 @@ let
     inherit pkgs lib;
     contents = cfg.rescue.squashfsContents;
     fullSystem = {
-      inherit (cfg.rescue.fullSystem) enable packages sshdPort rootAuthorizedKeys;
+      inherit (cfg.rescue.fullSystem) enable packages sshdPort rootAuthorizedKeys hostKeyPath;
+      networkStage = cfg.rescue.fullSystem.networkStage;
       # NIC drivers the recovery /init modprobes ITSELF after switch_root.
       # NMBL no longer preloads them — the .ko + firmware ship in the
       # squashfs (moduleClosure below), and the running kernel is still
@@ -254,7 +274,8 @@ let
       # staged into the squashfs root). null when there is nothing to load
       # (fullSystem disabled or non-external), in which case rescue-sfs.nix
       # skips the modprobe + staging.
-      moduleClosure = rescueModuleClosure;
+      moduleClosure =
+        if cfg.rescue.fullSystem.networkStage.enable then null else rescueModuleClosure;
     };
   };
 
@@ -592,6 +613,12 @@ in
     # regardless of mode), but only staged onto the boot partition when
     # `cfg.rescue.mode == "external"` — see install-bootloader.nix.
     system.build.nmblRescueSquashfs = nmblRescueSquashfs;
+    system.build.nmblNetworkStage = lib.mkIf
+      cfg.rescue.fullSystem.networkStage.enable
+      nmblNetworkStage;
+    system.build.nmblRescueStageInstaller = lib.mkIf
+      cfg.rescue.fullSystem.networkStage.enable
+      rescueStageInstaller;
 
     # Expose the pure driver-image squashfs derivations (#25a) for store-path
     # introspection. Each record is `{ name; sfs; destPath; sigDest; }`; the
@@ -693,6 +720,8 @@ in
         configLocation
         nmblConfigToml
         nmblRescueSquashfs
+        nmblNetworkStage
+        rescueStageInstaller
         ;
       nmblUki = config.system.build.nmblUki;
       # Install-time driver-image staging + `nmbl-sign` signing shell (#25a).

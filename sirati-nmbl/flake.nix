@@ -94,6 +94,29 @@
       # installer / operator can run it once after first boot; it is asserted
       # ABSENT from the initramfs closure by lib/config.nix.
       nmblTpmEnroll = import ./lib/tpm-enroll.nix { inherit pkgs lib; };
+      networkStageVmTest = pkgs.writeShellApplication {
+        name = "test-network-stage-vm";
+        runtimeInputs = with pkgs; [
+          cpio
+          dracut
+          e2fsprogs
+          erofs-utils
+          file
+          findutils
+          gzip
+          nix
+          openssh
+          python3
+          qemu_kvm
+          squashfsTools
+          xz
+          zstd
+        ];
+        text = builtins.replaceStrings
+          [ "@source@" "@harness@" "@qemu@" ]
+          [ "${self}" "${./testing/network-stage-vm/harness.py}" "${pkgs.qemu_kvm}/bin/qemu-system-x86_64" ]
+          (builtins.readFile ./testing/network-stage-vm/run.sh);
+      };
       lib = nixpkgs.lib;
 
       # Import rescue-vm-test app directly
@@ -852,6 +875,13 @@
       };
     in
     {
+      lib.mkNetworkStageVmConfig =
+        { publicKey }:
+        import ./testing/network-stage-vm/configuration.nix {
+          inherit nixpkgs publicKey system;
+          nmblModule = self.nixosModules.default;
+        };
+
       # The main NixOS module
       nixosModules.default =
         {
@@ -916,6 +946,7 @@
         # driver squashfs is pure, signed at install runtime from a staged PATH,
         # so no signing key is in its closure.
         test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;
+        test-network-stage-vm = networkStageVmTest;
       };
 
       # Build-only validation gates surfaced for CI / `nix flake check`-style
@@ -953,6 +984,10 @@
       # `<start>-<target>-<interaction>` naming.
       apps.${system} = testApps // {
         test-rescue-ssh = rescueVmTestApp;
+        test-network-stage-vm = {
+          type = "app";
+          program = "${networkStageVmTest}/bin/test-network-stage-vm";
+        };
         check-log-import = {
           type = "app";
           program = "${checkLogImport}/bin/check-log-import";

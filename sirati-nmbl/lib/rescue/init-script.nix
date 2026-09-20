@@ -20,6 +20,7 @@
   openssh,
   utilLinux,
   rescueModprobes,
+  networkStageEnabled,
 }:
 ''
     #!${bash}/bin/bash
@@ -64,18 +65,18 @@
     # squashfs (on demand) so it can loop-mount this blob. Everything the
     # recovery system needs — overlay + ext4 (the writable scratch),
     # af_packet (dhcpcd's BPF socket) and the NIC drivers — is shipped in
-    # this squashfs at /lib/modules/$(uname -r) and modprobe'd HERE. Done
+    # the signed networking stage (or legacy squashfs) and modprobe'd HERE. Done
     # before the ext4 scratch / overlays / networking below, which depend
     # on these modules. /sys is mounted above, so firmware_class exists.
     #
-    # Point the kernel's firmware loader at the squashfs /lib/firmware
+    # Point the kernel's firmware loader at the configured firmware tree
     # FIRST, so a NIC driver that requests firmware at modprobe time (wifi)
     # finds its blob. Best-effort: the sysfs knob is absent if
     # CONFIG_FW_LOADER_USER_HELPER is off, but the in-kernel loader also
     # searches /lib/firmware by default, so the override is belt-and-braces.
-    log "pointing firmware loader at /lib/firmware"
+    log "pointing firmware loader at ${if networkStageEnabled then "/nmbl-network/lib/firmware" else "/lib/firmware"}"
     if [ -w /sys/module/firmware_class/parameters/path ]; then
-      ${coreutils}/bin/printf '%s' /lib/firmware \
+      ${coreutils}/bin/printf '%s' ${if networkStageEnabled then "/nmbl-network/lib/firmware" else "/lib/firmware"} \
         > /sys/module/firmware_class/parameters/path 2>/dev/null \
         || log "WARNING: could not set firmware_class search path"
     fi
