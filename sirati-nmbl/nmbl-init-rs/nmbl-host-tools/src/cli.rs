@@ -100,18 +100,23 @@ fn parse_verify(args: &[String]) -> Result<Command> {
             "--domain" => domain = Some(parse_domain(next(&mut it, "--domain")?)?),
             "--sig" => signature = Some(PathBuf::from(next(&mut it, "--sig")?)),
             other if other.starts_with("--") => {
-                return Err(SignError::Usage(format!("verify: unexpected flag `{other}`")));
+                return Err(SignError::Usage(format!(
+                    "verify: unexpected flag `{other}`"
+                )));
             }
             positional if input.is_none() => input = Some(PathBuf::from(positional)),
-            _ => return Err(SignError::Usage("verify: more than one input file given".into())),
+            _ => {
+                return Err(SignError::Usage(
+                    "verify: more than one input file given".into(),
+                ));
+            }
         }
     }
     Ok(Command::Verify {
         key: key.ok_or_else(|| SignError::Usage("verify: --key is required".into()))?,
         domain: domain.ok_or_else(|| SignError::Usage("verify: --domain is required".into()))?,
         input: input.ok_or_else(|| SignError::Usage("verify: an input file is required".into()))?,
-        signature: signature
-            .ok_or_else(|| SignError::Usage("verify: --sig is required".into()))?,
+        signature: signature.ok_or_else(|| SignError::Usage("verify: --sig is required".into()))?,
     })
 }
 
