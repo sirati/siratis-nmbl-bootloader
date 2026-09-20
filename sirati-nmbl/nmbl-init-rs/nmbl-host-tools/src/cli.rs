@@ -8,7 +8,7 @@
 //! nmbl-sign sign-image …            (an alias of `sign`)
 //! ```
 //!
-//! `--domain <role>` selects one of the seven frozen verifier roles (see
+//! `--domain <role>` selects one of the eight frozen verifier roles (see
 //! [`crate::domain::role_tokens`]). The parser is intentionally tiny and
 //! flag-order-independent; every malformed invocation returns a [`SignError::Usage`]
 //! that `main` prints alongside [`USAGE`].
@@ -31,7 +31,7 @@ USAGE:
 
 ALG:    ml-dsa-65 | ml-dsa-87
 ROLE:   gen-kernel | gen-initrd | driver-image | staged-fragment |
-        priority-file | rescue-sfs | boot-config
+        priority-file | rescue-sfs | boot-config | network-stage
 OUT:    sidecar path; defaults to <INPUT>.sig
 
 Writes detached NMBLSIG1 sidecars verified by nmbl-init's signature pipeline.";
@@ -170,7 +170,7 @@ fn parse_domain(token: String) -> Result<&'static [u8]> {
 )]
 mod tests {
     use super::*;
-    use nmbl_init::sig::DOMAIN_RESCUE_SFS;
+    use nmbl_init::sig::{DOMAIN_NETWORK_STAGE, DOMAIN_RESCUE_SFS};
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
@@ -215,6 +215,28 @@ mod tests {
                 key: PathBuf::from("/k/sk"),
                 domain: DOMAIN_RESCUE_SFS,
                 input: PathBuf::from("/img/rescue.sfs"),
+                out: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_network_stage_domain() {
+        let cmd = parse(&argv(&[
+            "sign",
+            "--key",
+            "/k/sk",
+            "--domain",
+            "network-stage",
+            "/img/network.erofs",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::Sign {
+                key: PathBuf::from("/k/sk"),
+                domain: DOMAIN_NETWORK_STAGE,
+                input: PathBuf::from("/img/network.erofs"),
                 out: None,
             }
         );

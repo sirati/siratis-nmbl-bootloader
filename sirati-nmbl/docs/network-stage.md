@@ -1,0 +1,57 @@
+# Rescue networking EROFS stage
+
+`boot.nmbl.rescue.fullSystem.networkStage.enable = true` moves the recovery
+kernel-module closure, firmware, and network policy out of
+`nmbl-rescue.sfs` into `/boot/nmbl/network.erofs`.
+
+The rescue squashfs contains a trusted marker naming the boot-relative EROFS
+path. Before the rescue child starts, NMBL:
+
+1. opens the EROFS once;
+2. verifies that pinned file descriptor under the distinct
+   `nmbl:network-stage:v1` ML-DSA domain;
+3. loads the minimal `erofs` filesystem module from the initramfs;
+4. binds the same descriptor read-only to a loop device; and
+5. mounts it at `/rescue/nmbl-network` with `nodev,nosuid,noexec`.
+
+The rescue then loads its filesystem, packet, and NIC modules with
+`modprobe -d /nmbl-network`. Firmware requests use
+`/nmbl-network/lib/firmware`. The data-only `network.conf` selects all or a
+fixed list of interfaces and one of `dual-stack`, `ipv4-only`, or `ipv6-only`.
+It is parsed as fixed directives and is never executed as shell code.
+
+The stage requires enforced NMBL signing. Build with only the operator public
+key, then run the generated production installer on the target or from an
+operator environment that can write its boot filesystem:
+
+```console
+NMBL_BOOT_ROOT=/boot \
+NMBL_IMAGE_KEY_FILE=/secure/off-host/image.key \
+  /nix/store/...-nmbl-install-rescue-stage/bin/nmbl-install-rescue-stage
+```
+
+`system.build.nmblRescueStageInstaller` provides that command. It signs and
+atomically installs both `nmbl-rescue.sfs` and `network.erofs` under their
+separate signature domains. The private key path must be outside `/nix/store`.
+Setting `signing.imageKeyFile` supplies the default imperative path;
+`NMBL_IMAGE_KEY_FILE` overrides it without making the key a Nix input.
+
+Remote rescue also requires `rescue.fullSystem.hostKeyPath`. This names an
+already-provisioned Ed25519 private key in NMBL's mount namespace, normally on
+a bootstrap-mounted persistent state volume. Rescue rejects a symlink, a
+missing key, non-root ownership, or any mode other than 0600; on rejection it
+keeps local console recovery available and does not start sshd. The key path,
+but never its contents, appears in the generated rescue init script.
+
+Boot artifacts use an atomic install-if-changed helper. Identical kernel,
+initramfs, config, rescue, splash, and networking blobs are left untouched,
+which avoids rewriting a large boot blob on an ordinary configuration switch.
+
+Run `nix run .#test-network-stage-vm` for the production-flow VM test. Its
+outer harness creates a one-use ML-DSA key in private tmpfs, evaluates Nix with
+only the derived public key, invokes the production installer, and deletes the
+private key before booting. It scans evaluated sources, store closures, initrd,
+rescue/network images, signatures, and boot disks for the exact key bytes and a
+random secret marker. The suite boots valid, tampered, and unsigned images.
+Rejected networking stages keep the signed local rescue console available but
+start neither networking nor SSH.

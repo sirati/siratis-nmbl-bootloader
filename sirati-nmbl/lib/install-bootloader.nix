@@ -23,6 +23,8 @@
   nmblConfigToml,
   nmblRescueSquashfs,
   nmblUki,
+  nmblNetworkStage ? null,
+  rescueStageInstaller ? null,
   # Install-time driver-image staging + `nmbl-sign` signing shell (#25a).
   # Empty string when no driver images are enabled (default keeps older
   # callers evaluable).
@@ -69,6 +71,12 @@ let
     inherit lib cfg nmblConfigToml nmblSign deferInstallSigning;
   };
 
+  networkStageInstallShell = lib.optionalString
+    cfg.rescue.fullSystem.networkStage.enable
+    (import ./install-network-stage.nix {
+      inherit lib cfg deferInstallSigning rescueStageInstaller;
+    });
+
   # Resolve the cryptsetup the activation plan uses (prefer the static
   # build, same as lib/modules/activation.nix's `tryStatic`). Handed to
   # `--validate-hardware` so the read-only LUKS-header probe uses the
@@ -87,6 +95,8 @@ in
 pkgs.writeScript "install-nmbl-bootloader" ''
   #!${pkgs.runtimeShell}
   set -e
+
+  ${import ./install-file-shell.nix { inherit pkgs; }}
 
   echo "Installing NMBL bootloader..."
   echo "  Partition Table: ${bootstrapper.partition_table}"
@@ -137,8 +147,8 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     # EFI/BOOT/BOOTX64.EFI, so no separate files belong on the ESP.
     echo "Copying NMBL bootloader files to /boot..."
     mkdir -p /boot
-    cp -f "$KERNEL" /boot/nmbl-kernel
-    cp -f "$INITRD" /boot/nmbl-initrd
+    install_nmbl_file_if_changed "$KERNEL" /boot/nmbl-kernel 0644
+    install_nmbl_file_if_changed "$INITRD" /boot/nmbl-initrd 0644
     echo "✓ Bootloader files installed: /boot/nmbl-kernel, /boot/nmbl-initrd"
   ''}
 
@@ -153,7 +163,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
 
   ${lib.optionalString (configLocation == "external") externalConfigInstallShell}
 
-  ${lib.optionalString (cfg.rescue.mode == "external") (
+  ${lib.optionalString (cfg.rescue.mode == "external" && !cfg.rescue.fullSystem.networkStage.enable) (
     let
       # `cfg.rescue.sfsPath` is interpreted relative to the boot mount
       # by the Rust /init; strip a leading slash so the host-side
@@ -170,10 +180,12 @@ pkgs.writeScript "install-nmbl-bootloader" ''
       # live in the squashfs and are loop-mounted on the emergency
       # path.
       echo "Staging NMBL rescue squashfs to ${escapedDest}..."
-      install -D -m 0644 ${nmblRescueSquashfs} ${escapedDest}
+      install_nmbl_file_if_changed ${nmblRescueSquashfs} ${escapedDest} 0644
       echo "✓ Rescue squashfs installed: ${escapedDest}"
     ''
   )}
+
+  ${networkStageInstallShell}
 
   # Optional signed driver-image squashfs blobs (#25a). Each is staged onto
   # the ESP and signed in place with `nmbl-sign --domain driver-image`
@@ -209,7 +221,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
       # missing file degrades to a solid background at runtime — it never
       # blocks boot — but we still install it here so the image renders.
       echo "Staging NMBL splash background to ${escapedDest}..."
-      install -D -m 0644 ${cfg.splash.backgroundImage} ${escapedDest}
+      install_nmbl_file_if_changed ${cfg.splash.backgroundImage} ${escapedDest} 0644
       echo "✓ Splash background installed: ${escapedDest}"
     ''
   )}

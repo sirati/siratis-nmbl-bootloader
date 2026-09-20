@@ -40,5 +40,5 @@ let
       [ ];
 in
 {
-  imports = securityModules;
+  imports = [ ./rescue-network-stage.nix ] ++ securityModules;
 }

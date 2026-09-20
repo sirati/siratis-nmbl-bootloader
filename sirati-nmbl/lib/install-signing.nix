@@ -234,7 +234,7 @@ let
         || { echo "ERROR: sbverify of the signed UKI failed." >&2; rm -f "$uki_signed"; exit 1; }
 
       mkdir -p /boot/${efiStubDir}
-      cp -f "$uki_signed" ${ukiEspDest}
+      install_nmbl_file_if_changed "$uki_signed" ${ukiEspDest} 0644
       rm -f "$uki_signed"
       echo "✓ Signed NMBL UKI installed at ${ukiEspDest}"
     '';
@@ -242,7 +242,7 @@ let
   # Unsigned install (default / unchanged behaviour).
   ukiUnsignedShell = ''
     mkdir -p /boot/${efiStubDir}
-    cp -f ${nmblUki} ${ukiEspDest}
+    install_nmbl_file_if_changed ${nmblUki} ${ukiEspDest} 0644
     echo "✓ NMBL UKI installed at ${ukiEspDest}"
   '';
 

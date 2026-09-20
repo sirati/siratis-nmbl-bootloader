@@ -121,6 +121,11 @@ pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'stati
     let loop_dev = PathBuf::from(format!("/dev/loop{index}"));
     mount_overlay_root(&loop_dev)?;
 
+    #[cfg(feature = "secure-boot")]
+    if let Err(error) = super::network_stage::prepare(config) {
+        super::network_stage::disable(&error)?;
+    }
+
     Ok(Path::new(RESCUE_MOUNT))
 }
 

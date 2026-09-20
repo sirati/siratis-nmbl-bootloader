@@ -32,6 +32,7 @@
   dhcpcd,
   fullSystemPackagePaths,
   moduleClosurePath,
+  networkStageMarker ? "",
 }:
 
 let
@@ -90,6 +91,10 @@ let
       # resolves to the locked rev, fetched on demand from GitHub.
       cp ${nixRegistry}    root/etc/nix/registry.json
       cp ${sshdConfig}     root/etc/ssh/sshd_config
+      ${lib.optionalString (networkStageMarker != "") ''
+        printf '%s\n' ${lib.escapeShellArg networkStageMarker} \
+          > root/etc/nmbl-network-stage
+      ''}
       cp ${authorizedKeys} root/root/.ssh/authorized_keys
 
       # Login-shell PATH for interactive recovery sessions (SetEnv in
