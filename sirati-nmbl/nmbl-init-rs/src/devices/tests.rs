@@ -294,3 +294,11 @@ fn not_loop_backed_for_block_device_node() {
     let entry = fs_entry("/dev/null", "/x", false);
     assert!(!entry_is_loop_backed(&entry, dev_null));
 }
+
+#[test]
+fn bind_mount_detected_without_treating_source_as_device() {
+    let mut entry = fs_entry("/nix/var", "/nix/var", false);
+    entry.fstype = "none".to_string();
+    entry.options = "bind,ro,noexec,nosuid,nodev".to_string();
+    assert!(entry_is_bind(&entry));
+}

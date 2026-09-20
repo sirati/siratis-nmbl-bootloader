@@ -86,6 +86,9 @@ case "$cmd" in
       [[ ! -f "$bundle/system" ]] || install -m 0444 "$bundle/system" "$tmp/system"
       [[ ! -f "$bundle/config.toml" ]] || install -m 0444 "$bundle/config.toml" "$tmp/config.toml"
       [[ ! -f "$bundle/config.toml.sig" ]] || install -m 0444 "$bundle/config.toml.sig" "$tmp/config.toml.sig"
+      for extra in kernel.sig initrd.sig rescue.sfs rescue.sfs.sig network.erofs network.erofs.sig; do
+        [[ ! -f "$bundle/$extra" ]] || install -m 0444 "$bundle/$extra" "$tmp/$extra"
+      done
       printf '%s\n' "$id" > "$tmp/generation"; chmod 0444 "$tmp/generation"
       sync -f "$tmp/nix.erofs"; sync -f "$tmp/nix.erofs.sig"
       [[ ! -f "$tmp/config.toml" ]] || sync -f "$tmp/config.toml"

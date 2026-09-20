@@ -88,6 +88,14 @@ pub fn generation_sig_dir(config: &Config, generation: &Generation) -> Result<Pa
                      filesystem entry) to locate generation sidecars"
                 .to_string(),
         })?;
+    if let Some(store) = config
+        .generation_image
+        .as_ref()
+        .filter(|policy| policy.enable)
+        .and_then(|policy| policy.stage1_store.as_ref())
+    {
+        return Ok(boot.join(&store.relative_state_root).join("active"));
+    }
     let id = gen_id(generation)?;
     Ok(boot.join(SIGS_SUBDIR).join(id))
 }

@@ -48,11 +48,36 @@ if [[ "$mode" = local ]]; then
 else
   config=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
     "$installable.config.system.build.nmblConfigToml")
+  toplevel=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
+    "$installable.config.system.build.toplevel")
+  rescue=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
+    "$installable.config.system.build.nmblRescueSquashfs")
   signer=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
     "$installable.config.system.build.nmblSign")
   install -m 0444 "$config" "$bundle/config.toml"
   "$signer/bin/nmbl-sign" sign --key "$private_key" --domain boot-config \
     --out "$bundle/config.toml.sig" "$bundle/config.toml"
+  install -m 0444 "$toplevel/kernel" "$bundle/kernel"
+  install -m 0444 "$toplevel/initrd" "$bundle/initrd"
+  "$signer/bin/nmbl-sign" sign --key "$private_key" --domain gen-kernel \
+    --out "$bundle/kernel.sig" "$bundle/kernel"
+  "$signer/bin/nmbl-sign" sign --key "$private_key" --domain gen-initrd \
+    --out "$bundle/initrd.sig" "$bundle/initrd"
+  install -m 0444 "$rescue" "$bundle/rescue.sfs"
+  "$signer/bin/nmbl-sign" sign --key "$private_key" --domain rescue-sfs \
+    --out "$bundle/rescue.sfs.sig" "$bundle/rescue.sfs"
+  network_enabled=$(nix eval "${nix_args[@]}" --json \
+    "$installable.config.boot.nmbl.rescue.fullSystem.networkStage.enable")
+  network_size=0 network_signature_size=0
+  if [[ "$network_enabled" = true ]]; then
+    network=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
+      "$installable.config.system.build.nmblNetworkStage")
+    install -m 0444 "$network" "$bundle/network.erofs"
+    "$signer/bin/nmbl-sign" sign --key "$private_key" --domain network-stage \
+      --out "$bundle/network.erofs.sig" "$bundle/network.erofs"
+    network_size=$(stat -c %s "$bundle/network.erofs")
+    network_signature_size=$(stat -c %s "$bundle/network.erofs.sig")
+  fi
   config_id=$(sha512sum "$bundle/config.toml" | cut -d' ' -f1)
   remote_command=${NMBL_EROFS_REMOTE_COMMAND:-nmbl-erofs-receive}
   ssh_command=${NMBL_EROFS_SSH:-ssh}
@@ -67,13 +92,24 @@ else
   [[ ! -f "$payload/system" ]] || system_size=$(stat -c %s "$payload/system")
   config_size=$(stat -c %s "$bundle/config.toml")
   config_signature_size=$(stat -c %s "$bundle/config.toml.sig")
+  kernel_size=$(stat -c %s "$bundle/kernel")
+  kernel_signature_size=$(stat -c %s "$bundle/kernel.sig")
+  initrd_size=$(stat -c %s "$bundle/initrd")
+  initrd_signature_size=$(stat -c %s "$bundle/initrd.sig")
+  rescue_size=$(stat -c %s "$bundle/rescue.sfs")
+  rescue_signature_size=$(stat -c %s "$bundle/rescue.sfs.sig")
   {
-    printf 'NMBL-EROFS-BUNDLE-2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    printf 'NMBL-EROFS-BUNDLE-3\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
       "$generation" "$image_size" "$signature_size" "$system_size" \
-      "$config_id" "$config_size" "$config_signature_size" "$reboot"
+      "$config_id" "$config_size" "$config_signature_size" \
+      "$kernel_size" "$kernel_signature_size" "$initrd_size" "$initrd_signature_size" \
+      "$rescue_size" "$rescue_signature_size" "$network_size" "$network_signature_size" "$reboot"
     cat "$payload/nix.erofs" "$payload/nix.erofs.sig"
     [[ ! -f "$payload/system" ]] || cat "$payload/system"
     cat "$bundle/config.toml" "$bundle/config.toml.sig"
+    cat "$bundle/kernel" "$bundle/kernel.sig" "$bundle/initrd" "$bundle/initrd.sig"
+    cat "$bundle/rescue.sfs" "$bundle/rescue.sfs.sig"
+    [[ "$network_enabled" != true ]] || cat "$bundle/network.erofs" "$bundle/network.erofs.sig"
   } | "$ssh_command" -- "$destination" "$remote_command"
 fi
 printf '%s\n' "$generation"

@@ -4,6 +4,7 @@
   publicKey,
   system ? "x86_64-linux",
   rootStore ? false,
+  variant ? 1,
   signingAlgorithm ? "ml-dsa-65",
 }:
 
@@ -40,6 +41,12 @@ nixpkgs.lib.nixosSystem {
             done
             return 1
           }
+          assert_nix_var_flags() {
+            options=$(${pkgs.util-linux}/bin/findmnt -n -o OPTIONS /nix/var)
+            for option in ro noexec nosuid nodev; do
+              printf '%s\n' "$options" | ${pkgs.gnugrep}/bin/grep -Eq "(^|,)$option(,|$)"
+            done
+          }
           finish() {
             echo "$1" > /dev/ttyS0
             echo "$2" > /boot/nmbl-test-step
@@ -52,6 +59,7 @@ nixpkgs.lib.nixosSystem {
               test "$(pointer tested)" = "$first"
               test ! -e "$root/attempted"
               ${pkgs.util-linux}/bin/findmnt -n -t erofs /nix
+              assert_nix_var_flags
               ${config.system.build.nmblErofsCtl}/bin/nmbl-erofsctl activate "$second" "$root"
               finish NMBL_FIRST_BLESSED 1
               ;;
@@ -99,8 +107,9 @@ nixpkgs.lib.nixosSystem {
         enable = true;
         configLocation = "external";
         bootstrapper.bootMode = "qemu_kernel_invoke";
+        bootstrap.configPath = "/nmbl-generations/active/config.toml";
         bootstrap.bootFs = {
-          device = "/dev/vda";
+          device = if rootStore then "/dev/vdb" else "/dev/vdc";
           fstype = "ext4";
           options = "rw,nosuid,nodev,noexec";
           mountpoint = "/mnt/boot";
@@ -134,7 +143,7 @@ nixpkgs.lib.nixosSystem {
         };
         tpm = { measure = false; requireTpm = false; };
         rescue.mode = "external";
-        timeoutMillis = 250;
+        timeoutMillis = 250 + variant;
         kernelPackage = pkgs.linuxPackages_latest.kernel;
         kernelParams = [ "console=ttyS0,115200" ];
         serialConsole = "ttyS0,115200";
@@ -165,6 +174,12 @@ nixpkgs.lib.nixosSystem {
           fsType = "erofs";
           neededForBoot = true;
           options = [ "loop" "ro" ];
+        };
+        "/nix/var" = {
+          device = "/nix/var";
+          fsType = "none";
+          neededForBoot = true;
+          options = [ "bind" "ro" "noexec" "nosuid" "nodev" ];
         };
       };
 
@@ -199,7 +214,15 @@ nixpkgs.lib.nixosSystem {
 
       services.getty.autologinUser = "root";
       users.users.root.initialHashedPassword = "";
-      environment.systemPackages = [ config.system.build.nmblErofsCtl pkgs.util-linux ];
+      environment.systemPackages = [
+        config.system.build.nmblErofsCtl
+        pkgs.util-linux
+        (pkgs.writeTextFile {
+          name = "nmbl-generation-variant-${toString variant}";
+          destination = "/share/nmbl-generation-variant";
+          text = toString variant;
+        })
+      ];
       nix.enable = false;
       boot.loader.grub.enable = false;
       boot.loader.systemd-boot.enable = false;

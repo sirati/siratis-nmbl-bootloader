@@ -111,6 +111,8 @@ in
 
   config = lib.mkMerge [
     {
+      boot.nmbl.rescue.sfsPath = lib.mkIf cfg.enable "${relativeStateRoot}/active/rescue.sfs";
+      boot.nmbl.rescue.fullSystem.networkStage.imagePath = lib.mkIf cfg.enable "${relativeStateRoot}/active/network.erofs";
       assertions = lib.optionals cfg.enable [
         {
           assertion = signing.enable && signing.enforce;
