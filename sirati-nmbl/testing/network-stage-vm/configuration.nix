@@ -54,6 +54,32 @@ nixpkgs.lib.nixosSystem {
             networkStage = {
               enable = true;
               addressFamily = "dual-stack";
+              dnsServers = [ "10.0.2.3" "fec0::3" ];
+              staticProfiles = [
+                {
+                  macAddress = "52:54:00:12:34:56";
+                  ipv4 = {
+                    addresses = [ "10.0.2.15/32" ];
+                    gateway = "10.0.2.2";
+                    gatewayOnLink = true;
+                    routes = [ {
+                      destination = "198.51.100.0/24";
+                      via = "10.0.2.2";
+                      onLink = true;
+                    } ];
+                  };
+                  ipv6 = {
+                    addresses = [ "fec0::15/64" ];
+                    gateway = "fe80::2";
+                    gatewayOnLink = true;
+                    routes = [ {
+                      destination = "2001:db8:1::/64";
+                      via = "fe80::2";
+                      onLink = true;
+                    } ];
+                  };
+                }
+              ];
             };
           };
         };

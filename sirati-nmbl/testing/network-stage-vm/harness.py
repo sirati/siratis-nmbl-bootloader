@@ -86,7 +86,7 @@ def qemu_command(args, disk):
         "-append", "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200",
         "-drive", f"file={disk},format=raw,if=virtio,readonly=on",
         "-netdev", "user,id=net0,ipv6=on",
-        "-device", "virtio-net-pci,netdev=net0",
+        "-device", "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56",
         "-display", "none",
         "-serial", "stdio",
         "-monitor", "none",
@@ -113,7 +113,10 @@ set -eux
 findmnt -n -o OPTIONS /nmbl-network | grep -w ro | grep -w nodev | grep -w nosuid | grep -w noexec
 test -d /nmbl-network/lib/modules/$(uname -r)
 test -d /nmbl-network/lib/firmware
-grep -qx 'address-family dual-stack' /nmbl-network/etc/nmbl-network/network.conf
+grep -qx 'version 2' /nmbl-network/etc/nmbl-network/network.conf
+grep -qx 'profile mac 52:54:00:12:34:56' /nmbl-network/etc/nmbl-network/network.conf
+grep -qx 'dns 10.0.2.3' /nmbl-network/etc/nmbl-network/network.conf
+grep -qx 'dns fec0::3' /nmbl-network/etc/nmbl-network/network.conf
 lsmod | grep '^dummy '
 cmp /etc/ssh/ssh_host_ed25519_key /nmbl-root/mnt/boot/rescue-host-ed25519
 test "$(stat -c '%u:%g:%a' /nmbl-root/mnt/boot/rescue-host-ed25519)" = 0:0:600
@@ -122,8 +125,15 @@ sshd -T -f /etc/ssh/sshd_config | grep -qx 'kbdinteractiveauthentication no'
 sshd -T -f /etc/ssh/sshd_config | grep -qx 'authenticationmethods publickey'
 sshd -T -f /etc/ssh/sshd_config | grep -qx 'disableforwarding yes'
 ss -tln | grep ':22222 '
-ip -4 addr show dev eth0 | grep 'inet '
-ip -6 addr show dev eth0 | grep 'inet6 '
+ip -4 addr show dev eth0 | grep -F '10.0.2.15/32'
+ip -6 addr show dev eth0 | grep -F 'fec0::15/64'
+ip -4 route show | grep -F 'default via 10.0.2.2 dev eth0 onlink'
+ip -6 route show | grep -F 'default via fe80::2 dev eth0 onlink'
+ip -4 route show | grep -F '198.51.100.0/24 via 10.0.2.2 dev eth0 onlink'
+ip -6 route show | grep -F '2001:db8:1::/64 via fe80::2 dev eth0 onlink'
+grep -qx 'nameserver 10.0.2.3' /etc/resolv.conf
+grep -qx 'nameserver fec0::3' /etc/resolv.conf
+! pgrep -x dhcpcd
 echo NMBL_NETWORK_STAGE_VM_PASS
 '''
                 proc.stdin.write(commands.encode())
