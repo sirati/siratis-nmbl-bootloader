@@ -2,6 +2,8 @@
   source,
   publicKeyPath,
   publicKeyHash,
+  sshPublicKeyPath,
+  sshPublicKeyHash,
 }:
 
 let
@@ -11,7 +13,12 @@ let
     name = "nmbl-network-stage-vm-public.key";
     sha256 = publicKeyHash;
   };
-  config = flake.lib.mkNetworkStageVmConfig { inherit publicKey; };
+  sshPublicKey = builtins.readFile (builtins.path {
+    path = sshPublicKeyPath;
+    name = "nmbl-network-stage-vm-ssh-public.key";
+    sha256 = sshPublicKeyHash;
+  });
+  config = flake.lib.mkNetworkStageVmConfig { inherit publicKey sshPublicKey; };
   build = config.config.system.build;
   pkgs = flake.inputs.nixpkgs.legacyPackages.x86_64-linux;
   lib = flake.inputs.nixpkgs.lib;

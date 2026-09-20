@@ -106,6 +106,7 @@
           gzip
           nix
           openssh
+          passt
           python3
           qemu_kvm
           squashfsTools
@@ -113,13 +114,19 @@
           zstd
         ];
         text = builtins.replaceStrings
-          [ "@source@" "@harness@" "@qemu@" ]
-          [ "${self}" "${./testing/network-stage-vm/harness.py}" "${pkgs.qemu_kvm}/bin/qemu-system-x86_64" ]
+          [ "@source@" "@harness@" "@qemu@" "@ssh@" "@passt@" ]
+          [
+            "${self}"
+            "${./testing/network-stage-vm/harness.py}"
+            "${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
+            "${pkgs.openssh}/bin/ssh"
+            "${pkgs.passt}/bin/passt"
+          ]
           (builtins.readFile ./testing/network-stage-vm/run.sh);
       };
       nmblErofsCtl = import ./lib/erofsctl.nix { inherit pkgs nmblSign; };
       nmblErofsReceive = import ./lib/erofs-receive.nix {
-        inherit pkgs nmblErofsCtl;
+        inherit pkgs nmblErofsCtl nmblSign;
       };
       nmblErofsDeploy = import ./lib/erofs-deploy.nix { inherit pkgs; };
       nmblGenerationImageVmTest = import ./lib/generation-image-vm-test.nix {
@@ -169,27 +176,50 @@
         second=$(${nmblErofsCtl}/bin/nmbl-erofsctl prepare \
           "$TMPDIR/second.erofs" "$TMPDIR/keys/private" "$TMPDIR/second")
         send() {
-          bundle=$1; reboot=0
-          printf 'NMBL-EROFS-BUNDLE-1\n%s\n%s\n%s\n0\n%s\n' \
+          bundle=$1; config=$2; image_sig=$3; config_sig=$4; reboot=0
+          printf 'NMBL-EROFS-BUNDLE-2\n%s\n%s\n%s\n0\n%s\n%s\n%s\n%s\n' \
             "$(cat "$bundle/generation")" "$(stat -c %s "$bundle/nix.erofs")" \
-            "$(stat -c %s "$bundle/nix.erofs.sig")" "$reboot"
-          cat "$bundle/nix.erofs" "$bundle/nix.erofs.sig"
+            "$(stat -c %s "$image_sig")" "$(sha512sum "$config" | cut -d' ' -f1)" \
+            "$(stat -c %s "$config")" "$(stat -c %s "$config_sig")" "$reboot"
+          cat "$bundle/nix.erofs" "$image_sig" "$config" "$config_sig"
         }
-        send "$TMPDIR/first" | ${nmblErofsReceive}/bin/nmbl-erofs-receive \
-          "$TMPDIR/incoming" "$TMPDIR/root"
+        printf 'first config' > "$TMPDIR/first.config"
+        printf 'second config' > "$TMPDIR/second.config"
+        for name in first second; do
+          ${nmblSign}/bin/nmbl-sign sign --key "$TMPDIR/keys/private" --domain boot-config \
+            --out "$TMPDIR/$name.config.sig" "$TMPDIR/$name.config" >/dev/null
+        done
+        cp "$TMPDIR/second/nix.erofs.sig" "$TMPDIR/bad-image.sig"
+        cp "$TMPDIR/second.config.sig" "$TMPDIR/bad-config.sig"
+        chmod u+w "$TMPDIR/bad-image.sig" "$TMPDIR/bad-config.sig"
+        python3 - "$TMPDIR/bad-image.sig" "$TMPDIR/bad-config.sig" <<'PY'
+        import pathlib, sys
+        for name in sys.argv[1:]:
+            path = pathlib.Path(name)
+            value = bytearray(path.read_bytes())
+            value[40] ^= 0xff
+            path.write_bytes(value)
+        PY
+        send "$TMPDIR/first" "$TMPDIR/first.config" "$TMPDIR/first/nix.erofs.sig" \
+          "$TMPDIR/first.config.sig" | ${nmblErofsReceive}/bin/nmbl-erofs-receive \
+          "$TMPDIR/incoming" "$TMPDIR/root" "$TMPDIR/keys/public"
         test "$(readlink "$TMPDIR/root/active")" = "generations/$first"
-        image_size=$(stat -c %s "$TMPDIR/second/nix.erofs")
-        sig_size=$(stat -c %s "$TMPDIR/second/nix.erofs.sig")
-        {
-          printf 'NMBL-EROFS-BUNDLE-1\n%s\n%s\n%s\n0\n0\n' \
-            "$second" "$image_size" "$sig_size"
-          head -c 1 "$TMPDIR/second/nix.erofs"
-        } | if ${nmblErofsReceive}/bin/nmbl-erofs-receive \
-          "$TMPDIR/incoming" "$TMPDIR/root"; then exit 1; fi
-        test "$(readlink "$TMPDIR/root/active")" = "generations/$first"
-        send "$TMPDIR/second" | ${nmblErofsReceive}/bin/nmbl-erofs-receive \
-          "$TMPDIR/incoming" "$TMPDIR/root"
+        test "$(cat "$TMPDIR/root/active/config.toml")" = 'first config'
+        reject_unchanged() {
+          if ${nmblErofsReceive}/bin/nmbl-erofs-receive \
+            "$TMPDIR/incoming" "$TMPDIR/root" "$TMPDIR/keys/public"; then exit 1; fi
+          test "$(readlink "$TMPDIR/root/active")" = "generations/$first"
+          test "$(cat "$TMPDIR/root/active/config.toml")" = 'first config'
+        }
+        send "$TMPDIR/second" "$TMPDIR/second.config" "$TMPDIR/bad-image.sig" \
+          "$TMPDIR/second.config.sig" | reject_unchanged
+        send "$TMPDIR/second" "$TMPDIR/second.config" "$TMPDIR/second/nix.erofs.sig" \
+          "$TMPDIR/bad-config.sig" | reject_unchanged
+        send "$TMPDIR/second" "$TMPDIR/second.config" "$TMPDIR/second/nix.erofs.sig" \
+          "$TMPDIR/second.config.sig" | ${nmblErofsReceive}/bin/nmbl-erofs-receive \
+          "$TMPDIR/incoming" "$TMPDIR/root" "$TMPDIR/keys/public"
         test "$(readlink "$TMPDIR/root/active")" = "generations/$second"
+        test "$(cat "$TMPDIR/root/active/config.toml")" = 'second config'
         python3 - "$TMPDIR/keys/private" "$TMPDIR/root" ${nmblErofsReceive} <<'PY'
         import pathlib, sys
         secret = pathlib.Path(sys.argv[1]).read_bytes()
@@ -201,6 +231,30 @@
         touch "$out"
       '';
       lib = nixpkgs.lib;
+      rootStoreEvalSystem = import ./testing/generation-state-vm/configuration.nix {
+        inherit nixpkgs system;
+        nmblModule = self.nixosModules.default;
+        publicKey = ./testing/keys/insecure-test-ml-dsa-87.pub;
+        rootStore = true;
+        signingAlgorithm = "ml-dsa-87";
+      };
+      rootStoreEvalCheck = pkgs.runCommand "nmbl-generation-root-store-eval" {
+        nativeBuildInputs = [ pkgs.python3 ];
+      } ''
+        python3 - ${rootStoreEvalSystem.config.system.build.nmblConfigToml} <<'PY'
+        import sys
+        import tomllib
+
+        with open(sys.argv[1], "rb") as stream:
+            config = tomllib.load(stream)
+        store = config["generation_image"]["stage1_store"]
+        assert store["target_mountpoint"] == "/"
+        assert store["relative_state_root"] == "nmbl-generations"
+        mounts = [entry["mountpoint"] for entry in config["filesystems"]]
+        assert mounts.index("/") < mounts.index("/boot") < mounts.index("/nix")
+        PY
+        touch "$out"
+      '';
 
       # Import rescue-vm-test app directly
       rescueVmTestFlake = import ../rescue-vm-test/flake.nix;
@@ -1025,9 +1079,9 @@
     in
     {
       lib.mkNetworkStageVmConfig =
-        { publicKey }:
+        { publicKey, sshPublicKey }:
         import ./testing/network-stage-vm/configuration.nix {
-          inherit nixpkgs publicKey system;
+          inherit nixpkgs publicKey sshPublicKey system;
           nmblModule = self.nixosModules.default;
         };
 
@@ -1111,6 +1165,7 @@
         nmbl-erofsctl = nmblErofsCtlCheck;
         nmbl-erofs-receive = nmblErofsReceiveCheck;
         generation-image-initrd = generationImageInitrdCheck;
+        generation-root-store-eval = rootStoreEvalCheck;
         insecure-test-key-absent = insecureKeyAbsentFromProd;
         test-secure-boot-no-private-key = secureBootNoPrivateKey;
         test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;

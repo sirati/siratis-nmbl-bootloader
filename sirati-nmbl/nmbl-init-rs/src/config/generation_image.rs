@@ -23,10 +23,24 @@ pub struct GenerationImageConfig {
     pub state_root: PathBuf,
 
     #[serde(default)]
+    pub stage1_store: Option<GenerationStoreConfig>,
+
+    #[serde(default)]
     pub automatic_rollback: bool,
 
     #[serde(default)]
     pub automatic_rescue: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GenerationStoreConfig {
+    pub device: PathBuf,
+    pub fstype: String,
+    pub options: String,
+    pub mountpoint: PathBuf,
+    pub target_mountpoint: PathBuf,
+    pub relative_state_root: PathBuf,
 }
 
 #[cfg(test)]
@@ -52,5 +66,16 @@ mod tests {
             "enable = true\nsignature_path = '/x.sig'\nstate_root = '/x'\nunknown = true\n",
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn parses_root_backing_store_with_confined_state_path() {
+        let policy: GenerationImageConfig = toml::from_str(
+            "enable = true\nsignature_path = '/nmbl-generations/active/nix.erofs.sig'\nstate_root = '/nmbl-generations'\n[stage1_store]\ndevice = '/dev/root'\nfstype = 'ext4'\noptions = 'rw,noexec'\nmountpoint = '/mnt/nmbl-store'\ntarget_mountpoint = '/'\nrelative_state_root = 'nmbl-generations'\n",
+        )
+        .expect("root-backed generation store config");
+        let store = policy.stage1_store.expect("stage1 store");
+        assert_eq!(store.target_mountpoint, PathBuf::from("/"));
+        assert_eq!(store.relative_state_root, PathBuf::from("nmbl-generations"));
     }
 }

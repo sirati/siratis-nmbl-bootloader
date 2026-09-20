@@ -5,6 +5,7 @@
 //! ```text
 //! nmbl-sign keygen --alg <ml-dsa-65|ml-dsa-87> --out-priv <f> --out-pub <f>
 //! nmbl-sign sign   --key <priv-file> --domain <role> <input> [--out <sidecar>]
+//! nmbl-sign verify --key <public-file> --domain <role> <input> --sig <sidecar>
 //! nmbl-sign sign-image …            (an alias of `sign`)
 //! ```
 //!
@@ -27,6 +28,7 @@ nmbl-sign — NMBL ML-DSA image signer
 USAGE:
   nmbl-sign keygen --alg <ALG> --out-priv <FILE> --out-pub <FILE>
   nmbl-sign sign --key <PRIV> --domain <ROLE> <INPUT> [--out <SIDECAR>]
+  nmbl-sign verify --key <PUB> --domain <ROLE> <INPUT> --sig <SIDECAR>
   nmbl-sign sign-image …   (alias of `sign`)
 
 ALG:    ml-dsa-65 | ml-dsa-87
@@ -60,6 +62,13 @@ pub enum Command {
         /// Explicit sidecar output path (else `<input>.sig`).
         out: Option<PathBuf>,
     },
+    /// Verify a detached sidecar against one explicit trusted public key.
+    Verify {
+        key: PathBuf,
+        domain: &'static [u8],
+        input: PathBuf,
+        signature: PathBuf,
+    },
     /// Print usage and exit zero.
     Help,
 }
@@ -73,9 +82,37 @@ pub fn parse(args: &[String]) -> Result<Command> {
     match sub {
         "keygen" => parse_keygen(rest),
         "sign" | "sign-image" => parse_sign(rest),
+        "verify" => parse_verify(rest),
         "-h" | "--help" | "help" => Ok(Command::Help),
         other => Err(SignError::Usage(format!("unknown subcommand `{other}`"))),
     }
+}
+
+fn parse_verify(args: &[String]) -> Result<Command> {
+    let mut key = None;
+    let mut domain = None;
+    let mut signature = None;
+    let mut input = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--key" => key = Some(PathBuf::from(next(&mut it, "--key")?)),
+            "--domain" => domain = Some(parse_domain(next(&mut it, "--domain")?)?),
+            "--sig" => signature = Some(PathBuf::from(next(&mut it, "--sig")?)),
+            other if other.starts_with("--") => {
+                return Err(SignError::Usage(format!("verify: unexpected flag `{other}`")));
+            }
+            positional if input.is_none() => input = Some(PathBuf::from(positional)),
+            _ => return Err(SignError::Usage("verify: more than one input file given".into())),
+        }
+    }
+    Ok(Command::Verify {
+        key: key.ok_or_else(|| SignError::Usage("verify: --key is required".into()))?,
+        domain: domain.ok_or_else(|| SignError::Usage("verify: --domain is required".into()))?,
+        input: input.ok_or_else(|| SignError::Usage("verify: an input file is required".into()))?,
+        signature: signature
+            .ok_or_else(|| SignError::Usage("verify: --sig is required".into()))?,
+    })
 }
 
 /// Parse the `keygen` subcommand flags.
@@ -241,6 +278,35 @@ mod tests {
                 out: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_verify() {
+        let cmd = parse(&argv(&[
+            "verify",
+            "--key",
+            "/k/pub",
+            "--domain",
+            "boot-config",
+            "--sig",
+            "/b/config.sig",
+            "/b/config",
+        ]))
+        .unwrap();
+        match cmd {
+            Command::Verify {
+                key,
+                domain,
+                input,
+                signature,
+            } => {
+                assert_eq!(key, PathBuf::from("/k/pub"));
+                assert_eq!(domain, nmbl_init::sig::DOMAIN_BOOT_CONFIG);
+                assert_eq!(input, PathBuf::from("/b/config"));
+                assert_eq!(signature, PathBuf::from("/b/config.sig"));
+            }
+            _ => panic!("expected verify command"),
+        }
     }
 
     #[test]

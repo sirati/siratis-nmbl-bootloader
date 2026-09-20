@@ -122,13 +122,18 @@ let
 
       # nmbl-tui: a client onto NMBL's TUI. NMBL stays PID 1 OUTSIDE this
       # chroot and bind-mounts its own root in at /nmbl-root, so NMBL's own
-      # static binary is reachable here at /nmbl-root/init. Symlink it onto
-      # PATH as `nmbl-tui`; run from a non-PID-1 process it auto-detects
+      # static binary is bind-mounted by the rescue launcher onto the prepared
+      # /bin/nmbl file below. Expose it on PATH as `nmbl` (and through the
+      # compatibility alias `nmbl-tui`); run from
+      # a non-PID-1 process it auto-detects
       # getpid()!=1 → client mode and connects to NMBL_TUI_SOCK (exported in
       # /init, /etc/profile and sshd_config → /nmbl-root/nmbl-run/tui.sock).
-      # The link target only resolves once NMBL has set up the /nmbl-root
-      # bind mount; that is expected — the squashfs just provides the alias.
-      ln -s /nmbl-root/init              root/bin/nmbl-tui
+      # A bind mount is required because /init is itself a symlink into NMBL's
+      # private Nix store; an absolute symlink would resolve in the rescue
+      # store after chroot and fail.
+      touch                               root/bin/nmbl
+      chmod 0755                          root/bin/nmbl
+      ln -s /bin/nmbl                    root/bin/nmbl-tui
       for tool in ${coreutils}/bin/* ${utilLinux}/bin/* ${iproute2}/bin/* \
                   ${procps}/bin/* ${kmod}/bin/* ${btrfs}/bin/* \
                   ${cryptsetup}/bin/* ${btop}/bin/* ${e2fsprogs}/bin/* \

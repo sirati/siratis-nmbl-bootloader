@@ -40,6 +40,7 @@ def start(args, transcript):
         "-append", "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200",
         "-drive", f"file={args.boot},format=raw,if=virtio",
         "-drive", f"file={args.root},format=raw,if=virtio",
+        "-drive", f"file={args.store},format=raw,if=virtio",
         "-display", "none", "-serial", "stdio", "-monitor", "none", "-no-reboot",
     ]
     return subprocess.Popen(
@@ -83,7 +84,7 @@ def happy_path(args):
 
 
 def invalid_path(args, label):
-    args.boot = getattr(args, label)
+    args.store = getattr(args, label)
     expected = "signature" if label == "tampered" else "incomplete bundle"
     with Path(f"{args.transcript}-{label}").open("wb") as transcript:
         proc = start(args, transcript)
@@ -97,7 +98,7 @@ def invalid_path(args, label):
 
 def main():
     parser = argparse.ArgumentParser()
-    for name in ("qemu", "kernel", "initrd", "boot", "tampered", "unsigned", "root",
+    for name in ("qemu", "kernel", "initrd", "boot", "store", "tampered", "unsigned", "root",
                  "first", "second", "third", "transcript"):
         parser.add_argument(f"--{name}", required=True)
     args = parser.parse_args()

@@ -8,6 +8,22 @@ let
   );
   generationFs = config.fileSystems.${cfg.mountPoint} or { };
   imagePath = generationFs.device or "";
+  store = cfg.stage1Store;
+  storeMatches = lib.filter (fs: store != null && fs.mountPoint == store.targetMountPoint) (
+    builtins.attrValues config.boot.nmbl.fileSystems
+  );
+  storeFileSystem =
+    if store == null then null
+    else config.fileSystems.${store.targetMountPoint} or null;
+  storeNeededForBoot =
+    storeFileSystem != null && utils.fsNeededForBoot storeFileSystem;
+  storePrefix =
+    if store == null then null
+    else if store.targetMountPoint == "/" then "/"
+    else "${store.targetMountPoint}/";
+  relativeStateRoot =
+    if store == null then null
+    else lib.removePrefix storePrefix cfg.stateRoot;
   targetMountPoint = "/sysroot${cfg.mountPoint}";
   targetImagePath = "/sysroot${imagePath}";
   targetSignaturePath = "/sysroot${cfg.signaturePath}";
@@ -70,6 +86,27 @@ in
       default = 30;
       description = "Delay before assessing normal boot completion and marking a generation tested.";
     };
+
+    stage1Store = lib.mkOption {
+      type = lib.types.nullOr (lib.types.submodule {
+        options = {
+          targetMountPoint = lib.mkOption {
+            type = lib.types.str;
+            description = "Final-system mount containing stateRoot and the generation images.";
+          };
+          runtimeMountPoint = lib.mkOption {
+            type = lib.types.str;
+            default = "/mnt/nmbl-generation-store";
+            description = "Private stage-1 mountpoint for the generation backing filesystem.";
+          };
+        };
+      });
+      default = null;
+      description = ''
+        Mount the filesystem at targetMountPoint during NMBL stage 1, so
+        large generation images can live outside the boot partition.
+      '';
+    };
   };
 
   config = lib.mkMerge [
@@ -104,8 +141,27 @@ in
           message = "boot.nmbl.generationImage.signaturePath must be an absolute backing-filesystem path";
         }
         {
-          assertion = lib.hasPrefix "/boot/" cfg.stateRoot;
-          message = "boot.nmbl.generationImage.stateRoot must be below /boot";
+          assertion =
+            if store == null then lib.hasPrefix "/boot/" cfg.stateRoot
+            else
+              lib.hasPrefix storePrefix cfg.stateRoot
+              && relativeStateRoot != ""
+              && builtins.all (component: component != "." && component != "..") (
+                lib.splitString "/" relativeStateRoot
+              );
+          message = "generationImage.stateRoot must be below /boot or the configured stage1Store target";
+        }
+        {
+          assertion = store == null || (builtins.length storeMatches == 1 && storeNeededForBoot);
+          message = "generationImage.stage1Store.targetMountPoint must match exactly one needed-for-boot filesystem";
+        }
+        {
+          assertion = store == null || (
+            lib.hasPrefix "/" store.runtimeMountPoint
+            && store.runtimeMountPoint != "/"
+            && !(lib.hasInfix ".." store.runtimeMountPoint)
+          );
+          message = "generationImage.stage1Store.runtimeMountPoint must be a safe absolute non-root path";
         }
         {
           assertion = !cfg.automaticRescue || config.boot.nmbl.rescue.mode == "external";
@@ -118,6 +174,9 @@ in
       ];
     }
     (lib.mkIf cfg.enable {
+      boot.nmbl.bootstrap.kernelModules.explicit = lib.mkIf (builtins.length storeMatches == 1) (
+        lib.mkAfter [ (builtins.head storeMatches).fsType ]
+      );
       # The helper and config are both public build products. The ML-DSA public
       # key is baked into nmblInit; no private key is evaluated or copied.
       boot.initrd.systemd.extraBin.nmbl-generation-mount =

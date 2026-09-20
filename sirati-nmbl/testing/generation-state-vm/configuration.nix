@@ -3,6 +3,8 @@
   nmblModule,
   publicKey,
   system ? "x86_64-linux",
+  rootStore ? false,
+  signingAlgorithm ? "ml-dsa-65",
 }:
 
 nixpkgs.lib.nixosSystem {
@@ -12,11 +14,13 @@ nixpkgs.lib.nixosSystem {
     "${nixpkgs}/nixos/modules/profiles/qemu-guest.nix"
     ({ config, lib, pkgs, ... }:
       let
+        generationStoreMount = if rootStore then "/" else "/persistent";
+        generationStateRoot = if rootStore then "/nmbl-generations" else "/persistent/nmbl-generations";
         stateTest = pkgs.writeShellScript "nmbl-state-vm-step" ''
           set -eu
           exec > /dev/ttyS0 2>&1
           trap 'systemctl --failed --no-pager; systemctl status nmbl-generation-success.service boot-complete.target systemd-boot-check-no-failures.service --no-pager || true; echo NMBL_STATE_STEP_FAILED' ERR
-          root=/boot/nmbl-generations
+          root=${generationStateRoot}
           step=$(cat /boot/nmbl-test-step 2>/dev/null || echo 0)
           first=$(cat /boot/nmbl-test-first)
           second=$(cat /boot/nmbl-test-second)
@@ -107,12 +111,17 @@ nixpkgs.lib.nixosSystem {
           automaticRollback = true;
           automaticRescue = true;
           successDelaySec = 2;
-          signaturePath = "/boot/nmbl-generations/active/nix.erofs.sig";
+          stateRoot = generationStateRoot;
+          signaturePath = "${generationStateRoot}/active/nix.erofs.sig";
+          stage1Store = {
+            targetMountPoint = generationStoreMount;
+            runtimeMountPoint = "/mnt/nmbl-generation-store";
+          };
         };
         signing = {
           enable = true;
           enforce = true;
-          algorithm = "ml-dsa-65";
+          algorithm = signingAlgorithm;
           publicKeys = [ publicKey ];
           generationKeyFile = "/run/operator-only/private.key";
           imageKeyFile = "/run/operator-only/private.key";
@@ -134,15 +143,25 @@ nixpkgs.lib.nixosSystem {
       boot.initrd.systemd.enable = true;
       boot.initrd.availableKernelModules = [ "virtio_pci" "virtio_blk" "ext4" "loop" "erofs" ];
       fileSystems = {
-        "/" = { device = "/dev/disk/by-label/NMBLROOT"; fsType = "ext4"; };
+        "/" = {
+          device = "/dev/disk/by-label/NMBLROOT";
+          fsType = "ext4";
+          neededForBoot = rootStore;
+        };
         "/boot" = {
           device = "/dev/disk/by-label/NMBLBOOT";
           fsType = "ext4";
           neededForBoot = true;
           options = [ "nosuid" "nodev" "noexec" ];
         };
+        "/persistent" = lib.mkIf (!rootStore) {
+          device = "/dev/disk/by-label/NMBLSTORE";
+          fsType = "ext4";
+          neededForBoot = true;
+          options = [ "nosuid" "nodev" "noexec" ];
+        };
         "/nix" = {
-          device = "/boot/nmbl-generations/active/nix.erofs";
+          device = "${generationStateRoot}/active/nix.erofs";
           fsType = "erofs";
           neededForBoot = true;
           options = [ "loop" "ro" ];

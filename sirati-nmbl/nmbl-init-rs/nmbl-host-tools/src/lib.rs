@@ -22,6 +22,7 @@ pub mod error;
 pub mod keyfile;
 pub mod keygen;
 pub mod sign;
+pub mod verify;
 
 use error::Result;
 
@@ -40,6 +41,12 @@ pub fn run(cmd: cli::Command) -> Result<()> {
             input,
             out,
         } => sign::run(&input, &key, domain, out.as_deref()).map(|_| ()),
+        cli::Command::Verify {
+            key,
+            domain,
+            input,
+            signature,
+        } => verify::run(&input, &key, domain, &signature),
         cli::Command::Help => {
             println!("{}", cli::USAGE);
             Ok(())

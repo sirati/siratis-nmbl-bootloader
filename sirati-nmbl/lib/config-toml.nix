@@ -72,6 +72,34 @@ let
   rescueEntrypoint =
     if cfg.rescue.mode == "external" && cfg.rescue.fullSystem.enable then "/init" else "/bin/sh";
 
+  # A separately mounted generation store must precede the loop-backed
+  # generation image whose backing file lives on it. Keep every other entry
+  # in its declared order.
+  filesystemValues = builtins.attrValues cfg.fileSystems;
+  generationStoreTarget =
+    if cfg.generationImage.enable && cfg.generationImage.stage1Store != null
+    then cfg.generationImage.stage1Store.targetMountPoint
+    else null;
+  generationStateRelative =
+    if generationStoreTarget == null then null
+    else lib.removePrefix (
+      if generationStoreTarget == "/" then "/" else "${generationStoreTarget}/"
+    ) cfg.generationImage.stateRoot;
+  orderedFilesystems =
+    if generationStoreTarget == null then filesystemValues else
+    let
+      roots = lib.filter (fs: fs.mountPoint == "/") filesystemValues;
+      ordinary = lib.filter (
+        fs: fs.mountPoint != "/"
+          && fs.mountPoint != generationStoreTarget
+          && fs.mountPoint != cfg.generationImage.mountPoint
+      ) filesystemValues;
+      stores = lib.filter (
+        fs: fs.mountPoint == generationStoreTarget && fs.mountPoint != "/"
+      ) filesystemValues;
+      images = lib.filter (fs: fs.mountPoint == cfg.generationImage.mountPoint) filesystemValues;
+    in roots ++ ordinary ++ stores ++ images;
+
   tomlValue = {
     general = {
       verbosity = cfg.verbosity;
@@ -129,7 +157,7 @@ let
         ) fs.options
       );
       is_root = fs.mountPoint == "/";
-    }) (lib.attrValues cfg.fileSystems);
+    }) orderedFilesystems;
 
     # Rust field is `activations` (plural). Sibling F.3 produces the
     # list of pre-shaped blocks already matching the
@@ -302,7 +330,26 @@ let
       state_root = cfg.generationImage.stateRoot;
       automatic_rollback = cfg.generationImage.automaticRollback;
       automatic_rescue = cfg.generationImage.automaticRescue;
-    };
+    } // lib.optionalAttrs (cfg.generationImage.stage1Store != null) (
+      let
+        store = cfg.generationImage.stage1Store;
+        fs = builtins.head (lib.filter (entry: entry.mountPoint == store.targetMountPoint) (
+          builtins.attrValues cfg.fileSystems
+        ));
+      in {
+        stage1_store = {
+          device = fs.device;
+          fstype = fs.fsType;
+          options = lib.concatStringsSep "," (
+            builtins.filter (option: !(lib.elem option [ "nofail" "noauto" "_netdev" ])
+              && !(lib.hasPrefix "x-" option)) fs.options
+          );
+          mountpoint = store.runtimeMountPoint;
+          target_mountpoint = store.targetMountPoint;
+          relative_state_root = generationStateRelative;
+        };
+      }
+    );
   }
   # Secure-boot policy (#10): the ONE priority-volume concept (R-3) plus
   # the refuse countdown, sentinel and enforcement posture. Emitted ONLY

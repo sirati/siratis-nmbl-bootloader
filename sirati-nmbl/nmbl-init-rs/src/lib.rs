@@ -7,6 +7,8 @@ pub mod error;
 pub mod generation_mount;
 #[cfg(feature = "secure-boot")]
 pub mod generation_state;
+#[cfg(feature = "secure-boot")]
+pub mod generation_store;
 pub mod generations;
 /// Runtime loader for signed driver images (FEATURE-#1): verify → mount-ro →
 /// firmware → `init_module` over a single pinned fd. The public surface
