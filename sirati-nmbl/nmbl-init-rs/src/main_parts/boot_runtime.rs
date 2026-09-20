@@ -183,25 +183,44 @@ pub(crate) async fn run_boot_inside_runtime(
         .as_ref()
         .filter(|p| p.enable && (p.automatic_rollback || p.automatic_rescue))
     {
-        let Some(boot) = config.runtime_boot_mountpoint.as_deref() else {
-            let err = NmblError::ConfigInvalid {
-                reason: "generation state requires a mounted bootstrap boot volume".into(),
-                context: "generation-image state".into(),
-            };
-            return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
-        };
-        let relative = match policy.state_root.strip_prefix("/boot") {
-            Ok(path) => path,
-            Err(_) => {
-                let err = NmblError::ConfigInvalid {
-                    reason: "generation state_root must be below /boot".into(),
-                    context: "generation-image state".into(),
+        if policy.stage1_store.is_some() {
+            let btrfs_devices =
+                match nmbl_init::sys::blkid::populate_disk_by_symlinks(&sender).await {
+                    Ok(devices) => devices,
+                    Err(err) => return BootOutcome::Done(Box::new(Err(Box::new((err, config))))),
                 };
+            if let Err(err) = nmbl_init::sys::btrfs::scan_devices(&btrfs_devices) {
                 return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
             }
+        }
+        let state_root = match nmbl_init::generation_store::mount_and_resolve(policy) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                let Some(boot) = config.runtime_boot_mountpoint.as_deref() else {
+                    let err = NmblError::ConfigInvalid {
+                        reason: "generation state requires a mounted bootstrap boot volume".into(),
+                        context: "generation-image state".into(),
+                    };
+                    return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
+                };
+                let relative = match policy.state_root.strip_prefix("/boot") {
+                    Ok(path) => path,
+                    Err(_) => {
+                        let err = NmblError::ConfigInvalid {
+                            reason:
+                                "generation state_root must be below /boot without a stage1 store"
+                                    .into(),
+                            context: "generation-image state".into(),
+                        };
+                        return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
+                    }
+                };
+                boot.join(relative)
+            }
+            Err(err) => return BootOutcome::Done(Box::new(Err(Box::new((err, config))))),
         };
         match nmbl_init::generation_state::prepare_boot(
-            &boot.join(relative),
+            &state_root,
             policy.automatic_rollback,
             policy.automatic_rescue,
         ) {

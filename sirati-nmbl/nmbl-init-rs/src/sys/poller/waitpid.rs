@@ -170,15 +170,7 @@ mod tests {
     use nix::unistd::{ForkResult, fork};
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
-
-    #[derive(Default)]
-    struct NoopWaker;
-    impl Wake for NoopWaker {
-        fn wake(self: Arc<Self>) {}
-        fn wake_by_ref(self: &Arc<Self>) {}
-    }
+    use std::task::{Context, Poll, Waker};
 
     /// Drive `fut` and the poller together under a hand-rolled std-only
     /// executor: each iteration polls the future, then runs one driver
@@ -188,8 +180,7 @@ mod tests {
         poller: &crate::sys::poller::LocalPoller,
         max: usize,
     ) -> Option<F::Output> {
-        let waker = Waker::from(Arc::new(NoopWaker));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         for _ in 0..max {
             if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
                 return Some(v);

@@ -51,6 +51,7 @@ let
   nmblFeatures =
     lib.optional cfg.splash.enable "image-splash"
     ++ lib.optional cfg.rescue.network "network-rescue"
+    ++ lib.optional cfg.rescue.fullSystem.enable "remote-tui"
     ++ lib.optional cfg.stateful.enable "stateful"
     # IMPLICATION (FIX-16): enabling any security table pulls the
     # `secure-boot` feature into the built /init. `secureBootActive` is

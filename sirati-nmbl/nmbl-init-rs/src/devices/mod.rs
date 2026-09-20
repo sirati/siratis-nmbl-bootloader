@@ -304,7 +304,21 @@ pub async fn mount_system_filesystems(
                 // partition that Phase 0.5 mounted at
                 // `runtime_boot_mountpoint`. Bind-mount from there so the
                 // system root still gets the directory at the expected path.
-                if let Some(bootstrap_mp) = &config.runtime_boot_mountpoint {
+                #[cfg(feature = "secure-boot")]
+                let bootstrap_mp = config
+                    .generation_image
+                    .as_ref()
+                    .and_then(|policy| policy.stage1_store.as_ref())
+                    .filter(|store| {
+                        store.device == Path::new(&entry.device)
+                            && store.target_mountpoint == entry.mountpoint
+                    })
+                    .map(|store| &store.mountpoint)
+                    .or(config.runtime_boot_mountpoint.as_ref());
+                #[cfg(not(feature = "secure-boot"))]
+                let bootstrap_mp = config.runtime_boot_mountpoint.as_ref();
+
+                if let Some(bootstrap_mp) = bootstrap_mp {
                     nmbl_info!(
                         "device {} already mounted (EBUSY); bind-mounting {} -> {}",
                         dev.display(),

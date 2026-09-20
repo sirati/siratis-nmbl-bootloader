@@ -6,7 +6,9 @@ repartitioning or replacing the NMBL UKI for every system generation.
 
 ## Disk layout
 
-The writable image filesystem uses this layout:
+The writable image filesystem uses this layout. It may live on `/boot`, on a
+larger dedicated filesystem such as `/persistent`, or on the target root
+filesystem:
 
 ```text
 /boot/nmbl-generations/
@@ -17,6 +19,8 @@ The writable image filesystem uses this layout:
   attempted -> generations/<sha512>
   generations/<sha512>/
     generation
+    config.toml
+    config.toml.sig
     nix.erofs
     nix.erofs.sig
     system                 # optional NixOS toplevel metadata
@@ -65,6 +69,14 @@ only after signature verification and `LOOP_CONFIGURE` succeed. Verification
 failure therefore cannot fall back to reopening the mutable image pathname.
 The module requires a systemd initrd; evaluation fails for scripted stage 1.
 
+When the image tree is outside `/boot`, NMBL mounts its backing filesystem at
+a private stage-1 path before it reads selectors or opens the EROFS image. The
+same filesystem is then mounted or bind-mounted at its final target before
+`/nix`. `stage1Store.targetMountPoint` must identify exactly one filesystem
+that is needed for boot. The private runtime mount must be an absolute,
+non-root path, and `stateRoot` must remain strictly below the target with no
+`.` or `..` components.
+
 ## Configuration
 
 The NixOS filesystem entry and the post-kexec initrd must both use the stable
@@ -94,6 +106,73 @@ boot.nmbl = {
 };
 ```
 
+For a dedicated persistent filesystem, keep large images off the small boot
+partition:
+
+```nix
+fileSystems."/persistent" = {
+  device = "/dev/disk/by-label/NMBLSTORE";
+  fsType = "btrfs";
+  neededForBoot = true;
+  options = [ "subvol=nmbl" "noexec" "nodev" "nosuid" ];
+};
+
+fileSystems."/nix" = {
+  device = "/persistent/nmbl-generations/active/nix.erofs";
+  fsType = "erofs";
+  neededForBoot = true;
+  options = [ "loop" "ro" ];
+};
+
+boot.nmbl.generationImage = {
+  enable = true;
+  stateRoot = "/persistent/nmbl-generations";
+  signaturePath = "/persistent/nmbl-generations/active/nix.erofs.sig";
+  stage1Store = {
+    targetMountPoint = "/persistent";
+    runtimeMountPoint = "/mnt/nmbl-generation-store";
+  };
+};
+```
+
+On an existing Hetzner layout that mounts persistent subvolumes at both
+`/nix/store` and `/nix/var`, remove those two mounts in the generation-image
+configuration. They would shadow paths inside the verified `/nix` EROFS.
+Keep the Btrfs device mounted at `/persistent` as needed-for-boot storage, and
+let the single verified EROFS mount supply the complete `/nix` tree after the
+next reboot. Stage the first signed image before switching the boot config.
+
+A Stardust or fresh DNS VPS with a single root filesystem needs no
+repartitioning. Mark `/` needed for boot
+and use a root-relative image tree; NMBL still mounts the filesystem privately
+during stage 1 rather than treating `/` as its private mountpoint:
+
+```nix
+fileSystems."/" = {
+  device = "/dev/disk/by-label/NIXOS";
+  fsType = "ext4";
+  neededForBoot = true;
+  options = [ "noexec" "nodev" "nosuid" ];
+};
+
+fileSystems."/nix" = {
+  device = "/nmbl-generations/active/nix.erofs";
+  fsType = "erofs";
+  neededForBoot = true;
+  options = [ "loop" "ro" ];
+};
+
+boot.nmbl.generationImage = {
+  enable = true;
+  stateRoot = "/nmbl-generations";
+  signaturePath = "/nmbl-generations/active/nix.erofs.sig";
+  stage1Store = {
+    targetMountPoint = "/";
+    runtimeMountPoint = "/mnt/nmbl-generation-store";
+  };
+};
+```
+
 Only the public key is an immutable build input. Do not use a private key as a
 Nix path or option value.
 
@@ -110,8 +189,8 @@ is enabled. Atomic rename plus directory fsync protects every state update.
 
 ## Offline and remote deployment
 
-The production command builds the unsigned image and signs it on the operator
-machine. Local mode installs it directly:
+The production command builds the unsigned image and external runtime config,
+then signs both on the operator machine. Local mode installs the image directly:
 
 ```sh
 nix run .#nmbl-erofs-deploy -- \
@@ -119,8 +198,8 @@ nix run .#nmbl-erofs-deploy -- \
   /boot/nmbl-generations
 ```
 
-Remote mode retains the private key on the operator machine and streams only
-the signed bundle through SSH:
+Remote mode retains the private key on the operator machine and streams the
+signed generation and config bundle through SSH:
 
 ```sh
 nix run .#nmbl-erofs-deploy -- remote \
@@ -132,15 +211,23 @@ Configure the update key with `restrict` and a forced command equivalent to:
 
 ```text
 sudo -n /run/current-system/sw/bin/nmbl-erofs-receive \
-  /var/lib/nmbl-incoming /boot/nmbl-generations
+  /var/lib/nmbl-incoming /persistent/nmbl-generations \
+  /etc/nmbl/trusted-update.pub
 ```
 
 The sudo rule must permit only that exact command and fixed paths. The receiver
-reads a length-delimited stream into a private temporary directory, checks the
-complete image hash, installs without changing `active`, and activates only
-after the full stream validates. An interrupted transfer cannot affect the
-next boot. NMBL verifies the signature before pre-kexec use; the target initrd
-independently verifies it again after kexec.
+reads a length-delimited stream into a private temporary directory and verifies
+both detached signatures against the fixed public key before installation.
+The config, config signature, image, and image signature live in the same
+content-addressed generation directory. Configure the bootstrap filesystem as
+the filesystem holding that directory and set
+`configPath = "/nmbl-generations/active/config.toml"`. One atomic `active`
+symlink rename then selects the config and image together; there is no crash
+state containing a new config with an old image or the reverse. An interrupted
+transfer before that rename leaves the prior pair active. NMBL repeats
+generation verification before pre-kexec use and in the target initrd after
+kexec. The external config derivation is also an EROFS closure root, ensuring
+a config-only change produces a different image hash and generation directory.
 
 Rollback selects the preserved predecessor and requires a reboot:
 

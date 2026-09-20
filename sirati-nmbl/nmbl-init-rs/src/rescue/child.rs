@@ -26,135 +26,21 @@ use nix::unistd::{ForkResult, Pid, fork};
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
-use crate::sys::mount::{make_shared, mount_fs, umount};
 use crate::sys::poller::{LocalSender, reap_child};
 use crate::{nmbl_info, nmbl_warn};
 
 /// Where the writable rescue overlay is staged (mirrors
 /// `disk::RESCUE_MOUNT`). The chroot target.
 const RESCUE_ROOT: &str = "/rescue";
-/// PID 1's own mountpoint that mirrors the child's `/rescue/mnt` via a
-/// shared subtree, so PID 1 observes whatever the child mounts there.
-const PID1_MNT: &str = "/mnt";
-/// The chroot's `/mnt` (becomes `/mnt` after chroot); made a shared
-/// subtree peer of [`PID1_MNT`].
-const CHILD_MNT: &str = "/rescue/mnt";
-/// NMBL's own root, bind-mounted into the chroot. Becomes `/nmbl-root`
-/// after chroot, exposing the TUI socket at
-/// `/nmbl-root/nmbl-run/tui.sock` (matches the rescue-sfs contract).
-const CHILD_NMBL_ROOT: &str = "/rescue/nmbl-root";
+#[path = "child_mounts.rs"]
+mod mounts;
+#[cfg(test)]
+use mounts::{MountStep, child_boot_target, mount_plan, umount_plan};
+use mounts::{apply_mount_plan, teardown_mounts};
 
 /// Conventional exit code surfaced when the post-fork `execve(2)` (or a
 /// pre-exec syscall) fails in the child. Matches `sys::pty`.
 const EXEC_FAILED_EXIT_CODE: i32 = 127;
-
-/// One bind/shared-subtree step in the pre-fork mount plan. A pure
-/// description so the sequence is unit-testable without privileges.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MountStep {
-    /// `mkdir -p path` (idempotent).
-    MkDir(&'static str),
-    /// `mount --bind src dst` (`MS_BIND`).
-    Bind {
-        src: &'static str,
-        dst: &'static str,
-    },
-    /// `mount --rbind src dst` (`MS_BIND | MS_REC`).
-    RBind {
-        src: &'static str,
-        dst: &'static str,
-    },
-    /// `mount --make-shared target` (`MS_SHARED`, no fstype/source).
-    MakeShared(&'static str),
-}
-
-/// The pre-fork mount plan, in execution order. Pure so it can be
-/// asserted on in tests:
-///
-/// ```text
-/// mkdir -p /mnt /rescue/nmbl-root /rescue/mnt
-/// bind        /rescue/mnt -> /rescue/mnt   (self-bind so it is a mount)
-/// make-shared /rescue/mnt                  (MS_SHARED)
-/// rbind       /rescue/mnt -> /mnt          (PID 1 sees child mounts)
-/// rbind       /           -> /rescue/nmbl-root (expose NMBL root + socket)
-/// ```
-pub(crate) fn mount_plan() -> Vec<MountStep> {
-    vec![
-        MountStep::MkDir(PID1_MNT),
-        MountStep::MkDir(CHILD_NMBL_ROOT),
-        MountStep::MkDir(CHILD_MNT),
-        MountStep::Bind {
-            src: CHILD_MNT,
-            dst: CHILD_MNT,
-        },
-        MountStep::MakeShared(CHILD_MNT),
-        MountStep::RBind {
-            src: CHILD_MNT,
-            dst: PID1_MNT,
-        },
-        MountStep::RBind {
-            src: "/",
-            dst: CHILD_NMBL_ROOT,
-        },
-    ]
-}
-
-/// The teardown plan applied after the child exits, in order. Lazy
-/// `MNT_DETACH` is acceptable for the recursive binds (the task spec):
-/// unmount PID 1's `/mnt` first (the propagation target), then the
-/// child's `/rescue/mnt`, then NMBL's bind at `/rescue/nmbl-root`. Pure
-/// for the same reason as [`mount_plan`].
-pub(crate) fn umount_plan() -> Vec<&'static str> {
-    vec![PID1_MNT, CHILD_MNT, CHILD_NMBL_ROOT]
-}
-
-/// Execute [`mount_plan`] with safe nix/std wrappers (parent side, PID 1
-/// — runs before `fork`). Any failure aborts with a wrapped
-/// [`NmblError::Rescue`] so the recovery flow can surface it.
-fn apply_mount_plan() -> Result<()> {
-    let wrap = |source: NmblError| NmblError::Rescue {
-        stage: "rescue-child-mount",
-        source: Box::new(source),
-    };
-    for step in mount_plan() {
-        match step {
-            MountStep::MkDir(p) => ensure_dir(Path::new(p)).map_err(wrap)?,
-            MountStep::Bind { src, dst } => {
-                mount_fs(Some(Path::new(src)), Path::new(dst), "none", "bind").map_err(wrap)?;
-            }
-            MountStep::RBind { src, dst } => {
-                mount_fs(Some(Path::new(src)), Path::new(dst), "none", "rbind").map_err(wrap)?;
-            }
-            MountStep::MakeShared(p) => make_shared(Path::new(p)).map_err(wrap)?,
-        }
-    }
-    Ok(())
-}
-
-/// Tear down the binds set up by [`apply_mount_plan`]. Best-effort: a
-/// failed unmount is logged, never propagated — the recovery flow must
-/// proceed regardless.
-fn teardown_mounts() {
-    use nix::mount::MntFlags;
-    for target in umount_plan() {
-        match umount(Path::new(target), MntFlags::MNT_DETACH) {
-            Ok(()) => nmbl_info!("rescue child: detached {target}"),
-            Err(e) => nmbl_warn!("rescue child: could not detach {target}: {e}"),
-        }
-    }
-}
-
-/// Create `path` (and parents) idempotently. Mirrors `disk::ensure_dir`.
-fn ensure_dir(path: &Path) -> Result<()> {
-    match std::fs::create_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(NmblError::Io {
-            source: e,
-            context: format!("creating {}", path.display()),
-        }),
-    }
-}
 
 /// The CStrings the chrooted child needs, all allocated in the PARENT
 /// before `fork` (the child path is async-signal-safe and must not
@@ -318,15 +204,15 @@ pub async fn run_external_rescue_child(
     // up before propagating: the network path can loop back and retry,
     // and re-running bind/make-shared/rbind over surviving mounts would
     // stack duplicates. teardown_mounts is idempotent (lazy MNT_DETACH).
-    if let Err(e) = apply_mount_plan() {
-        teardown_mounts();
+    if let Err(e) = apply_mount_plan(config) {
+        teardown_mounts(config);
         return Err(e);
     }
 
     let pid = match fork_rescue_child(&exec) {
         Ok(pid) => pid,
         Err(e) => {
-            teardown_mounts();
+            teardown_mounts(config);
             return Err(e);
         }
     };
@@ -342,7 +228,7 @@ pub async fn run_external_rescue_child(
         }
         other => nmbl_warn!("rescue child: reaped with status {other:?}"),
     }
-    teardown_mounts();
+    teardown_mounts(config);
     Ok(())
 }
 

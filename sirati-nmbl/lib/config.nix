@@ -53,11 +53,13 @@ let
   nmblTpmEnroll = import ./tpm-enroll.nix { inherit pkgs lib; };
   nmblErofsCtl = import ./erofsctl.nix { inherit pkgs nmblSign; };
   nmblErofsReceive = import ./erofs-receive.nix {
-    inherit pkgs nmblErofsCtl;
+    inherit pkgs nmblErofsCtl nmblSign;
   };
   nmblGenerationImage = import ./generation-image.nix {
     inherit pkgs lib;
-    rootPaths = [ config.system.build.toplevel ];
+    # Include the external runtime config as an image GC root so any config
+    # change also changes the image hash and therefore the atomic bundle ID.
+    rootPaths = [ config.system.build.toplevel nmblConfigToml ];
   };
 
   # Activation options are contributed by ./modules/activation.nix. Read
@@ -638,6 +640,7 @@ in
     # store destinations; the key is never an evaluation or derivation input.
     system.build.nmblErofsCtl = nmblErofsCtl;
     system.build.nmblErofsReceive = nmblErofsReceive;
+    system.build.nmblSign = nmblSign;
 
     # Pure unsigned closure image. Signing and atomic installation are external
     # operator actions, so the private key is never an evaluation/build input.

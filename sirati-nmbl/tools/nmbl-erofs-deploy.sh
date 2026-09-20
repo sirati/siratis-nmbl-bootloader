@@ -9,9 +9,9 @@ usage:
 INSTALLABLE is a NixOS configuration, for example:
   .#nixosConfigurations.host
 
-The command builds only the unsigned system.build.nmblGenerationImage, signs
-outside Nix with PRIVATE_KEY, then atomically installs and selects it. Remote
-mode streams the bundle to a forced nmbl-erofs-receive command over SSH.
+The command builds unsigned generation and runtime-config artifacts and signs
+outside Nix with PRIVATE_KEY. Remote mode streams both signatures and payloads
+to a forced nmbl-erofs-receive command over SSH for verification and activation.
 PRIVATE_KEY and local IMAGE_ROOT paths must be outside /nix/store.
 EOF
   exit 2
@@ -46,6 +46,14 @@ if [[ "$mode" = local ]]; then
   "$ctl/bin/nmbl-erofsctl" install "$bundle/generation" "$destination"
   "$ctl/bin/nmbl-erofsctl" activate "$generation" "$destination"
 else
+  config=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
+    "$installable.config.system.build.nmblConfigToml")
+  signer=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
+    "$installable.config.system.build.nmblSign")
+  install -m 0444 "$config" "$bundle/config.toml"
+  "$signer/bin/nmbl-sign" sign --key "$private_key" --domain boot-config \
+    --out "$bundle/config.toml.sig" "$bundle/config.toml"
+  config_id=$(sha512sum "$bundle/config.toml" | cut -d' ' -f1)
   remote_command=${NMBL_EROFS_REMOTE_COMMAND:-nmbl-erofs-receive}
   ssh_command=${NMBL_EROFS_SSH:-ssh}
   [[ "$remote_command" =~ ^[A-Za-z0-9_./-]+$ ]] || {
@@ -57,11 +65,15 @@ else
   signature_size=$(stat -c %s "$payload/nix.erofs.sig")
   system_size=0
   [[ ! -f "$payload/system" ]] || system_size=$(stat -c %s "$payload/system")
+  config_size=$(stat -c %s "$bundle/config.toml")
+  config_signature_size=$(stat -c %s "$bundle/config.toml.sig")
   {
-    printf 'NMBL-EROFS-BUNDLE-1\n%s\n%s\n%s\n%s\n%s\n' \
-      "$generation" "$image_size" "$signature_size" "$system_size" "$reboot"
+    printf 'NMBL-EROFS-BUNDLE-2\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+      "$generation" "$image_size" "$signature_size" "$system_size" \
+      "$config_id" "$config_size" "$config_signature_size" "$reboot"
     cat "$payload/nix.erofs" "$payload/nix.erofs.sig"
     [[ ! -f "$payload/system" ]] || cat "$payload/system"
+    cat "$bundle/config.toml" "$bundle/config.toml.sig"
   } | "$ssh_command" -- "$destination" "$remote_command"
 fi
 printf '%s\n' "$generation"

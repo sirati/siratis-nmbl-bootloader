@@ -5,6 +5,7 @@
 //! plan helpers).
 
 use super::*;
+use std::path::PathBuf;
 
 #[test]
 fn mount_plan_matches_spec_sequence() {
@@ -28,6 +29,10 @@ fn mount_plan_matches_spec_sequence() {
                 src: "/",
                 dst: "/rescue/nmbl-root",
             },
+            MountStep::Bind {
+                src: "/init",
+                dst: "/rescue/bin/nmbl",
+            },
         ],
     );
 }
@@ -38,7 +43,20 @@ fn umount_plan_unwinds_mnt_before_nmbl_root() {
     // the child's /rescue/mnt, then the NMBL-root bind.
     assert_eq!(
         umount_plan(),
-        vec!["/mnt", "/rescue/mnt", "/rescue/nmbl-root"]
+        vec![
+            "/rescue/bin/nmbl",
+            "/mnt",
+            "/rescue/mnt",
+            "/rescue/nmbl-root"
+        ]
+    );
+}
+
+#[test]
+fn boot_mount_is_restored_at_its_original_nmbl_root_path() {
+    assert_eq!(
+        child_boot_target(Path::new("/mnt/boot")),
+        PathBuf::from("/rescue/nmbl-root/mnt/boot"),
     );
 }
 

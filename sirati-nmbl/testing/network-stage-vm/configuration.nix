@@ -2,6 +2,7 @@
   nixpkgs,
   nmblModule,
   publicKey,
+  sshPublicKey,
   system ? "x86_64-linux",
 }:
 
@@ -50,6 +51,7 @@ nixpkgs.lib.nixosSystem {
           fullSystem = {
             enable = true;
             sshdPort = 22222;
+            rootAuthorizedKeys = [ sshPublicKey ];
             hostKeyPath = "/mnt/boot/rescue-host-ed25519";
             networkStage = {
               enable = true;
