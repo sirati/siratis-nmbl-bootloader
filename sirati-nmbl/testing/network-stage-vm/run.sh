@@ -36,6 +36,12 @@ cp "$artifacts/config.toml" "$stage/nmbl/config.toml"
 ssh-keygen -q -t ed25519 -N '' -f "$stage/rescue-host-ed25519"
 chmod 0600 "$stage/rescue-host-ed25519"
 
+"$signer/bin/nmbl-sign" sign \
+  --key "$private_key" \
+  --domain boot-config \
+  --out "$stage/nmbl/config.toml.sig" \
+  "$stage/nmbl/config.toml"
+
 installer="$artifacts/rescue-installer/bin/nmbl-install-rescue-stage"
 NMBL_BOOT_ROOT="$stage" NMBL_IMAGE_KEY_FILE="$private_key" "$installer"
 network_inode=$(stat -c %i "$stage/nmbl/network.erofs")
