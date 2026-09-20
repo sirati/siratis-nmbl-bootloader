@@ -38,6 +38,8 @@ let
   rescueSet =
     bootstrap.rescue.defaultUrl != "" || bootstrap.rescue.defaultSha256 != "";
 
+  signingEnabled = cfg.signing.enable or false;
+
   tomlValue = {
     bootstrap = {
       config_path = toString bootstrap.configPath;
@@ -53,6 +55,9 @@ let
         explicit = bootstrap.kernelModules.explicit;
         modules_dir = bootstrap.kernelModules.modulesDir;
       };
+    } // lib.optionalAttrs signingEnabled {
+      config_signature =
+        "${toString bootstrap.configPath}${cfg.signing.sigPathSuffix}";
     } // lib.optionalAttrs rescueSet {
       rescue = {
         default_url = bootstrap.rescue.defaultUrl;

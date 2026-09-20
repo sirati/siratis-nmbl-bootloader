@@ -65,6 +65,10 @@ let
   # (build-VM) pass and run it only in the real install where the key is staged.
   deferInstallSigning = cfg.signing.deferInstallSigning or false;
 
+  externalConfigInstallShell = import ./install-external-config.nix {
+    inherit lib cfg nmblConfigToml nmblSign deferInstallSigning;
+  };
+
   # Resolve the cryptsetup the activation plan uses (prefer the static
   # build, same as lib/modules/activation.nix's `tryStatic`). Handed to
   # `--validate-hardware` so the read-only LUKS-header probe uses the
@@ -147,31 +151,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     echo "✓ State file initialised"
   ''}
 
-  ${lib.optionalString (configLocation == "external") (
-    let
-      # In external-config mode, copy the full config.toml onto the boot
-      # partition at the path the embedded bootstrap.toml will look for it.
-      # The `or "/nmbl/config.toml"` fallback matches
-      # `default_bootstrap_config_path` in `nmbl-init-rs/src/config.rs` so
-      # the runtime contract holds even if `boot.nmbl.bootstrap.configPath`
-      # is unset. Computed inside the optionalString body so embedded mode
-      # never evaluates it.
-      externalConfigPath =
-        let p = cfg.bootstrap.configPath or "/nmbl/config.toml";
-        in if lib.hasPrefix "/" p then lib.removePrefix "/" p else p;
-      # `lib.escapeShellArg` protects the heredoc-generated shell script
-      # against operator-supplied paths containing whitespace or quotes.
-      escapedDest = lib.escapeShellArg "/boot/${externalConfigPath}";
-    in ''
-      # External-config mode: stage the full config.toml on /boot at the
-      # path the embedded bootstrap.toml advertises. The initramfs itself
-      # carries only the bootstrap, so this file is what nmbl-init reads
-      # for filesystems / activations / TUI settings at boot time.
-      echo "Staging external NMBL config to ${escapedDest}..."
-      install -D -m 0644 ${nmblConfigToml} ${escapedDest}
-      echo "✓ External config installed: ${escapedDest}"
-    ''
-  )}
+  ${lib.optionalString (configLocation == "external") externalConfigInstallShell}
 
   ${lib.optionalString (cfg.rescue.mode == "external") (
     let
