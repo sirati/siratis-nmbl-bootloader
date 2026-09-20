@@ -72,7 +72,7 @@ cp -a "$stage" "$work_root/tampered-tree"
 printf 'NMBL_TAMPER' >> "$work_root/tampered-tree/nmbl/network.erofs"
 make_disk "$work_root/tampered-tree" "$work_root/tampered.img"
 cp -a "$stage" "$work_root/unsigned-tree"
-rm "$work_root/unsigned-tree/nmbl/network.erofs.sig"
+rm -f "$work_root/unsigned-tree/nmbl/network.erofs.sig"
 make_disk "$work_root/unsigned-tree" "$work_root/unsigned.img"
 
 # Rebuild and correctly sign an EROFS whose data-only policy is malformed.
