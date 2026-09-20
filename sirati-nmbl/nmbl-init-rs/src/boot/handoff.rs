@@ -275,9 +275,19 @@ pub(crate) fn verify_measure_then_load(
     key_injections: &[KeyInjection],
     driver_images: &DriverImagesHandle,
 ) -> Result<String> {
-    let handoff = Handoff {
-        cmdline: build_cmdline(generation, cmdline_override, &config.paths.system_root),
-    };
+    let mut cmdline = build_cmdline(generation, cmdline_override, &config.paths.system_root);
+    #[cfg(feature = "secure-boot")]
+    if config.generation_rollback
+        && !cmdline
+            .split_ascii_whitespace()
+            .any(|token| token == crate::generation_state::ROLLBACK_CMDLINE)
+    {
+        if !cmdline.is_empty() {
+            cmdline.push(' ');
+        }
+        cmdline.push_str(crate::generation_state::ROLLBACK_CMDLINE);
+    }
+    let handoff = Handoff { cmdline };
     nmbl_info!(
         "kexec: loading generation {} (kernel={}, initrd={})",
         generation.number,

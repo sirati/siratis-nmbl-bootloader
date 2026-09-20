@@ -1,6 +1,6 @@
 //! Per-role domain selection — a thin map over the verifier's frozen consts.
 //!
-//! The eight role domains are the EXACT `&[u8]` byte strings pinned in
+//! The nine role domains are the EXACT `&[u8]` byte strings pinned in
 //! `nmbl_init::sig` (`verify.rs`): a signature minted under one role can never
 //! verify under another (the domain-cross-reject property — FIX-01). This
 //! module does NOT redefine them; it re-exports them by a stable `--domain`
@@ -9,7 +9,8 @@
 
 use nmbl_init::sig::{
     DOMAIN_BOOT_CONFIG, DOMAIN_DRIVER_IMAGE, DOMAIN_GEN_INITRD, DOMAIN_GEN_KERNEL,
-    DOMAIN_NETWORK_STAGE, DOMAIN_PRIORITY_FILE, DOMAIN_RESCUE_SFS, DOMAIN_STAGED_FRAGMENT,
+    DOMAIN_GENERATION_IMAGE, DOMAIN_NETWORK_STAGE, DOMAIN_PRIORITY_FILE, DOMAIN_RESCUE_SFS,
+    DOMAIN_STAGED_FRAGMENT,
 };
 
 /// One selectable signing role, paired with its CLI token and the frozen
@@ -56,6 +57,10 @@ const ROLES: &[Role] = &[
         token: "network-stage",
         domain: DOMAIN_NETWORK_STAGE,
     },
+    Role {
+        token: "generation-image",
+        domain: DOMAIN_GENERATION_IMAGE,
+    },
 ];
 
 /// Resolve a `--domain` CLI token to the frozen verifier domain byte string.
@@ -86,6 +91,10 @@ mod tests {
         assert_eq!(domain_for("rescue-sfs"), Some(DOMAIN_RESCUE_SFS));
         assert_eq!(domain_for("boot-config"), Some(DOMAIN_BOOT_CONFIG));
         assert_eq!(domain_for("network-stage"), Some(DOMAIN_NETWORK_STAGE));
+        assert_eq!(
+            domain_for("generation-image"),
+            Some(DOMAIN_GENERATION_IMAGE)
+        );
     }
 
     #[test]
@@ -95,8 +104,8 @@ mod tests {
     }
 
     #[test]
-    fn all_eight_roles_present() {
-        assert_eq!(ROLES.len(), 8);
+    fn all_nine_roles_present() {
+        assert_eq!(ROLES.len(), 9);
         // Every role token must be distinct.
         for (i, a) in ROLES.iter().enumerate() {
             for b in ROLES.iter().skip(i + 1) {

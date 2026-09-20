@@ -51,6 +51,14 @@ let
   # build it here purely to compute its store path for the absence check below;
   # the package output proper is exposed by the host flake.
   nmblTpmEnroll = import ./tpm-enroll.nix { inherit pkgs lib; };
+  nmblErofsCtl = import ./erofsctl.nix { inherit pkgs nmblSign; };
+  nmblErofsReceive = import ./erofs-receive.nix {
+    inherit pkgs nmblErofsCtl;
+  };
+  nmblGenerationImage = import ./generation-image.nix {
+    inherit pkgs lib;
+    rootPaths = [ config.system.build.toplevel ];
+  };
 
   # Activation options are contributed by ./modules/activation.nix. Read
   # defensively so this file still evaluates if that module hasn't been
@@ -624,6 +632,16 @@ in
     # introspection. Each record is `{ name; sfs; destPath; sigDest; }`; the
     # `.sfs` is the unsigned, pure blob (signing happens at install).
     system.build.nmblDriverImages = driverImageBuild.driverImages;
+
+    # Host-side atomic EROFS generation staging/activation tool. Its `prepare`
+    # subcommand reads a private key only from a runtime argument and refuses
+    # store destinations; the key is never an evaluation or derivation input.
+    system.build.nmblErofsCtl = nmblErofsCtl;
+    system.build.nmblErofsReceive = nmblErofsReceive;
+
+    # Pure unsigned closure image. Signing and atomic installation are external
+    # operator actions, so the private key is never an evaluation/build input.
+    system.build.nmblGenerationImage = nmblGenerationImage;
 
     # Debug output to verify module configuration
     system.build.nmblDebugInfo = pkgs.writeText "nmbl-debug-info" ''

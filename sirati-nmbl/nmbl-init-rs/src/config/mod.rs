@@ -9,6 +9,8 @@ mod driver_image;
 mod entries;
 mod fragment;
 mod general;
+#[cfg(feature = "secure-boot")]
+mod generation_image;
 mod paths;
 mod rescue_cfg;
 #[cfg(feature = "secure-boot")]
@@ -40,6 +42,8 @@ pub use bootstrap::{
 pub use driver_image::{DriverImageSpec, DriverImagesConfig};
 pub use entries::{Activation, ActivationKind, FilesystemEntry};
 pub use general::{General, KernelModules};
+#[cfg(feature = "secure-boot")]
+pub use generation_image::GenerationImageConfig;
 pub use paths::Paths;
 pub use rescue_cfg::{EmergencyShellConfig, RescueConfig};
 pub use tpm::{SealedSecret, TpmConfig};
@@ -136,6 +140,13 @@ pub struct Config {
     #[serde(default)]
     pub signing: SigningConfig,
 
+    /// Signed loop-backed generation image policy. The matching filesystem
+    /// entry is opened once, verified, and attached to a read-only loop device
+    /// through that same fd before it is mounted.
+    #[cfg(feature = "secure-boot")]
+    #[serde(default)]
+    pub generation_image: Option<GenerationImageConfig>,
+
     /// `[secure_boot]` table (#10) — the top-level secure-boot policy:
     /// the ONE [`PriorityVolume`] concept (R-3), the refuse-screen
     /// countdown, the rescue sentinel, and the enforcement/TPM posture.
@@ -162,6 +173,12 @@ pub struct Config {
     /// makes [`Default for Config`] supply `None` automatically.
     #[serde(skip)]
     pub runtime_boot_mountpoint: Option<PathBuf>,
+
+    /// Set when generation-image state rolls an untested image back. The
+    /// kexec handoff appends the stable notification token to its cmdline.
+    #[cfg(feature = "secure-boot")]
+    #[serde(skip)]
+    pub generation_rollback: bool,
 
     /// Populated by Phase 0.5 when the bootstrap TOML carries a
     /// `[bootstrap.state]` section. Holds the RW twin mountpoint of the
@@ -364,6 +381,8 @@ impl Config {
             // reaching recovery never relaxes the security posture.
             // ──────────────────────────────────────────────────────────────────
             driver_images: DriverImagesConfig::default(),
+            #[cfg(feature = "secure-boot")]
+            generation_image: None,
             tpm: TpmConfig::default(),
             // signing: enforce stays false in recovery (audit-neutral); the
             // baked keys are unaffected, and reaching recovery never relaxes
@@ -381,6 +400,8 @@ impl Config {
             #[cfg(feature = "staged-boot")]
             staged: None,
             runtime_boot_mountpoint: None,
+            #[cfg(feature = "secure-boot")]
+            generation_rollback: false,
             #[cfg(feature = "stateful")]
             runtime_state_mountpoint: None,
         }

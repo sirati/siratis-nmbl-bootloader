@@ -5,6 +5,10 @@
 //! `while [ ! -b "$device" ]; do sleep 0.1; …; done` loop at the bottom
 //! of `sirati-nmbl/scripts/mount-and-kernel.sh.nix`.
 
+#[cfg(feature = "secure-boot")]
+use std::fs::File;
+#[cfg(feature = "secure-boot")]
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -264,7 +268,7 @@ pub async fn mount_system_filesystems(
         // backing file and mount THAT instead. The kernel detaches the
         // loop binding when the mount is torn down before kexec.
         let mount_src: PathBuf = if entry_is_loop_backed(entry, dev) {
-            let loop_dev = setup_loop_device(dev)?;
+            let loop_dev = setup_verified_loop_device(config, entry, dev)?;
             nmbl_info!(
                 "loop-backed {} attached to {}",
                 dev.display(),
@@ -368,6 +372,49 @@ fn setup_loop_device(file: &Path) -> Result<PathBuf> {
     // `LoopBindError` back to its inner `NmblError` to preserve behaviour.
     let index = loop_bind_ro(&backing_fd).map_err(|e| *e.source)?;
     Ok(PathBuf::from(format!("/dev/loop{index}")))
+}
+
+/// Verify the configured generation image over one pinned fd and hand that
+/// same fd to `LOOP_CONFIGURE`. Other loop-backed files retain the ordinary
+/// path. This closes the path-swap window between signature verification and
+/// mounting the selected immutable image.
+fn setup_verified_loop_device(
+    config: &Config,
+    entry: &FilesystemEntry,
+    file: &Path,
+) -> Result<PathBuf> {
+    #[cfg(not(feature = "secure-boot"))]
+    let _ = (config, entry);
+    #[cfg(feature = "secure-boot")]
+    if let Some(policy) = config.generation_image.as_ref().filter(|p| p.enable)
+        && entry.mountpoint == policy.mountpoint
+    {
+        let pinned = File::open(file).map_err(|source| NmblError::Io {
+            source,
+            context: format!("opening signed generation image {}", file.display()),
+        })?;
+        let sig = resolve_image_sidecar(config, &policy.signature_path);
+        crate::sig::verify_image_fd(
+            pinned.as_fd(),
+            "generation image",
+            Some(&sig),
+            crate::sig::DOMAIN_GENERATION_IMAGE,
+            config,
+        )?;
+        let index = loop_bind_ro(&pinned).map_err(|e| *e.source)?;
+        return Ok(PathBuf::from(format!("/dev/loop{index}")));
+    }
+    setup_loop_device(file)
+}
+
+#[cfg(feature = "secure-boot")]
+fn resolve_image_sidecar(config: &Config, path: &Path) -> PathBuf {
+    if path.is_absolute() && !path.starts_with("/dev/") {
+        let stripped = path.strip_prefix("/").unwrap_or(path);
+        config.paths.system_root.join(stripped)
+    } else {
+        path.to_path_buf()
+    }
 }
 
 #[cfg(test)]
