@@ -177,6 +177,46 @@ pub(crate) async fn run_boot_inside_runtime(
             Err(err) => return BootOutcome::Done(Box::new(Err(Box::new((err, config))))),
         }
     }
+    #[cfg(feature = "secure-boot")]
+    if let Some(policy) = config
+        .generation_image
+        .as_ref()
+        .filter(|p| p.enable && (p.automatic_rollback || p.automatic_rescue))
+    {
+        let Some(boot) = config.runtime_boot_mountpoint.as_deref() else {
+            let err = NmblError::ConfigInvalid {
+                reason: "generation state requires a mounted bootstrap boot volume".into(),
+                context: "generation-image state".into(),
+            };
+            return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
+        };
+        let relative = match policy.state_root.strip_prefix("/boot") {
+            Ok(path) => path,
+            Err(_) => {
+                let err = NmblError::ConfigInvalid {
+                    reason: "generation state_root must be below /boot".into(),
+                    context: "generation-image state".into(),
+                };
+                return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
+            }
+        };
+        match nmbl_init::generation_state::prepare_boot(
+            &boot.join(relative),
+            policy.automatic_rollback,
+            policy.automatic_rescue,
+        ) {
+            Ok(nmbl_init::generation_state::BootStateOutcome::Proceed) => {}
+            Ok(nmbl_init::generation_state::BootStateOutcome::RolledBack) => {
+                config.generation_rollback = true;
+                nmbl_info!("generation-image: rolling back failed untested generation");
+            }
+            Ok(nmbl_init::generation_state::BootStateOutcome::Rescue) => {
+                nmbl_warn!("generation-image: tested generation failed; entering rescue");
+                return BootOutcome::ForceRescue(Box::new(config));
+            }
+            Err(err) => return BootOutcome::Done(Box::new(Err(Box::new((err, config))))),
+        }
+    }
     // Force-rescue decision: the legacy `rescue.force_on_boot && external`
     // trigger UNIONED with the rescue sentinel (FIX-49/MED-1). Routing through
     // `should_force_rescue` is what actually READS the sentinel — without it an

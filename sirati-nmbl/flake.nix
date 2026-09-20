@@ -117,6 +117,89 @@
           [ "${self}" "${./testing/network-stage-vm/harness.py}" "${pkgs.qemu_kvm}/bin/qemu-system-x86_64" ]
           (builtins.readFile ./testing/network-stage-vm/run.sh);
       };
+      nmblErofsCtl = import ./lib/erofsctl.nix { inherit pkgs nmblSign; };
+      nmblErofsReceive = import ./lib/erofs-receive.nix {
+        inherit pkgs nmblErofsCtl;
+      };
+      nmblErofsDeploy = import ./lib/erofs-deploy.nix { inherit pkgs; };
+      nmblGenerationImageVmTest = import ./lib/generation-image-vm-test.nix {
+        inherit pkgs nmblSign nmblErofsCtl nmblErofsDeploy;
+        source = self;
+      };
+      nmblGenerationStateVmTest = import ./lib/generation-state-vm-test.nix {
+        inherit pkgs nmblSign nmblErofsCtl nmblErofsReceive nmblErofsDeploy;
+        source = self;
+      };
+      nmblErofsCtlCheck = pkgs.runCommand "nmbl-erofsctl-check" { } ''
+        export HOME="$TMPDIR/home"
+        mkdir -p "$HOME" "$TMPDIR/keys" "$TMPDIR/root"
+        ${nmblSign}/bin/nmbl-sign keygen --alg ml-dsa-65 \
+          --out-priv "$TMPDIR/keys/private" --out-pub "$TMPDIR/keys/public"
+        printf first > "$TMPDIR/first.erofs"
+        printf second > "$TMPDIR/second.erofs"
+        first=$(${nmblErofsCtl}/bin/nmbl-erofsctl prepare \
+          "$TMPDIR/first.erofs" "$TMPDIR/keys/private" "$TMPDIR/first")
+        second=$(${nmblErofsCtl}/bin/nmbl-erofsctl prepare \
+          "$TMPDIR/second.erofs" "$TMPDIR/keys/private" "$TMPDIR/second")
+        ${nmblErofsCtl}/bin/nmbl-erofsctl install "$TMPDIR/first" "$TMPDIR/root"
+        ${nmblErofsCtl}/bin/nmbl-erofsctl activate "$first" "$TMPDIR/root"
+        test "$(stat -c %a "$TMPDIR/root")" = 700
+        test "$(stat -c %a "$TMPDIR/root/generations/$first")" = 700
+        ${nmblErofsCtl}/bin/nmbl-erofsctl install "$TMPDIR/second" "$TMPDIR/root"
+        ${nmblErofsCtl}/bin/nmbl-erofsctl activate "$second" "$TMPDIR/root"
+        test "$(readlink "$TMPDIR/root/active")" = "generations/$second"
+        test "$(readlink "$TMPDIR/root/previous")" = "generations/$first"
+        ${nmblErofsCtl}/bin/nmbl-erofsctl rollback "$TMPDIR/root"
+        test "$(readlink "$TMPDIR/root/active")" = "generations/$first"
+        ${nmblErofsCtl}/bin/nmbl-erofsctl gc 0 "$TMPDIR/root"
+        test -d "$TMPDIR/root/generations/$first"
+        test -d "$TMPDIR/root/generations/$second"
+        touch "$out"
+      '';
+      nmblErofsReceiveCheck = pkgs.runCommand "nmbl-erofs-receive-check" {
+        nativeBuildInputs = [ pkgs.python3 ];
+      } ''
+        mkdir -p "$TMPDIR/keys" "$TMPDIR/incoming" "$TMPDIR/root"
+        ${nmblSign}/bin/nmbl-sign keygen --alg ml-dsa-65 \
+          --out-priv "$TMPDIR/keys/private" --out-pub "$TMPDIR/keys/public"
+        printf first > "$TMPDIR/first.erofs"
+        printf second > "$TMPDIR/second.erofs"
+        first=$(${nmblErofsCtl}/bin/nmbl-erofsctl prepare \
+          "$TMPDIR/first.erofs" "$TMPDIR/keys/private" "$TMPDIR/first")
+        second=$(${nmblErofsCtl}/bin/nmbl-erofsctl prepare \
+          "$TMPDIR/second.erofs" "$TMPDIR/keys/private" "$TMPDIR/second")
+        send() {
+          bundle=$1; reboot=0
+          printf 'NMBL-EROFS-BUNDLE-1\n%s\n%s\n%s\n0\n%s\n' \
+            "$(cat "$bundle/generation")" "$(stat -c %s "$bundle/nix.erofs")" \
+            "$(stat -c %s "$bundle/nix.erofs.sig")" "$reboot"
+          cat "$bundle/nix.erofs" "$bundle/nix.erofs.sig"
+        }
+        send "$TMPDIR/first" | ${nmblErofsReceive}/bin/nmbl-erofs-receive \
+          "$TMPDIR/incoming" "$TMPDIR/root"
+        test "$(readlink "$TMPDIR/root/active")" = "generations/$first"
+        image_size=$(stat -c %s "$TMPDIR/second/nix.erofs")
+        sig_size=$(stat -c %s "$TMPDIR/second/nix.erofs.sig")
+        {
+          printf 'NMBL-EROFS-BUNDLE-1\n%s\n%s\n%s\n0\n0\n' \
+            "$second" "$image_size" "$sig_size"
+          head -c 1 "$TMPDIR/second/nix.erofs"
+        } | if ${nmblErofsReceive}/bin/nmbl-erofs-receive \
+          "$TMPDIR/incoming" "$TMPDIR/root"; then exit 1; fi
+        test "$(readlink "$TMPDIR/root/active")" = "generations/$first"
+        send "$TMPDIR/second" | ${nmblErofsReceive}/bin/nmbl-erofs-receive \
+          "$TMPDIR/incoming" "$TMPDIR/root"
+        test "$(readlink "$TMPDIR/root/active")" = "generations/$second"
+        python3 - "$TMPDIR/keys/private" "$TMPDIR/root" ${nmblErofsReceive} <<'PY'
+        import pathlib, sys
+        secret = pathlib.Path(sys.argv[1]).read_bytes()
+        for root in map(pathlib.Path, sys.argv[2:]):
+            for path in ([root] if root.is_file() else root.rglob("*")):
+                if path.is_file() and secret in path.read_bytes():
+                    raise SystemExit(f"private key leaked into {path}")
+        PY
+        touch "$out"
+      '';
       lib = nixpkgs.lib;
 
       # Import rescue-vm-test app directly
@@ -292,6 +375,72 @@
       # No private-key-importing signer: test artifacts are signed at INSTALL
       # RUNTIME (lib/install-{signing,gen-signing}.nix), never in a derivation.
       testKeys = import ./testing/keys.nix { inherit pkgs lib; };
+
+      # Build a real systemd stage-1 with signed-generation wiring. This checks
+      # the static helper, embedded public policy, and native mount-unit graph
+      # together without importing a private key into any derivation.
+      generationImageInitrdConfig =
+        testing.mkTestConfigurations."test-gpt-qemu-kernel-invoke".extendModules {
+          modules = [
+            {
+              boot.initrd.systemd.enable = true;
+              fileSystems."/nix" = {
+                device = "/boot/nmbl-generations/active/nix.erofs";
+                fsType = "erofs";
+                neededForBoot = true;
+                options = [ "loop" "ro" ];
+              };
+              # Simulate the legacy hand-written unit used by EROFS hosts. The
+              # security module must put its verified unit first and win the
+              # duplicate-unit resolution in systemd initrd generation.
+              boot.initrd.systemd.mounts = [
+                {
+                  where = "/sysroot/nix";
+                  what = "/sysroot/boot/nmbl-generations/active/nix.erofs";
+                  type = "erofs";
+                  options = "loop,ro";
+                }
+              ];
+              boot.nmbl.signing = {
+                enable = true;
+                enforce = true;
+                algorithm = "ml-dsa-87";
+                publicKeys = [ testKeys.publicKey ];
+                generationKeyFile = "/run/secrets/offline-only";
+                deferInstallSigning = true;
+              };
+              boot.nmbl.generationImage.enable = true;
+              boot.nmbl.secureBoot.enable = true;
+              boot.nmbl.tpm.measure = true;
+            }
+          ];
+        };
+      generationImageInitrd = generationImageInitrdConfig.config.system.build.initialRamdisk;
+      generationImageHelper =
+        generationImageInitrdConfig.config.boot.initrd.systemd.extraBin.nmbl-generation-mount;
+      generationImageMounts = lib.filter
+        (mount: mount.where == "/sysroot/nix")
+        generationImageInitrdConfig.config.boot.initrd.systemd.mounts;
+      generationImageWiringOk =
+        builtins.length generationImageMounts >= 1
+        && (builtins.elemAt generationImageMounts 0).what == "/dev/nmbl-verified-generation"
+        && lib.elem "nmbl-generation-mount.service"
+          (builtins.elemAt generationImageMounts 0).requires;
+      generationImageNoPrivateKey = testKeys.assertAbsentFromClosure {
+        name = "generation-image-initrd-no-private-key";
+        closurePath = generationImageInitrd;
+      };
+      generationImageInitrdCheck = assert lib.assertMsg generationImageWiringOk
+        "generation-image initrd mount unit lost its fail-closed helper dependency";
+        pkgs.runCommand "generation-image-initrd-check" {
+          nativeBuildInputs = [ pkgs.file pkgs.gnugrep ];
+        } ''
+          test -e ${generationImageInitrd}/initrd
+          test -x ${generationImageHelper}
+          file ${generationImageHelper} | grep -q 'statically linked'
+          test -e ${generationImageNoPrivateKey}
+          touch "$out"
+        '';
 
       # The PRODUCTION-closure absence guard (#56 / FIX-61): the insecure-test
       # private key must NOT appear in a production NMBL initramfs closure.
@@ -921,6 +1070,11 @@
       # in NMBL's boot environment). Build with `nix build .#nmbl-tpm-enroll`.
       packages.${system} = {
         nmbl-tpm-enroll = nmblTpmEnroll;
+        nmbl-erofsctl = nmblErofsCtl;
+        nmbl-erofs-receive = nmblErofsReceive;
+        nmbl-erofs-deploy = nmblErofsDeploy;
+        nmbl-generation-image-vm-test = nmblGenerationImageVmTest;
+        nmbl-generation-state-vm-test = nmblGenerationStateVmTest;
         # Build check (#56): the insecure-test signing key must be ABSENT from
         # a production NMBL closure. `nix build .#insecure-test-key-absent`.
         insecure-test-key-absent = insecureKeyAbsentFromProd;
@@ -954,6 +1108,9 @@
       # secure-boot-install private-key-absence guard (#57 F6b — the signed test
       # disk is signed at install runtime, so no signing key is in its closure).
       checks.${system} = {
+        nmbl-erofsctl = nmblErofsCtlCheck;
+        nmbl-erofs-receive = nmblErofsReceiveCheck;
+        generation-image-initrd = generationImageInitrdCheck;
         insecure-test-key-absent = insecureKeyAbsentFromProd;
         test-secure-boot-no-private-key = secureBootNoPrivateKey;
         test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;
@@ -983,6 +1140,14 @@
       # them in muscle memory). New matrix apps use the dotted
       # `<start>-<target>-<interaction>` naming.
       apps.${system} = testApps // {
+        generation-image-vm-test = {
+          type = "app";
+          program = "${nmblGenerationImageVmTest}/bin/nmbl-generation-image-vm-test";
+        };
+        generation-state-vm-test = {
+          type = "app";
+          program = "${nmblGenerationStateVmTest}/bin/nmbl-generation-state-vm-test";
+        };
         test-rescue-ssh = rescueVmTestApp;
         test-network-stage-vm = {
           type = "app";

@@ -25,6 +25,16 @@ path = "src/lib.rs"
 name = "nmbl-init"
 path = "src/main.rs"
 
+[[bin]]
+name = "nmbl-generation-mount"
+path = "src/bin/nmbl-generation-mount.rs"
+required-features = ["secure-boot"]
+
+[[bin]]
+name = "nmbl-generation-state"
+path = "src/bin/nmbl-generation-state.rs"
+required-features = ["secure-boot"]
+
 # Size-tuned release profile. -Oz + fat LTO + 1 codegen unit + strip is the
 # canonical recipe; unwind stays on so the panic hook can re-exec into the
 # recovery path instead of letting PID 1 die.

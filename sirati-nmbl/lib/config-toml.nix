@@ -294,6 +294,16 @@ let
       };
     };
   }
+  // lib.optionalAttrs cfg.generationImage.enable {
+    generation_image = {
+      enable = true;
+      mountpoint = cfg.generationImage.mountPoint;
+      signature_path = cfg.generationImage.signaturePath;
+      state_root = cfg.generationImage.stateRoot;
+      automatic_rollback = cfg.generationImage.automaticRollback;
+      automatic_rescue = cfg.generationImage.automaticRescue;
+    };
+  }
   # Secure-boot policy (#10): the ONE priority-volume concept (R-3) plus
   # the refuse countdown, sentinel and enforcement posture. Emitted ONLY
   # when the `secure-boot` feature is compiled in (`secureBootActive`,

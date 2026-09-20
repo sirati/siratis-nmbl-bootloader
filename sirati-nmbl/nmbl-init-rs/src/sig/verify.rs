@@ -69,6 +69,8 @@ pub const DOMAIN_RESCUE_SFS: &[u8] = b"nmbl:rescue-sfs:v1";
 pub const DOMAIN_BOOT_CONFIG: &[u8] = b"nmbl:boot-config:v1";
 /// Domain for the rescue networking EROFS signature.
 pub const DOMAIN_NETWORK_STAGE: &[u8] = b"nmbl:network-stage:v1";
+/// Domain for a content-addressed, loop-backed Nix generation image.
+pub const DOMAIN_GENERATION_IMAGE: &[u8] = b"nmbl:generation-image:v1";
 
 /// How strictly a verify call treats a missing or unparseable sidecar.
 ///

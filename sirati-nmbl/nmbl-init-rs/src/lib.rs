@@ -3,6 +3,10 @@ pub mod boot;
 pub mod config;
 pub mod devices;
 pub mod error;
+#[cfg(feature = "secure-boot")]
+pub mod generation_mount;
+#[cfg(feature = "secure-boot")]
+pub mod generation_state;
 pub mod generations;
 /// Runtime loader for signed driver images (FEATURE-#1): verify → mount-ro →
 /// firmware → `init_module` over a single pinned fd. The public surface
