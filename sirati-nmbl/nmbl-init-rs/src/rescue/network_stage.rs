@@ -63,6 +63,16 @@ pub(super) fn prepare(config: &Config) -> Result<()> {
         "ro,nodev,nosuid,noexec",
     )
     .map_err(|source| wrap("network-stage-mount", source))?;
+    let config_path = Path::new(TARGET).join("etc/nmbl-network/network.conf");
+    super::network_profile::validate_file(&config_path).map_err(|reason| {
+        wrap(
+            "network-stage-profile",
+            NmblError::ConfigInvalid {
+                reason,
+                context: config_path.display().to_string(),
+            },
+        )
+    })?;
     Ok(())
 }
 

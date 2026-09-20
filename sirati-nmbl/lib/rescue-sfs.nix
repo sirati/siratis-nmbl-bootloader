@@ -119,8 +119,11 @@ let
         utilLinux rescueModprobes;
       networkStageEnabled = fullSystem.networkStage.enable;
     }
+    + import ./rescue/init-script-network.nix {
+      inherit bash coreutils dhcpcd gawk iproute2;
+    }
     + import ./rescue/init-script-net.nix {
-      inherit lib bash coreutils dhcpcd iproute2 nix openssh fullSystem;
+      inherit lib bash coreutils iproute2 nix openssh fullSystem;
     }
   );
 

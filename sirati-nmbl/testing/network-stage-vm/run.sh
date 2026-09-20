@@ -66,6 +66,28 @@ cp -a "$stage" "$work_root/unsigned-tree"
 rm "$work_root/unsigned-tree/nmbl/network.erofs.sig"
 make_disk "$work_root/unsigned-tree" "$work_root/unsigned.img"
 
+# Rebuild and correctly sign an EROFS whose data-only policy is malformed.
+# This exercises the production signature and mount path, then proves the
+# stage-1 parser fails closed before rescue networking or sshd can start.
+mkdir "$work_root/malformed-root"
+fsck.erofs --extract="$work_root/malformed-root" "$artifacts/network.erofs"
+cat > "$work_root/malformed-root/etc/nmbl-network/network.conf" <<'EOF'
+version 2
+address-family dual-stack
+profile interface eth0
+address 4 999.0.0.1/24
+end
+EOF
+mkfs.erofs -zlz4hc "$work_root/malformed.erofs" "$work_root/malformed-root"
+cp -a "$stage" "$work_root/malformed-tree"
+cp "$work_root/malformed.erofs" "$work_root/malformed-tree/nmbl/network.erofs"
+"$signer/bin/nmbl-sign" sign \
+  --key "$private_key" \
+  --domain network-stage \
+  --out "$work_root/malformed-tree/nmbl/network.erofs.sig" \
+  "$work_root/malformed-tree/nmbl/network.erofs"
+make_disk "$work_root/malformed-tree" "$work_root/malformed.img"
+
 verify_disk_file() {
   local disk="$1"
   local disk_path="$2"
@@ -76,7 +98,7 @@ verify_disk_file() {
   cmp "$expected" "$output"
 }
 
-for disk in good tampered unsigned; do
+for disk in good tampered unsigned malformed; do
   verify_disk_file "$work_root/$disk.img" /nmbl-rescue.sfs "$stage/nmbl-rescue.sfs"
   verify_disk_file "$work_root/$disk.img" /nmbl-rescue.sfs.sig "$stage/nmbl-rescue.sfs.sig"
   verify_disk_file "$work_root/$disk.img" /nmbl/config.toml "$stage/nmbl/config.toml"
@@ -94,12 +116,15 @@ python3 "$harness" scan \
   --target-list "$work_root/closure-paths" \
   "$source_tree" "$artifacts" "$stage" "$work_root/initrd" \
   "$work_root/rescue" "$work_root/network" "$work_root/disk" \
-  "$work_root/good.img" "$work_root/tampered.img" "$work_root/unsigned.img"
+  "$work_root/malformed-root" "$work_root/malformed-tree" \
+  "$work_root/malformed.erofs" "$work_root/good.img" \
+  "$work_root/tampered.img" "$work_root/unsigned.img" \
+  "$work_root/malformed.img"
 
 rm -f "$private_key" "$operator_root/do-not-export.marker"
 test ! -e "$private_key"
 
-for scenario in good tampered unsigned; do
+for scenario in good tampered unsigned malformed; do
   mode=invalid
   test "$scenario" = good && mode=good
   python3 "$harness" boot \

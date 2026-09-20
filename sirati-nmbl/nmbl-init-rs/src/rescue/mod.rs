@@ -31,6 +31,8 @@ pub mod verify;
 mod embedded;
 mod locate;
 #[cfg(feature = "secure-boot")]
+mod network_profile;
+#[cfg(feature = "secure-boot")]
 mod network_stage;
 mod types;
 

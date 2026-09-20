@@ -16,9 +16,39 @@ path. Before the rescue child starts, NMBL:
 
 The rescue then loads its filesystem, packet, and NIC modules with
 `modprobe -d /nmbl-network`. Firmware requests use
-`/nmbl-network/lib/firmware`. The data-only `network.conf` selects all or a
-fixed list of interfaces and one of `dual-stack`, `ipv4-only`, or `ipv6-only`.
-It is parsed as fixed directives and is never executed as shell code.
+`/nmbl-network/lib/firmware`. The data-only `network.conf` selects one of
+`dual-stack`, `ipv4-only`, or `ipv6-only`. With no `staticProfiles`, rescue
+keeps the DHCP default and either discovers NICs or uses the fixed `interfaces`
+list. Static profiles select exactly one NIC by kernel name or canonical MAC
+address, and carry addresses, an optional default gateway, additional direct
+or gateway routes, and optional DNS servers. Gateways and routes can be marked
+on-link. The strict Rust parser validates the bounded file before rescue
+starts; the shell only applies accepted directives and never evaluates file
+content.
+
+```nix
+boot.nmbl.rescue.fullSystem.networkStage = {
+  enable = true;
+  addressFamily = "dual-stack";
+  dnsServers = [ "1.1.1.1" "2606:4700:4700::1111" ];
+  staticProfiles = [ {
+    macAddress = "52:54:00:12:34:56";
+    ipv4 = {
+      addresses = [ "192.0.2.10/32" ];
+      gateway = "192.0.2.1";
+      gatewayOnLink = true;
+    };
+    ipv6 = {
+      addresses = [ "2001:db8::10/64" ];
+      routes = [ {
+        destination = "default";
+        via = "fe80::1";
+        onLink = true;
+      } ];
+    };
+  } ];
+};
+```
 
 The stage requires enforced NMBL signing. Build with only the operator public
 key, then run the generated production installer on the target or from an
@@ -52,6 +82,8 @@ outer harness creates a one-use ML-DSA key in private tmpfs, evaluates Nix with
 only the derived public key, invokes the production installer, and deletes the
 private key before booting. It scans evaluated sources, store closures, initrd,
 rescue/network images, signatures, and boot disks for the exact key bytes and a
-random secret marker. The suite boots valid, tampered, and unsigned images.
+random secret marker. The suite boots valid, tampered, unsigned, and correctly
+signed but malformed images. The valid VM verifies static IPv4 and IPv6
+addresses, gateways, routes, and DNS without starting DHCP.
 Rejected networking stages keep the signed local rescue console available but
 start neither networking nor SSH.

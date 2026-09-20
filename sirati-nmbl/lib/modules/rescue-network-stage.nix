@@ -4,6 +4,85 @@ let
   cfg = config.boot.nmbl.rescue.fullSystem;
   stage = cfg.networkStage;
   hostKey = cfg.hostKeyPath;
+  routeOptions =
+    { ... }:
+    {
+      options = {
+        destination = lib.mkOption {
+          type = lib.types.str;
+          description = "CIDR destination or `default`.";
+        };
+        via = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Gateway address; null creates a device route.";
+        };
+        onLink = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = "Pass the route's onlink flag to iproute2.";
+        };
+      };
+    };
+  familyOptions =
+    { ... }:
+    {
+      options = {
+        addresses = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          description = "Static addresses with prefix lengths.";
+        };
+        gateway = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Optional default gateway address.";
+        };
+        gatewayOnLink = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = "Treat the default gateway as directly reachable.";
+        };
+        routes = lib.mkOption {
+          type = lib.types.listOf (lib.types.submodule routeOptions);
+          default = [ ];
+          description = "Additional static routes.";
+        };
+      };
+    };
+  profileOptions =
+    { ... }:
+    {
+      options = {
+        interfaceName = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Exact kernel interface name selector.";
+        };
+        macAddress = lib.mkOption {
+          type = lib.types.nullOr lib.types.str;
+          default = null;
+          description = "Canonical six-octet MAC selector.";
+        };
+        ipv4 = lib.mkOption {
+          type = lib.types.submodule familyOptions;
+          default = { };
+        };
+        ipv6 = lib.mkOption {
+          type = lib.types.submodule familyOptions;
+          default = { };
+        };
+      };
+    };
+  validName = value: builtins.match "[A-Za-z0-9_.:-]+" value != null;
+  validMac = value: builtins.match "[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}" value != null;
+  profilesValid = lib.all (
+    profile:
+    ((profile.interfaceName != null) != (profile.macAddress != null))
+    && (profile.interfaceName == null || validName profile.interfaceName)
+    && (profile.macAddress == null || validMac profile.macAddress)
+    && (profile.ipv4.addresses != [ ] || profile.ipv6.addresses != [ ])
+  ) stage.staticProfiles;
 in
 {
   options.boot.nmbl.rescue.fullSystem = {
@@ -46,6 +125,22 @@ in
         example = [ "enp1s0" ];
         description = "Interfaces to configure; an empty list discovers all NICs.";
       };
+
+      staticProfiles = lib.mkOption {
+        type = lib.types.listOf (lib.types.submodule profileOptions);
+        default = [ ];
+        description = ''
+          Data-only static network profiles. Each profile selects exactly one
+          interface by kernel name or MAC address. An empty list preserves the
+          existing DHCP behavior.
+        '';
+      };
+
+      dnsServers = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        description = "DNS server IP addresses for static rescue networking.";
+      };
     };
   };
 
@@ -73,6 +168,23 @@ in
       {
         assertion = lib.all (iface: builtins.match "[A-Za-z0-9_.:-]+" iface != null) stage.interfaces;
         message = "networkStage.interfaces entries must be plain interface names.";
+      }
+      {
+        assertion = stage.staticProfiles == [ ] || stage.interfaces == [ ];
+        message = "networkStage.interfaces is DHCP-only and cannot be combined with staticProfiles.";
+      }
+      {
+        assertion = profilesValid;
+        message = "Each static profile needs one valid name/MAC selector and at least one address.";
+      }
+      {
+        assertion =
+          stage.staticProfiles == [ ]
+          || (
+            (stage.addressFamily != "ipv4-only" || lib.all (p: p.ipv6.addresses == [ ]) stage.staticProfiles)
+            && (stage.addressFamily != "ipv6-only" || lib.all (p: p.ipv4.addresses == [ ]) stage.staticProfiles)
+          );
+        message = "Static profile addresses must match networkStage.addressFamily.";
       }
       {
         assertion = !(lib.hasPrefix "/" stage.imagePath) && !(lib.hasInfix ".." stage.imagePath);
