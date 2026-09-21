@@ -270,7 +270,7 @@ let
     inherit pkgs lib;
     contents = cfg.rescue.squashfsContents;
     fullSystem = {
-      inherit (cfg.rescue.fullSystem) enable packages sshdPort rootAuthorizedKeys hostKeyPath;
+      inherit (cfg.rescue.fullSystem) enable minimal packages sshdPort rootAuthorizedKeys hostKeyPath;
       networkStage = cfg.rescue.fullSystem.networkStage;
       # NIC drivers the recovery /init modprobes ITSELF after switch_root.
       # NMBL no longer preloads them — the .ko + firmware ship in the
@@ -279,7 +279,10 @@ let
       nicDrivers = lib.unique (cfg.rescue.nicDrivers ++ detectedNicModules);
       # Filesystem / packet modules the recovery /init loads before the
       # overlay + network setup. Loaded from the staged tree, not NMBL's.
-      coreModules = [ "overlay" "ext4" "af_packet" ];
+      coreModules = if cfg.rescue.fullSystem.minimal then
+        [ "overlay" "af_packet" "btrfs" "raid1" "nvme" ]
+      else
+        [ "overlay" "ext4" "af_packet" ];
       # The makeModulesClosure result (its /lib/modules + /lib/firmware are
       # staged into the squashfs root). null when there is nothing to load
       # (fullSystem disabled or non-external), in which case rescue-sfs.nix

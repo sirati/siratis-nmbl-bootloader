@@ -117,6 +117,21 @@ mkdir "$work_root/initrd" "$work_root/rescue" "$work_root/network" "$work_root/d
 (cd "$work_root/initrd" && lsinitrd --unpack "$artifacts/initrd")
 unsquashfs -quiet -dest "$work_root/rescue" "$artifacts/rescue.sfs"
 fsck.erofs --extract="$work_root/network" "$artifacts/network.erofs"
+
+# The constrained-/boot profile must retain the actual recovery tools while
+# keeping package-fetching and unrelated storage stacks out of the image.
+for tool in bash sshd btrfs mdadm nmbl; do
+  test -x "$work_root/rescue/bin/$tool"
+done
+for forbidden in nix-daemon btop cryptsetup lvm mkfs.ext4; do
+  test ! -e "$work_root/rescue/bin/$forbidden"
+done
+if find "$work_root/rescue/nix/store" -mindepth 1 -maxdepth 1 \
+  -printf '%f\n' | grep -Eq '(^|-)nix-|btop|cacert|cryptsetup|lvm|e2fsprogs'; then
+  echo "minimal rescue contains a forbidden package" >&2
+  exit 1
+fi
+
 debugfs -R "rdump / $work_root/disk" "$work_root/good.img" >/dev/null
 nix-store -qR "$artifacts" "$signer" > "$work_root/closure-paths"
 python3 "$harness" scan \
