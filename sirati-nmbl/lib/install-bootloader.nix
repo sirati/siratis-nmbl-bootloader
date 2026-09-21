@@ -24,6 +24,7 @@
   nmblRescueSquashfs,
   nmblUki,
   nmblNetworkStage ? null,
+  nmblGrubConfig ? null,
   rescueStageInstaller ? null,
   # Install-time driver-image staging + `nmbl-sign` signing shell (#25a).
   # Empty string when no driver images are enabled (default keeps older
@@ -138,7 +139,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
       ''${config.system.build.nmblInit}/bin/nmbl-init --validate-hardware=${nmblConfigToml} ${cryptsetupToolArg} || echo "SEVERE WARNING: NMBL hardware validation failed; installing anyway because refuseInvalidHardwareOnInstall=false"''
   }
 
-  ${lib.optionalString (actualLoader != "efi-stub") ''
+  ${lib.optionalString (actualLoader != "efi-stub" && !(cfg.bootUpdate.enable or false)) ''
     KERNEL="${config.system.build.nmblKernel}/bzImage"
     INITRD="${config.system.build.nmblInitramfs}/initrd"
 
@@ -161,9 +162,9 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     echo "✓ State file initialised"
   ''}
 
-  ${lib.optionalString (configLocation == "external") externalConfigInstallShell}
+  ${lib.optionalString (configLocation == "external" && !(cfg.bootUpdate.enable or false)) externalConfigInstallShell}
 
-  ${lib.optionalString (cfg.rescue.mode == "external" && !cfg.rescue.fullSystem.networkStage.enable) (
+  ${lib.optionalString (cfg.rescue.mode == "external" && !cfg.rescue.fullSystem.networkStage.enable && !(cfg.bootUpdate.enable or false)) (
     let
       # `cfg.rescue.sfsPath` is interpreted relative to the boot mount
       # by the Rust /init; strip a leading slash so the host-side
@@ -185,7 +186,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     ''
   )}
 
-  ${networkStageInstallShell}
+  ${lib.optionalString (!(cfg.bootUpdate.enable or false)) networkStageInstallShell}
 
   # Optional signed driver-image squashfs blobs (#25a). Each is staged onto
   # the ESP and signed in place with `nmbl-sign --domain driver-image`
@@ -194,7 +195,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
   # UKI/generation signing: the build-VM (disko image) pass has no staged
   # `imageKeyFile`, so the `nmbl-sign` call would fail there — the real install
   # (deferInstallSigning = false) stages the key and signs in place.
-  ${lib.optionalString (!deferInstallSigning) driverImageInstallShell}
+  ${lib.optionalString (!deferInstallSigning && !(cfg.bootUpdate.enable or false)) driverImageInstallShell}
 
   # Optional staged-boot artifacts (FEATURE #2). Staged onto the priority
   # volume's filesystem — the install root `/` (the decrypted cryptroot the
@@ -203,7 +204,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
   # Empty string when staged boot is off.
   ${stagedInstallShell}
 
-  ${lib.optionalString (cfg.splash.enable && cfg.splash.backgroundLocation == "boot-partition") (
+  ${lib.optionalString (cfg.splash.enable && cfg.splash.backgroundLocation == "boot-partition" && !(cfg.bootUpdate.enable or false)) (
     let
       # Splash background sidecar mode: the PNG is NOT embedded in the
       # initramfs (see lib/config.nix `splashBackgroundContents`).
@@ -230,18 +231,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
         echo "Configuring GPT+BIOS bootloader with GRUB..."
         mkdir -p /boot/grub
 
-        # Create GRUB config
-        cat > /boot/grub/grub.cfg << EOF
-    set timeout=${toString actualLoaderExtraArgs.timeout}
-    set default=${actualLoaderExtraArgs.default}
-    ${actualLoaderExtraArgs.extraConfig}
-
-    menuentry "NMBL Bootloader" {
-      linux /nmbl-kernel ${lib.concatStringsSep " " cfg.kernelParams}
-      initrd /nmbl-initrd
-    }
-    ${actualLoaderExtraArgs.extraEntries}
-    EOF
+        install_nmbl_file_if_changed ${nmblGrubConfig} /boot/grub/grub.cfg 0600
 
         # Discover boot disks (whole disks with an EF02 partition) unless
         # the caller pinned bootstrapper.bootDisks. grub-install runs per
@@ -281,18 +271,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
         echo "Configuring GPT+UEFI bootloader with GRUB..."
         mkdir -p /boot/EFI/BOOT /boot/grub
 
-        # Create GRUB config
-        cat > /boot/grub/grub.cfg << EOF
-    set timeout=${toString actualLoaderExtraArgs.timeout}
-    set default=${actualLoaderExtraArgs.default}
-    ${actualLoaderExtraArgs.extraConfig}
-
-    menuentry "NMBL Bootloader" {
-      linux /nmbl-kernel ${lib.concatStringsSep " " cfg.kernelParams}
-      initrd /nmbl-initrd
-    }
-    ${actualLoaderExtraArgs.extraEntries}
-    EOF
+        install_nmbl_file_if_changed ${nmblGrubConfig} /boot/grub/grub.cfg 0600
 
         # Install GRUB to the mounted /boot ESP. UEFI doesn't need a per-disk
         # `grub-install` like BIOS does — grub-install writes the EFI binary

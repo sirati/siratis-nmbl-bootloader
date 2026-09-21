@@ -1,6 +1,6 @@
 //! Per-role domain selection — a thin map over the verifier's frozen consts.
 //!
-//! The nine role domains are the EXACT `&[u8]` byte strings pinned in
+//! The role domains are the EXACT `&[u8]` byte strings pinned in
 //! `nmbl_init::sig` (`verify.rs`): a signature minted under one role can never
 //! verify under another (the domain-cross-reject property — FIX-01). This
 //! module does NOT redefine them; it re-exports them by a stable `--domain`
@@ -8,9 +8,9 @@
 //! byte string the verifier recomputes its tag from.
 
 use nmbl_init::sig::{
-    DOMAIN_BOOT_CONFIG, DOMAIN_DRIVER_IMAGE, DOMAIN_GEN_INITRD, DOMAIN_GEN_KERNEL,
-    DOMAIN_GENERATION_IMAGE, DOMAIN_NETWORK_STAGE, DOMAIN_PRIORITY_FILE, DOMAIN_RESCUE_SFS,
-    DOMAIN_STAGED_FRAGMENT,
+    DOMAIN_BOOT_CONFIG, DOMAIN_BOOT_SET_ARTIFACT, DOMAIN_BOOT_SET_MANIFEST, DOMAIN_DRIVER_IMAGE,
+    DOMAIN_GEN_INITRD, DOMAIN_GEN_KERNEL, DOMAIN_GENERATION_IMAGE, DOMAIN_NETWORK_STAGE,
+    DOMAIN_PRIORITY_FILE, DOMAIN_RESCUE_SFS, DOMAIN_STAGED_FRAGMENT,
 };
 
 /// One selectable signing role, paired with its CLI token and the frozen
@@ -61,6 +61,14 @@ const ROLES: &[Role] = &[
         token: "generation-image",
         domain: DOMAIN_GENERATION_IMAGE,
     },
+    Role {
+        token: "boot-set-manifest",
+        domain: DOMAIN_BOOT_SET_MANIFEST,
+    },
+    Role {
+        token: "boot-set-artifact",
+        domain: DOMAIN_BOOT_SET_ARTIFACT,
+    },
 ];
 
 /// Resolve a `--domain` CLI token to the frozen verifier domain byte string.
@@ -95,6 +103,14 @@ mod tests {
             domain_for("generation-image"),
             Some(DOMAIN_GENERATION_IMAGE)
         );
+        assert_eq!(
+            domain_for("boot-set-manifest"),
+            Some(DOMAIN_BOOT_SET_MANIFEST)
+        );
+        assert_eq!(
+            domain_for("boot-set-artifact"),
+            Some(DOMAIN_BOOT_SET_ARTIFACT)
+        );
     }
 
     #[test]
@@ -104,8 +120,8 @@ mod tests {
     }
 
     #[test]
-    fn all_nine_roles_present() {
-        assert_eq!(ROLES.len(), 9);
+    fn all_eleven_roles_present() {
+        assert_eq!(ROLES.len(), 11);
         // Every role token must be distinct.
         for (i, a) in ROLES.iter().enumerate() {
             for b in ROLES.iter().skip(i + 1) {

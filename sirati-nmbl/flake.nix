@@ -86,6 +86,8 @@
       # hard eval error only WHEN driver images are enabled.
       nmblSign =
         nmbl-init-rs.packages.${system}.nmbl-sign or null;
+      nmblBootUpdate =
+        nmbl-init-rs.packages.${system}.nmbl-boot-update or null;
 
       # The host / install-time LUKS-to-TPM seal helper (`nmbl-tpm-enroll`). It
       # reuses `systemd-cryptenroll` to write a LUKS2 systemd-tpm2 token that
@@ -123,6 +125,24 @@
             "${pkgs.passt}/bin/passt"
           ]
           (builtins.readFile ./testing/network-stage-vm/run.sh);
+      };
+      bootUpdateVmTest = pkgs.writeShellApplication {
+        name = "test-boot-update-vm";
+        runtimeInputs = with pkgs; [
+          coreutils dosfstools e2fsprogs gnugrep gnused grub2_efi mtools nix
+          python3 qemu_kvm
+        ];
+        text = builtins.replaceStrings
+          [ "@source@" "@harness@" "@qemu@" "@ovmf_code@" "@ovmf_vars@" "@grub@" ]
+          [
+            "${self}"
+            "${./testing/boot-update-vm/harness.py}"
+            "${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
+            "${pkgs.OVMF.fd.firmware}"
+            "${pkgs.OVMF.fd.variables}"
+            "${pkgs.grub2_efi}"
+          ]
+          (builtins.readFile ./testing/boot-update-vm/run.sh);
       };
       nmblErofsCtl = import ./lib/erofsctl.nix { inherit pkgs nmblSign; };
       nmblErofsReceive = import ./lib/erofs-receive.nix {
@@ -368,6 +388,39 @@
       # No private-key-importing signer: test artifacts are signed at INSTALL
       # RUNTIME (lib/install-{signing,gen-signing}.nix), never in a derivation.
       testKeys = import ./testing/keys.nix { inherit pkgs lib; };
+      bootUpdateEvalConfig =
+        testing.mkTestConfigurations."test-gpt-uefi-grub".extendModules {
+          modules = [ {
+            users.users.nmbl-update = {
+              isSystemUser = true;
+              uid = 991;
+              group = "nmbl-update";
+            };
+            users.groups.nmbl-update.gid = 991;
+            boot.nmbl = {
+              configLocation = "external";
+              rescue.mode = "external";
+              signing = {
+                enable = true;
+                enforce = true;
+                algorithm = "ml-dsa-87";
+                publicKeys = [ testKeys.publicKey ];
+                generationKeyFile = "/run/operator/nmbl.key";
+                deferInstallSigning = true;
+              };
+              bootUpdate = {
+                enable = true;
+                publicKey = testKeys.publicKey;
+              };
+            };
+          } ];
+        };
+      bootUpdateEvalCheck = pkgs.runCommand "nmbl-boot-update-eval-check" { } ''
+        test -x ${bootUpdateEvalConfig.config.system.build.nmblBootSetTool}/bin/nmbl-boot-update
+        grep -q '/nmbl-boot-sets/A/rescue' ${bootUpdateEvalConfig.config.system.build.nmblBootSetSources.A}/config
+        grep -q '/nmbl-boot-sets/B/rescue' ${bootUpdateEvalConfig.config.system.build.nmblBootSetSources.B}/config
+        touch "$out"
+      '';
 
       # Build a real systemd stage-1 with signed-generation wiring. This checks
       # the static helper, embedded public policy, and native mount-unit graph
@@ -1054,6 +1107,7 @@
           # The `nmbl-sign` ML-DSA image signer, used by the driver-image
           # build to sign each squashfs at install time.
           _module.args.nmblSign = nmblSign;
+          _module.args.nmblBootUpdate = nmblBootUpdate;
         };
 
       # Installer-available host tools. `nmbl-tpm-enroll` seals a LUKS volume
@@ -1063,6 +1117,7 @@
       # in NMBL's boot environment). Build with `nix build .#nmbl-tpm-enroll`.
       packages.${system} = {
         nmbl-tpm-enroll = nmblTpmEnroll;
+        nmbl-boot-update = nmblBootUpdate;
         nmbl-erofsctl = nmblErofsCtl;
         nmbl-erofs-receive = nmblErofsReceive;
         nmbl-erofs-deploy = nmblErofsDeploy;
@@ -1094,6 +1149,7 @@
         # so no signing key is in its closure.
         test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;
         test-network-stage-vm = networkStageVmTest;
+        test-boot-update-vm = bootUpdateVmTest;
       };
 
       # Build-only validation gates surfaced for CI / `nix flake check`-style
@@ -1103,6 +1159,7 @@
       checks.${system} = {
         nmbl-erofsctl = nmblErofsCtlCheck;
         nmbl-erofs-receive = nmblErofsReceiveCheck;
+        nmbl-boot-update-eval = bootUpdateEvalCheck;
         generation-image-initrd = generationImageInitrdCheck;
         generation-root-store-eval = rootStoreEvalCheck;
         insecure-test-key-absent = insecureKeyAbsentFromProd;
@@ -1146,6 +1203,10 @@
         test-network-stage-vm = {
           type = "app";
           program = "${networkStageVmTest}/bin/test-network-stage-vm";
+        };
+        test-boot-update-vm = {
+          type = "app";
+          program = "${bootUpdateVmTest}/bin/test-boot-update-vm";
         };
         check-log-import = {
           type = "app";

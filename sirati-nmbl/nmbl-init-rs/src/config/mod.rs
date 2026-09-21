@@ -37,7 +37,7 @@ mod tests;
 pub use bootstrap::BootstrapStaged;
 pub use bootstrap::{
     BootstrapBootFs, BootstrapConfig, BootstrapKernelModules, BootstrapRescue, BootstrapSection,
-    BootstrapStateMount, resolve_full_config_path,
+    BootstrapStateMount, boot_set_config_from_cmdline, resolve_full_config_path,
 };
 pub use driver_image::{DriverImageSpec, DriverImagesConfig};
 pub use entries::{Activation, ActivationKind, FilesystemEntry};

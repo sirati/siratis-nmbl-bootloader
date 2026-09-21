@@ -275,6 +275,18 @@ mountpoint = "/mnt/boot"
 }
 
 #[test]
+fn boot_set_cmdline_accepts_only_selector_slots() {
+    use crate::config::boot_set_config_from_cmdline;
+
+    assert_eq!(
+        boot_set_config_from_cmdline("quiet nmbl.config=/nmbl-boot-sets/A/config"),
+        Some(PathBuf::from("/nmbl-boot-sets/A/config"))
+    );
+    assert!(boot_set_config_from_cmdline("nmbl.config=/etc/shadow").is_none());
+    assert!(boot_set_config_from_cmdline("nmbl.config=/nmbl-boot-sets/C/config").is_none());
+}
+
+#[test]
 fn bootstrap_load_missing_file_is_bootstrap_load_toml_error() {
     use std::error::Error;
 

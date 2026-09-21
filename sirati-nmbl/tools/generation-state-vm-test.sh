@@ -18,8 +18,17 @@ scan_targets=(@source@)
 closure_paths=(@signer@ @ctl@ @receive@ @deploy@)
 
 make_disk() {
-  local tree=$1 disk=$2 label=$3 size
-  size=$(( $(du -sm "$tree" | cut -f1) + 512 ))
+  local tree=$1 disk=$2 label=$3 used reserve size
+  # mkfs copies logical bytes, including holes in sparse EROFS images.
+  # Count hard links separately because mkfs.ext4's directory importer may
+  # materialize each path even when the host tree shares the inode.
+  used=$(du -sm --apparent-size --count-links "$tree" | cut -f1)
+  # EROFS generation files are already dense. Account for ext4 metadata,
+  # reserved blocks, and copy-time rounding instead of assuming 512 MiB is
+  # sufficient for an arbitrarily large three-generation fixture.
+  reserve=$(( used + 1024 ))
+  size=$(( used + reserve ))
+  echo "building $label test disk: logical tree ${used} MiB, image ${size} MiB"
   truncate -s "${size}M" "$disk"
   mkfs.ext4 -q -F -L "$label" -d "$tree" "$disk"
   e2fsck -fn "$disk" >/dev/null

@@ -72,10 +72,11 @@ pub use scan::{GenBlob, SidecarResolution, generation_sig_dir, resolve_sig_sidec
 
 #[cfg(feature = "secure-boot")]
 pub use verify::{
-    DOMAIN_BOOT_CONFIG, DOMAIN_DRIVER_IMAGE, DOMAIN_GEN_INITRD, DOMAIN_GEN_KERNEL,
-    DOMAIN_GENERATION_IMAGE, DOMAIN_NETWORK_STAGE, DOMAIN_PRIORITY_FILE, DOMAIN_RESCUE_SFS,
-    DOMAIN_STAGED_FRAGMENT, VerifiedGeneration, VerifyPolicy, ensure_generation_signed,
-    verify_digest, verify_generation_pinned, verify_image_fd, verify_image_fd_digest,
+    DOMAIN_BOOT_CONFIG, DOMAIN_BOOT_SET_ARTIFACT, DOMAIN_BOOT_SET_MANIFEST, DOMAIN_DRIVER_IMAGE,
+    DOMAIN_GEN_INITRD, DOMAIN_GEN_KERNEL, DOMAIN_GENERATION_IMAGE, DOMAIN_NETWORK_STAGE,
+    DOMAIN_PRIORITY_FILE, DOMAIN_RESCUE_SFS, DOMAIN_STAGED_FRAGMENT, VerifiedGeneration,
+    VerifyPolicy, ensure_generation_signed, verify_digest, verify_generation_pinned,
+    verify_image_fd, verify_image_fd_digest,
 };
 
 // ---- Always-compiled feature-presence probes (carried from the F1 stub) ----
