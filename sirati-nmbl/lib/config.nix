@@ -20,6 +20,7 @@
   # `null` on an older host flake; driver-image.nix only errors WHEN driver
   # images are enabled.
   nmblSign ? null,
+  nmblBootUpdate ? null,
   ...
 }:
 
@@ -353,6 +354,57 @@ let
     checkEmergencyShell = cfg.rescue.mode != "none";
   };
 
+  mkBootSetConfig = slot:
+    let
+      slotRoot = "/nmbl-boot-sets/${slot}";
+      slotNmbl = cfg // {
+        rescue = cfg.rescue // {
+          sfsPath = "${slotRoot}/rescue";
+          fullSystem = cfg.rescue.fullSystem // {
+            networkStage = cfg.rescue.fullSystem.networkStage // {
+              imagePath = "${slotRoot}/network";
+            };
+          };
+        };
+      };
+      slotConfig = config // {
+        boot = config.boot // { nmbl = slotNmbl; };
+      };
+    in import ./config-toml.nix {
+      inherit pkgs lib;
+      config = slotConfig;
+      nmblInit = selectedNmblInit;
+      initrdExecutables = initrdExecutablePaths;
+      rescueSfs = if cfg.rescue.mode == "external" then nmblRescueSquashfs else null;
+      checkEmergencyShell = cfg.rescue.mode != "none";
+    };
+
+  mkBootSetSource = slot:
+    let slotConfig = mkBootSetConfig slot;
+    in pkgs.runCommand "nmbl-boot-set-${slot}-sources" { } ''
+      mkdir -p "$out"
+      printf 'set nmbl_kernel=kernel\nset nmbl_initrd=initrd\nset nmbl_config=config\n' > "$out/bootloader"
+      cp ${config.system.build.nmblKernel}/bzImage "$out/kernel"
+      cp ${config.system.build.nmblInitramfs}/initrd "$out/initrd"
+      cp ${nmblRescueSquashfs} "$out/rescue"
+      cp ${slotConfig} "$out/config"
+      ${lib.optionalString cfg.rescue.fullSystem.networkStage.enable ''
+        cp ${nmblNetworkStage} "$out/network"
+      ''}
+    '';
+
+  bootSetSources = {
+    A = mkBootSetSource "A";
+    B = mkBootSetSource "B";
+  };
+  nmblBootSetTool = if (cfg.bootUpdate.enable or false) then nmblBootUpdate else null;
+  nmblGrubConfig = if actualLoader == "grub" then
+    import ./grub-dispatcher.nix {
+      inherit pkgs lib cfg;
+      loaderArgs = actualLoaderExtraArgs;
+    }
+  else null;
+
   # Where the runtime config TOML lives at boot. In embedded mode it
   # ships inside the initramfs; in external mode the initramfs only
   # carries the bootstrap TOML and the full config is staged onto the
@@ -632,6 +684,9 @@ in
     system.build.nmblRescueStageInstaller = lib.mkIf
       cfg.rescue.fullSystem.networkStage.enable
       rescueStageInstaller;
+    system.build.nmblBootSetSources = lib.mkIf (cfg.bootUpdate.enable or false) bootSetSources;
+    system.build.nmblBootSetTool = lib.mkIf (cfg.bootUpdate.enable or false) nmblBootSetTool;
+    system.build.nmblGrubConfig = lib.mkIf (actualLoader == "grub") nmblGrubConfig;
 
     # Expose the pure driver-image squashfs derivations (#25a) for store-path
     # introspection. Each record is `{ name; sfs; destPath; sigDest; }`; the
@@ -746,6 +801,7 @@ in
         nmblRescueSquashfs
         nmblNetworkStage
         rescueStageInstaller
+        nmblGrubConfig
         ;
       nmblUki = config.system.build.nmblUki;
       # Install-time driver-image staging + `nmbl-sign` signing shell (#25a).

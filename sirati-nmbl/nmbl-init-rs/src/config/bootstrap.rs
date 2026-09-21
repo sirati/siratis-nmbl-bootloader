@@ -161,6 +161,19 @@ pub fn resolve_full_config_path(mountpoint: &Path, config_path: &Path) -> PathBu
     mountpoint.join(stripped)
 }
 
+/// Accept only the two selector-bound config paths emitted by the stable GRUB
+/// dispatcher. The narrow grammar prevents a boot-menu edit from turning the
+/// signed-config loader into an arbitrary pathname oracle.
+pub fn boot_set_config_from_cmdline(cmdline: &str) -> Option<PathBuf> {
+    cmdline.split_ascii_whitespace().find_map(|token| {
+        let value = token.strip_prefix("nmbl.config=")?;
+        match value {
+            "/nmbl-boot-sets/A/config" | "/nmbl-boot-sets/B/config" => Some(PathBuf::from(value)),
+            _ => None,
+        }
+    })
+}
+
 impl BootstrapConfig {
     /// Reject contradictory rescue defaults: `default_url` and
     /// `default_sha256` are both stringly-typed sentinels (empty =

@@ -71,6 +71,10 @@ pub const DOMAIN_BOOT_CONFIG: &[u8] = b"nmbl:boot-config:v1";
 pub const DOMAIN_NETWORK_STAGE: &[u8] = b"nmbl:network-stage:v1";
 /// Domain for a content-addressed, loop-backed Nix generation image.
 pub const DOMAIN_GENERATION_IMAGE: &[u8] = b"nmbl:generation-image:v1";
+/// Whole boot-set manifest, binding every slot pathname and payload digest.
+pub const DOMAIN_BOOT_SET_MANIFEST: &[u8] = b"nmbl:boot-set-manifest:v1";
+/// Artifact carried by a whole boot-set transaction.
+pub const DOMAIN_BOOT_SET_ARTIFACT: &[u8] = b"nmbl:boot-set-artifact:v1";
 
 /// How strictly a verify call treats a missing or unparseable sidecar.
 ///

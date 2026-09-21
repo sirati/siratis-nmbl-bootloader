@@ -282,6 +282,17 @@
             pname = "nmbl-sign";
           }
         );
+        bootUpdateCommonArgs = hostCommonArgs // {
+          cargoExtraArgs = "-p nmbl-boot-update";
+        };
+        bootUpdateArtifacts = hostCraneLib.buildDepsOnly bootUpdateCommonArgs;
+        nmbl-boot-update = hostCraneLib.buildPackage (
+          bootUpdateCommonArgs
+          // {
+            cargoArtifacts = bootUpdateArtifacts;
+            pname = "nmbl-boot-update";
+          }
+        );
       in
       {
         # Function form: callers wire Cargo features through this
@@ -296,6 +307,7 @@
           # The host-platform ML-DSA image signer (FIX-25). A separate
           # buildPackage on the host target, outside the initramfs closure.
           nmbl-sign = nmbl-sign;
+          nmbl-boot-update = nmbl-boot-update;
         };
 
         # Useful for hand-testing: just runs the binary in your shell. It will
@@ -405,6 +417,22 @@
               # `hostCommonArgs` sets `doCheck = false` for the build/clippy
               # derivations; the test check MUST actually RUN the KATs, so flip
               # it back on here (else the test binary is built but never run).
+              doCheck = true;
+            }
+          );
+
+          nmbl-boot-update-clippy = hostCraneLib.cargoClippy (
+            bootUpdateCommonArgs
+            // {
+              cargoArtifacts = bootUpdateArtifacts;
+              cargoClippyExtraArgs = "-p nmbl-boot-update --all-targets -- --deny warnings";
+            }
+          );
+          nmbl-boot-update-test = hostCraneLib.cargoTest (
+            bootUpdateCommonArgs
+            // {
+              cargoArtifacts = bootUpdateArtifacts;
+              cargoExtraArgs = "-p nmbl-boot-update";
               doCheck = true;
             }
           );

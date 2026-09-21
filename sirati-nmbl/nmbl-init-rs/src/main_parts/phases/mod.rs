@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use nmbl_init::config::{BootstrapConfig, Config, resolve_full_config_path};
+use nmbl_init::config::{
+    BootstrapConfig, Config, boot_set_config_from_cmdline, resolve_full_config_path,
+};
 use nmbl_init::error::{NmblError, Result};
 use nmbl_init::modules::{load_early_modules, load_modules};
 use nmbl_init::mount::mount_pseudo_filesystems;
@@ -125,13 +127,23 @@ pub(super) async fn run_bootstrap_phase(
 
     // boot_fs is mounted; from here on, any failure must NOT unmount
     // it — the operator's emergency shell needs to see it.
-    let full_path = resolve_full_config_path(&boot_fs.mountpoint, &section.config_path);
+    let selected_config = std::fs::read_to_string("/proc/cmdline")
+        .ok()
+        .and_then(|line| boot_set_config_from_cmdline(&line));
+    let config_path = selected_config.as_deref().unwrap_or(&section.config_path);
+    let full_path = resolve_full_config_path(&boot_fs.mountpoint, config_path);
     nmbl_info!(
         "phase 0.5: loading full config from {}",
         full_path.display()
     );
     #[cfg(feature = "secure-boot")]
     let mut config = if let Some(signature) = &section.config_signature {
+        let selected_signature = selected_config.as_ref().map(|path| {
+            let mut value = path.as_os_str().to_owned();
+            value.push(".sig");
+            std::path::PathBuf::from(value)
+        });
+        let signature = selected_signature.as_deref().unwrap_or(signature);
         let signature_path = resolve_full_config_path(&boot_fs.mountpoint, signature);
         let text = nmbl_init::sig::boot_config::load_verified(&full_path, &signature_path)
             .map_err(|source| NmblError::Bootstrap {

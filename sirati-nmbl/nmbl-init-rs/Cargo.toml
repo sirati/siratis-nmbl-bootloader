@@ -6,7 +6,7 @@
 # drift. The host tool is built by a SEPARATE crane `buildPackage` for the host
 # target, outside the initramfs `cargoArtifacts`.
 [workspace]
-members = ["nmbl-host-tools"]
+members = ["nmbl-host-tools", "nmbl-boot-update"]
 resolver = "2"
 
 [package]
