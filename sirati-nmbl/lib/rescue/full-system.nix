@@ -33,6 +33,7 @@
   fullSystemPackagePaths,
   moduleClosurePath,
   networkStageMarker ? "",
+  minimal ? false,
 }:
 
 let
@@ -42,7 +43,8 @@ let
     }
     ''
       mkdir -p root/nix/store root/nix/var/nix/db
-      mkdir -p root/bin root/sbin root/usr/bin root/etc/nix root/etc/ssh
+      mkdir -p root/bin root/sbin root/usr/bin root/etc/ssh
+      ${lib.optionalString (!minimal) "mkdir -p root/etc/nix"}
       mkdir -p root/root/.ssh root/var/empty root/proc root/sys root/dev root/run root/tmp
 
       # Copy every path of the combined closure into the image store.
@@ -51,6 +53,7 @@ let
         cp -a "$p" root/nix/store/
       done < ${closure}/store-paths
 
+      ${lib.optionalString (!minimal) ''
       # Register the closure in the image's nix DB. NIX_STATE_DIR points
       # the db into the staging tree; the registration manifest comes
       # from closureInfo. load-db reads paths relative to the real store
@@ -59,6 +62,7 @@ let
       export NIX_STATE_DIR=$PWD/root/nix/var/nix
       export NIX_STORE_DIR=/nix/store
       nix-store --load-db < ${closure}/registration
+      ''}
 
       # --- rescue kernel modules + firmware ---
       # Stage the module closure (built against NMBL's exact kernel) into
@@ -86,10 +90,12 @@ let
       fi
 
       # --- baked config files ---
+      ${lib.optionalString (!minimal) ''
       cp ${nixConf}        root/etc/nix/nix.conf
       # Pinned flake registry so flake:nixpkgs (and <nixpkgs> via nix-path)
       # resolves to the locked rev, fetched on demand from GitHub.
       cp ${nixRegistry}    root/etc/nix/registry.json
+      ''}
       cp ${sshdConfig}     root/etc/ssh/sshd_config
       ${lib.optionalString (networkStageMarker != "") ''
         printf '%s\n' ${lib.escapeShellArg networkStageMarker} \
@@ -103,6 +109,7 @@ let
       cp ${profileScript} root/etc/profile
       cp ${profileScript} root/root/.bashrc
 
+      ${lib.optionalString (!minimal) ''
       # --- CA trust store ---
       # Symlink the conventional bundle paths at the cacert store path so
       # tools that consult /etc/ssl/certs (rather than NIX_SSL_CERT_FILE)
@@ -110,6 +117,7 @@ let
       mkdir -p root/etc/ssl/certs
       ln -s ${cacert}/etc/ssl/certs/ca-bundle.crt root/etc/ssl/certs/ca-bundle.crt
       ln -s ${cacert}/etc/ssl/certs/ca-bundle.crt root/etc/ssl/certs/ca-certificates.crt
+      ''}
 
       # /init entrypoint (the bash script, resolved to a real file).
       cp ${initScript} root/init
@@ -136,18 +144,17 @@ let
       ln -s /bin/nmbl                    root/bin/nmbl-tui
       for tool in ${coreutils}/bin/* ${utilLinux}/bin/* ${iproute2}/bin/* \
                   ${procps}/bin/* ${kmod}/bin/* ${btrfs}/bin/* \
-                  ${cryptsetup}/bin/* ${btop}/bin/* ${e2fsprogs}/bin/* \
                   ${gnugrep}/bin/* ${gnused}/bin/* ${gawk}/bin/*; do
         name=$(basename "$tool")
         [ -e "root/bin/$name" ] || ln -s "$tool" "root/bin/$name"
       done
-      for tool in ${nix}/bin/* ${openssh}/bin/* ${dhcpcd}/bin/* ${dhcpcd}/sbin/*; do
+      for tool in ${lib.optionalString (!minimal) "${nix}/bin/*"} ${openssh}/bin/* ${dhcpcd}/bin/* ${dhcpcd}/sbin/*; do
         [ -e "$tool" ] || continue
         name=$(basename "$tool")
         [ -e "root/bin/$name" ] || ln -s "$tool" "root/bin/$name"
       done
       # sbin tools (sshd lives in sbin in some builds; modprobe too).
-      for d in ${openssh}/sbin ${kmod}/sbin ${utilLinux}/sbin ${e2fsprogs}/sbin; do
+      for d in ${openssh}/sbin ${kmod}/sbin ${utilLinux}/sbin ${lib.optionalString (!minimal) "${e2fsprogs}/sbin"}; do
         [ -d "$d" ] || continue
         for tool in "$d"/*; do
           name=$(basename "$tool")

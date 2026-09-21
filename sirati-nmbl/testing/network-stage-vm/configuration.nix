@@ -50,6 +50,7 @@ nixpkgs.lib.nixosSystem {
           nicDrivers = [ "dummy" ];
           fullSystem = {
             enable = true;
+            minimal = true;
             sshdPort = 22222;
             rootAuthorizedKeys = [ sshPublicKey ];
             hostKeyPath = "/mnt/boot/rescue-host-ed25519";

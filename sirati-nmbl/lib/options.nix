@@ -6,6 +6,15 @@
 let
   cfg = config.boot.nmbl;
 
+  # Recovery only needs native Btrfs inspection/repair.  Omitting the
+  # ext-to-Btrfs converter avoids pulling the complete e2fsprogs runtime
+  # into a space-constrained rescue image.
+  minimalBtrfsProgs = pkgs.btrfs-progs.overrideAttrs (old: {
+    configureFlags = (old.configureFlags or [ ]) ++ [ "--disable-convert" ];
+    buildInputs = lib.filter (input: input != pkgs.e2fsprogs.dev)
+      (old.buildInputs or [ ]);
+  });
+
   # Filesystem-driver modules derived from `config.fileSystems.*.fsType`.
   # NMBL has no udev to auto-load drivers on mount(2), so anything that
   # gets mounted before kexec must appear in the explicit-load list.
@@ -1026,9 +1035,34 @@ in
       fullSystem = {
         enable = lib.mkEnableOption "the closure-store minimal recovery system for external rescue";
 
+        minimal = lib.mkOption {
+          type = lib.types.bool;
+          default = false;
+          description = lib.mdDoc ''
+            Build a small SSH recovery image without Nix, flake support, CA
+            certificates, btop, cryptsetup, LVM, or ext filesystem tools.
+            Intended for a constrained /boot while retaining networking,
+            the NMBL TUI, Btrfs, mdraid, NVMe modules, and a shell.
+          '';
+        };
+
         packages = lib.mkOption {
           type = lib.types.listOf lib.types.package;
-          default = with pkgs; [
+          default = with pkgs; if cfg.rescue.fullSystem.minimal then [
+            bashInteractive
+            openssh
+            minimalBtrfsProgs
+            mdadm
+            coreutils-full
+            util-linux
+            iproute2
+            dhcpcd
+            gnugrep
+            gnused
+            gawk
+            procps
+            kmod
+          ] else [
             bashInteractive
             btop
             nixVersions.stable
@@ -1050,16 +1084,13 @@ in
             kmod
           ];
           defaultText = lib.literalExpression ''
-            with pkgs; [ bashInteractive btop nixVersions.stable openssh
-              cacert btrfs-progs cryptsetup lvm2 mdadm coreutils-full
-              util-linux e2fsprogs iproute2 dhcpcd gnugrep gnused gawk procps kmod ]
+            Selected from the full or minimal built-in recovery profile.
           '';
           description = lib.mdDoc ''
             Packages whose closures are baked into the full recovery
-            squashfs. Every store path in the combined closure is copied
-            into the image's `/nix/store` and registered in the nix DB so
-            `nix-shell -p` and `nix run` work offline against what is
-            present (and online against substituters once DHCP is up).
+            squashfs. The full profile registers them in a Nix database;
+            the minimal profile exposes their binaries without including
+            the Nix daemon or package-fetching machinery.
           '';
         };
 

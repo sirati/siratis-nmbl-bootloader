@@ -7,6 +7,7 @@
   nix,
   openssh,
   fullSystem,
+  startNixDaemon ? true,
 }:
 ''
     # --- ssh host keys ---
@@ -42,9 +43,11 @@
       ''
     }
 
-    # --- nix daemon ---
-    log "starting nix-daemon"
-    ${nix}/bin/nix-daemon > /var/log/nix-daemon.log 2>&1 &
+    ${lib.optionalString startNixDaemon ''
+      # --- nix daemon ---
+      log "starting nix-daemon"
+      ${nix}/bin/nix-daemon > /var/log/nix-daemon.log 2>&1 &
+    ''}
 
     # --- sshd ---
     log "starting sshd on port ${toString fullSystem.sshdPort}"

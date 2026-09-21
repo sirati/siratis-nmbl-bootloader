@@ -33,6 +33,7 @@
   # busybox path. The remaining fields are only consumed when enabled.
   fullSystem ? {
     enable = false;
+    minimal = false;
     packages = [ ];
     sshdPort = 22222;
     rootAuthorizedKeys = [ ];
@@ -112,18 +113,26 @@ let
   # never depends on a pre-existing PATH. Defensive: every step logs to
   # the console and tolerates failure so the operator still lands in a
   # shell even if (say) DHCP times out.
-  initScript = pkgs.writeShellScript "nmbl-rescue-init" (
+  initScriptPrefix = if fullSystem.minimal then
+    import ./rescue/init-script-minimal.nix {
+      inherit bash coreutils kmod utilLinux rescueModprobes;
+      networkStageEnabled = fullSystem.networkStage.enable;
+    }
+  else
     import ./rescue/init-script.nix {
       inherit
         bash cacert coreutils e2fsprogs gawk gnugrep gnused nix openssh
         utilLinux rescueModprobes;
       networkStageEnabled = fullSystem.networkStage.enable;
-    }
+    };
+  initScript = pkgs.writeShellScript "nmbl-rescue-init" (
+    initScriptPrefix
     + import ./rescue/init-script-network.nix {
       inherit bash coreutils dhcpcd gawk iproute2;
     }
     + import ./rescue/init-script-net.nix {
       inherit lib bash coreutils iproute2 nix openssh fullSystem;
+      startNixDaemon = !fullSystem.minimal;
     }
   );
 
@@ -132,7 +141,8 @@ let
   # pkgs.dockerTools and nixos/lib/make-disk-image.nix to build a
   # self-contained /nix/store with a valid DB.
   closure = pkgs.closureInfo {
-    rootPaths = fullSystem.packages ++ [ initScript bash cacert ];
+    rootPaths = fullSystem.packages ++ [ initScript bash ]
+      ++ lib.optional (!fullSystem.minimal) cacert;
   };
 
   sshdConfig = import ./rescue/sshd-config.nix {
@@ -145,10 +155,9 @@ let
   profileScript = pkgs.writeText "profile" ''
     export PATH=/bin:/sbin:/usr/bin:/usr/sbin
     export HOME=/root
-    # Make <nixpkgs> resolvable for classic `nix-shell -p` in interactive
-    # login shells. Matches nix-path/registry in nix.conf — points at the
-    # pinned nixpkgs fetched on demand (not baked into the squashfs).
-    export NIX_PATH=nixpkgs=flake:nixpkgs
+    ${lib.optionalString (!fullSystem.minimal) ''
+      export NIX_PATH=nixpkgs=flake:nixpkgs
+    ''}
     # NMBL's TUI control socket, visible here because NMBL (still PID 1 outside
     # the chroot) bind-mounts its own root at /nmbl-root. `nmbl-tui` (a /bin
     # shim onto NMBL's own static binary) honours this as its socket override.
@@ -223,6 +232,7 @@ let
       profileScript cacert initScript bash coreutils utilLinux iproute2
       procps kmod btrfs cryptsetup btop e2fsprogs gnugrep gnused gawk nix
       openssh dhcpcd fullSystemPackagePaths moduleClosurePath;
+    minimal = fullSystem.minimal;
     networkStageMarker = lib.optionalString fullSystem.networkStage.enable
       fullSystem.networkStage.imagePath;
   };
