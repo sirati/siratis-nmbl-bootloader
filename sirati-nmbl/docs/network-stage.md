@@ -65,6 +65,9 @@ atomically installs both `nmbl-rescue.sfs` and `network.erofs` under their
 separate signature domains. The private key path must be outside `/nix/store`.
 Setting `signing.imageKeyFile` supplies the default imperative path;
 `NMBL_IMAGE_KEY_FILE` overrides it without making the key a Nix input.
+Alternatively set `signing.imageKeyCommand` to an argv that prints the key;
+the installer then runs it once per image and pipes it into
+`nmbl-sign sign --key-stdin` (an explicit `NMBL_IMAGE_KEY_FILE` still wins).
 
 Remote rescue also requires `rescue.fullSystem.hostKeyPath`. This names an
 already-provisioned Ed25519 private key in NMBL's mount namespace, normally on

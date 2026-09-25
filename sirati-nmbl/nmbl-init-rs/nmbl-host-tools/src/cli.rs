@@ -4,7 +4,9 @@
 //!
 //! ```text
 //! nmbl-sign keygen --alg <ml-dsa-65|ml-dsa-87> --out-priv <f> --out-pub <f>
+//! nmbl-sign keygen --alg <ml-dsa-65|ml-dsa-87> --stdio   (priv -> stdout, pub -> fd 3)
 //! nmbl-sign sign   --key <priv-file> --domain <role> <input> [--out <sidecar>]
+//! nmbl-sign sign   --key-stdin       --domain <role> <input> [--out <sidecar>]
 //! nmbl-sign verify --key <public-file> --domain <role> <input> --sig <sidecar>
 //! nmbl-sign sign-image …            (an alias of `sign`)
 //! ```
@@ -20,6 +22,7 @@ use nmbl_init::sig::AlgId;
 
 use crate::domain;
 use crate::error::{Result, SignError};
+pub use crate::sign::KeySource;
 
 /// One-screen usage text, printed on a parse error or `--help`.
 pub const USAGE: &str = "\
@@ -27,7 +30,9 @@ nmbl-sign — NMBL ML-DSA image signer
 
 USAGE:
   nmbl-sign keygen --alg <ALG> --out-priv <FILE> --out-pub <FILE>
+  nmbl-sign keygen --alg <ALG> --stdio
   nmbl-sign sign --key <PRIV> --domain <ROLE> <INPUT> [--out <SIDECAR>]
+  nmbl-sign sign --key-stdin --domain <ROLE> <INPUT> [--out <SIDECAR>]
   nmbl-sign verify --key <PUB> --domain <ROLE> <INPUT> --sig <SIDECAR>
   nmbl-sign sign-image …   (alias of `sign`)
 
@@ -36,6 +41,11 @@ ROLE:   gen-kernel | gen-initrd | driver-image | staged-fragment |
         priority-file | rescue-sfs | boot-config | network-stage |
         generation-image
 OUT:    sidecar path; defaults to <INPUT>.sig
+
+--stdio      write the private key to stdout and the raw public key to
+             fd 3; nothing touches disk (fails if fd 3 is not open)
+--key-stdin  read the private key from stdin (at most 16 KiB); INPUT must
+             then be a file path, never stdin
 
 Writes detached NMBLSIG1 sidecars verified by nmbl-init's signature pipeline.";
 
@@ -51,10 +61,16 @@ pub enum Command {
         /// Where to write the raw public-key bytes.
         out_pub: PathBuf,
     },
+    /// Generate a keypair onto pipes: private container to stdout, raw public
+    /// key to fd 3. Creates no files.
+    KeygenStdio {
+        /// Algorithm to generate.
+        alg: AlgId,
+    },
     /// Sign a file, producing a sidecar.
     Sign {
-        /// Path to the private-key file.
-        key: PathBuf,
+        /// Where the private key comes from (`--key <FILE>` or `--key-stdin`).
+        key: KeySource,
         /// The resolved per-role domain byte string (frozen verifier const).
         domain: &'static [u8],
         /// The input file to sign.
@@ -125,6 +141,7 @@ fn parse_keygen(args: &[String]) -> Result<Command> {
     let mut alg: Option<AlgId> = None;
     let mut out_priv: Option<PathBuf> = None;
     let mut out_pub: Option<PathBuf> = None;
+    let mut stdio = false;
 
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -132,11 +149,21 @@ fn parse_keygen(args: &[String]) -> Result<Command> {
             "--alg" => alg = Some(parse_alg(next(&mut it, "--alg")?)?),
             "--out-priv" => out_priv = Some(PathBuf::from(next(&mut it, "--out-priv")?)),
             "--out-pub" => out_pub = Some(PathBuf::from(next(&mut it, "--out-pub")?)),
+            "--stdio" => stdio = true,
             other => return Err(SignError::Usage(format!("keygen: unexpected `{other}`"))),
         }
     }
+    let alg = alg.ok_or_else(|| SignError::Usage("keygen: --alg is required".into()))?;
+    if stdio {
+        if out_priv.is_some() || out_pub.is_some() {
+            return Err(SignError::Usage(
+                "keygen: --stdio cannot be combined with --out-priv/--out-pub".into(),
+            ));
+        }
+        return Ok(Command::KeygenStdio { alg });
+    }
     Ok(Command::Keygen {
-        alg: alg.ok_or_else(|| SignError::Usage("keygen: --alg is required".into()))?,
+        alg,
         out_priv: out_priv
             .ok_or_else(|| SignError::Usage("keygen: --out-priv is required".into()))?,
         out_pub: out_pub.ok_or_else(|| SignError::Usage("keygen: --out-pub is required".into()))?,
@@ -146,6 +173,7 @@ fn parse_keygen(args: &[String]) -> Result<Command> {
 /// Parse the `sign`/`sign-image` subcommand flags + positional input.
 fn parse_sign(args: &[String]) -> Result<Command> {
     let mut key: Option<PathBuf> = None;
+    let mut key_stdin = false;
     let mut domain: Option<&'static [u8]> = None;
     let mut out: Option<PathBuf> = None;
     let mut input: Option<PathBuf> = None;
@@ -154,6 +182,7 @@ fn parse_sign(args: &[String]) -> Result<Command> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--key" => key = Some(PathBuf::from(next(&mut it, "--key")?)),
+            "--key-stdin" => key_stdin = true,
             "--domain" => domain = Some(parse_domain(next(&mut it, "--domain")?)?),
             "--out" => out = Some(PathBuf::from(next(&mut it, "--out")?)),
             other if other.starts_with("--") => {
@@ -169,12 +198,48 @@ fn parse_sign(args: &[String]) -> Result<Command> {
             }
         }
     }
+    let key = match (key, key_stdin) {
+        (Some(_), true) => {
+            return Err(SignError::Usage(
+                "sign: --key and --key-stdin are mutually exclusive".into(),
+            ));
+        }
+        (Some(path), false) => {
+            if is_stdin_path(&path) {
+                return Err(SignError::Usage(
+                    "sign: use --key-stdin to read the key from stdin".into(),
+                ));
+            }
+            KeySource::File(path)
+        }
+        (None, true) => KeySource::Stdin,
+        (None, false) => {
+            return Err(SignError::Usage(
+                "sign: --key <FILE> or --key-stdin is required".into(),
+            ));
+        }
+    };
+    let input = input.ok_or_else(|| SignError::Usage("sign: an input file is required".into()))?;
+    if key == KeySource::Stdin && is_stdin_path(&input) {
+        return Err(SignError::Usage(
+            "sign: with --key-stdin the input must be a file path, not stdin".into(),
+        ));
+    }
     Ok(Command::Sign {
-        key: key.ok_or_else(|| SignError::Usage("sign: --key is required".into()))?,
+        key,
         domain: domain.ok_or_else(|| SignError::Usage("sign: --domain is required".into()))?,
-        input: input.ok_or_else(|| SignError::Usage("sign: an input file is required".into()))?,
+        input,
         out,
     })
+}
+
+/// Textual spellings of the process's stdin. `sign::run_from_source` also
+/// compares device/inode at run time, which catches every other alias.
+fn is_stdin_path(path: &std::path::Path) -> bool {
+    matches!(
+        path.to_str(),
+        Some("-" | "/dev/stdin" | "/dev/fd/0" | "/proc/self/fd/0")
+    )
 }
 
 /// Pull the value following a flag, or a usage error if it is missing.
@@ -255,7 +320,7 @@ mod tests {
         assert_eq!(
             cmd,
             Command::Sign {
-                key: PathBuf::from("/k/sk"),
+                key: KeySource::File(PathBuf::from("/k/sk")),
                 domain: DOMAIN_RESCUE_SFS,
                 input: PathBuf::from("/img/rescue.sfs"),
                 out: None,
@@ -277,7 +342,7 @@ mod tests {
         assert_eq!(
             cmd,
             Command::Sign {
-                key: PathBuf::from("/k/sk"),
+                key: KeySource::File(PathBuf::from("/k/sk")),
                 domain: DOMAIN_NETWORK_STAGE,
                 input: PathBuf::from("/img/network.erofs"),
                 out: None,
@@ -342,6 +407,107 @@ mod tests {
     #[test]
     fn missing_subcommand_is_error() {
         assert!(matches!(parse(&[]), Err(SignError::Usage(_))));
+    }
+
+    #[test]
+    fn parses_keygen_stdio() {
+        let cmd = parse(&argv(&["keygen", "--alg", "ml-dsa-65", "--stdio"])).unwrap();
+        assert_eq!(
+            cmd,
+            Command::KeygenStdio {
+                alg: AlgId::MlDsa65
+            }
+        );
+    }
+
+    #[test]
+    fn keygen_stdio_rejects_output_files() {
+        let err = parse(&argv(&[
+            "keygen",
+            "--alg",
+            "ml-dsa-65",
+            "--stdio",
+            "--out-priv",
+            "/k/sk",
+        ]))
+        .unwrap_err();
+        assert!(matches!(err, SignError::Usage(_)));
+    }
+
+    #[test]
+    fn parses_sign_key_stdin() {
+        let cmd = parse(&argv(&[
+            "sign",
+            "--key-stdin",
+            "--domain",
+            "boot-config",
+            "/b/config",
+            "--out",
+            "/b/c.sig",
+        ]))
+        .unwrap();
+        assert_eq!(
+            cmd,
+            Command::Sign {
+                key: KeySource::Stdin,
+                domain: nmbl_init::sig::DOMAIN_BOOT_CONFIG,
+                input: PathBuf::from("/b/config"),
+                out: Some(PathBuf::from("/b/c.sig")),
+            }
+        );
+    }
+
+    #[test]
+    fn key_stdin_with_stdin_input_is_rejected() {
+        for input in ["-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"] {
+            let err = parse(&argv(&[
+                "sign",
+                "--key-stdin",
+                "--domain",
+                "gen-kernel",
+                input,
+            ]))
+            .unwrap_err();
+            assert!(
+                matches!(&err, SignError::Usage(m) if m.contains("not stdin")),
+                "{input}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn key_and_key_stdin_are_exclusive() {
+        let err = parse(&argv(&[
+            "sign",
+            "--key",
+            "/k/sk",
+            "--key-stdin",
+            "--domain",
+            "gen-kernel",
+            "/img/k",
+        ]))
+        .unwrap_err();
+        assert!(matches!(&err, SignError::Usage(m) if m.contains("mutually exclusive")));
+    }
+
+    #[test]
+    fn key_path_naming_stdin_is_rejected() {
+        let err = parse(&argv(&[
+            "sign",
+            "--key",
+            "/dev/stdin",
+            "--domain",
+            "gen-kernel",
+            "/i",
+        ]))
+        .unwrap_err();
+        assert!(matches!(&err, SignError::Usage(m) if m.contains("--key-stdin")));
+    }
+
+    #[test]
+    fn sign_without_key_is_usage_error() {
+        let err = parse(&argv(&["sign", "--domain", "gen-kernel", "/i"])).unwrap_err();
+        assert!(matches!(err, SignError::Usage(_)));
     }
 
     #[test]

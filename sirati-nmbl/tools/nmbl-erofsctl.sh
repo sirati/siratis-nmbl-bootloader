@@ -11,7 +11,10 @@ usage:
   nmbl-erofsctl gc KEEP IMAGE_ROOT
   nmbl-erofsctl status IMAGE_ROOT
 
-PRIVATE_KEY is read only at runtime. OUT_DIR must be outside /nix/store.
+PRIVATE_KEY is read only at runtime. Pass `-` to obtain the key instead from
+NMBL_SIGN_KEY_COMMAND, a shell command line whose stdout is the key; it runs
+once per signature and is piped into `nmbl-sign sign --key-stdin`, so the key
+never touches disk. OUT_DIR must be outside /nix/store.
 IMAGE_ROOT conventionally is /.nix-image. install never changes `active`;
 activate atomically replaces it after validating the complete generation.
 EOF
@@ -40,6 +43,20 @@ validate_generation() {
   actual=$(sha512sum "$root/generations/$id/nix.erofs" | cut -d' ' -f1)
   [[ "$actual" = "$id" ]] || die "generation $id content hash is $actual"
 }
+# Sign with a key file, or with NMBL_SIGN_KEY_COMMAND when the key is `-`.
+# The command runs under the caller's PATH (NMBL_CALLER_PATH, recorded by the
+# outer wrapper), since this script's own PATH is restricted to its inputs.
+sign_with() {
+  local key=$1; shift
+  if [[ "$key" = - ]]; then
+    [[ -n ${NMBL_SIGN_KEY_COMMAND:-} ]] || die "key '-' requires NMBL_SIGN_KEY_COMMAND"
+    ( set -o pipefail
+      PATH="${NMBL_CALLER_PATH:-$PATH}" "$BASH" -c "$NMBL_SIGN_KEY_COMMAND" \
+        | @nmblSign@/bin/nmbl-sign sign --key-stdin "$@" )
+  else
+    @nmblSign@/bin/nmbl-sign sign --key "$key" "$@"
+  fi
+}
 replace_link() {
   local name=$1 target=$2 root=$3 tmp
   tmp="$root/.${name}.new.$$"
@@ -54,13 +71,13 @@ case "$cmd" in
     [[ $# -ge 4 && $# -le 5 ]] || usage
     image=$2; key=$3; out=$4; system=${5:-}
     [[ -f "$image" ]] || die "image is not a regular file: $image"
-    [[ -f "$key" ]] || die "private key is not a regular file: $key"
+    [[ "$key" = - || -f "$key" ]] || die "private key is not a regular file: $key"
     [[ "$out" = /* ]] || die "OUT_DIR must be absolute"
     [[ "$out" != /nix/store && "$out" != /nix/store/* ]] || die "OUT_DIR cannot be in /nix/store"
     id=$(sha512sum "$image" | cut -d' ' -f1)
     tmp="${out}.tmp.$$"; rm -rf "$tmp"; install -d -m 0700 "$tmp"
     install -m 0444 "$image" "$tmp/nix.erofs"
-    @nmblSign@/bin/nmbl-sign sign --key "$key" --domain generation-image \
+    sign_with "$key" --domain generation-image \
       --out "$tmp/nix.erofs.sig" "$tmp/nix.erofs" >&2
     chmod 0444 "$tmp/nix.erofs.sig"
     printf '%s\n' "$id" > "$tmp/generation"

@@ -19,7 +19,7 @@
 
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
@@ -72,10 +72,7 @@ pub fn write_public(path: &Path, alg: AlgId, pubkey: &[u8]) -> Result<()> {
 /// truncated and rewritten; `mode` only applies on creation, so on a re-keygen
 /// we re-assert `0o600` explicitly to repair a file that was created insecurely.
 pub fn write_private(path: &Path, alg: AlgId, sk: &Zeroizing<Vec<u8>>) -> Result<()> {
-    let mut buf = Zeroizing::new(Vec::with_capacity(PRIV_KEY_OFF + sk.len()));
-    buf.extend_from_slice(&PRIV_MAGIC);
-    buf.push(alg_tag(alg));
-    buf.extend_from_slice(sk);
+    let buf = encode_private(alg, sk);
     let mut f = OpenOptions::new()
         .write(true)
         .create(true)
@@ -100,6 +97,11 @@ pub struct PrivateKeyFile {
     pub sk: Zeroizing<Vec<u8>>,
 }
 
+/// Upper bound on a private-key container read from a stream. The largest
+/// container (ML-DSA-87) is `9 + 4896` bytes; anything past this bound is not a
+/// key and is refused before more of it is buffered.
+pub const MAX_PRIVATE_CONTAINER: usize = 16 * 1024;
+
 /// Read and validate a private-key container from `path`. Fail-closed: a bad
 /// magic, an unknown algorithm tag, or a truncated body is a typed error, never
 /// a partial key.
@@ -108,6 +110,45 @@ pub fn read_private(path: &Path) -> Result<PrivateKeyFile> {
         fs::read(path)
             .map_err(|e| SignError::io(format!("read private key {}", path.display()), e))?,
     );
+    parse_private(&raw)
+}
+
+/// Read a private-key container from `reader` (normally stdin), refusing more
+/// than [`MAX_PRIVATE_CONTAINER`] bytes. Every intermediate buffer is
+/// [`Zeroizing`], so the secret is wiped once the parsed key is dropped.
+pub fn read_private_from(reader: &mut impl Read) -> Result<PrivateKeyFile> {
+    let mut raw = Zeroizing::new(Vec::with_capacity(MAX_PRIVATE_CONTAINER + 1));
+    // Reading one byte past the bound distinguishes "exactly at the limit"
+    // from "oversized" without buffering an unbounded stream. The capacity
+    // above covers the whole bound, so the Vec never reallocates and leaves
+    // no unzeroized copy of the secret behind.
+    let limit = u64::try_from(MAX_PRIVATE_CONTAINER + 1).unwrap_or(u64::MAX);
+    reader
+        .take(limit)
+        .read_to_end(&mut raw)
+        .map_err(|e| SignError::io("read private key from stdin", e))?;
+    if raw.len() > MAX_PRIVATE_CONTAINER {
+        return Err(SignError::Key(format!(
+            "private key on stdin exceeds {MAX_PRIVATE_CONTAINER} bytes"
+        )));
+    }
+    if raw.is_empty() {
+        return Err(SignError::Key("no private key on stdin".into()));
+    }
+    parse_private(&raw)
+}
+
+/// Assemble the private-key container (`magic || alg || raw-sk`) in memory.
+pub fn encode_private(alg: AlgId, sk: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut buf = Zeroizing::new(Vec::with_capacity(PRIV_KEY_OFF + sk.len()));
+    buf.extend_from_slice(&PRIV_MAGIC);
+    buf.push(alg_tag(alg));
+    buf.extend_from_slice(sk);
+    buf
+}
+
+/// Validate and split a private-key container held in memory.
+pub fn parse_private(raw: &[u8]) -> Result<PrivateKeyFile> {
     let magic = raw
         .get(..PRIV_ALG_OFF)
         .ok_or_else(|| SignError::Key("private-key file shorter than its header".into()))?;
@@ -194,6 +235,29 @@ mod tests {
         buf.extend_from_slice(&[0u8; 4]);
         fs::write(&path, &buf).unwrap();
         assert!(read_private(&path).is_err());
+    }
+
+    #[test]
+    fn private_roundtrips_through_a_stream() {
+        let container = encode_private(AlgId::MlDsa65, &[0x5A; 32]);
+        let loaded = read_private_from(&mut container.as_slice()).unwrap();
+        assert_eq!(loaded.alg, AlgId::MlDsa65);
+        assert_eq!(loaded.sk.as_slice(), &[0x5A; 32]);
+    }
+
+    #[test]
+    fn oversized_stream_is_rejected() {
+        let mut big = PRIV_MAGIC.to_vec();
+        big.push(AlgId::MlDsa87.to_u8());
+        big.resize(MAX_PRIVATE_CONTAINER + 1, 0);
+        let err = read_private_from(&mut big.as_slice()).err().unwrap();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn empty_stream_is_rejected() {
+        let err = read_private_from(&mut [].as_slice()).err().unwrap();
+        assert!(err.to_string().contains("no private key"), "{err}");
     }
 
     #[test]

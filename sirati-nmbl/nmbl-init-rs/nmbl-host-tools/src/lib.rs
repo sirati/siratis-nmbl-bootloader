@@ -35,12 +35,13 @@ pub fn run(cmd: cli::Command) -> Result<()> {
             out_priv,
             out_pub,
         } => keygen::run(alg, &out_priv, &out_pub),
+        cli::Command::KeygenStdio { alg } => keygen::run_stdio(alg),
         cli::Command::Sign {
             key,
             domain,
             input,
             out,
-        } => sign::run(&input, &key, domain, out.as_deref()).map(|_| ()),
+        } => sign::run_from_source(&input, &key, domain, out.as_deref()).map(|_| ()),
         cli::Command::Verify {
             key,
             domain,

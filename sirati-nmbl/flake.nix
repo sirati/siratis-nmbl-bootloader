@@ -181,6 +181,31 @@
         ${nmblErofsCtl}/bin/nmbl-erofsctl gc 0 "$TMPDIR/root"
         test -d "$TMPDIR/root/generations/$first"
         test -d "$TMPDIR/root/generations/$second"
+
+        # Pipe-only keys: `keygen --stdio` (private on stdout, public on fd 3)
+        # captured by a stand-in secrets store, then `prepare -` signing via
+        # NMBL_SIGN_KEY_COMMAND, whose stdout is piped into --key-stdin.
+        mkdir -p "$TMPDIR/store"
+        ${nmblSign}/bin/nmbl-sign keygen --alg ml-dsa-87 --stdio \
+          > "$TMPDIR/store/secret" 3> "$TMPDIR/keys/stdio-public"
+        test "$(stat -c %s "$TMPDIR/keys/stdio-public")" = 2592
+        if ${nmblSign}/bin/nmbl-sign keygen --alg ml-dsa-65 --stdio 3>&- > "$TMPDIR/orphan"; then
+          echo "keygen --stdio without fd 3 must fail" >&2; exit 1
+        fi
+        test ! -s "$TMPDIR/orphan"
+        printf third > "$TMPDIR/third.erofs"
+        third=$(NMBL_SIGN_KEY_COMMAND="cat $TMPDIR/store/secret" \
+          ${nmblErofsCtl}/bin/nmbl-erofsctl prepare \
+          "$TMPDIR/third.erofs" - "$TMPDIR/third")
+        ${nmblSign}/bin/nmbl-sign verify --key "$TMPDIR/keys/stdio-public" \
+          --domain generation-image --sig "$TMPDIR/third/nix.erofs.sig" \
+          "$TMPDIR/third/nix.erofs"
+        # A failing key command fails the signature instead of signing nothing.
+        if NMBL_SIGN_KEY_COMMAND=false ${nmblErofsCtl}/bin/nmbl-erofsctl prepare \
+          "$TMPDIR/third.erofs" - "$TMPDIR/fourth" 2>/dev/null; then
+          echo "a failing key command must fail prepare" >&2; exit 1
+        fi
+        test ! -e "$TMPDIR/fourth"
         touch "$out"
       '';
       nmblErofsReceiveCheck = pkgs.runCommand "nmbl-erofs-receive-check" {
@@ -419,6 +444,36 @@
         test -x ${bootUpdateEvalConfig.config.system.build.nmblBootSetTool}/bin/nmbl-boot-update
         grep -q '/nmbl-boot-sets/A/rescue' ${bootUpdateEvalConfig.config.system.build.nmblBootSetSources.A}/config
         grep -q '/nmbl-boot-sets/B/rescue' ${bootUpdateEvalConfig.config.system.build.nmblBootSetSources.B}/config
+        touch "$out"
+      '';
+
+      # Key commands instead of key files: the driver-image secure-boot config
+      # (generation, external-config, and driver-image signing) with
+      # generation/imageKeyCommand. The rendered installer must pipe each
+      # command into `nmbl-sign sign --key-stdin`, once per signature, and name
+      # no key file.
+      keyCommandEvalConfig =
+        testing.mkTestConfigurations."test-secure-boot-driver".extendModules {
+          modules = [ ({ lib, ... }: {
+            boot.nmbl.signing = {
+              generationKeyFile = lib.mkForce null;
+              imageKeyFile = lib.mkForce null;
+              generationKeyCommand = [ "nix-secrets" "pipe-secret" "nmbl gen key" ];
+              imageKeyCommand = [ "nix-secrets" "pipe-secret" "nmbl-image-key" ];
+              deferInstallSigning = lib.mkForce false;
+            };
+          }) ];
+        };
+      keyCommandEvalCheck = pkgs.runCommand "nmbl-key-command-eval-check" { } ''
+        script=${keyCommandEvalConfig.config.system.build.installBootLoader}
+        # Three generation-key signatures (kernel, initrd, external config)
+        # and one driver-image signature, each with its own command run.
+        test "$(grep -c "nix-secrets pipe-secret 'nmbl gen key'" "$script")" = 3
+        test "$(grep -c "nix-secrets pipe-secret nmbl-image-key" "$script")" = 1
+        test "$(grep -c -- '--key-stdin' "$script")" = 4
+        if grep -E -- '--key [^-]' "$script" | grep -v sbsign | grep -q nmbl-sign; then
+          echo "installer still passes an ML-DSA key file" >&2; exit 1
+        fi
         touch "$out"
       '';
 
@@ -1160,6 +1215,7 @@
         nmbl-erofsctl = nmblErofsCtlCheck;
         nmbl-erofs-receive = nmblErofsReceiveCheck;
         nmbl-boot-update-eval = bootUpdateEvalCheck;
+        nmbl-key-command-eval = keyCommandEvalCheck;
         generation-image-initrd = generationImageInitrdCheck;
         generation-root-store-eval = rootStoreEvalCheck;
         insecure-test-key-absent = insecureKeyAbsentFromProd;

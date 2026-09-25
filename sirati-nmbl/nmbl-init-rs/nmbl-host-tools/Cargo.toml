@@ -51,6 +51,11 @@ sha2 = { version = "0.10", default-features = false }
 # (FIX-30: nmbl-init's `secure-boot` feature must NOT list `dep:zeroize`).
 zeroize = { version = "1", default-features = false }
 
+# `keygen --stdio` duplicates the caller-provided fd 3 (the public-key
+# channel) with `fcntl(F_DUPFD_CLOEXEC)`, which reports EBADF when the caller
+# did not open it. Already in the workspace lockfile via nmbl-init.
+libc = "0.2"
+
 [dev-dependencies]
 # The cross-crate round-trip KAT (FIX-25/FIX-52) signs with this crate and
 # verifies with `nmbl_init::sig::verify_digest`, exercising BOTH crates' code on

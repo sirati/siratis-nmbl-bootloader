@@ -18,6 +18,9 @@
 //! the verifier uses (never a trust narrowing).
 
 use std::fs;
+use std::io::IsTerminal;
+use std::os::fd::AsFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use fips204::traits::{SerDes, Signer};
@@ -32,6 +35,16 @@ use crate::keyfile::{self, PrivateKeyFile};
 /// Default sidecar extension appended to the input path when `--out` is absent.
 const SIG_EXT: &str = "sig";
 
+/// Where `sign` obtains its private key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeySource {
+    /// A private-key container file (`--key <FILE>`).
+    File(PathBuf),
+    /// The private-key container piped on stdin (`--key-stdin`). Nothing is
+    /// written to disk; the bytes are bounded and zeroized after use.
+    Stdin,
+}
+
 /// Sign `input` under `domain` with the private key at `priv_path`, writing the
 /// sidecar to `out` (or `<input>.sig` when `out` is `None`). Returns the path
 /// the sidecar was written to.
@@ -42,7 +55,69 @@ pub fn run(
     out: Option<&Path>,
 ) -> Result<PathBuf> {
     let key = keyfile::read_private(priv_path)?;
-    let sidecar = sign_file(input, &key, domain)?;
+    run_with_key(input, &key, domain, out)
+}
+
+/// Sign `input` with a key taken from `source`. For [`KeySource::Stdin`] the
+/// input must not itself be stdin (the key and the payload cannot share one
+/// stream), and an interactive terminal on stdin is refused so the command
+/// never waits on a prompt-less read of a secret.
+pub fn run_from_source(
+    input: &Path,
+    source: &KeySource,
+    domain: &'static [u8],
+    out: Option<&Path>,
+) -> Result<PathBuf> {
+    match source {
+        KeySource::File(path) => run(input, path, domain, out),
+        KeySource::Stdin => {
+            reject_input_is_stdin(input)?;
+            let stdin = std::io::stdin();
+            if stdin.is_terminal() {
+                return Err(SignError::Usage(
+                    "--key-stdin expects the private key piped on stdin, not a terminal".into(),
+                ));
+            }
+            let key = keyfile::read_private_from(&mut stdin.lock())?;
+            run_with_key(input, &key, domain, out)
+        }
+    }
+}
+
+/// Refuse an input that is the process's own stdin (e.g. `/dev/stdin`,
+/// `/proc/self/fd/0`), compared by device and inode so every alias is caught.
+fn reject_input_is_stdin(input: &Path) -> Result<()> {
+    let refuse = || {
+        Err(SignError::Usage(
+            "sign: with --key-stdin the input must be a file path, not stdin".into(),
+        ))
+    };
+    if input.as_os_str() == "-" {
+        return refuse();
+    }
+    let Ok(input_meta) = fs::metadata(input) else {
+        // A missing input is reported by the hashing step with its own error.
+        return Ok(());
+    };
+    let stdin_meta = std::io::stdin()
+        .as_fd()
+        .try_clone_to_owned()
+        .ok()
+        .and_then(|fd| fs::File::from(fd).metadata().ok());
+    match stdin_meta {
+        Some(s) if s.dev() == input_meta.dev() && s.ino() == input_meta.ino() => refuse(),
+        _ => Ok(()),
+    }
+}
+
+/// Sign `input` with an already-loaded key.
+pub fn run_with_key(
+    input: &Path,
+    key: &PrivateKeyFile,
+    domain: &'static [u8],
+    out: Option<&Path>,
+) -> Result<PathBuf> {
+    let sidecar = sign_file(input, key, domain)?;
     let out_path = match out {
         Some(p) => p.to_path_buf(),
         None => default_sig_path(input),

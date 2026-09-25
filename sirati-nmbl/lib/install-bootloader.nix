@@ -381,6 +381,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
       in {
         enable = s.enable or false;
         keyFile = s.generationKeyFile or null;
+        keyCommand = s.generationKeyCommand or null;
         sigPathSuffix = s.sigPathSuffix or ".sig";
       };
     # Build-time-only: skip in-installer signing (unsigned UKI, no sidecars) so

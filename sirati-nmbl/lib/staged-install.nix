@@ -60,10 +60,14 @@ let
   # Reuse the per-generation ML-DSA private key path (impure string path; its
   # public half is the baked trust anchor). A string path stays out of the
   # store; a Nix path literal would be imported and is rejected below.
-  keyFile = signingCfg.generationKeyFile or null;
-  storeDir = builtins.storeDir;
-  keyStr = if keyFile == null then null else toString keyFile;
-  keyIsStorePath = keyStr != null && lib.hasPrefix storeDir keyStr;
+  # generationKeyFile or generationKeyCommand (lib/signing-key.nix).
+  signer = import ./signing-key.nix { inherit lib; } {
+    nmblSignBin = "${toString nmblSign}/bin/nmbl-sign";
+    keyFile = signingCfg.generationKeyFile or null;
+    keyCommand = signingCfg.generationKeyCommand or null;
+  };
+  keyStr = signer.keyFileStr;
+  keyIsStorePath = signer.keyInStore;
 
   # Eval-time guards, only meaningful when staged boot is enabled.
   signingChecked =
@@ -73,12 +77,14 @@ let
       at install time with `nmbl-sign`; without the signer the runtime would
       refuse the (unsigned) staged blobs. Thread `_module.args.nmblSign`.
     '';
-    assert lib.assertMsg (!enabled || keyFile != null) ''
-      boot.nmbl.staged.enable = true but boot.nmbl.signing.generationKeyFile is
-      null. The staged image + fragment + priority file are signed at install
-      time with the operator's ML-DSA private key (the pair of a baked
+    assert lib.assertMsg (!enabled || signer.configured) ''
+      boot.nmbl.staged.enable = true but neither
+      boot.nmbl.signing.generationKeyFile nor generationKeyCommand is set.
+      The staged image + fragment + priority file are signed at install time
+      with the operator's ML-DSA private key (the pair of a baked
       boot.nmbl.signing.publicKeys entry). Set
-      boot.nmbl.signing.generationKeyFile to the on-disk private key path.
+      boot.nmbl.signing.generationKeyFile to the on-disk private key path, or
+      generationKeyCommand to a command that prints it.
     '';
     assert lib.assertMsg (!(enabled && keyIsStorePath)) ''
       boot.nmbl.signing.generationKeyFile resolves to a Nix store path:
@@ -150,30 +156,30 @@ let
       install -D -m 0644 /dev/null ${signArg priorityDest}
       printf 'nmbl priority-volume attestation file (FEATURE #2)\n' > ${signArg priorityDest}
       echo "Signing priority file (nmbl-sign, install-time, --domain priority-file)..."
-      ${nmblSign}/bin/nmbl-sign sign \
-        --key ${signArg (toString keyStr)} \
-        --domain priority-file \
-        --out ${signArg prioritySigDest} \
-        ${signArg priorityDest}
+      ${signer.sign {
+        domain = "priority-file";
+        out = signArg prioritySigDest;
+        input = signArg priorityDest;
+      }}
 
       # 2. Staged driver image (squashfs), verified under nmbl:driver-image:v1.
       install -D -m 0644 ${stagedImage} ${signArg imageDest}
       echo "Signing staged image (nmbl-sign, install-time, --domain driver-image)..."
-      ${nmblSign}/bin/nmbl-sign sign \
-        --key ${signArg (toString keyStr)} \
-        --domain driver-image \
-        --out ${signArg imageSigDest} \
-        ${signArg imageDest}
+      ${signer.sign {
+        domain = "driver-image";
+        out = signArg imageSigDest;
+        input = signArg imageDest;
+      }}
 
       # 3. Signed config fragment, verified under nmbl:staged-fragment:v1. Its
       #    detached signature lives at the explicit [staged].sig path.
       install -D -m 0644 ${fragmentFile} ${signArg fragmentDest}
       echo "Signing staged fragment (nmbl-sign, install-time, --domain staged-fragment)..."
-      ${nmblSign}/bin/nmbl-sign sign \
-        --key ${signArg (toString keyStr)} \
-        --domain staged-fragment \
-        --out ${signArg fragmentSigDest} \
-        ${signArg fragmentDest}
+      ${signer.sign {
+        domain = "staged-fragment";
+        out = signArg fragmentSigDest;
+        input = signArg fragmentDest;
+      }}
 
       echo "✓ Staged-boot artifacts staged + signed on the priority volume:"
       echo "    ${priorityDest} (+ ${prioritySigDest})"

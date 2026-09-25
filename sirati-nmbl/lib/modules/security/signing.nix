@@ -131,6 +131,35 @@ in
       '';
     };
 
+    imageKeyCommand = lib.mkOption {
+      type = lib.types.nullOr (lib.types.nonEmptyListOf lib.types.str);
+      default = null;
+      example = [ "nix-secrets" "pipe-secret" "nmbl-image-key" ];
+      description = lib.mdDoc ''
+        Alternative to `imageKeyFile`: an argv whose STDOUT is the ML-DSA
+        private key (the `NMBLSK01` container `nmbl-sign keygen` emits). Each
+        image signature runs the command afresh at install time and pipes its
+        output into `nmbl-sign sign --key-stdin`, so the key never touches
+        disk. Only the command line is part of the configuration, never the
+        key. Mutually exclusive with `imageKeyFile`.
+      '';
+    };
+
+    generationKeyCommand = lib.mkOption {
+      type = lib.types.nullOr (lib.types.nonEmptyListOf lib.types.str);
+      default = null;
+      example = [ "nix-secrets" "pipe-secret" "nmbl-generation-key" ];
+      description = lib.mdDoc ''
+        Alternative to `generationKeyFile`: an argv whose STDOUT is the ML-DSA
+        private key (`NMBLSK01` container). Every install-time signature that
+        would read `generationKeyFile` (generation kernel/initrd, external
+        config, staged-boot artifacts) instead runs this command once and pipes
+        its output into `nmbl-sign sign --key-stdin`. The key is never written
+        to disk or cached between signatures. Mutually exclusive with
+        `generationKeyFile`.
+      '';
+    };
+
     deferInstallSigning = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -226,6 +255,20 @@ in
           is insecure for production. Set boot.nmbl.signing.enforce = true to
           fail closed, or deliberately opt into audit mode by ALSO setting
           boot.nmbl.secureBoot.allowAuditModeInsecure = true.
+        '';
+      }
+      {
+        assertion = !(cfg.generationKeyFile != null && cfg.generationKeyCommand != null);
+        message = ''
+          boot.nmbl.signing.generationKeyFile and generationKeyCommand are both
+          set. Choose one private-key source.
+        '';
+      }
+      {
+        assertion = !(cfg.imageKeyFile != null && cfg.imageKeyCommand != null);
+        message = ''
+          boot.nmbl.signing.imageKeyFile and imageKeyCommand are both set.
+          Choose one private-key source.
         '';
       }
       {
