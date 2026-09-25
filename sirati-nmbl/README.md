@@ -498,9 +498,9 @@ below). A bad or missing signature refuses the boot — there is no
 | `driverImages.images.<name>.path` | str | `nmbl/driver-<name>.sfs` | Image location, relative to the boot partition. |
 
 Each image is built pure (no key) and **signed in place at install
-time** with `nmbl-sign` (reusing `boot.nmbl.signing.imageKeyFile`), so
-the private key is only ever a runtime path, never a Nix derivation
-input.
+time** with `nmbl-sign` (reusing `boot.nmbl.signing.imageKeyFile` or
+`imageKeyCommand`), so the private key is only ever a runtime path or
+pipe, never a Nix derivation input.
 
 ## Staged boot
 
@@ -559,6 +559,22 @@ become a derivation input. (`signing.deferInstallSigning` skips the
 in-installer signing step for sealed disk-image builds while leaving
 runtime enforcement intact.)
 
+The key need not exist as a file at all. Set
+`signing.generationKeyCommand` (and `imageKeyCommand` for driver/rescue
+images) to an argv whose stdout is the private key, and every
+install-time signature runs that command once and pipes it into
+`nmbl-sign sign --key-stdin`. Nothing is cached on disk. A secrets store
+plugs in directly:
+
+```nix
+boot.nmbl.signing.generationKeyCommand = [ "nix-secrets" "pipe-secret" "nmbl-generation-key" ];
+```
+
+The matching key pair can likewise be generated straight into pipes:
+`nmbl-sign keygen --alg ml-dsa-65 --stdio` writes the private key to
+stdout and the raw public key to fd 3, creating no files (see
+[Pipe-only signing keys](#pipe-only-signing-keys)).
+
 | Option | Type | Default | Effect |
 |--------|------|---------|--------|
 | `signing.enable` | bool | `false` | Compile the verifier into `/init` (audit mode on its own). |
@@ -566,7 +582,33 @@ runtime enforcement intact.)
 | `signing.publicKeys` | list of path | `[ ]` | ML-DSA trust-anchor public keys baked into the binary. |
 | `signing.algorithm` | `"ml-dsa-65"` \| `"ml-dsa-87"` | `"ml-dsa-65"` | Signature variant. |
 | `signing.generationKeyFile` | null or path | `null` | Install-time private key (a path, never store-imported). |
+| `signing.generationKeyCommand` | null or list of str | `null` | Alternative: argv printing the private key on stdout, piped per signature. |
+| `signing.imageKeyFile` / `imageKeyCommand` | — | `null` | Same pair for driver, rescue and network-stage images. |
 | `signing.uki.*` | — | — | Optionally sign NMBL's own UKI with a firmware-`db` Secure-Boot key, and provide the signed-PCR-policy keypair for measured-boot auto-unseal. |
+
+### Pipe-only signing keys
+
+`nmbl-sign` can create and use ML-DSA keys without any private-key file:
+
+```console
+# private key -> stdout, raw public key -> fd 3; fails if fd 3 is closed
+nmbl-sign keygen --alg ml-dsa-65 --stdio > >(store-secret nmbl-key) 3> nmbl.pub
+
+# private key <- stdin (bounded, zeroized); the input must be a file path
+print-secret nmbl-key | nmbl-sign sign --key-stdin --domain gen-kernel kernel --out kernel.sig
+```
+
+`--key-stdin` refuses a terminal on stdin and refuses `-`, `/dev/stdin`
+or any path that is the same file as stdin as the input, since the key
+and the payload cannot share one stream. The key-file forms
+(`--out-priv`/`--out-pub`, `--key <FILE>`) keep working. Besides the
+install-time `*KeyCommand` options, the operator tools accept `-` as the
+private key: `nmbl-erofs-deploy` and `nmbl-erofsctl prepare` then run
+`NMBL_SIGN_KEY_COMMAND` (a shell command line) once per signature, and
+`nmbl-boot-update prepare A|B SRC OUT - PUB` reads the key once from
+stdin for the whole slot.
+The UEFI Secure-Boot `db` key (`signing.uki.keyFile`) is an RSA PEM
+consumed by `sbsign`, not an ML-DSA key, and stays file-based.
 
 ### Measured boot and the TPM lock
 

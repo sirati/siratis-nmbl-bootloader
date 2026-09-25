@@ -1334,6 +1334,7 @@ name = "nmbl-host-tools"
 version = "0.1.0"
 dependencies = [
  "fips204",
+ "libc",
  "nmbl-init",
  "sha2",
  "tempfile",

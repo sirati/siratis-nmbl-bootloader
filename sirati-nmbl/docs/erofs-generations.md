@@ -207,6 +207,17 @@ nix run .#nmbl-erofs-deploy -- remote \
   --reboot
 ```
 
+The private key need not be a file. Pass `-` instead of the key path and set
+`NMBL_SIGN_KEY_COMMAND` to a shell command line that prints the key; it runs
+once per signature and is piped into `nmbl-sign sign --key-stdin`:
+
+```sh
+NMBL_SIGN_KEY_COMMAND='nix-secrets pipe-secret nmbl-generation-key' \
+  nix run .#nmbl-erofs-deploy -- remote .#nixosConfigurations.host - update@host
+```
+
+`nmbl-erofsctl prepare IMAGE - OUT_DIR` accepts the same convention.
+
 Configure the update key with `restrict` and a forced command equivalent to:
 
 ```text

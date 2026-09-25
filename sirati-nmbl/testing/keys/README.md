@@ -51,3 +51,16 @@ nmbl-sign keygen --alg ml-dsa-87 \
 If you need real signing, generate a fresh keypair, keep the private key OFF the
 store (pass it as a string path to an on-disk secret, e.g.
 `"/run/secrets/nmbl.key"`), and never commit it.
+
+Better still, never let the real private key touch disk: `nmbl-sign keygen
+--stdio` writes the private key to stdout and the raw public key to fd 3,
+so a secrets store can capture it straight from the pipe:
+
+```
+nmbl-sign keygen --alg ml-dsa-87 --stdio \
+  3> nmbl.pub | nix-secrets <store command for the private key>
+```
+
+Then sign through a pipe with `nmbl-sign sign --key-stdin`, or set
+`boot.nmbl.signing.generationKeyCommand` / `imageKeyCommand` to a command that
+prints the key (e.g. `[ "nix-secrets" "pipe-secret" "nmbl-key" ]`).

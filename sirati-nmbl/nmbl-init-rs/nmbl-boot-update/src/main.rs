@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use nmbl_boot_update::{prepare, protocol, validate};
+use nmbl_host_tools::keyfile;
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -24,10 +25,22 @@ fn run(args: Vec<String>) -> nmbl_boot_update::Result<String> {
             let slot = slot_arg.chars().next()
                 .filter(|_| slot_arg.chars().count() == 1)
                 .ok_or_else(|| nmbl_boot_update::Error::Invalid("invalid slot".into()))?;
-            prepare::prepare(
-                slot, &PathBuf::from(source), &PathBuf::from(output),
-                &PathBuf::from(private), &PathBuf::from(public),
-            )?;
+            if private == "-" {
+                // PRIVATE_KEY `-`: read the key once from stdin (bounded,
+                // zeroized on drop); it signs the whole bundle and never
+                // touches disk.
+                let key = keyfile::read_private_from(&mut std::io::stdin().lock())
+                    .map_err(|e| nmbl_boot_update::Error::Invalid(format!("read private key: {e}")))?;
+                prepare::prepare_with_key(
+                    slot, &PathBuf::from(source), &PathBuf::from(output),
+                    &key, &PathBuf::from(public),
+                )?;
+            } else {
+                prepare::prepare(
+                    slot, &PathBuf::from(source), &PathBuf::from(output),
+                    &PathBuf::from(private), &PathBuf::from(public),
+                )?;
+            }
             Ok("bundle prepared and verified".into())
         }
         [command, bundle, public] if command == "check" => {
@@ -50,7 +63,7 @@ fn run(args: Vec<String>) -> nmbl_boot_update::Result<String> {
             Ok("service stopped".into())
         }
         _ => Err(nmbl_boot_update::Error::Invalid(
-            "usage: nmbl-boot-update prepare A|B SOURCE OUTPUT PRIVATE_KEY PUBLIC_KEY | check BUNDLE PUBLIC_KEY | request SOCKET BUNDLE PUBLIC_KEY | serve SOCKET SPOOL PUBLIC_KEY UID BOOT_ROOT...".into(),
+            "usage: nmbl-boot-update prepare A|B SOURCE OUTPUT PRIVATE_KEY|- PUBLIC_KEY | check BUNDLE PUBLIC_KEY | request SOCKET BUNDLE PUBLIC_KEY | serve SOCKET SPOOL PUBLIC_KEY UID BOOT_ROOT...".into(),
         )),
     }
 }

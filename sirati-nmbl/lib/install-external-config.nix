@@ -9,18 +9,22 @@
 
 let
   signingEnabled = cfg.signing.enable or false;
-  keyFile = cfg.signing.generationKeyFile or null;
-  keyString = if keyFile == null then null else toString keyFile;
-  keyInStore = keyString != null && lib.hasPrefix builtins.storeDir keyString;
+  # generationKeyFile or generationKeyCommand (lib/signing-key.nix).
+  signer = import ./signing-key.nix { inherit lib; } {
+    nmblSignBin = "${toString nmblSign}/bin/nmbl-sign";
+    keyFile = cfg.signing.generationKeyFile or null;
+    keyCommand = cfg.signing.generationKeyCommand or null;
+  };
   checked =
     assert lib.assertMsg (!signingEnabled || deferInstallSigning || nmblSign != null) ''
       External NMBL config signing is enabled, but nmblSign is unavailable.
     '';
-    assert lib.assertMsg (!signingEnabled || deferInstallSigning || keyFile != null) ''
-      External NMBL config signing requires signing.generationKeyFile.
-      Pass an install-time STRING path outside the Nix store.
+    assert lib.assertMsg (!signingEnabled || deferInstallSigning || signer.configured) ''
+      External NMBL config signing requires signing.generationKeyFile or
+      signing.generationKeyCommand. A key file must be an install-time STRING
+      path outside the Nix store.
     '';
-    assert lib.assertMsg (!signingEnabled || !keyInStore) ''
+    assert lib.assertMsg (!signingEnabled || !signer.keyInStore) ''
       signing.generationKeyFile resolves inside the Nix store. Private signing
       keys must be install-time STRING paths outside the store.
     '';
@@ -37,11 +41,11 @@ assert checked;
   install -D -m 0644 ${nmblConfigToml} ${lib.escapeShellArg destination}
   ${lib.optionalString (signingEnabled && !deferInstallSigning) ''
     echo "Signing external NMBL config..."
-    ${nmblSign}/bin/nmbl-sign sign \
-      --key ${lib.escapeShellArg keyString} \
-      --domain boot-config \
-      --out ${lib.escapeShellArg signature} \
-      ${lib.escapeShellArg destination}
+    ${signer.sign {
+      domain = "boot-config";
+      out = lib.escapeShellArg signature;
+      input = lib.escapeShellArg destination;
+    }}
     chmod 0644 ${lib.escapeShellArg signature}
   ''}
   ${lib.optionalString (signingEnabled && deferInstallSigning) ''

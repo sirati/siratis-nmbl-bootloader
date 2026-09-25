@@ -53,10 +53,14 @@ let
   # closure-leak posture as the UKI key: a STRING path stays out of the store;
   # a Nix path literal would be imported and is rejected below.
   signingCfg = config.boot.nmbl.signing or { };
-  imageKeyFile = signingCfg.imageKeyFile or null;
-  storeDir = builtins.storeDir;
-  imageKeyStr = if imageKeyFile == null then null else toString imageKeyFile;
-  imageKeyIsStorePath = imageKeyStr != null && lib.hasPrefix storeDir imageKeyStr;
+  # imageKeyFile or imageKeyCommand (lib/signing-key.nix).
+  signer = import ../signing-key.nix { inherit lib; } {
+    nmblSignBin = "${toString nmblSign}/bin/nmbl-sign";
+    keyFile = signingCfg.imageKeyFile or null;
+    keyCommand = signingCfg.imageKeyCommand or null;
+  };
+  imageKeyStr = signer.keyFileStr;
+  imageKeyIsStorePath = signer.keyInStore;
 
   # Eval-time guards. Only meaningful when driver images are enabled.
   signingChecked =
@@ -67,11 +71,13 @@ let
       the runtime loader would refuse every (unsigned) image. Update the host
       flake so it threads `_module.args.nmblSign`.
     '';
-    assert lib.assertMsg (!enabled || imageKeyFile != null) ''
-      boot.nmbl.driverImages.enable = true but boot.nmbl.signing.imageKeyFile
-      is null. Each driver image is signed at install time with the operator's
-      ML-DSA private key (the pair of a baked boot.nmbl.signing.publicKeys
-      entry). Set boot.nmbl.signing.imageKeyFile to the on-disk private key.
+    assert lib.assertMsg (!enabled || signer.configured) ''
+      boot.nmbl.driverImages.enable = true but neither
+      boot.nmbl.signing.imageKeyFile nor imageKeyCommand is set. Each driver
+      image is signed at install time with the operator's ML-DSA private key
+      (the pair of a baked boot.nmbl.signing.publicKeys entry). Set
+      boot.nmbl.signing.imageKeyFile to the on-disk private key,
+      or imageKeyCommand to a command that prints it.
     '';
     assert lib.assertMsg (!(enabled && imageKeyIsStorePath)) ''
       boot.nmbl.signing.imageKeyFile resolves to a Nix store path:
@@ -151,18 +157,17 @@ let
     let
       destArg = lib.escapeShellArg record.destPath;
       sigArg = lib.escapeShellArg record.sigDest;
-      keyArg = lib.escapeShellArg (toString imageKeyStr);
       sigDir = builtins.dirOf record.sigDest;
     in ''
       echo "Staging NMBL driver image '${record.name}' to ${destArg}..."
       install -D -m 0644 ${record.sfs} ${destArg}
       mkdir -p ${lib.escapeShellArg sigDir}
       echo "Signing driver image '${record.name}' (nmbl-sign, install-time, --domain driver-image)..."
-      ${nmblSign}/bin/nmbl-sign sign \
-        --key ${keyArg} \
-        --domain driver-image \
-        --out ${sigArg} \
-        ${destArg}
+      ${signer.sign {
+        domain = "driver-image";
+        out = sigArg;
+        input = destArg;
+      }}
       echo "✓ Driver image '${record.name}' installed + signed (${sigArg})"
     '';
 

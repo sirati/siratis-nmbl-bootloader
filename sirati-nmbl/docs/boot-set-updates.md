@@ -26,6 +26,10 @@ nmbl-boot-update request /run/nmbl-boot-update/update.sock \
   /var/lib/nmbl-boot-update/spool/first /run/operator/public.key
 ```
 
+Passing `-` as the private key makes `prepare` read it once from stdin
+(for example `nix-secrets pipe-secret nmbl-boot-key | nmbl-boot-update prepare
+A … - /run/operator/public.key`), so no private-key file is needed.
+
 The first command is implemented in safe Rust. It signs outside the store and
 then validates every input. The client validates the bundle again before it
 connects. The privileged service checks peer UID and executable identity both

@@ -30,6 +30,7 @@
   genSigning ? {
     enable = false;
     keyFile = null;
+    keyCommand = null;
     sigPathSuffix = ".sig";
   },
   # The host-platform `nmbl-sign` derivation (flake `_module.args.nmblSign`).
@@ -40,6 +41,13 @@
 let
   genSignEnable = genSigning.enable or false;
   genKeyFile = genSigning.keyFile or null;
+  # Alternative source: an argv whose stdout is the key (lib/signing-key.nix).
+  genKeyCommand = genSigning.keyCommand or null;
+  signer = import ./signing-key.nix { inherit lib; } {
+    inherit nmblSignBin;
+    keyFile = genKeyFile;
+    keyCommand = genKeyCommand;
+  };
   # Sidecar filename suffix — MUST match `signing.sigPathSuffix` (the Rust
   # `config.signing.sig_path_suffix`) so `src/sig/scan.rs::resolve_sig_sidecar`
   # finds `<boot>/nmbl/sigs/<gen-id>/{kernel,initrd}<suffix>` at boot.
@@ -56,13 +64,15 @@ let
   genKeyIsStorePath = genKeyStr != null && lib.hasPrefix storeDir genKeyStr;
 
   genClosureLeakChecked =
-    assert lib.assertMsg (!(genSignEnable && genKeyFile == null)) ''
-      boot.nmbl.signing.enable is set but boot.nmbl.signing.generationKeyFile
-      is null. Each bootable generation's kernel + initrd is signed at install
-      time so NMBL's pre-kexec verify guard has sidecars to check; an enforcing
+    assert lib.assertMsg (!(genSignEnable && !signer.configured)) ''
+      boot.nmbl.signing.enable is set but neither
+      boot.nmbl.signing.generationKeyFile nor generationKeyCommand is set.
+      Each bootable generation's kernel + initrd is signed at install time so
+      NMBL's pre-kexec verify guard has sidecars to check; an enforcing
       install would otherwise refuse every generation. Set
       boot.nmbl.signing.generationKeyFile to the on-disk ML-DSA private key
-      (the PRIVATE half of a baked boot.nmbl.signing.publicKeys entry).
+      (the PRIVATE half of a baked boot.nmbl.signing.publicKeys entry), or
+      generationKeyCommand to a command that prints it.
     '';
     assert lib.assertMsg (!(genSignEnable && nmblSign == null)) ''
       boot.nmbl.signing.enable is set but the `nmbl-sign` signer is not
@@ -81,10 +91,8 @@ let
     '';
     true;
 
-  # Escaped install-time-impure key path + the `nmbl-init` / `nmbl-sign`
-  # binaries. The key only appears as a literal argument to the imperative
-  # signing command, never inside a derivation.
-  genKeyArg = lib.escapeShellArg (toString genKeyStr);
+  # The `nmbl-init` / `nmbl-sign` binaries. The key (path or command) only
+  # appears in the imperative signing command, never inside a derivation.
   nmblInitBin = "${config.system.build.nmblInit}/bin/nmbl-init";
   nmblSignBin = lib.optionalString (nmblSign != null) "${nmblSign}/bin/nmbl-sign";
 
@@ -143,16 +151,16 @@ let
         mkdir -p "$sig_dir"
 
         echo "  Signing generation $gen_id (kernel + initrd)..."
-        ${nmblSignBin} sign \
-          --key ${genKeyArg} \
-          --domain gen-kernel \
-          --out "$sig_dir/kernel${genSigSuffix}" \
-          "$gen_kernel"
-        ${nmblSignBin} sign \
-          --key ${genKeyArg} \
-          --domain gen-initrd \
-          --out "$sig_dir/initrd${genSigSuffix}" \
-          "$gen_initrd"
+        ${signer.sign {
+          domain = "gen-kernel";
+          out = ''"$sig_dir/kernel${genSigSuffix}"'';
+          input = ''"$gen_kernel"'';
+        }}
+        ${signer.sign {
+          domain = "gen-initrd";
+          out = ''"$sig_dir/initrd${genSigSuffix}"'';
+          input = ''"$gen_initrd"'';
+        }}
         echo "  ✓ generation $gen_id signed -> $sig_dir/{kernel,initrd}${genSigSuffix}"
 
         nmbl_live_gen_ids="$nmbl_live_gen_ids $gen_id"

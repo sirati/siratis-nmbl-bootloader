@@ -8,7 +8,12 @@ trap cleanup EXIT INT TERM
 private="$operator/operator.key"
 public="$operator/operator.pub"
 marker="$operator/operator.marker"
-@signer@/bin/nmbl-sign keygen --alg ml-dsa-65 --out-priv "$private" --out-pub "$public"
+# keygen --stdio: private key on stdout (captured on tmpfs, standing in for a
+# secrets store), raw public key on fd 3. No key file is created by the tool.
+@signer@/bin/nmbl-sign keygen --alg ml-dsa-65 --stdio > "$private" 3> "$public"
+# The first and third deploys sign through NMBL_SIGN_KEY_COMMAND (piped into
+# nmbl-sign --key-stdin); the second keeps the key-file path.
+key_command="cat $private"
 head -c 64 /dev/urandom | base64 > "$marker"
 [[ "$private" != /nix/store/* && $(stat -f -c %T "$operator") = tmpfs ]]
 
@@ -86,14 +91,14 @@ exec @receive@/bin/nmbl-erofs-receive "$dir/incoming" "$state_root" "$public"
 EOF
   chmod 0700 "$dir/test-ssh"
   first=$(NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
-    @deploy@/bin/nmbl-erofs-deploy remote \
-    "path:$dir#nixosConfigurations.first" "$private" generation-test-target | tail -n1)
+    NMBL_SIGN_KEY_COMMAND="$key_command" @deploy@/bin/nmbl-erofs-deploy remote \
+    "path:$dir#nixosConfigurations.first" - generation-test-target | tail -n1)
   second=$(NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
     @deploy@/bin/nmbl-erofs-deploy remote \
     "path:$dir#nixosConfigurations.second" "$private" generation-test-target | tail -n1)
   third=$(NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
-    @deploy@/bin/nmbl-erofs-deploy remote \
-    "path:$dir#nixosConfigurations.third" "$private" generation-test-target | tail -n1)
+    NMBL_SIGN_KEY_COMMAND="$key_command" @deploy@/bin/nmbl-erofs-deploy remote \
+    "path:$dir#nixosConfigurations.third" - generation-test-target | tail -n1)
   test "$first" != "$second"
   test "$second" != "$third"
   test "$first" != "$third"

@@ -3,6 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
+use nmbl_host_tools::keyfile::{self, PrivateKeyFile};
 use nmbl_host_tools::{domain, sign};
 use sha2::{Digest, Sha512};
 
@@ -20,10 +21,28 @@ pub fn prepare(
         return Err(Error::Invalid("slot must be A or B".into()));
     }
     reject_store_private_key(private_key)?;
+    let key = keyfile::read_private(private_key)
+        .map_err(|e| Error::Invalid(format!("load private key: {e}")))?;
+    prepare_with_key(slot, source, output, &key, public_key)
+}
+
+/// Like [`prepare`], with an already-loaded private key (e.g. read once from
+/// stdin). The key signs every member and the manifest, then is dropped and
+/// zeroized by the caller; it never touches disk.
+pub fn prepare_with_key(
+    slot: char,
+    source: &Path,
+    output: &Path,
+    key: &PrivateKeyFile,
+    public_key: &Path,
+) -> Result<()> {
+    if !matches!(slot, 'A' | 'B') {
+        return Err(Error::Invalid("slot must be A or B".into()));
+    }
     fs::create_dir(output).map_err(|e| Error::io("create output bundle", e))?;
     fs::set_permissions(output, fs::Permissions::from_mode(0o700))
         .map_err(|e| Error::io("protect output bundle", e))?;
-    let result = populate(slot, source, output, private_key, public_key);
+    let result = populate(slot, source, output, key, public_key);
     if result.is_err() {
         let _ = fs::remove_dir_all(output);
     }
@@ -34,7 +53,7 @@ fn populate(
     slot: char,
     source: &Path,
     output: &Path,
-    private_key: &Path,
+    key: &PrivateKeyFile,
     public_key: &Path,
 ) -> Result<()> {
     let roles = [
@@ -58,9 +77,9 @@ fn populate(
         identity.update(name.as_bytes());
         identity.update(digest.as_bytes());
         let signature = format!("{name}.sig");
-        sign::run(
+        sign::run_with_key(
             &output.join(name),
-            private_key,
+            key,
             domain::domain_for("boot-set-artifact")
                 .ok_or_else(|| Error::Invalid("artifact signature domain missing".into()))?,
             Some(&output.join(&signature)),
@@ -84,9 +103,9 @@ fn populate(
     let bytes = serde_json::to_vec(&manifest)
         .map_err(|e| Error::Invalid(format!("encode manifest: {e}")))?;
     write_new(&output.join("manifest.json"), &bytes)?;
-    sign::run(
+    sign::run_with_key(
         &output.join("manifest.json"),
-        private_key,
+        key,
         domain::domain_for("boot-set-manifest")
             .ok_or_else(|| Error::Invalid("manifest signature domain missing".into()))?,
         Some(&output.join("manifest.json.sig")),

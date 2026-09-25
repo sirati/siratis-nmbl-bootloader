@@ -45,6 +45,17 @@ nmbl-sign sign \
   config.toml
 ```
 
+The key can also arrive on stdin, so it never has to exist as a file on the
+signing host:
+
+```console
+nix-secrets pipe-secret nmbl-generation-key \
+  | nmbl-sign sign --key-stdin --domain boot-config --out config.toml.sig config.toml
+```
+
+The install-time signer uses the same pipe when
+`boot.nmbl.signing.generationKeyCommand` is set instead of `generationKeyFile`.
+
 Install the configuration and sidecar together at their advertised paths.
 Until a matching sidecar exists, the enforcing boot path refuses the external
 configuration. The embedded public key remains the trust anchor; neither the
