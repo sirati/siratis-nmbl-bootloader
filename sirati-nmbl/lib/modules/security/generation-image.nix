@@ -24,6 +24,12 @@ let
   relativeStateRoot =
     if store == null then null
     else lib.removePrefix storePrefix cfg.stateRoot;
+  # stateRoot relative to the filesystem NMBL mounts as its boot volume, where
+  # the rescue and network-stage paths are resolved: the stage-1 store when one
+  # is configured, otherwise /boot (the assertion below keeps stateRoot there).
+  bootRelativeStateRoot =
+    if store == null then lib.removePrefix "/boot/" cfg.stateRoot
+    else relativeStateRoot;
   targetMountPoint = "/sysroot${cfg.mountPoint}";
   targetImagePath = "/sysroot${imagePath}";
   targetSignaturePath = "/sysroot${cfg.signaturePath}";
@@ -111,8 +117,8 @@ in
 
   config = lib.mkMerge [
     {
-      boot.nmbl.rescue.sfsPath = lib.mkIf cfg.enable "${relativeStateRoot}/active/rescue.sfs";
-      boot.nmbl.rescue.fullSystem.networkStage.imagePath = lib.mkIf cfg.enable "${relativeStateRoot}/active/network.erofs";
+      boot.nmbl.rescue.sfsPath = lib.mkIf cfg.enable "${bootRelativeStateRoot}/active/rescue.sfs";
+      boot.nmbl.rescue.fullSystem.networkStage.imagePath = lib.mkIf cfg.enable "${bootRelativeStateRoot}/active/network.erofs";
       assertions = lib.optionals cfg.enable [
         {
           assertion = signing.enable && signing.enforce;
