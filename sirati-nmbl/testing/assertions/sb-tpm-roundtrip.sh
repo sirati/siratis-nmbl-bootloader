@@ -482,5 +482,71 @@ if seen_in_history "$BOOT_FAILED_RE"; then
   exit 1
 fi
 
+# ── Phase 3 (#3b, opt-in): rescue AFTER a TPM unseal locks the TPM ─────────
+# With NMBL_SB_TPM_PHASE3=1 the SAME enrolled disk is booted a third time with
+# the rescue sentinel on the ESP. The luks-tpm activation unseals cryptroot
+# first; the embedded-config sentinel check then forces rescue after the unlock.
+# Before the rescue shell, the seal must cap the lock PCR and close the
+# TPM-unsealed mapper. Assert that in the rescue shell: cryptroot's mapper is
+# ABSENT, and a fresh `--token-only` unseal FAILS (the PCR no longer matches
+# the policy the key was sealed to).
+if [ "${NMBL_SB_TPM_PHASE3:-0}" = 1 ]; then
+  echo "=== Phase 3: rescue after unseal must lock the TPM (#3b) ===" >&2
+  stop_vm
+  : >"${RUN_DIR}/sentinel"
+  if ! guestfish --rw -a "$SHARED_DISK" <<EOF3
+run
+mount /dev/sda2 /
+mkdir-p /nmbl
+upload ${RUN_DIR}/sentinel /nmbl/rescue
+umount /
+EOF3
+  then
+    echo "FAIL: could not drop the rescue sentinel on the ESP" >&2
+    exit 1
+  fi
+  if ! "$RUNNER"; then
+    echo "FAIL: phase-3 runner exited non-zero" >&2
+    exit 1
+  fi
+  if ! pin_vm_socket "$CONFIG_NAME"; then
+    echo "FAIL: could not pin VM_SOCKET for phase 3" >&2
+    exit 1
+  fi
+  if ! wait_for 'luks-tpm: unsealed cryptroot|rescue sentinel present' "$SHELL_TIMEOUT"; then
+    echo "FAIL: phase 3 never reached the post-unlock sentinel check" >&2
+    exit 1
+  fi
+  if ! wait_for 'seal: lock PCR capped' 120; then
+    echo "FAIL: entering rescue did not cap the lock PCR" >&2
+    exit 1
+  fi
+  if ! wait_for 'seal: closed TPM-unsealed mapper cryptroot' 60; then
+    echo "FAIL: entering rescue did not close the TPM-unsealed cryptroot mapper" >&2
+    exit 1
+  fi
+  if seen_in_history "$BOOTED_RE"; then
+    echo "FAIL: the generation booted although the sentinel forced rescue" >&2
+    exit 1
+  fi
+  # Probe from the rescue shell (embedded busybox + cryptsetup).
+  sleep 10
+  send_cmd "test -e /dev/mapper/cryptroot && echo NMBL_P3_MAPPER_PRESENT || echo NMBL_P3_MAPPER_ABSENT"
+  if ! wait_for 'NMBL_P3_MAPPER_ABSENT' 60; then
+    echo "FAIL: /dev/mapper/cryptroot is still present in rescue" >&2
+    exit 1
+  fi
+  send_cmd "/bin/cryptsetup open --token-only ${LUKS_DEV} nmblprobe && echo NMBL_P3_UNSEAL_WORKED || echo NMBL_P3_UNSEAL_FAILED"
+  if ! wait_for 'NMBL_P3_UNSEAL_(WORKED|FAILED)' 120; then
+    echo "FAIL: the post-cap unseal probe produced no result" >&2
+    exit 1
+  fi
+  if seen_in_history 'NMBL_P3_UNSEAL_WORKED'; then
+    echo "FAIL: the TPM still unseals the LUKS key after rescue was entered" >&2
+    exit 1
+  fi
+  echo "PASS: rescue after a TPM unseal capped PCR 11, closed cryptroot, and the key no longer unseals." >&2
+fi
+
 echo "PASS: TPM seal/unseal roundtrip — enroll, power-cycle, auto-unseal, up." >&2
 exit 0

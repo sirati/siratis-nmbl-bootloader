@@ -91,8 +91,12 @@ pub fn write_sentinel(config: &Config) {
 /// configured path to anchor against.
 fn resolve_sentinel_path(config: &Config) -> Option<PathBuf> {
     let configured = configured_sentinel_path(config);
-    match config.runtime_boot_mountpoint.as_deref() {
-        Some(mp) => Some(join_boot_relative(mp, configured)),
+    // The same boot-mountpoint resolution the sidecar scan uses: the bootstrap
+    // mount when present, else `<system_root>/boot` once phase 3b has mounted
+    // the boot filesystem in embedded-config mode. Without the second arm an
+    // embedded-config system wrote the sentinel but could never read it back.
+    match config.resolve_boot_mountpoint() {
+        Some(mp) => Some(join_boot_relative(&mp, configured)),
         None if configured.is_absolute() => Some(configured.to_path_buf()),
         None => None,
     }

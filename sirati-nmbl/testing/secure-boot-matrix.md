@@ -153,38 +153,49 @@ no longer fails trying to sign the driver squashfs.
 |---|---|---|---|---|
 | SB | `check-sb-unsigned-uki` | firmware refuses an unsigned UKI | Boots a deliberately-UNSIGNED UKI under SB-OVMF (`smm=on`, db-enrolled). The firmware REFUSES it (Secure-Boot violation banner / UEFI shell) and NMBL NEVER runs. Distinguishes "firmware refused" (PASS) from "NMBL refused". | `assertions/sb-unsigned-uki.sh` exits 0: a SB-refusal banner appears AND no NMBL marker is present. This is the literal precondition for #29 — run it FIRST so the rest of the SB matrix cannot false-green on a non-enforcing firmware. |
 
-## NEXT scenarios — STUBBED (described; harness work pending)
+## Formerly stubbed scenarios — now wired
 
-Each row says exactly what must be wired. These were left as precise stubs
-because they need either a Rust/boot-flow feature seam that this F6b task does
-not own, or disk/priority-volume preparation beyond the core chain.
+All six share the core harness. The three disk-preparation negatives and the
+sentinel scenario use `testing/assertions/sb-disk-tamper-refused.sh`, selected
+by `NMBL_SB_TAMPER`; #3b is an opt-in third phase of `sb-tpm-roundtrip.sh`.
 
-| id | proposed app | scenario | exact assertion (target) | what's needed to wire it (TODO) |
-|---|---|---|---|---|
-| #4c | `test-secure-boot-wrong-key-refused` | wrong-key generation refused (NEG) | A generation signed by a NON-baked key ⇒ any-of verify fails ⇒ refused; bad gen never boots; no shell. | STUBBED. Needs a SECOND insecure keypair (sign the gen sidecars with a key whose public half is NOT baked) staged onto the disk's `/boot/nmbl/sigs/<gen-id>/`. Re-uses the `sb-bad-sig-refused.sh` assertion shape verbatim; only the disk-prep differs (re-sign with a foreign key instead of deleting the sidecar). Add `testing/keys/insecure-test-ml-dsa-87-foreign.{key,pub}` + a re-sign step. |
-| #4d | `test-secure-boot-domain-transplant-refused` | domain-transplant refused (NEG, FIX-01) | A valid `driver-image`-domain signature presented as the `gen-kernel` sidecar ⇒ rejected (per-role domain separation). | STUBBED. Needs `nmbl-sign --domain driver-image` over the gen kernel, dropped at the `kernel.sig` path. Disk-prep only; assertion = `sb-bad-sig-refused.sh` shape (refuse + no boot + no shell). |
-| #3b | `test-secure-boot-rescue-locks-tpm` | rescue caps TPM, mapper GONE (NEG, FIX-03) | Force a drop to rescue AFTER a post-LUKS-unlock failure. Assert (precondition) `/dev/tpmrm0` exists + a probe secret seals; then PCR 11 is CAPPED before the prompt; the `cryptroot` **mapper node is GONE** (`/dev/mapper/cryptroot` ABSENT); a post-cap unseal FAILS. Assert ABSENCE (mapper gone, unseal fails), not a banner. | STUBBED. Needs a deterministic way to force the post-unlock failure + rescue (a fault-injection knob or a config that unlocks then fails a later activation), and a rescue-shell probe that runs `ls /dev/mapper/cryptroot` (expect absent) and a TPM-unseal probe (expect FAIL). The seal/cap behaviour is #17/#26 Rust work; the assertion can be written once a force-rescue-after-unlock path is reachable. Assertion skeleton: precondition like `sb-tpm-roundtrip.sh` (seal probe) + absence sweep for `/dev/mapper/cryptroot` + an unseal-probe that must error. |
-| #5a | `test-secure-boot-sentinel-rescue` | sentinel ⇒ rescue, stays capped | An empty `/boot/nmbl/rescue` sentinel forces a rescue boot; NMBL refuses the measured boot, keeps the TPM capped, goes straight to rescue. | STUBBED. Disk-prep: `touch /boot/nmbl/rescue` on the ESP (mtools/guestfish, no LUKS key needed). Assertion: refuse marker + rescue reached + (probe) TPM stays capped. Needs the sentinel→straight-to-rescue path (#30) live; assertion = refuse-shape + a capped-PCR probe. |
-| #5b | `test-secure-boot-priority-ok` | priority signed-file OK | A signed priority file on the first LUKS/LVM volume verifies ⇒ proceeds to measured boot. | STUBBED. Needs a config variant with `secureBoot.priorityVolume.device` set + a signed `priority.signed` file staged on that volume (sign with `nmbl-sign --domain priority-file`). Then assertion = signed-gen-happy shape (proceeds, boots). Priority-gate is #31. |
-| #5c | `test-secure-boot-bad-priority-refused` | bad/missing priority (NEG) | Priority file missing/bad with boot-FS ⊆ priority LUKS variant ⇒ cap FIRST + close mappers + sentinel persists to next boot; refuse boot AND shell; only `RebootIntoRescue`. Assert **NO shell** + `/dev/mapper/<x>` ABSENT + unseal FAILS. | STUBBED. Needs the priority-volume config variant (as #5b) but with the signed file removed/tampered, plus the rescue-shell mapper/unseal probes from #3b. Assertion = bad-sig refuse-shape + mapper-absent + unseal-fail + sentinel-persists-across-reboot check. Priority-gate is #31; the relock/close-mappers is #26/#17. |
+Running any scenario needs `NMBL_TEST_KEYS_DIR` (the committed test signing
+keys) and `NMBL_SSH_KEY` (any throwaway passphrase-less key; the installer
+authorises it only inside its own nixos-anywhere VM). Point
+`NMBL_SB_SIGNED_DISK` / `NMBL_SB_ENROLL_DISK` at an existing install to skip
+reinstalling.
+
+| id | app | disk preparation | PASS requires |
+|---|---|---|---|
+| #4c | `test-secure-boot-wrong-key-refused` | every kernel/initrd sidecar replaced by a VALID signature from a fresh key that is not baked into NMBL | refuse; the generation never boots un-refused; no emergency shell |
+| #4d | `test-secure-boot-domain-transplant-refused` | the kernel sidecar replaced by the BAKED key's signature over the same kernel bytes under the `driver-image` domain | same as #4c: per-role domain separation rejects it |
+| #5a | `test-secure-boot-sentinel-rescue` | empty `/boot/nmbl/rescue` on the ESP | the sentinel is detected, rescue is entered after `seal: lock PCR capped`, and the generation never boots |
+| #5b | `test-secure-boot-staged` (existing) | none; the install-signed priority file | `priority-gate (PostUnlock): signature VALID` and the staged boot completes |
+| #5c | `test-secure-boot-bad-priority-refused` | the signed priority file on the inside-LUKS priority volume is overwritten (cryptsetup inside the guestfish appliance) | NMBL's `SECURE BOOT: REFUSED` screen; no shell; the generation never boots |
+| #3b | `test-secure-boot-rescue-locks-tpm` | after the enrol and TPM-unseal phases, the sentinel is dropped and the tpm-unlock config boots a third time | the TPM unseal happens, then `seal: lock PCR capped` and `seal: closed TPM-unsealed mapper cryptroot`; in rescue `/dev/mapper/cryptroot` is absent and `cryptsetup open --token-only` fails |
+
+**#3b is blocked by the existing TPM roundtrip.** Its phases 1 and 2 are the
+unmodified `test-secure-boot-tpm-roundtrip`, which currently fails at the
+phase-2 unseal (`cryptsetup --token-only` exits 1). The enroll twin and the
+tpm-unlock config boot different system generations
+(`nixos-system-test-secure-boot-enroll-…` vs `nixos-system-test-secure-boot-…`),
+so the kexec command line NMBL measures into PCR 11 (its `init=` store path)
+differs between the phase that seals and the phase that unseals. Fixing it
+means making both phases boot one identical generation; until then phase 3
+does not run.
+
+The relock of password-unlocked volumes on a refuse runs while NMBL holds the
+console, so it is not visible on serial; its order (cap, close TPM mappers,
+sentinel, relock) is pinned by the policy unit tests.
+
+#5a found that an embedded-config system never read the rescue sentinel (it
+looked at the literal `/boot/nmbl/rescue` before `/boot` was mounted), so a
+refuse's "next boot enters rescue" did not happen. The sentinel now resolves
+through the boot mountpoint and is re-checked after phase 3b mounts `/boot`.
 
 ## Status summary
 
-* **FULLY WIRED (ready for #57 to run):**
-  `test-secure-boot-tpm-roundtrip`, `test-secure-boot-signed-gen-happy`,
-  `test-secure-boot-bad-sig-refused`, `test-secure-boot-driver-image` (#1) +
-  its `test-secure-boot-driver-image-bad-refused` negative,
-  `test-secure-boot-staged` (#2 — the staged-boot/priority-volume apply,
-  FEATURE #2), plus the already-landed `check-sb-unsigned-uki` precondition.
-* **STUBBED (precise TODOs above):** wrong-key (#4c), domain-transplant (#4d),
-  rescue-locks-tpm / mapper-gone (#3b), sentinel-rescue (#5a),
-  priority-ok (#5b), bad-priority (#5c).
-
-The STUBBED rows are deferred because they need either a second/foreign test
-key, a priority-volume config + staged signed file, a driver/staged image, or a
-reachable force-rescue-after-unlock seam — none of which are part of the CORE
-chain this harness wires. Each row above names the exact missing piece so the
-next pass can land it incrementally; the assertion SHAPES are already proven by
-the three wired scripts (`sb-signed-gen-happy.sh` for happy paths,
-`sb-bad-sig-refused.sh` for refuse/absence negatives, `sb-tpm-roundtrip.sh` for
-TPM seal/unseal probes).
+* **Wired:** `test-secure-boot-tpm-roundtrip`, `test-secure-boot-signed-gen-happy`,
+  `test-secure-boot-bad-sig-refused`, `test-secure-boot-driver-image` +
+  `test-secure-boot-driver-image-bad-refused`, `test-secure-boot-staged`,
+  `check-sb-unsigned-uki`, and the six scenarios above.

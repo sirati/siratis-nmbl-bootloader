@@ -38,6 +38,19 @@ pub(super) async fn select_and_act(
     skip_selector: &SkipSelector,
     driver_images: &nmbl_init::imageload::DriverImagesHandle,
 ) -> Result<TerminalAction> {
+    // In embedded-config mode the boot filesystem is only mounted by phase 3b,
+    // after the early force-rescue check ran. Re-check the rescue sentinel now
+    // that `/boot` is reachable, BEFORE any generation is measured or kexec'd.
+    if nmbl_init::policy::sentinel_present(config) {
+        nmbl_warn!("rescue sentinel present; skipping the generation boot");
+        return Err(NmblError::Rescue {
+            stage: "rescue-sentinel",
+            source: Box::new(NmblError::Io {
+                source: std::io::Error::other("the rescue sentinel requested a rescue boot"),
+                context: "rescue sentinel".to_string(),
+            }),
+        });
+    }
     nmbl_info!("phase 4: scan generations");
     let generations = {
         let mut reporter = BootReporter::new(console, "phase 4: scan generations");
@@ -362,6 +375,15 @@ pub(super) async fn run_tui_session(
                 nmbl_init::policy::run_refuse_screen(config, &mut *console, *cause, sender).await;
             drop(console);
             action
+        }
+        // The rescue sentinel is an explicit request for rescue, not a boot
+        // failure: it forces rescue independently of `rescue.automatic`.
+        Err(err @ NmblError::Rescue {
+            stage: "rescue-sentinel",
+            ..
+        }) => {
+            drop(console);
+            return SessionOutcome::AutomaticRescue(err);
         }
         Err(err) => {
             // Hand the live boot console down to the emergency screen so

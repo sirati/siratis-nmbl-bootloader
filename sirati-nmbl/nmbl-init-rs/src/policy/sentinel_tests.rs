@@ -98,3 +98,25 @@ fn write_resolves_under_the_runtime_boot_mountpoint() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn embedded_mode_reads_the_sentinel_from_the_mounted_boot_entry() {
+    // Embedded-config mode has no bootstrap mount: the boot filesystem is a
+    // `/boot` entry mounted under `system_root`. The sentinel on it must be
+    // found (it previously resolved to the literal `/boot/nmbl/rescue`).
+    let root = temp_boot("embedded");
+    let mut cfg = Config::recovery_default();
+    cfg.paths.system_root = root.clone();
+    cfg.filesystems.push(crate::config::FilesystemEntry {
+        device: "/dev/disk/by-partlabel/disk-main-ESP".into(),
+        mountpoint: PathBuf::from("/boot"),
+        fstype: "vfat".into(),
+        options: String::new(),
+        is_root: false,
+    });
+    assert!(!sentinel_present(&cfg));
+    std::fs::create_dir_all(root.join("boot/nmbl")).expect("boot dir");
+    std::fs::write(root.join("boot/nmbl/rescue"), b"").expect("sentinel");
+    assert!(sentinel_present(&cfg), "sentinel under <system_root>/boot is found");
+    let _ = std::fs::remove_dir_all(&root);
+}

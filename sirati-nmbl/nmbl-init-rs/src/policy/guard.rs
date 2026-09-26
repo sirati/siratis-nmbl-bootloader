@@ -182,7 +182,10 @@ pub(super) async fn seal_for_refuse_async(require_tpm: bool, sender: &LocalSende
 fn close_all_best_effort_blocking() {
     for entry in registry::snapshot() {
         match close_one_blocking(&entry) {
-            Ok(()) => registry::mark_closed(&entry.name),
+            Ok(()) => {
+                registry::mark_closed(&entry.name);
+                crate::nmbl_info!("seal: closed TPM-unsealed mapper {}", entry.name);
+            }
             Err(e) => crate::nmbl_warn!(
                 "refuse: best-effort close of mapper {} failed: {}; rebooting anyway",
                 entry.name,
@@ -196,7 +199,10 @@ fn close_all_best_effort_blocking() {
 async fn close_all_best_effort_async(sender: &LocalSender) {
     for entry in registry::snapshot() {
         match close_one_async(&entry, sender).await {
-            Ok(()) => registry::mark_closed(&entry.name),
+            Ok(()) => {
+                registry::mark_closed(&entry.name);
+                crate::nmbl_info!("seal: closed TPM-unsealed mapper {}", entry.name);
+            }
             Err(e) => crate::nmbl_warn!(
                 "refuse: best-effort close of mapper {} failed: {}; rebooting anyway",
                 entry.name,
@@ -213,7 +219,10 @@ async fn close_all_best_effort_async(sender: &LocalSender) {
 /// * `Failed` ⇒ ALWAYS fail closed (present-but-uncappable diverts to refuse).
 fn cap_step(require_tpm: bool) -> Result<(), SealFailed> {
     match cap_lock_pcr_seam() {
-        CapOutcome::Capped => Ok(()),
+        CapOutcome::Capped => {
+            crate::nmbl_info!("seal: lock PCR capped");
+            Ok(())
+        }
         // cap-exempt: NO TPM is present, so there is no lock PCR to cap and no
         // TPM-sealed secret to poison — the cap is vacuous, not skipped. The
         // posture is the operator's `requireTpm`: degrade-open when unset
@@ -243,6 +252,7 @@ async fn close_all_async(sender: &LocalSender) -> Result<(), SealFailed> {
     for entry in registry::snapshot() {
         close_one_async(&entry, sender).await?;
         registry::mark_closed(&entry.name);
+        crate::nmbl_info!("seal: closed TPM-unsealed mapper {}", entry.name);
     }
     debug_assert_eq!(
         registry::pending(),
@@ -257,6 +267,7 @@ fn close_all_blocking() -> Result<(), SealFailed> {
     for entry in registry::snapshot() {
         close_one_blocking(&entry)?;
         registry::mark_closed(&entry.name);
+        crate::nmbl_info!("seal: closed TPM-unsealed mapper {}", entry.name);
     }
     debug_assert_eq!(
         registry::pending(),
