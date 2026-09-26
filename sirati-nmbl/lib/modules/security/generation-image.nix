@@ -35,7 +35,9 @@ let
   targetSignaturePath = "/sysroot${cfg.signaturePath}";
   verifiedDevice = "/dev/nmbl-verified-generation";
   targetMountUnit = "${utils.escapeSystemdPath targetMountPoint}.mount";
-  stateEnabled = cfg.automaticRollback || cfg.automaticRescue;
+  # Boot attempts are tracked whenever a failed boot must be detected: for
+  # the untested-generation rollback, or for boot.nmbl.rescue.automatic.
+  stateEnabled = cfg.automaticRollback || config.boot.nmbl.rescue.automatic;
   helperArgs = lib.escapeShellArgs [
     "/bin/nmbl-generation-mount"
     "/etc/nmbl/generation-mount.toml"
@@ -46,6 +48,15 @@ let
   ];
 in
 {
+  # `generationImage.automaticRescue` was one of several settings that each
+  # decided automatic rescue on its own path. `boot.nmbl.rescue.automatic`
+  # is now the only one; the old name forwards to it.
+  imports = [
+    (lib.mkRenamedOptionModule
+      [ "boot" "nmbl" "generationImage" "automaticRescue" ]
+      [ "boot" "nmbl" "rescue" "automatic" ])
+  ];
+
   options.boot.nmbl.generationImage = {
     enable = lib.mkEnableOption "pre- and post-kexec verification for an atomically selected EROFS generation image";
 
@@ -79,12 +90,6 @@ in
       type = lib.types.bool;
       default = false;
       description = "Roll back an untested generation when its prior boot did not complete.";
-    };
-
-    automaticRescue = lib.mkOption {
-      type = lib.types.bool;
-      default = false;
-      description = "Enter the configured external rescue after a tested generation fails.";
     };
 
     successDelaySec = lib.mkOption {
@@ -170,10 +175,6 @@ in
             && !(lib.hasInfix ".." store.runtimeMountPoint)
           );
           message = "generationImage.stage1Store.runtimeMountPoint must be a safe absolute non-root path";
-        }
-        {
-          assertion = !cfg.automaticRescue || config.boot.nmbl.rescue.mode == "external";
-          message = "generationImage.automaticRescue requires an external NMBL rescue image";
         }
         {
           assertion = !stateEnabled || config.boot.nmbl.configLocation == "external";

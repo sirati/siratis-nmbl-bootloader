@@ -118,7 +118,6 @@ nixpkgs.lib.nixosSystem {
         generationImage = {
           enable = true;
           automaticRollback = true;
-          automaticRescue = true;
           successDelaySec = 2;
           stateRoot = generationStateRoot;
           signaturePath = "${generationStateRoot}/active/nix.erofs.sig";
@@ -143,6 +142,7 @@ nixpkgs.lib.nixosSystem {
         };
         tpm = { measure = false; requireTpm = false; };
         rescue.mode = "external";
+        rescue.automatic = true;
         timeoutMillis = 250 + variant;
         kernelPackage = pkgs.linuxPackages_latest.kernel;
         kernelParams = [ "console=ttyS0,115200" ];

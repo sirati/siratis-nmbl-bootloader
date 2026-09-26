@@ -70,6 +70,13 @@ pub struct RescueConfig {
     /// `boot.nmbl.rescue.forceOnBoot`.
     #[serde(default)]
     pub force_on_boot: bool,
+
+    /// The ONE setting that decides whether a failed boot with nothing left
+    /// to fall back to enters rescue (`true`) or the emergency menu
+    /// (`false`). See [`crate::rescue::automatic`]. `mode` only selects which
+    /// rescue is entered. Matches `boot.nmbl.rescue.automatic`.
+    #[serde(default)]
+    pub automatic: bool,
 }
 
 fn default_rescue_entrypoint() -> PathBuf {
@@ -86,6 +93,7 @@ impl Default for RescueConfig {
             default_sha256: String::new(),
             entrypoint: default_rescue_entrypoint(),
             force_on_boot: false,
+            automatic: false,
         }
     }
 }

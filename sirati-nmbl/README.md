@@ -129,12 +129,12 @@ The two post-v1 features (external config, external rescue) are
 independently togglable. Pick the combination that matches the
 operator's recovery story:
 
-| Profile         | `configLocation` | `rescue.mode` | `rescue.network` | When to pick |
-|-----------------|------------------|---------------|------------------|--------------|
-| **Default install** | `embedded`   | `embedded`    | `false`          | Single-user desktop or laptop. Smallest moving-parts surface; everything ships in the initramfs. |
-| **Power user**  | `external`       | `external`    | `false`          | Workstation where the operator wants edit-and-reboot config changes and a richer rescue toolbox without bloating the initramfs. |
-| **Servers**     | `external`       | `external`    | `true`           | Headless / remote machines. The HTTP fallback recovers an unbootable system over the network when the boot partition's rescue blob is missing or stale. |
-| **Air-gapped / tiny** | `embedded` | `none`        | `false`          | Appliances and air-gapped systems where rescue is handled out-of-band (e.g. yank the disk into another machine). NMBL halts cleanly with a banner instead of dropping to a shell. |
+| Profile         | `configLocation` | `rescue.mode` | `rescue.automatic` | `rescue.network` | When to pick |
+|-----------------|------------------|---------------|--------------------|------------------|--------------|
+| **Default install** | `embedded`   | `embedded`    | `false`            | `false`          | Single-user desktop or laptop. Smallest moving-parts surface; everything ships in the initramfs. |
+| **Power user**  | `external`       | `external`    | `false`            | `false`          | Workstation where the operator wants edit-and-reboot config changes and a richer rescue toolbox without bloating the initramfs. |
+| **Servers**     | `external`       | `external`    | `true`             | `true`           | Headless / remote machines. A failed boot enters the signed rescue unattended. The HTTP fallback recovers an unbootable system over the network when the boot partition's rescue blob is missing or stale. |
+| **Air-gapped / tiny** | `embedded` | `none`        | `false`            | `false`          | Appliances and air-gapped systems where rescue is handled out-of-band (e.g. yank the disk into another machine). NMBL halts cleanly with a banner instead of dropping to a shell. |
 
 All four profiles boot the same `nmbl-init` binary; only the
 initramfs contents and the on-boot-partition staging differ.
@@ -393,6 +393,44 @@ Example: external rescue with extra debug tooling.
   };
 }
 ```
+
+### Automatic rescue after a failed boot
+
+`boot.nmbl.rescue.automatic` is the single setting that decides what
+happens when a boot fails and nothing is left to fall back to:
+
+| `rescue.automatic` | Outcome |
+|---|---|
+| `true` | Enter the configured rescue without operator input. |
+| `false` (default) | Open the interactive emergency menu. |
+
+It applies uniformly to every such path: a failed tested signed generation
+(`generationImage`), exhausted stateful retries (`stateful`), and any
+boot-phase failure (mount, storage activation, generation scan, kexec,
+config load, panic). No other option changes the decision:
+
+- `rescue.mode` only chooses WHICH rescue is entered (the signed external
+  squashfs, or the embedded shell). `rescue.automatic = true` with
+  `rescue.mode = "none"` is rejected at evaluation time, because there is
+  nothing to enter.
+- Rollback comes first. A failed untested generation rolls back to its
+  tested predecessor, and the stateful ring tries its known-good
+  generations, before any failure is declared.
+- Operator decisions (choosing reboot, aborting a device wait, leaving a
+  wrong-password shell) are not boot failures and return to the menu. A
+  rescue that itself fails falls back to the menu, never to another
+  rescue attempt.
+
+Unattended servers should set `rescue.automatic = true`. The former
+`generationImage.automaticRescue` option is renamed to this one.
+
+**Automatic rescue is not the security refuse.** A bad or missing
+signature, the priority-file gate, or a failed TPM seal takes the
+*refuse* terminus instead: cap the TPM PCR, close TPM-unsealed mappers,
+relock storage, write the rescue sentinel, reboot. That happens regardless
+of `rescue.automatic`. Rescue entered automatically is sealed the same
+way: the TPM is capped and TPM-unsealed mappers are closed before the
+rescue system starts, and a failed seal diverts to the refuse terminus.
 
 ### Network fallback
 

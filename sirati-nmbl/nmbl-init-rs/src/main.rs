@@ -201,9 +201,32 @@ fn load_config_lenient(path: &std::path::Path) -> Config {
     }
 }
 
+/// Route a failed boot through the single automatic-rescue decision
+/// ([`nmbl_init::rescue::automatic`]): enter the configured rescue when
+/// `[rescue].automatic` is set, otherwise open the emergency menu. A rescue
+/// that itself fails falls back to the menu (never a second rescue attempt).
+fn handle_boot_failure(config: Config, err: NmblError) -> TerminalAction {
+    use nmbl_init::rescue::automatic::{FailureRoute, on_boot_error};
+    if on_boot_error(&config, &err) == FailureRoute::EmergencyMenu {
+        return open_console_and_drop_to_emergency(&config, err);
+    }
+    nmbl_warn!(
+        "boot failed; entering automatic rescue: {}",
+        format_chain(&err as &dyn std::error::Error)
+    );
+    let mut noop = NoopConsole::new();
+    match run_force_rescue(config, err, &mut noop) {
+        Ok(action) => action,
+        Err(boxed) => {
+            let (rescue_err, config) = *boxed;
+            open_console_and_drop_to_emergency(&config, rescue_err)
+        }
+    }
+}
+
 /// Run the panic-recovery flow. Returns a [`TerminalAction`] the
 /// dispatcher in `main` performs after the call stack has unwound.
-fn recover_from_panic(args: Args, report_path: PathBuf) -> (TerminalAction, Config) {
+fn recover_from_panic(args: Args, report_path: PathBuf) -> TerminalAction {
     let report = match std::fs::read_to_string(&report_path) {
         Ok(text) => text,
         Err(err) => format!(
@@ -217,8 +240,7 @@ fn recover_from_panic(args: Args, report_path: PathBuf) -> (TerminalAction, Conf
     nmbl_warn!("panic recovery mode: report at {}", report_path.display());
     nmbl_warn!("panic report follows:\n{report}");
 
-    let action = open_console_and_drop_to_emergency(&config, NmblError::Panicked { report_path });
-    (action, config)
+    handle_boot_failure(config, NmblError::Panicked { report_path })
 }
 
 /// Whether the deterministic force-rescue trigger should fire: the
@@ -288,9 +310,10 @@ fn run_inner(
         // `block_on`s on one thread would panic. The bootstrap blkid
         // reap that precedes the gate already ran async inside the
         // runtime above; only the dispatch itself is deferred out here.
-        Ok(BootOutcome::ForceRescue(config)) => {
+        Ok(BootOutcome::ForceRescue(boxed)) => {
+            let (cause, config) = *boxed;
             let mut noop = NoopConsole::new();
-            run_force_rescue(*config, &mut noop)
+            run_force_rescue(config, cause, &mut noop)
         }
         Err(rt_err) => {
             nmbl_warn!(
@@ -346,7 +369,7 @@ fn main() -> ExitCode {
     }
 
     if let Some(report_path) = args.errored_report.clone() {
-        let (action, _config) = recover_from_panic(args, report_path);
+        let action = recover_from_panic(args, report_path);
         execute_terminal_action(action);
     }
 
@@ -371,7 +394,7 @@ fn main() -> ExitCode {
         Ok(action) => action,
         Err(boxed) => {
             let (err, config) = *boxed;
-            open_console_and_drop_to_emergency(&config, err)
+            handle_boot_failure(config, err)
         }
     };
     execute_terminal_action(action);

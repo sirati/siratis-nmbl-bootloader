@@ -26,6 +26,12 @@ on-link. The strict Rust parser validates the bounded file before rescue
 starts; the shell only applies accepted directives and never evaluates file
 content.
 
+Without a network stage (`networkStage.enable = false`, the default) the full
+rescue carries its own NIC drivers and runs dual-stack DHCP on every
+interface. With a stage configured, only the signed stage's configuration is
+ever applied; a missing or rejected stage keeps the rescue local-console
+only.
+
 ```nix
 boot.nmbl.rescue.fullSystem.networkStage = {
   enable = true;

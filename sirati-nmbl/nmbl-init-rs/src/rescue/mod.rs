@@ -18,6 +18,7 @@
 //! Phase E.1 (`net::try_network_rescue`) build against, so the shapes
 //! must not change without orchestrator coordination.
 
+pub mod automatic;
 pub mod child;
 pub mod disk;
 #[cfg(feature = "network-rescue")]

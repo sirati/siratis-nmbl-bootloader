@@ -133,6 +133,16 @@ in
         The target system kernel (boot.kernelPackages) is unaffected by this assertion.
       '';
     }
+    {
+      assertion = !(cfg.rescue.automatic && cfg.rescue.mode == "none");
+      message = ''
+        boot.nmbl.rescue.automatic = true but boot.nmbl.rescue.mode = "none":
+        there is no rescue image to enter automatically after a failed boot.
+        Set rescue.mode to "external" (the signed rescue squashfs) or
+        "embedded", or set rescue.automatic = false to open the emergency
+        menu instead.
+      '';
+    }
   ]
   # Add storage driver validation assertions
   ++ storageDriverAssertions;

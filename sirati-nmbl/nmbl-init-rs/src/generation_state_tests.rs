@@ -25,7 +25,7 @@ fn first_attempt_then_success_blesses_generation()
     link(temp.path(), "active", &id)?;
     link(temp.path(), "pending", &id)?;
     assert_eq!(
-        prepare_boot(temp.path(), true, true)?,
+        prepare_boot(temp.path(), true)?,
         BootStateOutcome::Proceed
     );
     mark_success(temp.path())?;
@@ -46,7 +46,7 @@ fn failed_pending_generation_rolls_back_to_tested()
     link(temp.path(), "attempted", &pending)?;
     link(temp.path(), "tested", &good)?;
     assert_eq!(
-        prepare_boot(temp.path(), true, true)?,
+        prepare_boot(temp.path(), true)?,
         BootStateOutcome::RolledBack
     );
     assert_eq!(required_id(temp.path(), "active")?, good);
@@ -63,8 +63,8 @@ fn failed_tested_generation_requests_rescue() -> std::result::Result<(), Box<dyn
     link(temp.path(), "tested", &id)?;
     link(temp.path(), "attempted", &id)?;
     assert_eq!(
-        prepare_boot(temp.path(), true, true)?,
-        BootStateOutcome::Rescue
+        prepare_boot(temp.path(), true)?,
+        BootStateOutcome::Failed
     );
     Ok(())
 }
@@ -73,6 +73,33 @@ fn failed_tested_generation_requests_rescue() -> std::result::Result<(), Box<dyn
 fn unsafe_or_incomplete_links_fail_closed() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
     symlink("../../etc", temp.path().join("active"))?;
-    assert!(prepare_boot(temp.path(), true, true).is_err());
+    assert!(prepare_boot(temp.path(), true).is_err());
+    Ok(())
+}
+
+#[test]
+fn failed_untested_generation_without_rollback_target_reports_failure()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let id = generation(temp.path(), 5)?;
+    link(temp.path(), "active", &id)?;
+    link(temp.path(), "pending", &id)?;
+    link(temp.path(), "attempted", &id)?;
+    assert_eq!(prepare_boot(temp.path(), true)?, BootStateOutcome::Failed);
+    Ok(())
+}
+
+#[test]
+fn failed_untested_generation_with_rollback_disabled_reports_failure()
+-> std::result::Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let good = generation(temp.path(), 6)?;
+    let pending = generation(temp.path(), 7)?;
+    link(temp.path(), "active", &pending)?;
+    link(temp.path(), "pending", &pending)?;
+    link(temp.path(), "attempted", &pending)?;
+    link(temp.path(), "tested", &good)?;
+    assert_eq!(prepare_boot(temp.path(), false)?, BootStateOutcome::Failed);
+    assert_eq!(required_id(temp.path(), "active")?, pending);
     Ok(())
 }
