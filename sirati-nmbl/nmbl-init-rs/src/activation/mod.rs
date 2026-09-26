@@ -120,6 +120,19 @@ pub async fn run_all_activations(
         )
         .await?;
 
+        // luks-tpm stage-1 hand-off. Read the token passphrase NOW, while
+        // PCR 11 still holds the unseal-time value: the kexec drops the
+        // mapping cryptsetup just created, and once NMBL extends its handoff
+        // the TPM refuses a second unseal, so stage 1 could never reopen the
+        // volume from the token itself.
+        let stdin_owned = if activation.kind == ActivationKind::LuksTpm
+            && activation.pass_to_stage1.is_some()
+        {
+            Some(read_tpm_stage1_secret(activation, sender).await?)
+        } else {
+            stdin_owned
+        };
+
         let device_count = activation.produces_devices.len();
         let wait_operation = format!("phase 3: {} waiting for", kind_label(activation.kind));
         let device_timeout = Duration::from_secs(config.general.device_timeout_secs);
@@ -140,8 +153,10 @@ pub async fn run_all_activations(
         // The stdin buffer is the same Zeroizing-wrapped bytes
         // cryptsetup just consumed; moving it into the injection
         // keeps it under Zeroizing all the way through.
-        if activation.kind == ActivationKind::LuksPassword
-            && let Some(path) = activation.pass_to_stage1.as_ref()
+        if matches!(
+            activation.kind,
+            ActivationKind::LuksPassword | ActivationKind::LuksTpm
+        ) && let Some(path) = activation.pass_to_stage1.as_ref()
             && let Some(secret) = stdin_owned
         {
             injections.push(KeyInjection {
@@ -158,6 +173,52 @@ pub async fn run_all_activations(
     }
 
     Ok(injections)
+}
+
+/// Helper that prints a luks-tpm device's unsealed token passphrase
+/// (`lib/tpm-passphrase/nmbl-tpm-passphrase.c`). Staged into luks-tpm
+/// initramfs builds only.
+const TPM_PASSPHRASE_HELPER: &str = "/bin/nmbl-tpm-passphrase";
+
+/// Run [`TPM_PASSPHRASE_HELPER`] against the luks-tpm activation's backing
+/// device and return the passphrase it printed, for injection as the
+/// stage-1 keyfile. Any failure is fatal: without the hand-off stage 1
+/// would fall back to a passphrase prompt on a box meant to boot
+/// unattended, so surface it here with the cause instead.
+async fn read_tpm_stage1_secret(
+    activation: &Activation,
+    sender: &crate::sys::poller::LocalSender,
+) -> Result<Zeroizing<Vec<u8>>> {
+    let device = activation
+        .source_devices
+        .first()
+        .ok_or_else(|| NmblError::Activation {
+            kind: kind_label(activation.kind).to_string(),
+            source: Box::new(NmblError::ConfigInvalid {
+                reason: "luks-tpm activation with pass_to_stage1 lists no source device".into(),
+                context: "stage-1 hand-off".into(),
+            }),
+        })?;
+    let helper = std::path::Path::new(TPM_PASSPHRASE_HELPER);
+    let argv = vec![device.to_string_lossy().into_owned()];
+    let (outcome, captured) = crate::sys::activation::run_capture(helper, &argv, sender)
+        .await
+        .map_err(|source| wrap_runner_error(activation, source))?;
+    let secret = Zeroizing::new(captured);
+    if outcome.exit_code != 0 || secret.is_empty() {
+        return Err(NmblError::Activation {
+            kind: kind_label(activation.kind).to_string(),
+            source: Box::new(NmblError::Io {
+                source: std::io::Error::other("stage-1 hand-off failed"),
+                context: format!(
+                    "{TPM_PASSPHRASE_HELPER} {} exited with code {} (no stage-1 keyfile)",
+                    device.display(),
+                    outcome.exit_code
+                ),
+            }),
+        });
+    }
+    Ok(secret)
 }
 
 /// Wait for every `source_devices` entry of `activation` to appear,

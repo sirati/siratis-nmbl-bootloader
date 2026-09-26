@@ -220,14 +220,31 @@ once, after the box has first-booted the installed system, against the
 LUKS header:
 
 ```sh
-# Seal the volume key to the TPM, bound to PCRs 11+7 (the default).
-sudo nmbl-tpm-enroll --device /dev/disk/by-partlabel/disk-main-luks
+# Seal the volume key to the TPM, bound to PCRs 11+7 (the default), with
+# PCR 11 predicted for the NMBL UKI that will perform the unlock.
+sudo nmbl-tpm-enroll --device /dev/disk/by-partlabel/disk-main-luks \
+  --uki /boot/EFI/BOOT/BOOTX64.EFI
+
+# Or predict on the build host (no TPM or device needed) and seal to the
+# literal digest on the target:
+nmbl-tpm-enroll --uki result/BOOTX64.EFI --print-pcrs   # -> 11:sha256=<hex>+7
+sudo nmbl-tpm-enroll --device /dev/disk/by-partlabel/disk-main-luks \
+  --pcrs "11:sha256=<hex>+7"
 ```
+
+**Pass `--uki` (or a literal PCR 11 digest).** NMBL unseals during
+storage activation, before it extends its own handoff into PCR 11, so
+the value the unseal sees is only systemd-stub's measurement of the NMBL
+UKI. By the time the installed system runs, NMBL has already extended
+its handoff, so the live PCR 11 value never recurs at unlock time.
+Sealing to it (plain `--pcrs 11+7` without `--uki`) produces a token
+that never unseals. `--uki` predicts the unlock-time value with
+`systemd-measure calculate` over the UKI's sections.
 
 The **enroll → boot-unlock round trip**:
 
 1. **Enroll (host, once).** `nmbl-tpm-enroll` runs
-   `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=11+7 <device>`,
+   `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=11:sha256=<predicted>+7 <device>`,
    which generates a random volume key, seals it to the TPM under the
    `{11, 7}` PCR policy, adds a LUKS2 keyslot for it, and writes a
    `systemd-tpm2` **token** into the LUKS2 header. PCR 11 is NMBL's
@@ -237,9 +254,18 @@ The **enroll → boot-unlock round trip**:
    `cryptsetup open --token-only <device> <name>`. `--token-only` makes
    libcryptsetup consume that `systemd-tpm2` token and unseal the
    volume key from the TPM **without any passphrase prompt** — but only
-   if PCR 11 (NMBL's measured handoff) and PCR 7 (Secure-Boot state)
+   if PCR 11 (systemd-stub's measurement of the NMBL UKI) and PCR 7 (Secure-Boot state)
    still match the values they had at enrol time.
-3. **Tamper / rescue ⇒ secrets safe.** PCR 11 is *capped* (extended with
+3. **Hand-off to stage 1.** The kexec drops NMBL's dm-crypt mapping, and
+   by the time NixOS stage 1 runs NMBL has extended its handoff into
+   PCR 11, so stage 1 cannot unseal the token itself. Right after the
+   unseal NMBL reads the token passphrase (`nmbl-tpm-passphrase`) and
+   injects it into the kexec'd initrd as the `passToStage1` keyfile
+   (default `/etc/nmbl-luks/<name>`), exactly as for a passphrase
+   unlock. A `tpm` initramfs ships the dynamic cryptsetup, systemd's
+   `systemd-tpm2` token plugin and its tpm2-tss closure; the static
+   cryptsetup cannot load token plugins.
+4. **Tamper / rescue ⇒ secrets safe.** PCR 11 is *capped* (extended with
    a poison value) the moment NMBL diverts to rescue, and a tampered
    kernel/initrd or a firmware that stopped enforcing Secure Boot moves
    PCR 7. Either way the sealed PCR policy no longer matches, the
@@ -248,8 +274,8 @@ The **enroll → boot-unlock round trip**:
    on an untampered-only basis.
 
 Keep a passphrase keyslot as a recovery path, and re-run
-`nmbl-tpm-enroll --wipe-existing …` after any change to the measured
-inputs (a new NMBL kernel/initrd, or a firmware update that moves PCR 7).
+`nmbl-tpm-enroll --wipe-existing --uki <new UKI> …` after any change to the measured
+inputs (a new NMBL UKI, or a firmware update that moves PCR 7).
 The default PCR set is `11+7`; override with `--pcrs` if your
 `boot.nmbl.activation.luks.<name>.tpmPcrs` policy differs.
 

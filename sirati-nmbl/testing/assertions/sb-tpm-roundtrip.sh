@@ -149,7 +149,13 @@ ENROLL_WATCH="${NMBL_ENROLL_WATCH:-180}"
 # The LUKS device the post-kexec enroll seals. Matches the disko layout
 # (disk-main-luks = /dev/vda3 wrapped LUKS2) declared in the test config.
 LUKS_DEV="${NMBL_LUKS_DEV:-/dev/disk/by-partlabel/disk-main-luks}"
-ENROLL_PCRS="${NMBL_ENROLL_PCRS:-11+7}"
+# Resolved after the runner checks: PCR 11 must be the value the TPM-UNLOCK UKI
+# yields when NMBL unseals (systemd-stub measurement only, before NMBL extends
+# its handoff). The enroll twin boots a DIFFERENT UKI and has already extended
+# its handoff by the time the shell runs, so sealing to its live PCR 11 can
+# never match phase 2. `nmbl-tpm-enroll --uki <tpm-unlock UKI> --print-pcrs`
+# predicts the literal digest host-side; the guest then seals to it.
+ENROLL_PCRS="${NMBL_ENROLL_PCRS:-}"
 
 # The fixed install LUKS passphrase (disko-luks-password.nix). It answers NMBL
 # stage-0's luks-password modal on the phase-1 enroll boot AND feeds
@@ -225,7 +231,19 @@ for r in "$RUNNER" "$ENROLL_RUNNER"; do
   fi
 done
 
-# ── Phase 1: ENROLL ────────────────────────────────────────────────────────
+if [ -z "$ENROLL_PCRS" ]; then
+  if [ -z "${NMBL_SB_TPM_UKI:-}" ] || [ ! -f "${NMBL_SB_TPM_UKI}" ]; then
+    echo "FAIL: NMBL_SB_TPM_UKI (the tpm-unlock UKI) is needed to predict PCR 11" >&2
+    exit 1
+  fi
+  if ! ENROLL_PCRS=$("${NMBL_TPM_ENROLL:-nmbl-tpm-enroll}" --uki "$NMBL_SB_TPM_UKI" --print-pcrs); then
+    echo "FAIL: could not predict the unlock-time PCR 11 of ${NMBL_SB_TPM_UKI}" >&2
+    exit 1
+  fi
+fi
+echo "=== sealing against ${ENROLL_PCRS} ===" >&2
+
+# ── Phase 1: ENROLL────────────────────────────────────────────────────────
 echo "=== Phase 1: enrolling a TPM-sealed token (passphrase-unlock boot) ===" >&2
 cd "${RUN_DIR}" || { echo "FAIL: could not cd into ${RUN_DIR}" >&2; exit 1; }
 if ! "$ENROLL_RUNNER"; then
@@ -532,16 +550,17 @@ EOF3
   # Probe from the rescue shell (embedded busybox + cryptsetup).
   sleep 10
   send_cmd "test -e /dev/mapper/cryptroot && echo NMBL_P3_MAPPER_PRESENT || echo NMBL_P3_MAPPER_ABSENT"
-  if ! wait_for 'NMBL_P3_MAPPER_ABSENT' 60; then
+  if ! wait_for '^NMBL_P3_MAPPER_ABSENT\s*$' 60; then
     echo "FAIL: /dev/mapper/cryptroot is still present in rescue" >&2
     exit 1
   fi
   send_cmd "/bin/cryptsetup open --token-only ${LUKS_DEV} nmblprobe && echo NMBL_P3_UNSEAL_WORKED || echo NMBL_P3_UNSEAL_FAILED"
-  if ! wait_for 'NMBL_P3_UNSEAL_(WORKED|FAILED)' 120; then
+  if ! wait_for '^NMBL_P3_UNSEAL_(WORKED|FAILED)\s*$' 120; then
     echo "FAIL: the post-cap unseal probe produced no result" >&2
     exit 1
   fi
-  if seen_in_history 'NMBL_P3_UNSEAL_WORKED'; then
+  # Anchored: the echoed command line itself contains both marker words.
+  if seen_in_history '^NMBL_P3_UNSEAL_WORKED\s*$'; then
     echo "FAIL: the TPM still unseals the LUKS key after rescue was entered" >&2
     exit 1
   fi

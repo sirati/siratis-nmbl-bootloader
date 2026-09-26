@@ -47,7 +47,8 @@ pub struct Activation {
     pub prompt_label: Option<String>,
 
     /// When set on a `luks-password` activation, NMBL captures the
-    /// typed passphrase and injects it into the kexec'd initrd as a
+    /// typed passphrase (on `luks-tpm`, the TPM-unsealed token passphrase
+    /// read by `nmbl-tpm-passphrase`) and injects it into the kexec'd initrd as a
     /// keyfile at this in-cpio path (e.g. `/etc/nmbl-luks/cryptroot`).
     /// The next stage's NixOS config points
     /// `boot.initrd.luks.devices.<name>.keyFile` at the same path so

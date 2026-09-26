@@ -774,10 +774,10 @@
       # `luks-tpm` activation runs `cryptsetup open --token-only` and cannot use
       # a passphrase, so a fresh (un-enrolled) disk would never reach the
       # system. This twin overrides ONLY the cryptroot unlock to `password`
-      # (the install passphrase), so it boots the SAME generation — same
-      # kernel/initrd/cmdline ⇒ the SAME PCR-11 event sequence the real config
-      # extends — and reaches the system to enroll. PCR 7 is identical too (same
-      # SB db / UKI signature). After it seals the token onto the on-disk LUKS2
+      # (the install passphrase), so it reaches the system to enroll. The seal does NOT depend on
+      # what this twin booted: `nmbl-tpm-enroll --uki` binds PCR 11 to the value
+      # the tpm-unlock UKI yields at unseal time (predicted host-side by the
+      # roundtrip), and PCR 7 is identical (same SB db / UKI signature). After it seals the token onto the on-disk LUKS2
       # header, the real tpm-unlock config power-cycles into the SAME swtpm and
       # auto-unseals. The twin is a SEPARATE signed disk (its config.toml/UKI
       # differ), built only when the roundtrip runs.
@@ -786,10 +786,9 @@
           baseCfg = testing.configs."test-secure-boot";
           # Re-instantiate the test-secure-boot config through the SAME builder
           # but with one extra module that forces the cryptroot activation to a
-          # passphrase unlock. Everything else (the generation: kernel, initrd,
-          # cmdline, signing, SB posture) is identical, so the PCR-11 events and
-          # PCR 7 match the real config — the seal the enroll phase makes is
-          # exactly what the tpm-unlock phase unseals. `passToStage1` hands the
+          # passphrase unlock. The SB posture (PCR 7) is identical; PCR 11 is
+          # sealed to the tpm-unlock UKI's predicted value, not to anything this
+          # twin measured. `passToStage1` hands the
           # passphrase to the post-kexec system initrd.
           enrollOverride = { lib, ... }: {
             boot.nmbl.activation.luks = lib.mkForce [
@@ -1115,6 +1114,9 @@
           umount /
           GF
           export NMBL_SB_TPM_UKI
+          # Phase 1 seals PCR 11 to the value the tpm-unlock UKI produces at
+          # unseal time, predicted host-side from that exact UKI.
+          export NMBL_TPM_ENROLL=${nmblTpmEnroll}/bin/nmbl-tpm-enroll
 
           assertions=${./testing/assertions}
           timeout "''${NMBL_WALL_TIMEOUT:-3000}" \

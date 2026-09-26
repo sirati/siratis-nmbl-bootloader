@@ -250,6 +250,8 @@ fn cap_step(require_tpm: bool) -> Result<(), SealFailed> {
 /// succeed.
 async fn close_all_async(sender: &LocalSender) -> Result<(), SealFailed> {
     for entry in registry::snapshot() {
+        #[cfg(not(test))]
+        detach_mapper_mounts(&entry.name);
         close_one_async(&entry, sender).await?;
         registry::mark_closed(&entry.name);
         crate::nmbl_info!("seal: closed TPM-unsealed mapper {}", entry.name);
@@ -265,6 +267,8 @@ async fn close_all_async(sender: &LocalSender) -> Result<(), SealFailed> {
 /// Step 2 (blocking) — synchronous sibling of [`close_all_async`].
 fn close_all_blocking() -> Result<(), SealFailed> {
     for entry in registry::snapshot() {
+        #[cfg(not(test))]
+        detach_mapper_mounts(&entry.name);
         close_one_blocking(&entry)?;
         registry::mark_closed(&entry.name);
         crate::nmbl_info!("seal: closed TPM-unsealed mapper {}", entry.name);
@@ -300,6 +304,84 @@ fn close_outcome(name: &str, exit_code: i32) -> Result<(), SealFailed> {
             }),
         }))
     }
+}
+
+/// Lazily detach every mount backed by `/dev/mapper/<name>` so the close
+/// that follows is not refused as busy. A rescue forced AFTER phase 3b (the
+/// embedded-config sentinel re-check, a later boot failure) finds the system
+/// filesystems still mounted on the TPM-unsealed mapper; without this the
+/// seal fails and a rescue sentinel can never be honoured on such a box.
+///
+/// Only the STRICT seal (the path into an interactive rescue) detaches. A
+/// lazy detach also drops every mount below the target, including an
+/// embedded-config `/boot`, and the best-effort REFUSE seal still has to write
+/// the rescue sentinel there; it reboots right after, which is its lock
+/// boundary.
+///
+/// Mounts are matched by the kernel's view (`/proc/self/mountinfo`, major:minor
+/// of the mapper node), not by the configured device string, and detached
+/// deepest-first. Best-effort: a detach failure is logged and the close
+/// reports the real outcome.
+#[cfg(not(test))]
+fn detach_mapper_mounts(name: &str) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let node = std::path::PathBuf::from(format!("/dev/mapper/{name}"));
+    let Ok(meta) = std::fs::metadata(&node) else {
+        return;
+    };
+    let rdev = meta.rdev();
+    let dev_id = format!("{}:{}", libc::major(rdev), libc::minor(rdev));
+    let Ok(mountinfo) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return;
+    };
+    let mut targets = mounts_on_device(&mountinfo, &dev_id);
+    targets.sort_by_key(|t| std::cmp::Reverse(t.components().count()));
+    for target in targets {
+        match crate::sys::mount::umount(&target, nix::mount::MntFlags::MNT_DETACH) {
+            Ok(()) => crate::nmbl_info!(
+                "seal: detached {} (on TPM-unsealed mapper {name})",
+                target.display()
+            ),
+            Err(e) => crate::nmbl_warn!("seal: could not detach {}: {e}", target.display()),
+        }
+    }
+}
+
+/// Mount points in `mountinfo` whose device (field 3, `major:minor`) is
+/// `dev_id`. Octal escapes in the mount point (`\040` for a space) are
+/// decoded.
+pub(super) fn mounts_on_device(mountinfo: &str, dev_id: &str) -> Vec<std::path::PathBuf> {
+    mountinfo
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let dev = fields.nth(2)?;
+            let mount_point = fields.nth(1)?;
+            (dev == dev_id).then(|| std::path::PathBuf::from(unescape_mountinfo(mount_point)))
+        })
+        .collect()
+}
+
+/// Decode the `\ooo` octal escapes the kernel uses in mountinfo paths.
+fn unescape_mountinfo(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while let Some(&b) = bytes.get(i) {
+        if b == b'\\'
+            && let Some(oct) = bytes.get(i + 1..i + 4)
+            && let Ok(s) = std::str::from_utf8(oct)
+            && let Ok(v) = u8::from_str_radix(s, 8)
+        {
+            out.push(v);
+            i += 4;
+            continue;
+        }
+        out.push(b);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // === Real-vs-test seams ===
