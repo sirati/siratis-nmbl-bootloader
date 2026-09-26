@@ -246,8 +246,9 @@ pub async fn mount_system_filesystems(
             raw_dev.to_path_buf()
         };
         let dev = resolved_dev.as_path();
+        let pseudo_fs = entry_is_pseudo(entry);
 
-        if !bind_mount {
+        if !bind_mount && !pseudo_fs {
             let _ = reporter.set_phase(format!(
                 "phase 3b: waiting for {} -> {}",
                 dev.display(),
@@ -270,7 +271,7 @@ pub async fn mount_system_filesystems(
         // If the entry is loop-backed, set up a loop device over the
         // backing file and mount THAT instead. The kernel detaches the
         // loop binding when the mount is torn down before kexec.
-        let mount_src: PathBuf = if entry_is_loop_backed(entry, dev) {
+        let mount_src: PathBuf = if !pseudo_fs && entry_is_loop_backed(entry, dev) {
             let loop_dev = setup_verified_loop_device(config, entry, dev)?;
             nmbl_info!(
                 "loop-backed {} attached to {}",
@@ -372,6 +373,13 @@ fn entry_is_loop_backed(entry: &FilesystemEntry, resolved_device: &Path) -> bool
         ),
         Err(_) => false,
     }
+}
+
+/// Memory-backed filesystems (a tmpfs `/` on an impermanent host) have no
+/// source device: NixOS writes `none` or the fstype as the device. There is
+/// nothing to wait for or loop-attach; mount them directly.
+fn entry_is_pseudo(entry: &FilesystemEntry) -> bool {
+    matches!(entry.fstype.as_str(), "tmpfs" | "ramfs")
 }
 
 fn entry_is_bind(entry: &FilesystemEntry) -> bool {

@@ -68,6 +68,12 @@ let
   # (build-VM) pass and run it only in the real install where the key is staged.
   deferInstallSigning = cfg.signing.deferInstallSigning or false;
 
+  # With signed EROFS generations the external config, rescue image and
+  # network stage are members of each generation directory, delivered by
+  # nmbl-erofs-deploy together with the image they belong to. Staging them
+  # here would write a stray, unsigned `<state>/active/` tree onto /boot.
+  generationOwnsRuntime = cfg.generationImage.enable or false;
+
   externalConfigInstallShell = import ./install-external-config.nix {
     inherit lib cfg nmblConfigToml nmblSign deferInstallSigning;
   };
@@ -162,9 +168,9 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     echo "✓ State file initialised"
   ''}
 
-  ${lib.optionalString (configLocation == "external" && !(cfg.bootUpdate.enable or false)) externalConfigInstallShell}
+  ${lib.optionalString (configLocation == "external" && !(cfg.bootUpdate.enable or false) && !generationOwnsRuntime) externalConfigInstallShell}
 
-  ${lib.optionalString (cfg.rescue.mode == "external" && !cfg.rescue.fullSystem.networkStage.enable && !(cfg.bootUpdate.enable or false)) (
+  ${lib.optionalString (cfg.rescue.mode == "external" && !cfg.rescue.fullSystem.networkStage.enable && !(cfg.bootUpdate.enable or false) && !generationOwnsRuntime) (
     let
       # `cfg.rescue.sfsPath` is interpreted relative to the boot mount
       # by the Rust /init; strip a leading slash so the host-side
@@ -186,7 +192,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     ''
   )}
 
-  ${lib.optionalString (!(cfg.bootUpdate.enable or false)) networkStageInstallShell}
+  ${lib.optionalString (!(cfg.bootUpdate.enable or false) && !generationOwnsRuntime) networkStageInstallShell}
 
   # Optional signed driver-image squashfs blobs (#25a). Each is staged onto
   # the ESP and signed in place with `nmbl-sign --domain driver-image`

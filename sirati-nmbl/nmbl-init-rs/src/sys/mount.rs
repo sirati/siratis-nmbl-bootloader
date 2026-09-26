@@ -140,6 +140,29 @@ pub fn remount_bind(target: &Path, options: &str) -> Result<()> {
     })
 }
 
+/// Remount an existing mount's SUPERBLOCK with `options` (`MS_REMOUNT` without
+/// `MS_BIND`). Unlike [`remount_bind`] this changes filesystem-wide state such as
+/// read-only vs read-write, while other mounts of the same superblock keep their
+/// own per-mount flags (a mount created `ro` stays read-only at the mount level).
+pub fn remount_superblock(target: &Path, options: &str) -> Result<()> {
+    let (mut flags, data) = fold_options(options);
+    flags.insert(MsFlags::MS_REMOUNT);
+    let data_opt: Option<&str> = if data.is_empty() { None } else { Some(&data) };
+    nix::mount::mount(
+        Option::<&Path>::None,
+        target,
+        Option::<&str>::None,
+        flags,
+        data_opt,
+    )
+    .map_err(|source| NmblError::Mount {
+        src: None,
+        dst: target.to_path_buf(),
+        fstype: "(remount)".to_owned(),
+        source,
+    })
+}
+
 /// Mark an existing mount as a shared-subtree peer
 /// (`mount(NULL, target, NULL, MS_SHARED, NULL)`). The shared-subtree
 /// propagation calls take neither a source, an fstype, nor a data
