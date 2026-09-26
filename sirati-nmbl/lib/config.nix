@@ -89,7 +89,7 @@ let
     else if bootstrapper.bootMode == "qemu_kernel_invoke" then
       null
     else
-      { }; # Default empty set for bios/uefi
+      import ./loader-extra-args-defaults.nix; # option defaults for bios/uefi
 
   # Get filesystems needed for boot
   # This includes filesystems marked with neededForBoot = true and those in critical paths

@@ -222,6 +222,41 @@
         rootStore = true;
         signingAlgorithm = "ml-dsa-87";
       };
+      # DNS-VPS topology (BIOS/GRUB + EROFS generations on a stage-1 store +
+      # network stage + rescue SSH): the rescue and network images resolve
+      # into the active generation directory next to config.toml, the rendered
+      # config names them, and every artifact the deploy bundle carries builds.
+      erofsBiosHost = import ./testing/erofs-bios-host/configuration.nix {
+        inherit nixpkgs system;
+        nmblModule = self.nixosModules.default;
+        publicKey = ./testing/keys/insecure-test-ml-dsa-87.pub;
+      };
+      erofsBiosHostEvalCheck =
+        let
+          c = erofsBiosHost.config;
+          b = c.system.build;
+        in
+        assert c.boot.nmbl.rescue.sfsPath == "nmbl-generations/active/rescue.sfs";
+        assert c.boot.nmbl.rescue.fullSystem.networkStage.imagePath
+          == "nmbl-generations/active/network.erofs";
+        pkgs.runCommand "nmbl-erofs-bios-host-eval" {
+          nativeBuildInputs = [ pkgs.python3 ];
+        } ''
+          python3 - ${b.nmblConfigToml} <<'PY'
+          import sys, tomllib
+          with open(sys.argv[1], "rb") as stream:
+              config = tomllib.load(stream)
+          generation = config["generation_image"]
+          assert generation["automatic_rollback"] and generation["automatic_rescue"]
+          assert generation["stage1_store"]["relative_state_root"] == "nmbl-generations"
+          PY
+          test -e ${b.nmblGenerationImage}
+          test -e ${b.nmblNetworkStage}
+          test -e ${b.nmblRescueSquashfs}
+          test -x ${b.nmblErofsReceive}/bin/nmbl-erofs-receive
+          grep -q 'grub-install --target=i386-pc' ${b.installBootLoader}
+          touch "$out"
+        '';
       rootStoreEvalCheck = pkgs.runCommand "nmbl-generation-root-store-eval" {
         nativeBuildInputs = [ pkgs.python3 ];
       } ''
@@ -1218,6 +1253,7 @@
         nmbl-key-command-eval = keyCommandEvalCheck;
         generation-image-initrd = generationImageInitrdCheck;
         generation-root-store-eval = rootStoreEvalCheck;
+        nmbl-erofs-bios-host-eval = erofsBiosHostEvalCheck;
         insecure-test-key-absent = insecureKeyAbsentFromProd;
         test-secure-boot-no-private-key = secureBootNoPrivateKey;
         test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;

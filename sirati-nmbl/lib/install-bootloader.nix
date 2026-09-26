@@ -57,7 +57,7 @@ let
     else if bootstrapper.bootMode == "qemu_kernel_invoke" then
       null
     else
-      { };
+      import ./loader-extra-args-defaults.nix;
 
   # Build-time-only signing skip — the SAME flag install-signing.nix uses to
   # leave the UKI unsigned + emit no generation sidecars (line 394 below). A

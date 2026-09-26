@@ -257,3 +257,23 @@ nmbl-erofsctl gc 2 /boot/nmbl-generations
 The update account needs no shell and no direct access to the image root.
 Recovery networking and SSH belong in a separately signed NMBL driver/rescue
 image so normal generations can change without rebuilding the immutable UKI.
+
+## Rescue and network stage in the generation directory
+
+With `generationImage.enable`, the rescue image and the optional signed
+network stage live in the selected generation directory, next to
+`config.toml`: `rescue.sfsPath` becomes `<state>/active/rescue.sfs` and
+`rescue.fullSystem.networkStage.imagePath` becomes `<state>/active/network.erofs`,
+relative to the boot volume NMBL mounts (the stage-1 store when
+`stage1Store` is set, otherwise `/boot`). `nmbl-erofs-deploy remote` signs
+both (`rescue-sfs`, `network-stage`) and the receiver verifies them with the
+rest of the bundle before `active` changes, so a switch never pairs a new
+config with an old rescue or network image.
+
+This works on BIOS/GRUB hosts as well as UEFI. The
+`nmbl-erofs-bios-host-eval` check evaluates that combination (BIOS/GRUB,
+generations on a persistent stage-1 store, automatic rollback and rescue,
+network stage with recovery SSH, key commands instead of key files) and
+builds every artifact the deploy bundle carries. The state machine itself
+is exercised by `nmbl-generation-state-vm-test`, and the network stage and
+recovery SSH by `test-network-stage-vm`.
