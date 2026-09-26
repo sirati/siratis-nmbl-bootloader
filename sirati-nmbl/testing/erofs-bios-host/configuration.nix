@@ -126,7 +126,6 @@ nixpkgs.lib.nixosSystem {
             stateRoot = stateRoot;
             signaturePath = "${stateRoot}/active/nix.erofs.sig";
             automaticRollback = true;
-            automaticRescue = true;
             successDelaySec = 2;
             stage1Store.targetMountPoint = "/persistent";
           };
@@ -135,6 +134,7 @@ nixpkgs.lib.nixosSystem {
           ignoreMissingDiskModules = true;
           rescue = {
             mode = "external";
+            automatic = true;
             nicDrivers = [ "virtio_net" ];
             fullSystem = {
               enable = true;

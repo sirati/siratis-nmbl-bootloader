@@ -28,8 +28,27 @@ pub struct GenerationImageConfig {
     #[serde(default)]
     pub automatic_rollback: bool,
 
+    /// Record boot attempts in the generation state (`attempted`/`pending`)
+    /// so a failed previous boot is detected. Emitted by Nix whenever rollback
+    /// is enabled or `boot.nmbl.rescue.automatic` needs failures detected.
     #[serde(default)]
-    pub automatic_rescue: bool,
+    pub track_state: bool,
+
+    /// Ignored. Automatic rescue is decided only by `[rescue].automatic`;
+    /// the key is still accepted so configs written by older NMBL versions
+    /// (e.g. inside already-installed generation directories) keep parsing.
+    #[serde(default, rename = "automatic_rescue")]
+    pub legacy_automatic_rescue: Option<bool>,
+}
+
+impl GenerationImageConfig {
+    /// Whether boot attempts are tracked. Also true for configs written by
+    /// older NMBL versions, which enabled tracking through
+    /// `automatic_rollback` or `automatic_rescue` instead of `track_state`.
+    #[must_use]
+    pub fn tracks_state(&self) -> bool {
+        self.track_state || self.automatic_rollback || self.legacy_automatic_rescue == Some(true)
+    }
 }
 
 #[derive(Debug, Deserialize)]

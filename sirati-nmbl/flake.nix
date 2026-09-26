@@ -247,7 +247,8 @@
           with open(sys.argv[1], "rb") as stream:
               config = tomllib.load(stream)
           generation = config["generation_image"]
-          assert generation["automatic_rollback"] and generation["automatic_rescue"]
+          assert generation["automatic_rollback"] and generation["track_state"]
+          assert config["rescue"]["automatic"]
           assert generation["stage1_store"]["relative_state_root"] == "nmbl-generations"
           PY
           test -e ${b.nmblGenerationImage}
@@ -284,6 +285,28 @@
             "${pkgs.openssh}/bin/ssh"
           ]
           (builtins.readFile ./tools/erofs-bios-host-vm-test.sh);
+      };
+      # Hetzner-shape stateful host (BIOS/GRUB, vfat ESP, Btrfs root with a
+      # normal Nix store): rollback through the stateful ring, then
+      # boot.nmbl.rescue.automatic = true -> rescue + SSH, false -> menu.
+      statefulBiosHostVmTest = pkgs.writeShellApplication {
+        name = "test-stateful-bios-host-vm";
+        runtimeInputs = with pkgs; [
+          btrfs-progs coreutils dosfstools fakeroot findutils gnugrep gptfdisk
+          mtools nix openssh python3
+        ];
+        text = builtins.replaceStrings
+          [ "@source@" "@disk@" "@harness@" "@grub@" "@qemu@" "@passt@" "@ssh@" ]
+          [
+            "${self}"
+            "${./testing/stateful-bios-host/disk.py}"
+            "${./testing/stateful-bios-host/harness.py}"
+            "${pkgs.grub2}"
+            "${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
+            "${pkgs.passt}/bin/passt"
+            "${pkgs.openssh}/bin/ssh"
+          ]
+          (builtins.readFile ./tools/stateful-bios-host-vm-test.sh);
       };
       rootStoreEvalCheck = pkgs.runCommand "nmbl-generation-root-store-eval" {
         nativeBuildInputs = [ pkgs.python3 ];
@@ -1268,6 +1291,7 @@
         test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;
         test-network-stage-vm = networkStageVmTest;
         test-erofs-bios-host-vm = erofsBiosHostVmTest;
+        test-stateful-bios-host-vm = statefulBiosHostVmTest;
         test-boot-update-vm = bootUpdateVmTest;
       };
 

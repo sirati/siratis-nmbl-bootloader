@@ -101,8 +101,8 @@ boot.nmbl = {
     mountPoint = "/nix";
     signaturePath = "/boot/nmbl-generations/active/nix.erofs.sig";
     automaticRollback = true;
-    automaticRescue = true;
   };
+  rescue.automatic = true;
 };
 ```
 
@@ -183,9 +183,11 @@ check runs `systemd-boot-check-no-failures`; only then does
 `nmbl-generation-success` mark the selection tested. A degraded boot remains
 attempted. On the next boot an untested failure rolls back first and adds
 `nmbl.rollback-after-untested-new-generation-failed` to the kernel command
-line. The matching systemd target lets consumers react to that event. Failure
-of a tested generation enters the signed external rescue when automatic rescue
-is enabled. Atomic rename plus directory fsync protects every state update.
+line. The matching systemd target lets consumers react to that event. When no
+rollback target exists (a tested generation failed, or an untested one without
+a tested predecessor), `boot.nmbl.rescue.automatic` alone decides: `true`
+enters the configured rescue, `false` opens the emergency menu. Atomic rename
+plus directory fsync protects every state update.
 
 ## Offline and remote deployment
 

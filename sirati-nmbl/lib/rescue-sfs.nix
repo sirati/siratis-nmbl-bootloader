@@ -129,6 +129,7 @@ let
     initScriptPrefix
     + import ./rescue/init-script-network.nix {
       inherit bash coreutils dhcpcd gawk iproute2;
+      networkStageEnabled = fullSystem.networkStage.enable;
     }
     + import ./rescue/init-script-net.nix {
       inherit lib bash coreutils iproute2 nix openssh fullSystem;

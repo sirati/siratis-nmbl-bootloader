@@ -1004,6 +1004,33 @@ in
     # legacy v1 behaviour so existing setups don't silently lose their
     # rescue path.
     rescue = {
+      automatic = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = lib.mdDoc ''
+          The single setting that decides what happens when a boot fails and
+          nothing is left to fall back to: `true` enters the configured
+          rescue without operator input, `false` opens the interactive
+          emergency menu. It applies uniformly to every such path: a failed
+          tested generation (`generationImage`), exhausted stateful retries
+          (`stateful`), and any boot-phase failure (mount, activation,
+          generation scan, kexec, config load, panic).
+
+          No other option changes this decision. `rescue.mode` only selects
+          WHICH rescue is entered. The automatic rollback of a failed
+          untested generation to its tested predecessor still happens first
+          whenever a rollback target exists. Security refusals (bad
+          signatures, the priority-file gate, a failed TPM seal) are not
+          affected: they take the refuse terminus, which locks the TPM and
+          reboots into rescue regardless of this setting.
+
+          Defaults to `false` so existing installations keep the interactive
+          menu; unattended servers should set `true`. Requires a rescue
+          image (`rescue.mode = "external"` or `"embedded"`); `"none"` has
+          nothing to enter and is rejected at evaluation time.
+        '';
+      };
+
       mode = lib.mkOption {
         type = lib.types.enum [ "embedded" "external" "none" ];
         default = "embedded";

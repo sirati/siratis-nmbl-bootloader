@@ -288,7 +288,7 @@ pub(super) async fn run_tui_session(
     session: &SessionInteraction,
     sender: &nmbl_init::sys::poller::LocalSender,
     driver_images: &mut nmbl_init::imageload::DriverImagesHandle,
-) -> TerminalAction {
+) -> SessionOutcome {
     // Wrap the live boot console in the central interaction-latch layer
     // for the whole session. Every consumer below — the early-boot
     // reporter (phases 2b/3/3b), the generation selector, and the
@@ -334,7 +334,7 @@ pub(super) async fn run_tui_session(
         }
         Err(err) => Err(err),
     };
-    match outcome {
+    let action = match outcome {
         Ok(action) => {
             // `console` falls out of scope on return, running
             // SplashConsole/TtyConsole Drop (KD_TEXT restore, termios
@@ -373,7 +373,23 @@ pub(super) async fn run_tui_session(
             // its [Retry boot from config] re-runs phase 3 and re-prompts
             // for the passphrase, which is what the operator wants after
             // a shell detour.
+            // The single automatic-rescue decision: enter rescue (after this
+            // runtime unwinds) or open the emergency menu on this console.
+            use nmbl_init::rescue::automatic::{FailureRoute, on_boot_error};
+            if on_boot_error(config, &err) == FailureRoute::Rescue {
+                drop(console);
+                return SessionOutcome::AutomaticRescue(err);
+            }
             drop_to_emergency(console, config, err, session, sender).await
         }
-    }
+    };
+    SessionOutcome::Action(action)
+}
+
+/// Result of [`run_tui_session`]: a terminal action, or a boot failure that
+/// [`nmbl_init::rescue::automatic`] routes into rescue. Rescue dispatch builds
+/// its own runtime, so it runs after the session's runtime has unwound.
+pub(super) enum SessionOutcome {
+    Action(TerminalAction),
+    AutomaticRescue(NmblError),
 }

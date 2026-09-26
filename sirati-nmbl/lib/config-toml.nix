@@ -216,6 +216,11 @@ let
       # is `false`.
       // lib.optionalAttrs cfg.rescue.forceOnBoot {
         force_on_boot = true;
+      }
+      # The single automatic-rescue decision; emitted only when set so the
+      # wire shape is unchanged for the default (Rust serde default false).
+      // lib.optionalAttrs cfg.rescue.automatic {
+        automatic = true;
       };
 
     # Operator-curated list of extra `/dev/<tty>` paths the picker
@@ -329,7 +334,7 @@ let
       signature_path = cfg.generationImage.signaturePath;
       state_root = cfg.generationImage.stateRoot;
       automatic_rollback = cfg.generationImage.automaticRollback;
-      automatic_rescue = cfg.generationImage.automaticRescue;
+      track_state = cfg.generationImage.automaticRollback || cfg.rescue.automatic;
     } // lib.optionalAttrs (cfg.generationImage.stage1Store != null) (
       let
         store = cfg.generationImage.stage1Store;

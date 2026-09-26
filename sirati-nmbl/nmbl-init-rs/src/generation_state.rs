@@ -8,18 +8,22 @@ use crate::error::{NmblError, Result};
 
 pub const ROLLBACK_CMDLINE: &str = "nmbl.rollback-after-untested-new-generation-failed";
 
+/// What the persistent generation state says about this boot. Whether a
+/// [`BootStateOutcome::Failed`] enters rescue is decided by
+/// [`crate::rescue::automatic`] alone, never here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootStateOutcome {
+    /// Boot the active generation (recorded as attempted).
     Proceed,
+    /// An untested generation failed and the tested one was re-selected.
     RolledBack,
-    Rescue,
+    /// The previous attempt failed and there is no rollback target: a
+    /// tested generation failed, or an untested one with no tested
+    /// predecessor (or with rollback disabled).
+    Failed,
 }
 
-pub fn prepare_boot(
-    root: &Path,
-    automatic_rollback: bool,
-    automatic_rescue: bool,
-) -> Result<BootStateOutcome> {
+pub fn prepare_boot(root: &Path, automatic_rollback: bool) -> Result<BootStateOutcome> {
     let active = required_id(root, "active")?;
     let attempted = optional_id(root, "attempted")?;
     let pending = optional_id(root, "pending")?;
@@ -37,21 +41,9 @@ pub fn prepare_boot(
                 atomic_text(root, "rollback-event", &format!("{failed} {good}\n"))?;
                 return Ok(BootStateOutcome::RolledBack);
             }
-            return if automatic_rescue {
-                Ok(BootStateOutcome::Rescue)
-            } else {
-                Err(invalid(
-                    "untested generation failed and no tested rollback exists",
-                ))
-            };
+            return Ok(BootStateOutcome::Failed);
         }
-        return if automatic_rescue {
-            Ok(BootStateOutcome::Rescue)
-        } else {
-            Err(invalid(
-                "tested generation failed and automatic rescue is disabled",
-            ))
-        };
+        return Ok(BootStateOutcome::Failed);
     }
 
     replace_link(root, "attempted", &active)?;

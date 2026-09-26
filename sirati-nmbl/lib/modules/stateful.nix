@@ -10,7 +10,9 @@ in
       type = lib.types.ints.positive;
       default = 5;
       description = lib.mdDoc ''
-        How many failed boots NMBL tries before dropping to rescue.
+        How many rollbacks NMBL attempts before the failure is final. What
+        then happens is decided only by `boot.nmbl.rescue.automatic`: the
+        configured rescue (`true`) or the emergency menu (`false`).
       '';
     };
 

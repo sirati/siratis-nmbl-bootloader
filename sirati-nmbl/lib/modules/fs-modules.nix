@@ -89,11 +89,21 @@ let
   # through the kernel crypto API. modules.dep does not link these
   # because the relationship is runtime, not symbol-level — so our
   # dep walker won't pull them in unless we list them here.
+  #
+  # The crc32c provider was renamed across kernels (`crc32c_generic` up to
+  # 6.14, `crc32c_cryptoapi` from 6.15); names absent from a kernel's
+  # modules tree are skipped at load time, so listing both is safe.
+  crc32cProviders = [ "crc32c_generic" "crc32c_cryptoapi" ];
   cryptoForFs = {
     # ext4 uses crc32c for metadata checksums (default-on since e2fsprogs 1.43).
     # Without it, `mount(2)` returns ENOENT with kernel printk
     # "EXT4-fs: Cannot load crc32c driver".
-    "ext4" = [ "crc32c_generic" ];
+    "ext4" = crc32cProviders;
+    # btrfs allocates its checksum transform at mount; crc32c is the default
+    # csum type. Without it: "error allocating crc32c hash for checksum" and
+    # `mount(2)` fails with ENOENT. xxhash64 / blake2b cover the other csum
+    # types (sha256 is built in).
+    "btrfs" = crc32cProviders ++ [ "xxhash_generic" "blake2b_generic" "blake2b" ];
   };
 
   cryptoModules = lib.unique (

@@ -18,7 +18,7 @@ use nmbl_init::ui::key_echo::run_key_echo_loop;
 use nmbl_init::ui::{BootReporter, SessionInteraction};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
 
-use super::dispatch::run_tui_session;
+use super::dispatch::{SessionOutcome, run_tui_session};
 #[cfg(feature = "stateful")]
 use super::phases::mount_state_twin;
 use super::phases::{run_bootstrap_phase, run_phase_2a};
@@ -37,9 +37,13 @@ use super::{cmdline_has_key_echo_flag, should_force_external_rescue};
 /// action).
 pub(crate) fn run_force_rescue(
     config: Config,
+    cause: NmblError,
     noop: &mut NoopConsole,
 ) -> std::result::Result<TerminalAction, Box<(NmblError, Config)>> {
-    nmbl_info!("force_on_boot: entering external rescue");
+    nmbl_info!(
+        "entering rescue without operator input: {}",
+        format_chain(&cause as &dyn std::error::Error)
+    );
     // SEAL ON ENTRY (G5): force-on-boot rescue drops the operator into an
     // interactive rescue system, so cap the lock PCR + close every
     // TPM-unsealed mapper FIRST (blocking — this runs after the runtime
@@ -74,15 +78,6 @@ pub(crate) fn run_force_rescue(
         }
     }
     nmbl_info!("force_on_boot: loaded rescue modules");
-    let cause = NmblError::Rescue {
-        stage: "force-on-boot",
-        source: Box::new(NmblError::Io {
-            source: std::io::Error::other(
-                "rescue.force_on_boot requested an unconditional external rescue boot",
-            ),
-            context: "force-on-boot rescue trigger".to_string(),
-        }),
-    };
     let console: Box<dyn Console> = Box::new(NoopConsole::new());
     match rescue::dispatch(&config, console, cause) {
         Ok(action) => Ok(action),
@@ -145,7 +140,10 @@ pub(crate) enum BootOutcome {
     // whole `Done` result so this variant stays pointer-sized next to the
     // tiny `ForceRescue` (clippy `large_enum_variant`).
     Done(Box<std::result::Result<TerminalAction, Box<(NmblError, Config)>>>),
-    ForceRescue(Box<Config>),
+    /// Enter rescue without operator input. Carries the reason shown by the
+    /// rescue banner: an automatic-rescue failure, `force_on_boot`, or the
+    /// rescue sentinel.
+    ForceRescue(Box<(NmblError, Config)>),
 }
 
 /// The post-phase-1 boot flow that runs inside the interactive
@@ -181,7 +179,7 @@ pub(crate) async fn run_boot_inside_runtime(
     if let Some(policy) = config
         .generation_image
         .as_ref()
-        .filter(|p| p.enable && (p.automatic_rollback || p.automatic_rescue))
+        .filter(|p| p.enable && p.tracks_state())
     {
         if policy.stage1_store.is_some() {
             let btrfs_devices =
@@ -222,19 +220,33 @@ pub(crate) async fn run_boot_inside_runtime(
             }
             Err(err) => return BootOutcome::Done(Box::new(Err(Box::new((err, config))))),
         };
-        match nmbl_init::generation_state::prepare_boot(
-            &state_root,
-            policy.automatic_rollback,
-            policy.automatic_rescue,
-        ) {
+        match nmbl_init::generation_state::prepare_boot(&state_root, policy.automatic_rollback) {
             Ok(nmbl_init::generation_state::BootStateOutcome::Proceed) => {}
             Ok(nmbl_init::generation_state::BootStateOutcome::RolledBack) => {
                 config.generation_rollback = true;
                 nmbl_info!("generation-image: rolling back failed untested generation");
             }
-            Ok(nmbl_init::generation_state::BootStateOutcome::Rescue) => {
-                nmbl_warn!("generation-image: tested generation failed; entering rescue");
-                return BootOutcome::ForceRescue(Box::new(config));
+            Ok(nmbl_init::generation_state::BootStateOutcome::Failed) => {
+                use nmbl_init::rescue::automatic::{FailureKind, FailureRoute, on_boot_failure};
+                let cause = NmblError::Rescue {
+                    stage: "generation-failed",
+                    source: Box::new(NmblError::Io {
+                        source: std::io::Error::other(
+                            "the selected generation failed its previous boot and no rollback target exists",
+                        ),
+                        context: "generation-image state".to_string(),
+                    }),
+                };
+                return match on_boot_failure(&config, FailureKind::TestedGenerationFailed) {
+                    FailureRoute::Rescue => {
+                        nmbl_warn!("generation-image: generation failed; entering automatic rescue");
+                        BootOutcome::ForceRescue(Box::new((cause, config)))
+                    }
+                    FailureRoute::EmergencyMenu => {
+                        nmbl_warn!("generation-image: generation failed; automatic rescue is off");
+                        BootOutcome::Done(Box::new(Err(Box::new((cause, config)))))
+                    }
+                };
             }
             Err(err) => return BootOutcome::Done(Box::new(Err(Box::new((err, config))))),
         }
@@ -247,7 +259,16 @@ pub(crate) async fn run_boot_inside_runtime(
     // sentinel-forced rescue takes the SAME `rescue::dispatch` path, whose G4
     // seal keeps the TPM locked.
     if nmbl_init::policy::should_force_rescue(should_force_external_rescue(&config), &config) {
-        return BootOutcome::ForceRescue(Box::new(config));
+        let cause = NmblError::Rescue {
+            stage: "force-on-boot",
+            source: Box::new(NmblError::Io {
+                source: std::io::Error::other(
+                    "rescue.force_on_boot or the rescue sentinel requested a rescue boot",
+                ),
+                context: "force-on-boot rescue trigger".to_string(),
+            }),
+        };
+        return BootOutcome::ForceRescue(Box::new((cause, config)));
     }
     #[cfg(feature = "stateful")]
     if bootstrap_mode && let Err(err) = mount_state_twin(&mut config, bootstrap_path) {
@@ -302,9 +323,22 @@ pub(crate) async fn run_boot_inside_runtime(
         ));
     }
     let session = SessionInteraction::new();
-    let action = run_tui_session(&mut config, console, &session, &sender, &mut driver_images).await;
-    teardown_driver_images_if_normal(&action, &driver_images);
-    BootOutcome::Done(Box::new(Ok(action)))
+    match run_tui_session(&mut config, console, &session, &sender, &mut driver_images).await {
+        SessionOutcome::Action(action) => {
+            teardown_driver_images_if_normal(&action, &driver_images);
+            BootOutcome::Done(Box::new(Ok(action)))
+        }
+        SessionOutcome::AutomaticRescue(cause) => {
+            nmbl_warn!(
+                "boot failed; entering automatic rescue: {}",
+                format_chain(&cause as &dyn std::error::Error)
+            );
+            if let Err(err) = detach_all_driver_images(&driver_images) {
+                nmbl_warn!("driver-image teardown before rescue failed: {err}");
+            }
+            BootOutcome::ForceRescue(Box::new((cause, config)))
+        }
+    }
 }
 
 /// Whether the driver images should be torn down for `action` (FIX-55).

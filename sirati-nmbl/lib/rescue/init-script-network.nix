@@ -5,6 +5,12 @@
   dhcpcd,
   gawk,
   iproute2,
+  # Whether this rescue image was built with a signed network stage. Without
+  # one (e.g. a Hetzner host whose rescue carries its own NIC drivers) the
+  # rescue uses DHCP on every interface. With one, a missing or rejected
+  # stage keeps the rescue local-only: only signed network configuration is
+  # ever applied.
+  networkStageEnabled ? true,
 }:
 ''
   ${""}    # --- networking ---
@@ -18,7 +24,13 @@
       fi
 
       network_config=/nmbl-network/etc/nmbl-network/network.conf
-      [ -r "$network_config" ] || local_network_only "network profile is missing"
+      ${if networkStageEnabled then ''
+        [ -r "$network_config" ] || local_network_only "network profile is missing"
+      '' else ''
+        # No signed network stage configured: DHCP on every interface.
+        network_config=/etc/nmbl-network-default.conf
+        ${coreutils}/bin/printf 'version 1\naddress-family dual-stack\n' > "$network_config"
+      ''}
       network_version=$(${gawk}/bin/awk 'NF { if ($1 == "version") { print $2; exit } }' "$network_config")
       network_family=$(${gawk}/bin/awk 'NF { if ($1 == "address-family") { print $2; exit } }' "$network_config")
       ${iproute2}/bin/ip link set lo up > /dev/console 2>&1 || true
