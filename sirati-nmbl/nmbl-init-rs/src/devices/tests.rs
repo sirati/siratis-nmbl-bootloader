@@ -302,3 +302,14 @@ fn bind_mount_detected_without_treating_source_as_device() {
     entry.options = "bind,ro,noexec,nosuid,nodev".to_string();
     assert!(entry_is_bind(&entry));
 }
+
+#[test]
+fn tmpfs_root_is_pseudo_and_never_waited_for() {
+    let mut entry = fs_entry("none", "/", false);
+    entry.fstype = "tmpfs".to_string();
+    entry.options = "mode=0755,nodev,nosuid".to_string();
+    assert!(entry_is_pseudo(&entry));
+    let mut disk = fs_entry("/dev/vda3", "/persistent", false);
+    disk.fstype = "ext4".to_string();
+    assert!(!entry_is_pseudo(&disk));
+}

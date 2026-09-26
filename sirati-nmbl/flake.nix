@@ -257,6 +257,34 @@
           grep -q 'grub-install --target=i386-pc' ${b.installBootLoader}
           touch "$out"
         '';
+      # Boots the DNS-VPS / Stardust topology from a real BIOS disk: GRUB ->
+      # NMBL -> stage-1 store -> signed EROFS generation (tmpfs root), then
+      # rollback, and rescue with the signed network stage + recovery SSH.
+      erofsBiosHostVmTest = pkgs.writeShellApplication {
+        name = "test-erofs-bios-host-vm";
+        runtimeInputs = with pkgs; [
+          coreutils dosfstools e2fsprogs findutils gnugrep gptfdisk mtools nix
+          openssh python3
+        ];
+        text = builtins.replaceStrings
+          [ "@source@" "@signer@" "@ctl@" "@receive@" "@deploy@" "@scanner@"
+            "@disk@" "@harness@" "@grub@" "@qemu@" "@passt@" "@ssh@" ]
+          [
+            "${self}"
+            (toString nmblSign)
+            (toString nmblErofsCtl)
+            (toString nmblErofsReceive)
+            (toString nmblErofsDeploy)
+            "${./testing/scan-private-key.py}"
+            "${./testing/erofs-bios-host/disk.py}"
+            "${./testing/erofs-bios-host/harness.py}"
+            "${pkgs.grub2}"
+            "${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
+            "${pkgs.passt}/bin/passt"
+            "${pkgs.openssh}/bin/ssh"
+          ]
+          (builtins.readFile ./tools/erofs-bios-host-vm-test.sh);
+      };
       rootStoreEvalCheck = pkgs.runCommand "nmbl-generation-root-store-eval" {
         nativeBuildInputs = [ pkgs.python3 ];
       } ''
@@ -1239,6 +1267,7 @@
         # so no signing key is in its closure.
         test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;
         test-network-stage-vm = networkStageVmTest;
+        test-erofs-bios-host-vm = erofsBiosHostVmTest;
         test-boot-update-vm = bootUpdateVmTest;
       };
 

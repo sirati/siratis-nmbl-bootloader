@@ -5,7 +5,17 @@ use std::path::{Component, Path, PathBuf};
 use crate::config::GenerationImageConfig;
 use crate::error::{NmblError, Result};
 
-pub fn mount_and_resolve(policy: &GenerationImageConfig) -> Result<Option<PathBuf>> {
+/// Mount the stage-1 generation store privately and return the state root in
+/// it. When the store's device is the bootstrap boot filesystem (a single
+/// persistent partition holding both the external config and the generations,
+/// as on a DNS-VPS layout), the kernel refuses a second mount of the same ext4
+/// block device with `EBUSY` when the read-only flags differ; the mounted
+/// `boot_mountpoint` is then bind-mounted and the shared superblock remounted
+/// with the store options, leaving the bootstrap mount read-only.
+pub fn mount_and_resolve(
+    policy: &GenerationImageConfig,
+    boot_mountpoint: Option<&Path>,
+) -> Result<Option<PathBuf>> {
     let Some(store) = policy.stage1_store.as_ref() else {
         return Ok(None);
     };
@@ -17,12 +27,32 @@ pub fn mount_and_resolve(policy: &GenerationImageConfig) -> Result<Option<PathBu
         source,
         context: format!("creating generation store {}", store.mountpoint.display()),
     })?;
-    crate::sys::mount::mount_fs(
+    match crate::sys::mount::mount_fs(
         Some(store.device.as_path()),
         store.mountpoint.as_path(),
         &store.fstype,
         &store.options,
-    )?;
+    ) {
+        Ok(()) => {}
+        Err(NmblError::Mount {
+            source: nix::errno::Errno::EBUSY,
+            ..
+        }) if boot_mountpoint.is_some() => {
+            let boot = boot_mountpoint.unwrap_or(Path::new("/"));
+            crate::nmbl_info!(
+                "generation store {} already mounted as the boot filesystem; bind-mounting {}",
+                store.device.display(),
+                boot.display(),
+            );
+            crate::sys::mount::mount_fs(Some(boot), store.mountpoint.as_path(), &store.fstype, "bind")?;
+            // The bootstrap may have mounted the shared superblock read-only.
+            // Generation state is written here, so remount the superblock with
+            // the store options through the private mount; the bootstrap mount
+            // keeps its own read-only mount flag.
+            crate::sys::mount::remount_superblock(store.mountpoint.as_path(), &store.options)?;
+        }
+        Err(err) => return Err(err),
+    }
     Ok(Some(store.mountpoint.join(&store.relative_state_root)))
 }
 

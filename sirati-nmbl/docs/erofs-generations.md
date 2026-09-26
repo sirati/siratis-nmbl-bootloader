@@ -270,10 +270,26 @@ both (`rescue-sfs`, `network-stage`) and the receiver verifies them with the
 rest of the bundle before `active` changes, so a switch never pairs a new
 config with an old rescue or network image.
 
-This works on BIOS/GRUB hosts as well as UEFI. The
-`nmbl-erofs-bios-host-eval` check evaluates that combination (BIOS/GRUB,
-generations on a persistent stage-1 store, automatic rollback and rescue,
-network stage with recovery SSH, key commands instead of key files) and
-builds every artifact the deploy bundle carries. The state machine itself
-is exercised by `nmbl-generation-state-vm-test`, and the network stage and
-recovery SSH by `test-network-stage-vm`.
+This works on BIOS/GRUB hosts as well as UEFI. With generation images the
+installer writes only GRUB and the NMBL kernel/initrd to `/boot`; config,
+rescue and network images reach the generation directory only through a
+signed deploy.
+
+The bootstrap filesystem may be the same partition as the stage-1 store (one
+persistent ext4 holding config and generations, as on the DNS VPS). NMBL then
+bind-mounts the already-mounted bootstrap filesystem for the store and
+remounts it read-write for state updates; the bootstrap view stays
+read-only. A tmpfs `/` (an impermanent root) is mounted directly without a
+device wait.
+
+`test-erofs-bios-host-vm` boots this layout from a real BIOS disk image:
+SeaBIOS and GRUB from the MBR and BIOS boot partition, the NMBL kernel on a
+vfat `/boot`, generations on an ext4 `/persistent`, and a tmpfs `/`. Two
+generations are signed through key commands and delivered by
+`nmbl-erofs-deploy remote`. The test boots the tested generation, fails an
+untested one, verifies the automatic rollback and its kernel command-line
+marker, fails the tested generation, and requires the signed rescue with the
+signed network stage from the generation directory, a static address, the
+hardened sshd settings, and a recovery SSH login with the dedicated key.
+`nmbl-erofs-bios-host-eval` checks the production shape of the same
+configuration without booting.

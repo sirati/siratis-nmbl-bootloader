@@ -193,7 +193,10 @@ pub(crate) async fn run_boot_inside_runtime(
                 return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
             }
         }
-        let state_root = match nmbl_init::generation_store::mount_and_resolve(policy) {
+        let state_root = match nmbl_init::generation_store::mount_and_resolve(
+            policy,
+            config.runtime_boot_mountpoint.as_deref(),
+        ) {
             Ok(Some(path)) => path,
             Ok(None) => {
                 let Some(boot) = config.runtime_boot_mountpoint.as_deref() else {
