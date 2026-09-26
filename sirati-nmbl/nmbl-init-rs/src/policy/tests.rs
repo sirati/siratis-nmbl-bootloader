@@ -345,3 +345,28 @@ fn unconfirmed_close_keeps_the_persist_line_and_errs() {
         "the persist-file line survives an unconfirmed close, got {body:?}"
     );
 }
+
+/// The seal detaches mounts backed by a TPM-unsealed mapper before closing
+/// it. `mounts_on_device` must pick exactly the mapper's `major:minor`
+/// rows (not a prefix match such as `254:10` for `254:1`) and decode the
+/// kernel's octal escapes.
+#[test]
+fn mounts_on_device_matches_major_minor_and_unescapes() {
+    let mountinfo = "\
+22 1 254:1 / /mnt/system rw,relatime shared:1 - ext4 /dev/mapper/cryptroot rw
+23 22 254:1 /nix/store /mnt/system/nix/store ro shared:2 - ext4 /dev/mapper/cryptroot rw
+24 22 8:2 / /mnt/system/boot rw shared:3 - vfat /dev/vda2 rw
+25 22 254:10 / /mnt/system/data rw shared:4 - ext4 /dev/mapper/other rw
+26 22 254:1 / /mnt/with\\040space rw shared:5 - ext4 /dev/mapper/cryptroot rw
+";
+    let got = super::guard::mounts_on_device(mountinfo, "254:1");
+    assert_eq!(
+        got,
+        vec![
+            PathBuf::from("/mnt/system"),
+            PathBuf::from("/mnt/system/nix/store"),
+            PathBuf::from("/mnt/with space"),
+        ]
+    );
+    assert!(super::guard::mounts_on_device(mountinfo, "254:2").is_empty());
+}

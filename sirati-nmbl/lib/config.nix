@@ -72,6 +72,7 @@ let
   # here (doing so would duplicate every activation assertion).
   activationCfg = cfg.activation or { };
   activationExtraContents = activationCfg.extraContents or [ ];
+  activationPrependCpios = activationCfg.prependCpios or [ ];
 
   # Set default loader based on bootMode if not explicitly set
   actualLoader =
@@ -614,6 +615,7 @@ in
 
         initramfs = pkgs.makeInitrd {
           contents = baseContents ++ splashContents ++ activationExtraContents;
+          prepend = activationPrependCpios;
           compressor = "gzip -9";
         };
 

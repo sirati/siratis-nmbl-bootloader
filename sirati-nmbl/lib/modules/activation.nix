@@ -8,6 +8,7 @@
 #   cfg.activation.activationBlocks   - [[activation]] TOML schema rows
 #   cfg.activation.extraKernelModules - module names to add to allKernelModules
 #   cfg.activation.extraContents      - makeInitrd content entries
+#   cfg.activation.prependCpios       - uncompressed cpio archives prepended to it
 #   cfg.activation.assertions         - NixOS assertions
 
 { config, lib, pkgs, ... }:
@@ -104,8 +105,71 @@ let
   extraContents =
     lib.optionals (lvmOn && lvm2.pkg != null) (map (bin lvm2.pkg) [ "vgchange" "vgs" "lvchange" ])
     ++ lib.optionals (mdOn && mdadm.pkg != null) [ (sbin mdadm.pkg "mdadm") ]
-    ++ lib.optionals (luksAny && cryptsetup.pkg != null) [ (bin cryptsetup.pkg "cryptsetup") ]
+    ++ lib.optionals (luksAny && !luksTpm && cryptsetup.pkg != null) [ (bin cryptsetup.pkg "cryptsetup") ]
     ++ lib.optionals (zfsOn && zfs.pkg != null) (map (sbin zfs.pkg) [ "zpool" "zfs" ]);
+
+  # --- luks-tpm unlock tooling ---------------------------------------------
+  #
+  # `cryptsetup open --token-only` consumes the `systemd-tpm2` LUKS2 token
+  # through systemd's EXTERNAL token plugin
+  # (libcryptsetup-token-systemd-tpm2.so, which pulls in libsystemd-shared
+  # and tpm2-tss). The static cryptsetup is built with
+  # `--disable-external-tokens`, so it can never load that plugin: every
+  # `--token-only` open fails with "No usable token is available" whatever
+  # the PCRs are. A luks-tpm initramfs therefore ships the DYNAMIC cryptsetup
+  # plus the plugin and its shared-library closure.
+  #
+  # nixpkgs patches cryptsetup to dlopen the plugin by bare soname
+  # (relative-token-path.patch), resolved through LD_LIBRARY_PATH — which
+  # NMBL's activation runner deliberately does not set. Drop that patch and
+  # compile in the plugin directory as an absolute store path instead.
+  tpmCryptsetupPkg = pkgs.cryptsetup.overrideAttrs (old: {
+    pname = "cryptsetup-nmbl-tpm";
+    patches = lib.filter
+      (p: !(lib.hasSuffix "relative-token-path.patch" (toString p)))
+      (old.patches or [ ]);
+    configureFlags =
+      (lib.filter (f: !(lib.hasPrefix "--with-luks2-external-tokens-path" f)) old.configureFlags)
+      ++ [ "--with-luks2-external-tokens-path=${pkgs.systemd}/lib/cryptsetup" ];
+    doCheck = false;
+  });
+  tpmCryptsetup = tpmCryptsetupPkg.bin;
+  tpmTokenPlugin = "${pkgs.systemd}/lib/cryptsetup/libcryptsetup-token-systemd-tpm2.so";
+
+  # Stage-1 hand-off for luks-tpm (see lib/tpm-passphrase/nmbl-tpm-passphrase.c):
+  # prints the unsealed token passphrase so NMBL can inject it as the kexec'd
+  # initrd's keyfile, the TPM analogue of the luks-password hand-off.
+  tpmPassphrase = pkgs.stdenv.mkDerivation {
+    pname = "nmbl-tpm-passphrase";
+    version = "1";
+    src = ../tpm-passphrase;
+    buildInputs = [ tpmCryptsetupPkg.dev ];
+    buildPhase = ''
+      $CC -O2 -Wall -Werror -o nmbl-tpm-passphrase nmbl-tpm-passphrase.c \
+        -DNMBL_TPM2_TOKEN_PLUGIN='"${tpmTokenPlugin}"' -lcryptsetup -ldl
+    '';
+    installPhase = "install -Dm755 nmbl-tpm-passphrase $out/bin/nmbl-tpm-passphrase";
+  };
+
+  # makeInitrdNG resolves the ELF closure (NEEDED + RUNPATH) and the plugin's
+  # dlopen notes (feature "tpm": libtss2-esys/-mu/-rc), copying real files
+  # instead of symlinking whole store paths. The device TCTI is dlopen'ed by
+  # name at runtime without a note, so it is listed explicitly. Uncompressed,
+  # prepended to the main cpio (the kernel concatenates cpio segments).
+  luksTpmTools = pkgs.makeInitrdNG {
+    name = "nmbl-luks-tpm-tools";
+    compressor = "cat";
+    contents = [
+      { source = "${tpmCryptsetup}/bin/cryptsetup"; target = "/bin/cryptsetup"; }
+      { source = "${tpmPassphrase}/bin/nmbl-tpm-passphrase"; target = "/bin/nmbl-tpm-passphrase"; }
+      {
+        source = tpmTokenPlugin;
+        dlopen = { usePriority = "required"; features = [ "tpm" ]; };
+      }
+      { source = "${pkgs.tpm2-tss}/lib/libtss2-tcti-device.so.0"; }
+    ];
+  };
+  prependCpios = lib.optional luksTpm "${luksTpmTools}/initrd";
 
   # --- activationBlocks ([[activation]] TOML rows) --------------------------
 
@@ -124,6 +188,7 @@ let
       binary = "/bin/cryptsetup"; argv = [ "open" "--token-only" l.device l.name ];
       produces_devices = [ mapper ]; source_devices = [ l.device ];
       description = "Unlock ${l.name} via TPM-sealed token";
+      pass_to_stage1 = l.passToStage1;
     } else if l.unlock == "keyfile" then {
       kind = "luks-keyfile"; required_modules = luksBaseMods;
       binary = "/bin/cryptsetup";
@@ -261,8 +326,8 @@ let
         # `config.passToStage1 = mkOptionDefault ...` collide in the
         # module merger when both are present.
         defaultText = lib.literalMD ''
-          `"/etc/nmbl-luks/''${name}"` when `unlock = "password"` (and
-          any future passphrase-style unlock such as `"tpm+pin"`),
+          `"/etc/nmbl-luks/''${name}"` when `unlock = "password"` or
+          `unlock = "tpm"`,
           `null` otherwise. Operators opt out by explicitly setting
           `passToStage1 = null`, which also suppresses the
           auto-wired `boot.initrd.luks.devices.<name>.keyFile`.
@@ -276,21 +341,25 @@ let
           `boot.initrd.luks.devices.<name>.keyFile` and
           `fallbackToPassword = true` (both via `lib.mkDefault`) so
           the post-kexec NixOS stage-1 picks up the injected secret
-          and the operator types the passphrase exactly once. Only
-          meaningful for passphrase-style unlocks (currently
-          `unlock = "password"`; future `"tpm+pin"` will behave the
-          same).
+          and the operator types the passphrase exactly once. For
+          `unlock = "tpm"` the injected secret is the TPM-unsealed token
+          passphrase (read with `nmbl-tpm-passphrase` right after the
+          unseal): the kexec drops NMBL's dm-crypt mapping, and stage 1
+          cannot unseal the token itself because NMBL has extended its
+          handoff into PCR 11 by then. Meaningless for `unlock = "keyfile"`.
         '';
       };
     };
     # Per-entry default. `mkOptionDefault` sits below the priority of
     # any explicit operator value, so writing `passToStage1 = null`
     # opts out cleanly. For non-password unlocks we default to `null`:
-    # there's no operator-typed secret to hand through.
-    # NOTE: when a future `unlock = "tpm+pin"` variant lands, add it
-    # to the passphrase-style branch so it gets the same auto-wiring.
+    # there's no operator-typed secret to hand through. A `tpm` unlock
+    # hands the TPM-unsealed token passphrase through the same way: the
+    # kexec drops NMBL's dm-crypt mapping, and by the time stage 1 runs
+    # NMBL has extended its handoff into PCR 11, so stage 1 could not
+    # unseal the token again itself.
     config.passToStage1 = lib.mkOptionDefault (
-      if config.unlock == "password" then "/etc/nmbl-luks/${config.name}" else null
+      if config.unlock == "password" || config.unlock == "tpm" then "/etc/nmbl-luks/${config.name}" else null
     );
   });
 
@@ -314,7 +383,7 @@ let
   # `boot.initrd.luks.devices.<name>` below). Future `unlock = "tpm+pin"`
   # should land here too.
   injectedLuks =
-    lib.filter (l: l.unlock == "password" && l.passToStage1 != null) act.luks;
+    lib.filter (l: (l.unlock == "password" || l.unlock == "tpm") && l.passToStage1 != null) act.luks;
   injectedPaths = map (l: l.passToStage1) injectedLuks;
 
   wipeSnippet = path: ''
@@ -375,13 +444,15 @@ in
       "Computed kernel module names that the activations require; merged into the bootloader initramfs module set.";
     extraContents = mkComputed (lib.types.listOf lib.types.attrs)
       "Computed `pkgs.makeInitrd` content entries for the activation binaries.";
+    prependCpios = mkComputed (lib.types.listOf lib.types.str)
+      "Computed uncompressed cpio archives prepended to the initramfs (the luks-tpm cryptsetup + token plugin closure).";
     assertions = mkComputed (lib.types.listOf lib.types.attrs)
       "Computed NixOS assertions about the activation configuration.";
   };
 
   config = {
     boot.nmbl.activation = {
-      inherit activationBlocks extraKernelModules extraContents;
+      inherit activationBlocks extraKernelModules extraContents prependCpios;
       assertions = computedAssertions;
     };
     # Surface activation assertions through the standard NixOS mechanism so

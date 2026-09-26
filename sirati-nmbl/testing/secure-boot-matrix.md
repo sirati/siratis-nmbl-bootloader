@@ -174,15 +174,33 @@ reinstalling.
 | #5c | `test-secure-boot-bad-priority-refused` | the signed priority file on the inside-LUKS priority volume is overwritten (cryptsetup inside the guestfish appliance) | NMBL's `SECURE BOOT: REFUSED` screen; no shell; the generation never boots |
 | #3b | `test-secure-boot-rescue-locks-tpm` | after the enrol and TPM-unseal phases, the sentinel is dropped and the tpm-unlock config boots a third time | the TPM unseal happens, then `seal: lock PCR capped` and `seal: closed TPM-unsealed mapper cryptroot`; in rescue `/dev/mapper/cryptroot` is absent and `cryptsetup open --token-only` fails |
 
-**#3b is blocked by the existing TPM roundtrip.** Its phases 1 and 2 are the
-unmodified `test-secure-boot-tpm-roundtrip`, which currently fails at the
-phase-2 unseal (`cryptsetup --token-only` exits 1). The enroll twin and the
-tpm-unlock config boot different system generations
-(`nixos-system-test-secure-boot-enroll-…` vs `nixos-system-test-secure-boot-…`),
-so the kexec command line NMBL measures into PCR 11 (its `init=` store path)
-differs between the phase that seals and the phase that unseals. Fixing it
-means making both phases boot one identical generation; until then phase 3
-does not run.
+**The TPM roundtrip was broken in three independent ways**, all fixed (the
+roundtrip and #3b now pass):
+
+1. The initramfs shipped the static cryptsetup, which is built with
+   `--disable-external-tokens` and so can never load systemd's
+   `systemd-tpm2` token plugin: every `--token-only` open failed with "No
+   usable token is available", whatever the PCRs. A `luks-tpm` initramfs now
+   ships a dynamic cryptsetup with the plugin directory compiled in, plus
+   the plugin and its tpm2-tss closure.
+2. The enroll step sealed to the booted system's live PCR 11, which already
+   includes NMBL's handoff extension. The unseal runs before that extension,
+   so the value never recurred. `nmbl-tpm-enroll --uki <UKI>` now predicts the
+   unlock-time PCR 11 of the UKI that will perform the unlock (systemd-stub's
+   measurement only) with `systemd-measure`, and the roundtrip seals to the
+   tpm-unlock UKI's prediction. Which generation the enroll phase booted no
+   longer matters.
+3. The kexec drops the mapping NMBL opened, and NixOS stage 1 cannot unseal
+   the token again because PCR 11 has moved. A `luks-tpm` volume now hands
+   the unsealed token passphrase to stage 1 through `passToStage1`, like a
+   `luks-password` volume does (`nmbl-tpm-passphrase` reads it right after
+   the unseal).
+
+#3b then found that a rescue forced after phase 3b (the embedded-config
+sentinel re-check) could not close the TPM-unsealed mapper, because the root
+filesystem was still mounted on it: the seal failed and diverted to the refuse
+reboot. The strict seal now lazily detaches every mount backed by the mapper
+(matched by `major:minor` in `/proc/self/mountinfo`) before `cryptsetup close`.
 
 The relock of password-unlocked volumes on a refuse runs while NMBL holds the
 console, so it is not visible on serial; its order (cap, close TPM mappers,

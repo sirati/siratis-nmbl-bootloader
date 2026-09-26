@@ -43,9 +43,11 @@ pkgs.writeShellApplication {
 
   runtimeInputs = [
     pkgs.systemd # systemd-cryptenroll (writes the systemd-tpm2 LUKS2 token)
+    pkgs.binutils-unwrapped # objcopy (extracts the UKI sections to measure)
     pkgs.cryptsetup # cryptsetup luksDump / token inspection
     pkgs.coreutils
     pkgs.gnugrep
+    pkgs.gnused
   ];
 
   # `writeShellApplication` runs the body under `set -euo pipefail` and
@@ -65,6 +67,8 @@ pkgs.writeShellApplication {
     keyfile=""
     wipe_existing=0
     tpm_device="auto"
+    uki=""
+    print_pcrs=0
 
     usage() {
       cat <<EOF
@@ -81,6 +85,16 @@ pkgs.writeShellApplication {
       --key-file <FILE>  Existing volume key / passphrase file used to authorise the
                          new TPM keyslot. Omit to be prompted for an existing passphrase.
       --tpm2-device <D>  TPM2 device passed to systemd-cryptenroll. Default: auto.
+      --uki <PATH>       The NMBL UKI that will perform the unlock. PCR 11 is then
+                         sealed to the value it has when NMBL unseals the volume
+                         (after systemd-stub measured this UKI, before NMBL
+                         extends its handoff), predicted with systemd-measure.
+                         Without --uki, PCR 11 is sealed to its CURRENT value,
+                         which only matches if NMBL has not extended it yet.
+      --print-pcrs       Only print the resolved PCR set (with --uki: the predicted
+                         literal PCR 11 digest) and exit. Needs no TPM and no
+                         --device, so it can run on the build host; pass its
+                         output to --pcrs on the target.
       --wipe-existing    Remove any prior systemd-tpm2 token/keyslot before enrolling
                          (re-enroll after the measured inputs changed).
       -h, --help         Show this help.
@@ -103,11 +117,43 @@ pkgs.writeShellApplication {
         --key-file=*)  keyfile="''${1#*=}"; shift ;;
         --tpm2-device) [ "$#" -ge 2 ] || die "--tpm2-device needs an argument"; tpm_device="$2"; shift 2 ;;
         --tpm2-device=*) tpm_device="''${1#*=}"; shift ;;
+        --uki)         [ "$#" -ge 2 ] || die "--uki needs an argument"; uki="$2"; shift 2 ;;
+        --uki=*)       uki="''${1#*=}"; shift ;;
         --wipe-existing) wipe_existing=1; shift ;;
+        --print-pcrs)  print_pcrs=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         *)             die "unknown argument: $1 (try --help)" ;;
       esac
     done
+
+    # PCR 11 at unlock time. NMBL unseals during storage activation, BEFORE it
+    # extends its own handoff events into PCR 11, so the value the unseal sees
+    # is exactly what systemd-stub measured for the NMBL UKI (NMBL runs no
+    # systemd-pcrphase, so the phase list is empty). Reading PCR 11 from the
+    # booted system would instead yield the post-handoff value, which never
+    # recurs at unlock time.
+    if [ -n "$uki" ]; then
+      [ -f "$uki" ] || die "UKI not found: $uki"
+      uki_dir=$(mktemp -d)
+      trap 'rm -rf "$uki_dir"' EXIT
+      measure_args=()
+      for section in linux osrel cmdline initrd ucode splash dtb uname sbat pcrpkey profile; do
+        objcopy -O binary --only-section=".$section" "$uki" "$uki_dir/$section" 2>/dev/null || true
+        [ -s "$uki_dir/$section" ] && measure_args+=( "--$section=$uki_dir/$section" )
+      done
+      [ "''${#measure_args[@]}" -gt 0 ] || die "$uki has no UKI sections to measure"
+      pcr11=$(${pkgs.systemd}/lib/systemd/systemd-measure calculate "''${measure_args[@]}" \
+                 --bank=sha256 --phase=)
+      pcr11=$(printf '%s\n' "$pcr11" | sed -n 's/^11:sha256=//p')
+      [ -n "$pcr11" ] || die "systemd-measure did not predict PCR 11 for $uki"
+      echo "$prog: predicted PCR 11 at unlock for $uki: $pcr11" >&2
+      pcrs=$(printf '%s' "$pcrs" | sed -E "s/(^|\+)11(:sha256)?(=[0-9a-f]+)?(\+|$)/\111:sha256=$pcr11\4/")
+    fi
+
+    if [ "$print_pcrs" -eq 1 ]; then
+      printf '%s\n' "$pcrs"
+      exit 0
+    fi
 
     [ -n "$device" ] || { usage >&2; die "--device is required"; }
     [ -b "$device" ] || [ -e "$device" ] || die "device not found: $device"
