@@ -1160,6 +1160,58 @@
         extraInputs = [ pkgs.libguestfs-with-appliance ];
       };
 
+      # Disk-prep negatives sharing the #4b refuse assertions (matrix #4c, #4d)
+      # and the sentinel-forced rescue (#5a). They boot the passphrase ENROLL
+      # twin so cryptroot opens and the boot reaches generation verify. The
+      # generation kernel/initrd are the SAME store paths the verifier checks,
+      # so a re-signature is over the real bytes.
+      mkSbTamperCheck = scenario: mode:
+        let
+          top = secureBootEnrollInstallConfig.config.system.build.toplevel;
+        in
+        mkSbScenarioCheck {
+          inherit scenario;
+          script = "sb-disk-tamper-refused.sh";
+          installer = secureBootEnrollInstaller;
+          installBin = "sb-install-test-secure-boot-enroll";
+          installSubdir = "enroll";
+          runner = secureBootEnrollRunner;
+          extraInputs = [ pkgs.libguestfs-with-appliance ];
+          extraEnv = ''
+            export NMBL_SB_TAMPER=${mode}
+            export NMBL_SB_SIGNER=${nmblSign}/bin/nmbl-sign
+            export NMBL_SB_GEN_KERNEL=${top}/kernel
+            export NMBL_SB_GEN_INITRD=${top}/initrd
+            # The committed, publicly known TEST key (testing/keys/README.md).
+            export NMBL_SB_BAKED_KEY=${testKeys.privateKey}
+          '';
+        };
+      checkSbWrongKeyRefused = mkSbTamperCheck "wrong-key-refused" "wrong-key";
+      checkSbDomainTransplantRefused =
+        mkSbTamperCheck "domain-transplant-refused" "domain-transplant";
+      checkSbSentinelRescue = mkSbTamperCheck "sentinel-rescue" "sentinel";
+
+      # Priority-file gate negative (matrix #5c): the staged twin's signed
+      # priority file (inside LUKS) is overwritten, so the post-unlock gate must
+      # refuse, relock cryptroot and reboot into rescue without offering a shell.
+      # The positive twin (#5b) is `test-secure-boot-staged`, whose assertion
+      # already requires "priority-gate (PostUnlock): signature VALID".
+      checkSbBadPriorityRefused = mkSbScenarioCheck {
+        scenario = "bad-priority-refused";
+        script = "sb-disk-tamper-refused.sh";
+        installer = secureBootStagedInstaller;
+        installBin = "sb-install-test-secure-boot-staged";
+        installSubdir = "staged";
+        runner = secureBootStagedRunner;
+        extraInputs = [ pkgs.libguestfs-with-appliance ];
+        extraEnv = ''
+          export NMBL_SB_TAMPER=bad-priority
+          export NMBL_SB_CONFIG_NAME=test-secure-boot-staged
+          export NMBL_SB_SIGNER=${nmblSign}/bin/nmbl-sign
+          export NMBL_SB_PRIORITY_FILE=/nmbl-staged/priority.signed
+        '';
+      };
+
       # POSITIVE driver-image scenario (#1 / FEATURE-#1). Boots the
       # test-secure-boot-driver config: NMBL verifies the signed driver squashfs,
       # loop-mounts it, and `finit_module`s `dummy` (a module absent from the base
@@ -1370,6 +1422,16 @@
           type = "app";
           program = "${checkSbTpmRoundtrip}/bin/test-secure-boot-tpm-roundtrip";
         };
+        # Matrix #3b: the roundtrip plus a third boot that is forced into rescue
+        # AFTER the TPM unseal; asserts the PCR cap, the closed mapper, and that
+        # the key no longer unseals.
+        test-secure-boot-rescue-locks-tpm = {
+          type = "app";
+          program = toString (pkgs.writeShellScript "test-secure-boot-rescue-locks-tpm" ''
+            export NMBL_SB_TPM_PHASE3=1
+            exec ${checkSbTpmRoundtrip}/bin/test-secure-boot-tpm-roundtrip "$@"
+          '');
+        };
         test-secure-boot-signed-gen-happy = {
           type = "app";
           program = "${checkSbSignedGenHappy}/bin/test-secure-boot-signed-gen-happy";
@@ -1377,6 +1439,22 @@
         test-secure-boot-bad-sig-refused = {
           type = "app";
           program = "${checkSbBadSigRefused}/bin/test-secure-boot-bad-sig-refused";
+        };
+        test-secure-boot-wrong-key-refused = {
+          type = "app";
+          program = "${checkSbWrongKeyRefused}/bin/test-secure-boot-wrong-key-refused";
+        };
+        test-secure-boot-domain-transplant-refused = {
+          type = "app";
+          program = "${checkSbDomainTransplantRefused}/bin/test-secure-boot-domain-transplant-refused";
+        };
+        test-secure-boot-sentinel-rescue = {
+          type = "app";
+          program = "${checkSbSentinelRescue}/bin/test-secure-boot-sentinel-rescue";
+        };
+        test-secure-boot-bad-priority-refused = {
+          type = "app";
+          program = "${checkSbBadPriorityRefused}/bin/test-secure-boot-bad-priority-refused";
         };
         # Driver-image scenarios (#1 / FEATURE-#1): a signed driver squashfs
         # carrying a module absent from the base initrd is verified, loop-mounted

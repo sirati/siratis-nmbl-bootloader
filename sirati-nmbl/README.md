@@ -705,6 +705,10 @@ NMBL skips the measured boot entirely and goes straight to rescue with
 the TPM kept locked. The refuse path above writes this sentinel before
 relocking, so a refused boot reliably lands in rescue (and only rescue)
 on the next cycle. Remove the sentinel to restore normal measured boot.
+It is honoured with both external and embedded config: embedded-config
+systems re-check it once `/boot` is mounted, before any generation is
+measured or kexec'd. The sentinel forces rescue regardless of
+`rescue.automatic`, because it is an explicit request, not a boot failure.
 
 ## Where to find things
 
