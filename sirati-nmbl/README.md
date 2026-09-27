@@ -183,6 +183,7 @@ in `lib/options.nix` and `lib/modules/activation.nix`.
     };
 
     timeoutSeconds = 3;           # countdown before auto-boot
+    instantBoot.enable = false;   # skip the countdown when healthy + untouched
     serialConsole = "ttyS0,115200";  # null = video console
 
     kernelModules = [ "nvme" "ahci" ];   # explicitly load at boot
@@ -753,6 +754,7 @@ measured or kexec'd. The sentinel forces rescue regardless of
 | `nmbl-init-rs/src/imageload/` | Driver-image loop-mount + module load. |
 | `nmbl-init-rs/src/staged/` | Staged-boot fragment verify, transactional merge, re-run. |
 | `nmbl-init-rs/nmbl-host-tools/` | `nmbl-sign` host signer (install-time signing). |
+| `nmbl-init-rs/nmblctl/` | `nmblctl`, the root-only control tool (see `docs/nmblctl.md`). |
 | `lib/options.nix` | `boot.nmbl.*` NixOS option definitions. |
 | `lib/modules/security/` | `signing` / `tpm` / `secureBoot` / `staged-boot` / `driver-image` options + assertions. |
 | `lib/config.nix` | Module implementation (assembles the initramfs). |
@@ -805,6 +807,8 @@ Working:
   verified before measured/staged boot; a missing or wrong-signed file
   relocks LUKS, caps the TPM, writes the rescue sentinel, and offers
   only reboot-into-rescue.
+- **nmblctl** and **instant boot** (`boot.nmbl.instantBoot.enable`): see
+  `docs/nmblctl.md`.
 - **Rescue sentinel**: an empty `/boot/nmbl/rescue` forces
   straight-to-rescue with the TPM kept locked.
 - **Driver images** (`boot.nmbl.driverImages`) and **staged boot**
