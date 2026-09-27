@@ -91,7 +91,8 @@ pub(super) async fn select_and_act(
     #[cfg(feature = "stateful")]
     let decision = if skip_selector.get() || instant {
         nmbl_info!("phase 5: selector skipped — booting default generation");
-        select_default_with_stateful(config, &generations)?
+        let default_index = resolve_default_index(config, &generations);
+        select_default_with_stateful(config, &generations, default_index)?
     } else {
         // Stateful rollback gate. When the operator opted into stateful
         // storage AND state.bin is readable, `select_with_stateful`
@@ -167,7 +168,7 @@ pub(super) async fn select_and_act(
 /// `active` symlink, so this is a NO-OP there (returns the active index) — the
 /// flag files are never written on EROFS and must never act as an unverified
 /// selector.
-fn resolve_default_index(
+pub(super) fn resolve_default_index(
     config: &Config,
     generations: &[nmbl_init::generations::Generation],
 ) -> usize {
