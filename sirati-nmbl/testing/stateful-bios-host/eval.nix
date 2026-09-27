@@ -1,7 +1,7 @@
 # Artifacts for test-stateful-bios-host-vm: three generations sharing one NMBL
 # boot chain, plus the closure the Btrfs root must carry. `automatic` is the
 # only difference between the two scenarios the test boots.
-{ source, automatic, sshPublicKeyPath, sshPublicKeyHash }:
+{ source, automatic, sshPublicKeyPath, sshPublicKeyHash, instantBoot ? false }:
 
 let
   flake = builtins.getFlake "path:${source}";
@@ -13,7 +13,7 @@ let
     sha256 = sshPublicKeyHash;
   });
   generation = variant: import ./configuration.nix {
-    inherit nixpkgs variant automatic sshPublicKey;
+    inherit nixpkgs variant automatic sshPublicKey instantBoot;
     nmblModule = flake.nixosModules.default;
   };
   first = (generation 1).config.system.build;

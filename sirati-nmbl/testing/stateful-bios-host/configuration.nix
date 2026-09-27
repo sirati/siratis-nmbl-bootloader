@@ -12,6 +12,9 @@
   system ? "x86_64-linux",
   variant ? 1,
   automatic ? true,
+  # Instant-boot scenario: enable boot.nmbl.instantBoot with a long normal
+  # timeout so "immediate boot" and "menu" are distinguishable.
+  instantBoot ? false,
   sshPublicKey ? "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixtureOnlyNotARealKeyxxxxxxxxxxxxxxxxxxx fixture",
 }:
 
@@ -67,7 +70,8 @@ nixpkgs.lib.nixosSystem {
         kernelModules = [ "crc32c_generic" "libcrc32c" ];
         kernelParams = [ "console=ttyS0,115200" ];
         serialConsole = "ttyS0,115200";
-        timeoutMillis = 300;
+        timeoutMillis = if instantBoot then 30000 else 300;
+        instantBoot.enable = instantBoot;
         emergencyTimeoutSecs = 600;
         refuseInvalidHardwareOnInstall = false;
         ignoreMissingDiskModules = true;
