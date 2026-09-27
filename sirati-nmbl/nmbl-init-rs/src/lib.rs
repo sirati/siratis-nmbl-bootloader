@@ -10,6 +10,11 @@ pub mod generation_state;
 #[cfg(feature = "secure-boot")]
 pub mod generation_store;
 pub mod generations;
+/// Shared decoders for everything NMBL hands the kexec'd kernel (cmdline,
+/// initrd cpio fragment, log buffer, LUKS key handover). Single source of
+/// truth for both `nmblctl status` and the syscall-simulating container
+/// harness, with round-trip tests against the encoders. Always compiled.
+pub mod handover;
 /// Runtime loader for signed driver images (FEATURE-#1): verify → mount-ro →
 /// firmware → `init_module` over a single pinned fd. The public surface
 /// (`load_driver_images` / `detach_all_driver_images` / the handle types) is
