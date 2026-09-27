@@ -217,7 +217,90 @@ pub fn status(sys: &System, p: Palette) -> String {
     section(&mut out, &p, "Success mark");
     render_success_units(&mut out, &p, sys);
 
+    // What NMBL handed over at kexec, decoded with the shared handover
+    // decoders (the same ones the nmbl-simbox harness uses).
+    section(&mut out, &p, "Handover from NMBL");
+    render_handover(&mut out, &p);
+
     out
+}
+
+fn render_handover(out: &mut String, p: &Palette) {
+    // The boot log NMBL spliced into the initrd is imported into the journal
+    // under the `nmbl-init` tag (lib/modules/log-import.nix) and then deleted.
+    let log = std::process::Command::new("journalctl")
+        .args(["-b", "-t", "nmbl-init", "-o", "cat", "--no-pager"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    match log {
+        Some(text) if !text.trim().is_empty() => {
+            let lines = nmbl_init::handover::decode_log_buffer(&text);
+            let warns = lines
+                .iter()
+                .filter(|l| l.level == nmbl_init::handover::LogLevel::Warn)
+                .count();
+            line(
+                out,
+                p,
+                "boot log",
+                if warns > 0 { Style::Warn } else { Style::Good },
+                &format!(
+                    "{} lines, {warns} warning(s) (journalctl -b -t nmbl-init)",
+                    lines.len()
+                ),
+            );
+            for l in lines
+                .iter()
+                .filter(|l| l.level == nmbl_init::handover::LogLevel::Warn)
+                .take(10)
+            {
+                out.push_str(&format!("    {}\n", p.paint(Style::Warn, &l.message)));
+            }
+        }
+        _ => line(
+            out,
+            p,
+            "boot log",
+            Style::Dim,
+            "not imported into this boot's journal",
+        ),
+    }
+    // Stage 1 overwrites and removes the passToStage1 keyfiles; any left here
+    // are shown masked (never the value).
+    let leftover: Vec<String> = std::fs::read_dir("/etc/nmbl-luks")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let data = std::fs::read(e.path()).ok()?;
+            let d = nmbl_init::handover::describe_key_injection(
+                &e.path().to_string_lossy(),
+                &data,
+                nmbl_init::handover::KeyMethod::Unknown,
+                false,
+            );
+            Some(format!("{} ({}, {})", d.volume, d.key_format, d.masked))
+        })
+        .collect();
+    if leftover.is_empty() {
+        line(
+            out,
+            p,
+            "LUKS keyfiles",
+            Style::Good,
+            "none left after stage 1",
+        );
+    } else {
+        line(
+            out,
+            p,
+            "LUKS keyfiles LEFT OVER",
+            Style::Bad,
+            &leftover.join(", "),
+        );
+    }
 }
 
 // ---- section helpers -------------------------------------------------------
