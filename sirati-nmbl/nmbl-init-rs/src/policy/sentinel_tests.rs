@@ -117,6 +117,9 @@ fn embedded_mode_reads_the_sentinel_from_the_mounted_boot_entry() {
     assert!(!sentinel_present(&cfg));
     std::fs::create_dir_all(root.join("boot/nmbl")).expect("boot dir");
     std::fs::write(root.join("boot/nmbl/rescue"), b"").expect("sentinel");
-    assert!(sentinel_present(&cfg), "sentinel under <system_root>/boot is found");
+    assert!(
+        sentinel_present(&cfg),
+        "sentinel under <system_root>/boot is found"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

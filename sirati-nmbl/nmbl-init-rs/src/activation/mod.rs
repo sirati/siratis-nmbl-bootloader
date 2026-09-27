@@ -125,13 +125,12 @@ pub async fn run_all_activations(
         // mapping cryptsetup just created, and once NMBL extends its handoff
         // the TPM refuses a second unseal, so stage 1 could never reopen the
         // volume from the token itself.
-        let stdin_owned = if activation.kind == ActivationKind::LuksTpm
-            && activation.pass_to_stage1.is_some()
-        {
-            Some(read_tpm_stage1_secret(activation, sender).await?)
-        } else {
-            stdin_owned
-        };
+        let stdin_owned =
+            if activation.kind == ActivationKind::LuksTpm && activation.pass_to_stage1.is_some() {
+                Some(read_tpm_stage1_secret(activation, sender).await?)
+            } else {
+                stdin_owned
+            };
 
         let device_count = activation.produces_devices.len();
         let wait_operation = format!("phase 3: {} waiting for", kind_label(activation.kind));
