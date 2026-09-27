@@ -58,14 +58,41 @@ pub(super) async fn select_and_act(
         // reporter drops here, releasing the &mut console borrow.
     };
 
+    // Instant-boot fast path (`boot.nmbl.instantBoot.enable`). When every
+    // health condition holds AND no key was pressed anywhere before the
+    // selector, skip the countdown and boot the default generation now. Any
+    // early keypress (the tap OR the session latch) declines it, exactly like
+    // pressing a key during the countdown. The decision is a pure predicate
+    // over the gathered facts (see `nmbl_init::ui::instant_boot`).
+    let instant = {
+        use nmbl_init::ui::{InstantBootDecision, decide_instant_boot};
+        let inputs = gather_instant_boot_inputs(config, session);
+        match decide_instant_boot(inputs) {
+            InstantBootDecision::BootImmediately => {
+                nmbl_info!("phase 5: instant boot — booting default generation, selector skipped");
+                true
+            }
+            InstantBootDecision::UseNormalTimer(reason) => {
+                if config.general.instant_boot {
+                    nmbl_info!(
+                        "phase 5: instant boot declined ({}); using the normal timer",
+                        reason.as_str()
+                    );
+                }
+                false
+            }
+        }
+    };
+
     // Skip-selector fast path. Set only when the operator unlocked LUKS
     // with the "Select NixOS Generation" checkbox left UNCHECKED: boot the
     // same default generation the selector's timeout would pick, without
     // rendering the picker or running its countdown. `false` (non-LUKS
     // boots, or a CHECKED submit) falls through to the normal selector.
+    // Instant boot takes the SAME default-boot path (no countdown, no menu).
     #[cfg(feature = "stateful")]
-    let decision = if skip_selector.get() {
-        nmbl_info!("phase 5: selector skipped (checkbox off) — booting default generation");
+    let decision = if skip_selector.get() || instant {
+        nmbl_info!("phase 5: selector skipped — booting default generation");
         select_default_with_stateful(config, &generations)?
     } else {
         // Stateful rollback gate. When the operator opted into stateful
@@ -76,8 +103,8 @@ pub(super) async fn select_and_act(
         select_with_stateful(config, &generations, console, session).await?
     };
     #[cfg(not(feature = "stateful"))]
-    let decision = if skip_selector.get() {
-        nmbl_info!("phase 5: selector skipped (checkbox off) — booting default generation");
+    let decision = if skip_selector.get() || instant {
+        nmbl_info!("phase 5: selector skipped — booting default generation");
         Decision::Boot {
             generation_index: nmbl_init::generations::active_generation_index(
                 &generations,
@@ -121,6 +148,106 @@ pub(super) async fn select_and_act(
             Ok(TerminalAction::Reboot)
         }
     }
+}
+
+/// Gather the facts that drive the instant-boot decision from the loaded
+/// config, the early-key tap, the session latch, and (per boot mode) the
+/// stateful state.bin / signed-generation selectors. Pure reads — no state is
+/// mutated. See [`nmbl_init::ui::instant_boot`] for the policy.
+fn gather_instant_boot_inputs(
+    config: &Config,
+    session: &SessionInteraction,
+) -> nmbl_init::ui::InstantBootInputs {
+    use nmbl_init::ui::InstantBootInputs;
+
+    // Presence: either the early-boot tap saw a key before the console came up,
+    // OR the session latch was set once the interactive console was live. Both
+    // windows together span stage 0 → selector.
+    let key_pressed = nmbl_init::ui::early_key_tap::key_pressed() || session.get();
+
+    // Baseline: disabled unless the operator opted in; last-boot health starts
+    // pessimistic and is proven per boot mode below.
+    let mut inputs = InstantBootInputs {
+        enabled: config.general.instant_boot,
+        last_boot_succeeded: false,
+        stateful_rollback_active: false,
+        generation_rollback_active: false,
+        rescue_sentinel_present: nmbl_init::policy::sentinel_present(config),
+        pending_untested_generation: false,
+        key_pressed_during_early_boot: key_pressed,
+    };
+
+    // A boot with neither stateful tracking nor signed-generation state cannot
+    // prove the previous boot was healthy, so instant boot stays conservative
+    // and only applies when at least one health source vouches for it.
+    let mut health_known = false;
+
+    #[cfg(feature = "stateful")]
+    if let (Some(_stateful), Some(state_mp)) = (
+        config.stateful.as_ref(),
+        config.runtime_state_mountpoint.as_deref(),
+    ) {
+        let state_path = state_mp.join("nmbl").join("state.bin");
+        if let Ok(Some(state)) = nmbl_init::state::read(&state_path) {
+            health_known = true;
+            inputs.last_boot_succeeded = state.last_boot_succeeded;
+            // A rollback is in-flight when the last boot failed and a prior
+            // attempt was recorded — `state::decide` would ForcePick an older
+            // generation. Instant boot must not skip the menu in that case.
+            inputs.stateful_rollback_active =
+                !state.last_boot_succeeded && state.last_attempted_generation.is_some();
+        }
+    }
+
+    // The signed-EROFS generation state, when configured, is the other health
+    // source: the active generation must be `tested`, with no pending untested
+    // image and no unresolved failed attempt. `generation_rollback` is set by
+    // the boot_runtime state machine when it rolled an untested image back.
+    #[cfg(feature = "secure-boot")]
+    if let Some(policy) = config
+        .generation_image
+        .as_ref()
+        .filter(|p| p.enable && p.tracks_state())
+    {
+        inputs.generation_rollback_active = config.generation_rollback;
+        // Resolve the state root the same way boot_runtime did.
+        let state_root = policy
+            .stage1_store
+            .as_ref()
+            .map(|s| s.mountpoint.join(&s.relative_state_root))
+            .or_else(|| {
+                config.runtime_boot_mountpoint.as_deref().and_then(|boot| {
+                    policy
+                        .state_root
+                        .strip_prefix("/boot")
+                        .ok()
+                        .map(|r| boot.join(r))
+                })
+            });
+        if let Some(root) = state_root
+            && let Ok(Some(health)) = nmbl_init::generation_state::inspect_health(&root)
+        {
+            health_known = true;
+            inputs.last_boot_succeeded = health.active_is_tested;
+            if health.pending_present {
+                inputs.pending_untested_generation = true;
+            }
+            if health.attempted_unresolved {
+                inputs.stateful_rollback_active = true;
+            }
+        }
+    }
+
+    if !health_known {
+        // No trackable state at all: we cannot prove the last boot succeeded,
+        // so leave `last_boot_succeeded = false`. The policy then declines
+        // instant boot with `LastBootNotHealthy`, which is the safe default —
+        // an operator who wants instant boot enables stateful or signed
+        // generations, both of which record boot health.
+        inputs.last_boot_succeeded = false;
+    }
+
+    inputs
 }
 
 /// Dispatch the final [`TerminalAction`] produced by the inner
@@ -378,10 +505,12 @@ pub(super) async fn run_tui_session(
         }
         // The rescue sentinel is an explicit request for rescue, not a boot
         // failure: it forces rescue independently of `rescue.automatic`.
-        Err(err @ NmblError::Rescue {
-            stage: "rescue-sentinel",
-            ..
-        }) => {
+        Err(
+            err @ NmblError::Rescue {
+                stage: "rescue-sentinel",
+                ..
+            },
+        ) => {
             drop(console);
             return SessionOutcome::AutomaticRescue(err);
         }

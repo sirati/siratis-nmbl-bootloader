@@ -120,6 +120,12 @@ let
     # operator set it so absent configs keep the Rust-side 30 s default.
     // lib.optionalAttrs (cfg.emergencyTimeoutSecs != null) {
       emergency_timeout_secs = cfg.emergencyTimeoutSecs;
+    }
+    # Instant boot: skip the selector countdown when healthy and no key was
+    # pressed early. Emitted only when enabled so the wire shape is unchanged
+    # for the default (Rust serde default `false`).
+    // lib.optionalAttrs cfg.instantBoot.enable {
+      instant_boot = true;
     };
 
     kernel_modules = {

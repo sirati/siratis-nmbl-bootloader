@@ -64,6 +64,40 @@ pub fn mark_success(root: &Path) -> Result<()> {
     remove_state(root, "attempted")
 }
 
+/// A read-only health summary of the signed-EROFS generation state, for the
+/// instant-boot decision ([`crate::ui::instant_boot`]) and `nmblctl status`.
+/// Computed WITHOUT mutating any selector, so it is safe to call at any point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationHealth {
+    /// The active generation has been marked `tested` (a prior boot of it
+    /// reached the success target). This is the signed-generation analogue of
+    /// stateful `last_boot_succeeded`.
+    pub active_is_tested: bool,
+    /// A `pending` selector exists (an untested generation awaiting its
+    /// success assessment).
+    pub pending_present: bool,
+    /// An unresolved `attempted` selector exists that does not match `active`
+    /// — a previous boot did not complete. `prepare_boot` would treat this as
+    /// a failure/rollback trigger.
+    pub attempted_unresolved: bool,
+}
+
+/// Inspect the generation state read-only. Returns `Ok(None)` when the state
+/// root has no `active` selector yet (nothing to assess). Never writes.
+pub fn inspect_health(root: &Path) -> Result<Option<GenerationHealth>> {
+    let Some(active) = optional_id(root, "active")? else {
+        return Ok(None);
+    };
+    let tested = optional_id(root, "tested")?;
+    let pending = optional_id(root, "pending")?;
+    let attempted = optional_id(root, "attempted")?;
+    Ok(Some(GenerationHealth {
+        active_is_tested: tested.as_deref() == Some(active.as_str()),
+        pending_present: pending.is_some(),
+        attempted_unresolved: attempted.is_some_and(|a| a != active),
+    }))
+}
+
 fn optional_id(root: &Path, name: &str) -> Result<Option<String>> {
     match fs::read_link(root.join(name)) {
         Ok(target) => parse_target(root, name, &target).map(Some),

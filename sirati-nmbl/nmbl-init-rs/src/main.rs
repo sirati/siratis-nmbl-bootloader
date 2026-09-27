@@ -117,6 +117,13 @@ fn early_init() {
         // `/dev` alone (no console reopen) still aborts — so the console
         // reopen here is the operative fix, not the mounts by themselves.
         wire_console_stdio();
+
+        // Arm the early-boot keypress tap as soon as /dev/console exists, so a
+        // key pressed during ANY pre-selector phase (bootstrap, mounts, device
+        // waits, verification) is observed and cancels instant boot. Best-effort
+        // and non-destructive — it opens its own O_RDONLY fd (see
+        // `ui::early_key_tap`). No-op on non-PID-1 invocations (below).
+        nmbl_init::ui::early_key_tap::arm();
     }
 
     // Hook installed before parse_args / Config::load so their panics are

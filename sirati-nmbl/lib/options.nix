@@ -451,6 +451,19 @@ in
       '';
     };
 
+    instantBoot.enable = lib.mkEnableOption ''
+      instant boot: skip NMBL's selector countdown entirely and boot the
+      default generation immediately whenever the last boot succeeded, there
+      is no rollback/fallback in effect, no rescue sentinel, and no pending
+      untested generation — AND no key was pressed during early boot. NMBL
+      listens for keypresses from stage 0 onward (console and serial); a
+      single key anywhere before the selector cancels the instant boot and
+      restores the normal timeout/menu. In every other case the normal timer
+      applies. Requires a boot-health source (`boot.nmbl.stateful.enable`
+      or signed `boot.nmbl.generationImage`): without one NMBL cannot prove
+      the previous boot was healthy and always uses the normal timer
+    '';
+
     timeoutMillis = lib.mkOption {
       type = lib.types.int;
       default = cfg.timeoutSeconds * 1000;
@@ -467,7 +480,6 @@ in
     };
 
     emergencyTimeoutSecs = lib.mkOption {
-      type = lib.types.nullOr lib.types.ints.positive;
       default = null;
       description = lib.mdDoc ''
         Auto-reboot countdown (seconds) shown on NMBL's emergency/error

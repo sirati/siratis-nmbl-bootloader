@@ -35,6 +35,14 @@ pub struct General {
     #[serde(default = "default_panic_report_dir")]
     pub panic_report_dir: PathBuf,
 
+    /// `boot.nmbl.instantBoot.enable`: when set, NMBL skips the selector
+    /// countdown and boots the default generation immediately whenever every
+    /// health condition holds and no key was pressed during early boot. See
+    /// [`crate::ui::instant_boot`]. Defaults to `false` so the wire shape and
+    /// boot UX are unchanged for configs that do not opt in.
+    #[serde(default)]
+    pub instant_boot: bool,
+
     /// Legacy toggle: kept as a no-op field so existing configs that
     /// still set `serial_console = true/false` parse successfully under
     /// `deny_unknown_fields`. The TUI now renders through ratatui's
@@ -53,6 +61,7 @@ impl Default for General {
             emergency_timeout_secs: None,
             device_timeout_secs: default_device_timeout_secs(),
             panic_report_dir: default_panic_report_dir(),
+            instant_boot: false,
             _serial_console_compat: false,
         }
     }
