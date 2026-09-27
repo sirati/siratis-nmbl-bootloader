@@ -108,7 +108,12 @@ mod tests {
                     timeout_ms: 1,
                 },
             ),
-            ("no-generations", NmblError::NoGenerations { searched: "/p".into() }),
+            (
+                "no-generations",
+                NmblError::NoGenerations {
+                    searched: "/p".into(),
+                },
+            ),
             (
                 "bootstrap",
                 NmblError::Bootstrap {
@@ -116,7 +121,12 @@ mod tests {
                     source: Box::new(io_error()),
                 },
             ),
-            ("panicked", NmblError::Panicked { report_path: "/r".into() }),
+            (
+                "panicked",
+                NmblError::Panicked {
+                    report_path: "/r".into(),
+                },
+            ),
             (
                 "stateful-exhausted",
                 NmblError::Rescue {
@@ -148,19 +158,33 @@ mod tests {
             FailureKind::StatefulExhausted,
             FailureKind::BootError,
         ] {
-            assert_eq!(route(false, Some(kind)), FailureRoute::EmergencyMenu, "{kind:?}");
+            assert_eq!(
+                route(false, Some(kind)),
+                FailureRoute::EmergencyMenu,
+                "{kind:?}"
+            );
         }
         for (name, err) in every_failure() {
-            assert_eq!(route(false, classify(&err)), FailureRoute::EmergencyMenu, "{name}");
+            assert_eq!(
+                route(false, classify(&err)),
+                FailureRoute::EmergencyMenu,
+                "{name}"
+            );
         }
     }
 
     #[test]
     fn operator_decisions_and_rescue_failures_never_enter_rescue() {
         let not_failures = [
-            NmblError::OperatorAborted { context: "wait".into() },
-            NmblError::OperatorChoseReboot { context: "modal".into() },
-            NmblError::WrongPasswordShellExited { context: "shell".into() },
+            NmblError::OperatorAborted {
+                context: "wait".into(),
+            },
+            NmblError::OperatorChoseReboot {
+                context: "modal".into(),
+            },
+            NmblError::WrongPasswordShellExited {
+                context: "shell".into(),
+            },
             NmblError::Rescue {
                 stage: "disk-rescue-failed",
                 source: Box::new(io_error()),
@@ -168,7 +192,11 @@ mod tests {
         ];
         for err in &not_failures {
             assert_eq!(classify(err), None, "{err}");
-            assert_eq!(route(true, classify(err)), FailureRoute::EmergencyMenu, "{err}");
+            assert_eq!(
+                route(true, classify(err)),
+                FailureRoute::EmergencyMenu,
+                "{err}"
+            );
         }
     }
 

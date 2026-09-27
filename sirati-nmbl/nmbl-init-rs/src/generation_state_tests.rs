@@ -24,10 +24,7 @@ fn first_attempt_then_success_blesses_generation()
     let id = generation(temp.path(), 1)?;
     link(temp.path(), "active", &id)?;
     link(temp.path(), "pending", &id)?;
-    assert_eq!(
-        prepare_boot(temp.path(), true)?,
-        BootStateOutcome::Proceed
-    );
+    assert_eq!(prepare_boot(temp.path(), true)?, BootStateOutcome::Proceed);
     mark_success(temp.path())?;
     assert_eq!(required_id(temp.path(), "tested")?, id);
     assert!(!temp.path().join("attempted").exists());
@@ -62,10 +59,7 @@ fn failed_tested_generation_requests_rescue() -> std::result::Result<(), Box<dyn
     link(temp.path(), "active", &id)?;
     link(temp.path(), "tested", &id)?;
     link(temp.path(), "attempted", &id)?;
-    assert_eq!(
-        prepare_boot(temp.path(), true)?,
-        BootStateOutcome::Failed
-    );
+    assert_eq!(prepare_boot(temp.path(), true)?, BootStateOutcome::Failed);
     Ok(())
 }
 

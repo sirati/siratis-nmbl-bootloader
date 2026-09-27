@@ -44,7 +44,12 @@ pub fn mount_and_resolve(
                 store.device.display(),
                 boot.display(),
             );
-            crate::sys::mount::mount_fs(Some(boot), store.mountpoint.as_path(), &store.fstype, "bind")?;
+            crate::sys::mount::mount_fs(
+                Some(boot),
+                store.mountpoint.as_path(),
+                &store.fstype,
+                "bind",
+            )?;
             // The bootstrap may have mounted the shared superblock read-only.
             // Generation state is written here, so remount the superblock with
             // the store options through the private mount; the bootstrap mount
