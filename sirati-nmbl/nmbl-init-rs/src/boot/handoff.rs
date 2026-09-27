@@ -275,6 +275,9 @@ pub(crate) fn verify_measure_then_load(
     key_injections: &[KeyInjection],
     driver_images: &DriverImagesHandle,
 ) -> Result<String> {
+    // `mut` only when the secure-boot rollback block below can append to it;
+    // a feature-free build never mutates it (avoids an unused-mut lint).
+    #[cfg_attr(not(feature = "secure-boot"), allow(unused_mut))]
     let mut cmdline = build_cmdline(generation, cmdline_override, &config.paths.system_root);
     #[cfg(feature = "secure-boot")]
     if config.generation_rollback

@@ -1,5 +1,9 @@
 pub mod activation;
 pub mod boot;
+/// Persistent-default + one-shot boot selection files (`boot-default` /
+/// `boot-once`), written by `nmblctl` and honoured by the boot-time selector.
+/// Single source of the format and the read/consume logic. Always compiled.
+pub mod boot_selection;
 pub mod config;
 pub mod devices;
 pub mod error;
