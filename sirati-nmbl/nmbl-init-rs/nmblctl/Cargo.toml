@@ -1,0 +1,45 @@
+[package]
+name = "nmblctl"
+version = "0.1.0"
+edition = "2024"
+description = "System-side control + inspection tool for the NMBL bootloader (root-only)."
+license = "MIT"
+publish = false
+
+# nmblctl runs on the BOOTED NixOS, not in the initramfs, so it is a normal
+# dynamic host binary (like nmbl-host-tools) — NOT the musl-static init target.
+[[bin]]
+name = "nmblctl"
+path = "src/main.rs"
+
+[lib]
+name = "nmblctl"
+path = "src/lib.rs"
+
+# Same panic-free posture as the rest of the workspace: a control tool that
+# runs as root must return errors, not panic mid-operation.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+
+[dependencies]
+# The single source of truth for config parsing, generation/stateful state,
+# the handover decoders, and the security consts. `secure-boot` pulls in the
+# generation-image / signing config structs nmblctl reports on; the default
+# `pretty-shell` feature is dropped (nmblctl never hosts a terminal).
+nmbl-init = { path = "..", default-features = false, features = ["secure-boot", "stateful"] }
+# ratatui is what NMBL's own TUI uses; the reboot-into / default selectors
+# reuse it for the interactive picker. crossterm drives the real terminal here
+# (nmblctl runs on a normal tty, unlike PID 1 which owns /dev/console).
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

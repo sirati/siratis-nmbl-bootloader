@@ -88,6 +88,10 @@
         nmbl-init-rs.packages.${system}.nmbl-sign or null;
       nmblBootUpdate =
         nmbl-init-rs.packages.${system}.nmbl-boot-update or null;
+      # The system-side control/inspection tool, shipped in the system closure
+      # when NMBL is enabled. `null` on an older sibling flake.
+      nmblCtl =
+        nmbl-init-rs.packages.${system}.nmblctl or null;
 
       # The host / install-time LUKS-to-TPM seal helper (`nmbl-tpm-enroll`). It
       # reuses `systemd-cryptenroll` to write a LUKS2 systemd-tpm2 token that
@@ -1303,6 +1307,9 @@
           # build to sign each squashfs at install time.
           _module.args.nmblSign = nmblSign;
           _module.args.nmblBootUpdate = nmblBootUpdate;
+          # The system-side control/inspection tool, added to the system
+          # closure by lib/config.nix when NMBL is enabled.
+          _module.args.nmblCtl = nmblCtl;
         };
 
       # Installer-available host tools. `nmbl-tpm-enroll` seals a LUKS volume

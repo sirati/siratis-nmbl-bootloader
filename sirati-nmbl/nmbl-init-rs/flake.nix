@@ -293,6 +293,22 @@
             pname = "nmbl-boot-update";
           }
         );
+        # `nmblctl` — the system-side control/inspection tool. Runs on the BOOTED
+        # NixOS (root-only), not in the initramfs, so it is a normal host binary
+        # built like the other host tools. It depends on `nmbl-init` (the lib) for
+        # config parsing, the handover decoders, and the state readers, but never
+        # enters the musl initramfs closure (it is a separate host buildPackage).
+        nmblctlCommonArgs = hostCommonArgs // {
+          cargoExtraArgs = "-p nmblctl";
+        };
+        nmblctlArtifacts = hostCraneLib.buildDepsOnly nmblctlCommonArgs;
+        nmblctl = hostCraneLib.buildPackage (
+          nmblctlCommonArgs
+          // {
+            cargoArtifacts = nmblctlArtifacts;
+            pname = "nmblctl";
+          }
+        );
       in
       {
         # Function form: callers wire Cargo features through this
@@ -308,6 +324,9 @@
           # buildPackage on the host target, outside the initramfs closure.
           nmbl-sign = nmbl-sign;
           nmbl-boot-update = nmbl-boot-update;
+          # The system-side control/inspection tool (root-only), shipped in the
+          # system closure when NMBL is enabled.
+          nmblctl = nmblctl;
         };
 
         # Useful for hand-testing: just runs the binary in your shell. It will
@@ -433,6 +452,26 @@
             // {
               cargoArtifacts = bootUpdateArtifacts;
               cargoExtraArgs = "-p nmbl-boot-update";
+              doCheck = true;
+            }
+          );
+
+          # nmblctl (host target): build + clippy + test. Its pure logic
+          # (arg/color/pager/flag-file parsing, durable writes) is unit-tested;
+          # the clippy gate keeps it panic-free like the rest of the workspace.
+          inherit nmblctl;
+          nmblctl-clippy = hostCraneLib.cargoClippy (
+            nmblctlCommonArgs
+            // {
+              cargoArtifacts = nmblctlArtifacts;
+              cargoClippyExtraArgs = "-p nmblctl --all-targets -- --deny warnings";
+            }
+          );
+          nmblctl-test = hostCraneLib.cargoTest (
+            nmblctlCommonArgs
+            // {
+              cargoArtifacts = nmblctlArtifacts;
+              cargoExtraArgs = "-p nmblctl";
               doCheck = true;
             }
           );

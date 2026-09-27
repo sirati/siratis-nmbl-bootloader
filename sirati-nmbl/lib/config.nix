@@ -21,6 +21,10 @@
   # images are enabled.
   nmblSign ? null,
   nmblBootUpdate ? null,
+  # The system-side control/inspection tool `nmblctl`. `null` on an older
+  # sibling flake; when non-null and NMBL is enabled it is added to the
+  # system packages so `nmblctl chain/status/reboot-*/default` are available.
+  nmblCtl ? null,
   ...
 }:
 
@@ -831,6 +835,9 @@ in
     environment.systemPackages = [
       installScriptModule.installNmbl
       nmblTpmEnroll
-    ];
+    ]
+    # `nmblctl` — the root-only control/inspection tool. Shipped in the system
+    # closure whenever NMBL is enabled and the sibling flake provides it.
+    ++ lib.optional (nmblCtl != null) nmblCtl;
   };
 }
