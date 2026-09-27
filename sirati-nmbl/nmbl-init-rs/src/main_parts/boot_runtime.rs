@@ -239,7 +239,9 @@ pub(crate) async fn run_boot_inside_runtime(
                 };
                 return match on_boot_failure(&config, FailureKind::TestedGenerationFailed) {
                     FailureRoute::Rescue => {
-                        nmbl_warn!("generation-image: generation failed; entering automatic rescue");
+                        nmbl_warn!(
+                            "generation-image: generation failed; entering automatic rescue"
+                        );
                         BootOutcome::ForceRescue(Box::new((cause, config)))
                     }
                     FailureRoute::EmergencyMenu => {
@@ -281,6 +283,10 @@ pub(crate) async fn run_boot_inside_runtime(
             return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
         }
     }
+    // Drain the early-key tap once more before console bring-up so a keypress
+    // during the pre-console phases is latched even if the kernel tty buffer
+    // would otherwise fill. Idempotent and non-blocking.
+    let _ = nmbl_init::ui::early_key_tap::poll();
     // Driver-image hook (#24 / FEATURE-#1): load every declared, signed
     // out-of-tree driver image AFTER the early explicit-module load and
     // BEFORE the generation kexec, so extra drivers (and their firmware) are
@@ -314,6 +320,11 @@ pub(crate) async fn run_boot_inside_runtime(
             return BootOutcome::Done(Box::new(Err(Box::new((err, config)))));
         }
     };
+    // The interactive console now owns `/dev/console`; close the early-key tap
+    // fd so the two never contend for input. The tap's latched "a key was
+    // pressed" flag survives this (see `ui::early_key_tap`), and from here the
+    // session latch driven by `LatchingConsole` covers presence.
+    nmbl_init::ui::early_key_tap::disarm();
     if cmdline_has_key_echo_flag() {
         // The key-echo diagnostic drops into the emergency shell, so the
         // driver images are LEFT MOUNTED for inspection (FIX-55): they carry

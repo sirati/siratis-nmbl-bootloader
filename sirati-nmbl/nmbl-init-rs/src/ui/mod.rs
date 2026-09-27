@@ -33,10 +33,12 @@ pub mod console;
 pub mod console_picker;
 pub mod console_relay;
 pub mod countdown;
+pub mod early_key_tap;
 pub mod editline;
 pub mod emergency;
 pub mod emergency_actions;
 pub(crate) mod event_tick;
+pub mod instant_boot;
 pub mod key_echo;
 pub mod log_viewer;
 pub mod modal_confirm;
@@ -72,6 +74,9 @@ pub use app::{
 pub(crate) use emergency::{build_emergency_app, build_message, default_items};
 pub use emergency::{
     resolve_emergency_timeout, run_emergency_screen, run_emergency_screen_with_app,
+};
+pub use instant_boot::{
+    InstantBootDecision, InstantBootDeclineReason, InstantBootInputs, decide_instant_boot,
 };
 pub use reporter::{BootReporter, ProgressSink, TickOutcome};
 pub use runtime::{block_on_tui, block_on_tui_with_poller, build_local_runtime, spawn_poller};
