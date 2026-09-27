@@ -94,6 +94,30 @@
         nmbl-init-rs.packages.${system}.nmblctl or null;
       nmblUiPreview =
         nmbl-init-rs.packages.${system}.nmbl-ui-preview or null;
+      nmblSimbox =
+        nmbl-init-rs.packages.${system}.nmbl-simbox or null;
+      simboxScenarios = import ./testing/simbox/scenarios.nix {
+        inherit nixpkgs;
+        nmblModule = self.nixosModules.default;
+      };
+      # Wraps nmbl-simbox with rootless podman + crun on PATH.
+      simboxApp = pkgs.writeShellApplication {
+        name = "nmbl-simbox";
+        runtimeInputs = [ pkgs.podman pkgs.crun pkgs.coreutils ];
+        text = ''exec ${nmblSimbox}/bin/nmbl-simbox "$@"'';
+      };
+      simboxTest = pkgs.writeShellApplication {
+        name = "test-nmbl-simbox";
+        runtimeInputs = [
+          pkgs.podman pkgs.crun pkgs.coreutils pkgs.gnugrep pkgs.gnused pkgs.python3
+          pkgs.xorg.xorgserver pkgs.xorg.xdpyinfo pkgs.xdotool
+        ];
+        text = builtins.replaceStrings
+          [ "@simbox@" "@normal@" "@luks@" "@splash@" ]
+          [ "${nmblSimbox}/bin/nmbl-simbox" "${simboxScenarios.normal}" "${simboxScenarios.luks}"
+            "${simboxScenarios.splash}" ]
+          (builtins.readFile ./tools/simbox-test.sh);
+      };
 
       # The host / install-time LUKS-to-TPM seal helper (`nmbl-tpm-enroll`). It
       # reuses `systemd-cryptenroll` to write a LUKS2 systemd-tpm2 token that
@@ -1377,6 +1401,13 @@
         test-instant-boot-vm = instantBootVmTest;
         # Development only: NMBL's boot UI in an X11 window with mock scenarios.
         nmbl-ui-preview = nmblUiPreview;
+        # Development only: the real nmbl-init as PID 1 in a rootless,
+        # capability-free container with simulated syscalls.
+        nmbl-simbox = simboxApp;
+        simbox-scenario-normal = simboxScenarios.normal;
+        simbox-scenario-luks = simboxScenarios.luks;
+        simbox-scenario-splash = simboxScenarios.splash;
+        test-nmbl-simbox = simboxTest;
         test-boot-update-vm = bootUpdateVmTest;
       };
 

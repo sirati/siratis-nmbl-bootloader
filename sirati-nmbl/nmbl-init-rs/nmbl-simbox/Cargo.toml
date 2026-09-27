@@ -1,0 +1,30 @@
+[package]
+name = "nmbl-simbox"
+version = "0.1.0"
+edition = "2024"
+description = "Run the unmodified NMBL PID 1 in a rootless podman container with its kernel-facing syscalls simulated via seccomp user notification (development only)."
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "nmbl-simbox"
+path = "src/main.rs"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[dependencies]
+# The shared handover decoders (cmdline / cpio / keyfiles / log) — the single
+# source of truth also used by nmblctl status.
+nmbl-init = { path = "..", default-features = false, features = ["secure-boot"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+libc = "0.2"
+x11rb = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
