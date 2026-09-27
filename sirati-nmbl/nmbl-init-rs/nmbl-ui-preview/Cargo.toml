@@ -1,0 +1,29 @@
+[package]
+name = "nmbl-ui-preview"
+version = "0.1.0"
+edition = "2024"
+description = "X11 preview of NMBL's boot UI driven by a mock backend (development only)."
+license = "MIT"
+publish = false
+
+# Development-only host binary. It depends on nmbl-init; nothing depends on it,
+# and every mock scenario lives in THIS crate, so no production target can link
+# preview code. The `nmbl-ui-preview-absent` flake check scans the production
+# binaries for this crate's marker string to prove it.
+[[bin]]
+name = "nmbl-ui-preview"
+path = "src/main.rs"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+
+[dependencies]
+# The real rendering code: the ratatui views (`ui::render_app`) and the splash
+# compositor (`ui::composite_frame`). `image-splash` compiles the compositor.
+nmbl-init = { path = "..", default-features = false, features = ["image-splash", "secure-boot"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"
+x11rb = { version = "0.13", default-features = false }

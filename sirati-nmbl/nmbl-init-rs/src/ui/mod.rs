@@ -88,8 +88,15 @@ pub use password_supplier::TuiPasswordSupplier;
 #[cfg(feature = "mocking")]
 pub(crate) use password_supplier::passphrase_prompt_on_console;
 pub(crate) use screen_render::render_current_screen;
+/// Paint the App's current screen + modal into a ratatui frame. Public so the
+/// separate `nmbl-ui-preview` crate renders through NMBL's real view code.
+pub fn render_app(frame: &mut ratatui::Frame<'_>, app: &App<'_>) {
+    render_current_screen(frame, app);
+}
 pub use selector::{run_selector, run_selector_with_default};
 
+#[cfg(feature = "image-splash")]
+pub use splash_render::composite_frame;
 #[cfg(feature = "image-splash")]
 pub(crate) use splash_render::{render_splash_frame, render_splash_frame_with};
 
