@@ -312,6 +312,25 @@
           ]
           (builtins.readFile ./tools/stateful-bios-host-vm-test.sh);
       };
+      # boot.nmbl.instantBoot on the same Hetzner-shape disk: untouched healthy
+      # boot skips the menu; a serial keypress during early boot shows it.
+      instantBootVmTest = pkgs.writeShellApplication {
+        name = "test-instant-boot-vm";
+        runtimeInputs = with pkgs; [
+          btrfs-progs coreutils dosfstools fakeroot findutils gnugrep gptfdisk
+          mtools nix openssh python3
+        ];
+        text = builtins.replaceStrings
+          [ "@source@" "@disk@" "@harness@" "@grub@" "@qemu@" ]
+          [
+            "${self}"
+            "${./testing/stateful-bios-host/disk.py}"
+            "${./testing/stateful-bios-host/instant_harness.py}"
+            "${pkgs.grub2}"
+            "${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
+          ]
+          (builtins.readFile ./tools/instant-boot-vm-test.sh);
+      };
       rootStoreEvalCheck = pkgs.runCommand "nmbl-generation-root-store-eval" {
         nativeBuildInputs = [ pkgs.python3 ];
       } ''
@@ -1353,6 +1372,7 @@
         test-network-stage-vm = networkStageVmTest;
         test-erofs-bios-host-vm = erofsBiosHostVmTest;
         test-stateful-bios-host-vm = statefulBiosHostVmTest;
+        test-instant-boot-vm = instantBootVmTest;
         test-boot-update-vm = bootUpdateVmTest;
       };
 
