@@ -37,6 +37,9 @@ pub struct CpioEntry {
     pub mode: u32,
     /// File-data length in bytes (0 for directories / the trailer).
     pub size: usize,
+    /// Byte offset of the file data within the decoded buffer, so a caller
+    /// can slice the content (`&buf[data_offset..data_offset + size]`).
+    pub data_offset: usize,
     /// A coarse content-type guess for regular files, from the name and the
     /// first bytes of the body. `None` for non-files.
     pub content_hint: Option<&'static str>,
@@ -114,6 +117,7 @@ pub fn decode_cpio_fragment(buf: &[u8]) -> Vec<CpioEntry> {
             },
             mode,
             size: data_len,
+            data_offset: data_start,
             content_hint,
         });
         if is_trailer {
@@ -193,6 +197,11 @@ mod tests {
             .find(|e| e.name == "etc/nmbl-luks/cryptroot")
             .expect("keyfile entry");
         assert_eq!(keyf.size, key.len());
+        assert_eq!(
+            fragment.get(keyf.data_offset..keyf.data_offset + keyf.size),
+            Some(&key[..]),
+            "data_offset must point at the file content"
+        );
         assert_eq!(keyf.content_hint, Some("LUKS keyfile (secret)"));
 
         let logf = files

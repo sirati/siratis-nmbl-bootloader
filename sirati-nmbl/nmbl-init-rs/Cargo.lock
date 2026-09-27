@@ -1388,6 +1388,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nmbl-simbox"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "nmbl-init",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "x11rb",
+]
+
+[[package]]
 name = "nmbl-ui-preview"
 version = "0.1.0"
 dependencies = [

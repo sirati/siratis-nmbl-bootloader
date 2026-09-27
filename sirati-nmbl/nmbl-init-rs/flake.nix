@@ -323,6 +323,20 @@
             pname = "nmbl-ui-preview";
           }
         );
+        # `nmbl-simbox` — runs the production nmbl-init as PID 1 in a rootless
+        # podman container with seccomp-notify simulated syscalls. Static musl:
+        # the same binary is copied into the container as blkid/cryptsetup.
+        simboxArgs = commonArgs // {
+          cargoExtraArgs = "-p nmbl-simbox";
+        };
+        simboxArtifacts = craneLib.buildDepsOnly simboxArgs;
+        nmbl-simbox = craneLib.buildPackage (
+          simboxArgs
+          // {
+            cargoArtifacts = simboxArtifacts;
+            pname = "nmbl-simbox";
+          }
+        );
       in
       {
         # Function form: callers wire Cargo features through this
@@ -343,6 +357,8 @@
           nmblctl = nmblctl;
           # Development only: never add this to a system or initramfs.
           nmbl-ui-preview = nmbl-ui-preview;
+          # Development only: the syscall-simulating container harness.
+          nmbl-simbox = nmbl-simbox;
         };
 
         # Useful for hand-testing: just runs the binary in your shell. It will
@@ -489,6 +505,14 @@
               cargoArtifacts = nmblctlArtifacts;
               cargoExtraArgs = "-p nmblctl";
               doCheck = true;
+            }
+          );
+
+          nmbl-simbox-clippy = craneLib.cargoClippy (
+            simboxArgs
+            // {
+              cargoArtifacts = simboxArtifacts;
+              cargoClippyExtraArgs = "-p nmbl-simbox --all-targets -- --deny warnings";
             }
           );
 
