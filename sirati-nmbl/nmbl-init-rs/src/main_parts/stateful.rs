@@ -127,7 +127,7 @@ pub(super) async fn select_with_stateful(
 /// (rollback) or `Exhausted` (no known-good left) overrides the
 /// operator's "just boot the default" intent exactly as it would have if
 /// the selector's countdown had expired. On the `HonourTui` branch we
-/// pick the active-profile default instead of rendering the picker, and
+/// pick the resolved remembered default instead of rendering the picker, and
 /// record the attempt in state.bin like the normal path does.
 ///
 /// No `console`/`session`: this path never draws, so it cannot reach
@@ -137,10 +137,11 @@ pub(super) async fn select_with_stateful(
 pub(super) fn select_default_with_stateful(
     config: &Config,
     generations: &[Generation],
+    default_index: usize,
 ) -> Result<Decision> {
     let active_index = active_generation_index(generations, &config.paths.nix_profiles_dir);
     let default_boot = || Decision::Boot {
-        generation_index: active_index,
+        generation_index: default_index,
         cmdline_override: None,
     };
 
@@ -179,7 +180,7 @@ pub(super) fn select_default_with_stateful(
                 "phase 5: selector skipped; booting default generation (recovery_attempt={})",
                 state.recovery_attempt,
             );
-            record_attempt(&mut state, generations, active_index, &state_path);
+            record_attempt(&mut state, generations, default_index, &state_path);
             Ok(default_boot())
         }
         nmbl_init::state::StatefulDecision::ForcePick(idx) => {

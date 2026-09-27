@@ -11,6 +11,68 @@ use nmbl_init::ui::console::NoopConsole;
 use super::should_force_external_rescue;
 use crate::boot_runtime::should_teardown_driver_images;
 
+#[cfg(feature = "stateful")]
+#[test]
+fn skipped_selector_honours_remembered_default_and_records_it() {
+    use nmbl_init::config::StatefulConfig;
+    use nmbl_init::generations::Generation;
+    use nmbl_init::state::{State, read, write_padded};
+    use nmbl_init::ui::Decision;
+
+    use super::dispatch::resolve_default_index;
+    use super::stateful::select_default_with_stateful;
+
+    let dir = tempfile::tempdir().expect("temporary state directory");
+    let profiles = dir.path().join("profiles");
+    let state_dir = dir.path().join("boot/nmbl");
+    std::fs::create_dir_all(&profiles).expect("profiles directory");
+    std::fs::create_dir_all(&state_dir).expect("state directory");
+    std::os::unix::fs::symlink("system-3-link", profiles.join("system"))
+        .expect("active profile link");
+    let generation = |number| Generation {
+        number,
+        profile_link: profiles.join(format!("system-{number}-link")),
+        toplevel: dir.path().join(format!("system-{number}")),
+        kernel: dir.path().join("kernel"),
+        initrd: dir.path().join("initrd"),
+        init_path: dir.path().join("init"),
+        kernel_params: Vec::new(),
+        label: String::new(),
+    };
+    let generations = [generation(3), generation(2)];
+    let state_path = state_dir.join("state.bin");
+    write_padded(&state_path, &State::default()).expect("initial state");
+    std::fs::write(state_dir.join("boot-default"), "generation 2\n").expect("remembered default");
+
+    let mut config = Config::recovery_default();
+    config.paths.nix_profiles_dir = profiles;
+    config.runtime_state_mountpoint = Some(dir.path().join("boot"));
+    config.stateful = Some(StatefulConfig {
+        max_recovery_attempts: 5,
+        success_target: "multi-user.target".to_owned(),
+    });
+
+    let default_index = resolve_default_index(&config, &generations);
+    assert_eq!(default_index, 1);
+    let decision =
+        select_default_with_stateful(&config, &generations, default_index).expect("boot decision");
+    assert!(matches!(
+        decision,
+        Decision::Boot {
+            generation_index: 1,
+            ..
+        }
+    ));
+    assert_eq!(
+        read(&state_path)
+            .expect("read state")
+            .expect("state exists")
+            .last_attempted_generation
+            .map(|n| n.get()),
+        Some(2),
+    );
+}
+
 #[test]
 fn force_on_boot_external_selects_rescue() {
     // The regression: force_on_boot=true + mode=external must select
