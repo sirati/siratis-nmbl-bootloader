@@ -28,6 +28,14 @@ pub const REFUSE_COUNTDOWN_SECONDS: u32 = 30;
 /// capped (FIX-38 / FIX-21). Nix mirror: `defaults.sentinelPath`.
 pub const SENTINEL_PATH: &str = "/boot/nmbl/rescue";
 
+/// Kernel-cmdline marker NMBL appends when the signed-generation state machine
+/// rolls an untested new generation back to its tested predecessor. Consumed
+/// by the `nmbl-rollback-after-untested-new-generation-failed` systemd target
+/// and by the handover cmdline decoder ([`crate::handover::cmdline`]). Defined
+/// here (always compiled) so the decoder can name it without pulling in the
+/// `secure-boot`-gated `generation_state` module.
+pub const ROLLBACK_CMDLINE: &str = "nmbl.rollback-after-untested-new-generation-failed";
+
 /// The committed 32-byte poison digest, pinned independently of `sha2` so the
 /// always-compiled `security_consts` test catches a silent change to the
 /// derived value even in a feature-free build (FIX-38). It MUST equal

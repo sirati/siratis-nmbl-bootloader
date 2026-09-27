@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::error::{NmblError, Result};
 
-pub const ROLLBACK_CMDLINE: &str = "nmbl.rollback-after-untested-new-generation-failed";
+pub const ROLLBACK_CMDLINE: &str = crate::security_consts::ROLLBACK_CMDLINE;
 
 /// What the persistent generation state says about this boot. Whether a
 /// [`BootStateOutcome::Failed`] enters rescue is decided by
