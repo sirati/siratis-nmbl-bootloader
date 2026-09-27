@@ -92,6 +92,8 @@
       # when NMBL is enabled. `null` on an older sibling flake.
       nmblCtl =
         nmbl-init-rs.packages.${system}.nmblctl or null;
+      nmblUiPreview =
+        nmbl-init-rs.packages.${system}.nmbl-ui-preview or null;
 
       # The host / install-time LUKS-to-TPM seal helper (`nmbl-tpm-enroll`). It
       # reuses `systemd-cryptenroll` to write a LUKS2 systemd-tpm2 token that
@@ -1373,6 +1375,8 @@
         test-erofs-bios-host-vm = erofsBiosHostVmTest;
         test-stateful-bios-host-vm = statefulBiosHostVmTest;
         test-instant-boot-vm = instantBootVmTest;
+        # Development only: NMBL's boot UI in an X11 window with mock scenarios.
+        nmbl-ui-preview = nmblUiPreview;
         test-boot-update-vm = bootUpdateVmTest;
       };
 

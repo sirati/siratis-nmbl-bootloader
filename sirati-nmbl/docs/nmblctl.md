@@ -79,3 +79,26 @@ on, the interactive console's latch records presence. One key anywhere before
 the selector cancels instant boot. Input is read from `/dev/console`, which
 is the primary console: the last `console=` argument (the serial line when
 `boot.nmbl.serialConsole` is set).
+
+## UI preview (development only)
+
+`nix run .#nmbl-ui-preview` opens NMBL's boot UI in an X11 window. The
+separate `nmbl-ui-preview` crate drives it with mock state: fake generations,
+boot progress, LUKS prompt and verification, wrong passphrase, emergency
+menu, rescue confirmation, and signature errors. It renders through NMBL's
+own code, unchanged: `ui::render_app` for the ratatui views and
+`ui::composite_frame`, the pipeline the DRM splash uses. Only the output
+surface (an X11 window) and the state source differ.
+
+- Tab and Shift+Tab switch scenarios, F5 resets, q quits. Every other key
+  goes to NMBL's own key handler.
+- `--scenario NAME` sets the starting scenario; `--list` lists the names.
+- `--size WxH` sets the window size.
+- `--dump-ppm DIR` renders every scenario to PPM files without X11.
+
+The mock code exists only in that crate, and no other crate depends on it.
+The `nmbl-ui-preview-absent` flake check greps every production binary
+(nmbl-init in its default, splash and full-feature builds, nmblctl, nmbl-sign
+and nmbl-boot-update) for the preview's marker string and crate name. The
+check also requires the marker to be present in the preview binary itself,
+so it cannot pass vacuously.

@@ -68,6 +68,24 @@ pub(crate) fn render_splash_frame_with(
     cell_dims: CellDims,
     body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
 ) -> Result<()> {
+    drm.render(|fb, fb_dims| composite_frame(fb, fb_dims, bg_scaled, cache, cell_dims, body))
+}
+
+/// Render one ratatui frame into an XRGB8888 framebuffer: draw `body`, parse
+/// the escape stream into a cell grid, then blit background, halo, cell
+/// backgrounds and glyphs. This is the whole splash pipeline minus the output
+/// device: [`render_splash_frame_with`] hands it the DRM dumb buffer, and the
+/// separate `nmbl-ui-preview` crate hands it an X11 window's buffer, so both
+/// show byte-identical pixels.
+#[cfg(feature = "image-splash")]
+pub fn composite_frame(
+    fb: &mut [u8],
+    fb_dims: crate::splash::types::FramebufferDims,
+    bg_scaled: &[u8],
+    cache: &glyph_cache::GlyphCache,
+    cell_dims: CellDims,
+    body: &mut dyn FnMut(&mut ratatui::Frame<'_>),
+) -> Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     {
         let backend = CrosstermBackend::new(&mut buf);
@@ -79,66 +97,63 @@ pub(crate) fn render_splash_frame_with(
 
     let mut term_pipe = SplashTerminal::new(cell_dims);
     term_pipe.feed(&buf);
-
-    drm.render(|fb, fb_dims| {
-        compositor::blit_background(fb, fb_dims, bg_scaled);
-        // Pass 1: build ONE unified text-coverage mask from every cell
-        // that wants the halo (transparent default bg + inked glyph),
-        // then blur + composite the dark contrast halo a single time.
-        // Painted before any glyph so it only darkens the background
-        // photo, never adjacent drawn text; the mask uses max-combine so
-        // overlapping glyphs union (no rings / no double-darkening).
-        let mut halo = compositor::HaloMask::new(fb_dims);
-        term_pipe.for_each_cell(|col, row, cell| {
-            if !compositor::wants_halo(cell.bg) {
-                return;
-            }
-            let bold = cell.flags.contains(Flags::BOLD);
-            let Some(glyph) = cache.get(cell.c, bold) else {
-                return;
-            };
-            let x = u32::from(col).saturating_mul(cell_dims.cell_w);
-            let y = u32::from(row).saturating_mul(cell_dims.cell_h);
-            let rect = compositor::CellRect {
-                x,
-                y,
-                w: cell_dims.cell_w,
-                h: cell_dims.cell_h,
-            };
-            halo.stamp(glyph, rect);
-        });
-        halo.composite_onto(fb, fb_dims);
-        // Pass 2: cell-background fills (selection highlight etc.) drawn
-        // directly, while every foreground glyph is collected into ONE
-        // text layer. The layer is composited last (after all bg fills)
-        // so text sits on top of selection backgrounds, and so two
-        // overlapping semi-transparent glyphs composite exactly once
-        // (no doubled "white dots" at cell joins).
-        let mut text_layer = compositor::TextLayer::new(fb_dims);
-        term_pipe.for_each_cell(|col, row, cell| {
-            if cell.c == ' ' && cell.bg == Color::Named(NamedColor::Background) {
-                return;
-            }
-            let bold = cell.flags.contains(Flags::BOLD);
-            let Some(glyph) = cache.get(cell.c, bold) else {
-                return;
-            };
-            let fg = compositor::resolve_color(cell.fg);
-            let bg = compositor::resolve_bg_color(cell.bg);
-            let x = u32::from(col).saturating_mul(cell_dims.cell_w);
-            let y = u32::from(row).saturating_mul(cell_dims.cell_h);
-            let rect = compositor::CellRect {
-                x,
-                y,
-                w: cell_dims.cell_w,
-                h: cell_dims.cell_h,
-            };
-            compositor::fill_cell_bg(fb, fb_dims, rect, bg);
-            text_layer.stamp(glyph, rect, fg);
-        });
-        text_layer.composite_onto(fb, fb_dims);
-        Ok(())
-    })
+    compositor::blit_background(fb, fb_dims, bg_scaled);
+    // Pass 1: build ONE unified text-coverage mask from every cell
+    // that wants the halo (transparent default bg + inked glyph),
+    // then blur + composite the dark contrast halo a single time.
+    // Painted before any glyph so it only darkens the background
+    // photo, never adjacent drawn text; the mask uses max-combine so
+    // overlapping glyphs union (no rings / no double-darkening).
+    let mut halo = compositor::HaloMask::new(fb_dims);
+    term_pipe.for_each_cell(|col, row, cell| {
+        if !compositor::wants_halo(cell.bg) {
+            return;
+        }
+        let bold = cell.flags.contains(Flags::BOLD);
+        let Some(glyph) = cache.get(cell.c, bold) else {
+            return;
+        };
+        let x = u32::from(col).saturating_mul(cell_dims.cell_w);
+        let y = u32::from(row).saturating_mul(cell_dims.cell_h);
+        let rect = compositor::CellRect {
+            x,
+            y,
+            w: cell_dims.cell_w,
+            h: cell_dims.cell_h,
+        };
+        halo.stamp(glyph, rect);
+    });
+    halo.composite_onto(fb, fb_dims);
+    // Pass 2: cell-background fills (selection highlight etc.) drawn
+    // directly, while every foreground glyph is collected into ONE
+    // text layer. The layer is composited last (after all bg fills)
+    // so text sits on top of selection backgrounds, and so two
+    // overlapping semi-transparent glyphs composite exactly once
+    // (no doubled "white dots" at cell joins).
+    let mut text_layer = compositor::TextLayer::new(fb_dims);
+    term_pipe.for_each_cell(|col, row, cell| {
+        if cell.c == ' ' && cell.bg == Color::Named(NamedColor::Background) {
+            return;
+        }
+        let bold = cell.flags.contains(Flags::BOLD);
+        let Some(glyph) = cache.get(cell.c, bold) else {
+            return;
+        };
+        let fg = compositor::resolve_color(cell.fg);
+        let bg = compositor::resolve_bg_color(cell.bg);
+        let x = u32::from(col).saturating_mul(cell_dims.cell_w);
+        let y = u32::from(row).saturating_mul(cell_dims.cell_h);
+        let rect = compositor::CellRect {
+            x,
+            y,
+            w: cell_dims.cell_w,
+            h: cell_dims.cell_h,
+        };
+        compositor::fill_cell_bg(fb, fb_dims, rect, bg);
+        text_layer.stamp(glyph, rect, fg);
+    });
+    text_layer.composite_onto(fb, fb_dims);
+    Ok(())
 }
 
 #[cfg(feature = "image-splash")]

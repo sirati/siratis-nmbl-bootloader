@@ -309,6 +309,20 @@
             pname = "nmblctl";
           }
         );
+        # `nmbl-ui-preview` — development-only X11 preview of the boot UI driven
+        # by mock scenarios. Its own crate: nothing depends on it, so no
+        # production target can link its mock code (see nmbl-ui-preview-absent).
+        previewCommonArgs = hostCommonArgs // {
+          cargoExtraArgs = "-p nmbl-ui-preview";
+        };
+        previewArtifacts = hostCraneLib.buildDepsOnly previewCommonArgs;
+        nmbl-ui-preview = hostCraneLib.buildPackage (
+          previewCommonArgs
+          // {
+            cargoArtifacts = previewArtifacts;
+            pname = "nmbl-ui-preview";
+          }
+        );
       in
       {
         # Function form: callers wire Cargo features through this
@@ -327,6 +341,8 @@
           # The system-side control/inspection tool (root-only), shipped in the
           # system closure when NMBL is enabled.
           nmblctl = nmblctl;
+          # Development only: never add this to a system or initramfs.
+          nmbl-ui-preview = nmbl-ui-preview;
         };
 
         # Useful for hand-testing: just runs the binary in your shell. It will
@@ -475,6 +491,52 @@
               doCheck = true;
             }
           );
+
+          nmbl-ui-preview-clippy = hostCraneLib.cargoClippy (
+            previewCommonArgs
+            // {
+              cargoArtifacts = previewArtifacts;
+              cargoClippyExtraArgs = "-p nmbl-ui-preview --all-targets -- --deny warnings";
+            }
+          );
+          # Renders every mock scenario through NMBL's real views + compositor
+          # (headless, no X11 needed).
+          nmbl-ui-preview-test = hostCraneLib.cargoTest (
+            previewCommonArgs
+            // {
+              cargoArtifacts = previewArtifacts;
+              cargoExtraArgs = "-p nmbl-ui-preview";
+              doCheck = true;
+            }
+          );
+          # The preview's mock code must never reach a production binary. Its
+          # crate embeds a unique marker string; every production binary is
+          # scanned for it (and for the crate name), and the scan is proven
+          # effective by requiring the marker IN the preview binary itself.
+          nmbl-ui-preview-absent = pkgs.runCommand "nmbl-ui-preview-absent" {
+            nativeBuildInputs = [ pkgs.gnugrep pkgs.binutils ];
+          } ''
+            marker="NMBL-UI-PREVIEW-MOCK-BACKEND-7f3c"
+            grep -qaF "$marker" ${nmbl-ui-preview}/bin/nmbl-ui-preview \
+              || { echo "scan is ineffective: marker missing from the preview itself"; exit 1; }
+            rc=0
+            for bin in \
+              ${nmbl-init}/bin/nmbl-init \
+              ${nmbl-init-splash}/bin/nmbl-init \
+              ${mkNmblInit { features = [ "image-splash" "secure-boot" "stateful" ]; publicKeys = [ ]; requireKeys = false; }}/bin/nmbl-init \
+              ${nmblctl}/bin/nmblctl \
+              ${nmbl-sign}/bin/nmbl-sign \
+              ${nmbl-boot-update}/bin/nmbl-boot-update; do
+              for needle in "$marker" "nmbl_ui_preview" "nmbl-ui-preview"; do
+                if grep -qaF "$needle" "$bin"; then
+                  echo "FAIL: $bin contains preview code ($needle)"; rc=1
+                fi
+              done
+            done
+            [ "$rc" -eq 0 ] || exit 1
+            echo "OK: no production binary contains nmbl-ui-preview code"
+            touch $out
+          '';
 
           # Replacing our own process (execve) or spawning one
           # (std::process::Command) is only sound at a handful of sites:
