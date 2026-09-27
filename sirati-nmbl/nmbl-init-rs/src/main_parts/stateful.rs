@@ -4,7 +4,7 @@ use nmbl_init::config::Config;
 use nmbl_init::error::{NmblError, Result};
 use nmbl_init::generations::{Generation, active_generation_index};
 use nmbl_init::ui::console::Console;
-use nmbl_init::ui::{Decision, SessionInteraction, run_selector};
+use nmbl_init::ui::{Decision, SessionInteraction, run_selector_with_default};
 use nmbl_init::{nmbl_info, nmbl_warn};
 
 /// Stateful entry point for the boot selector. Returns the same
@@ -28,6 +28,7 @@ pub(super) async fn select_with_stateful(
     generations: &[Generation],
     console: &mut dyn Console,
     session: &SessionInteraction,
+    default_index: usize,
 ) -> Result<Decision> {
     // No opt-in: legacy path verbatim.
     let (Some(_stateful), Some(state_mp)) = (
@@ -35,7 +36,8 @@ pub(super) async fn select_with_stateful(
         config.runtime_state_mountpoint.as_deref(),
     ) else {
         nmbl_info!("phase 5: TUI generation selector");
-        return run_selector(config, generations, console, session).await;
+        return run_selector_with_default(config, generations, console, default_index, session)
+            .await;
     };
 
     let state_path = state_mp.join("nmbl").join("state.bin");
@@ -51,7 +53,8 @@ pub(super) async fn select_with_stateful(
                 state_path.display(),
             );
             nmbl_info!("phase 5: TUI generation selector");
-            return run_selector(config, generations, console, session).await;
+            return run_selector_with_default(config, generations, console, default_index, session)
+                .await;
         }
         Err(err) => {
             // IO error other than NotFound (which `read` already maps to
@@ -64,7 +67,8 @@ pub(super) async fn select_with_stateful(
                 state_path.display(),
             );
             nmbl_info!("phase 5: TUI generation selector");
-            return run_selector(config, generations, console, session).await;
+            return run_selector_with_default(config, generations, console, default_index, session)
+                .await;
         }
     };
 
@@ -79,7 +83,9 @@ pub(super) async fn select_with_stateful(
                 "phase 5: TUI generation selector (stateful: honour operator choice, recovery_attempt={})",
                 state.recovery_attempt,
             );
-            let decision = run_selector(config, generations, console, session).await?;
+            let decision =
+                run_selector_with_default(config, generations, console, default_index, session)
+                    .await?;
             if let Decision::Boot {
                 generation_index,
                 cmdline_override: _,

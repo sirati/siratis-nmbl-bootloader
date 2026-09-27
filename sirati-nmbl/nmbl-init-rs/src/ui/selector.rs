@@ -33,6 +33,20 @@ pub async fn run_selector(
     run_selector_on_console(config, generations, console, default_index, session).await
 }
 
+/// Like [`run_selector`] but with a caller-supplied default index (the entry
+/// highlighted at start and booted on timeout). Used to honour the operator's
+/// remembered default / one-shot selection ([`crate::boot_selection`]) instead
+/// of always defaulting to the active profile.
+pub async fn run_selector_with_default(
+    config: &Config,
+    generations: &[Generation],
+    console: &mut dyn Console,
+    default_index: usize,
+    session: &SessionInteraction,
+) -> Result<Decision> {
+    run_selector_on_console(config, generations, console, default_index, session).await
+}
+
 /// TUI event loop. Backend-agnostic: every render and key-poll goes
 /// through the [`Console`] trait. Hosts the countdown, the List/Editing
 /// state machine, and the timeout-defaults-to-active-profile rule.

@@ -11,8 +11,6 @@ use nmbl_init::generations::scan_generations;
 use nmbl_init::shell::{drop_to_emergency, print_banner, print_halt_banner};
 use nmbl_init::terminal::{TerminalAction, redirect_stdio_for_execve};
 use nmbl_init::ui::console::{Console, LatchingConsole};
-#[cfg(not(feature = "stateful"))]
-use nmbl_init::ui::run_selector;
 use nmbl_init::ui::{BootReporter, Decision, SessionInteraction, SkipSelector};
 use nmbl_init::{log, nmbl_info, nmbl_warn};
 
@@ -99,22 +97,30 @@ pub(super) async fn select_and_act(
         // storage AND state.bin is readable, `select_with_stateful`
         // decides whether to honour the TUI countdown, force-pick a
         // known-good generation, or surface an Exhausted rescue
-        // condition. Otherwise it collapses to the legacy selector.
-        select_with_stateful(config, &generations, console, session).await?
+        // condition. Otherwise it collapses to the legacy selector. The
+        // resolved default index carries the operator's remembered default /
+        // one-shot selection into the HonourTui countdown.
+        let default_index = resolve_default_index(config, &generations);
+        select_with_stateful(config, &generations, console, session, default_index).await?
     };
     #[cfg(not(feature = "stateful"))]
     let decision = if skip_selector.get() || instant {
         nmbl_info!("phase 5: selector skipped — booting default generation");
         Decision::Boot {
-            generation_index: nmbl_init::generations::active_generation_index(
-                &generations,
-                &config.paths.nix_profiles_dir,
-            ),
+            generation_index: resolve_default_index(config, &generations),
             cmdline_override: None,
         }
     } else {
         nmbl_info!("phase 5: TUI generation selector");
-        run_selector(config, &generations, console, session).await?
+        let default_index = resolve_default_index(config, &generations);
+        nmbl_init::ui::run_selector_with_default(
+            config,
+            &generations,
+            console,
+            default_index,
+            session,
+        )
+        .await?
     };
 
     match decision {
@@ -131,6 +137,11 @@ pub(super) async fn select_and_act(
                     context: "decision dispatch".to_string(),
                 });
             };
+            // A one-shot selection fires exactly once: now that this boot has
+            // committed to a generation, consume it so the next boot reverts to
+            // the persistent default. Only meaningful on profile hosts (the
+            // resolver is a no-op on signed-EROFS — see `resolve_default_index`).
+            consume_one_shot_if_any(config);
             kexec_into(
                 config,
                 target,
@@ -148,6 +159,67 @@ pub(super) async fn select_and_act(
             Ok(TerminalAction::Reboot)
         }
     }
+}
+
+/// Resolve the effective default generation index for the selector, honouring
+/// the operator's remembered default / one-shot ([`nmbl_init::boot_selection`])
+/// on profile hosts. On signed-EROFS hosts the selection is the verified
+/// `active` symlink, so this is a NO-OP there (returns the active index) — the
+/// flag files are never written on EROFS and must never act as an unverified
+/// selector.
+fn resolve_default_index(
+    config: &Config,
+    generations: &[nmbl_init::generations::Generation],
+) -> usize {
+    let active = nmbl_init::generations::active_generation_index(
+        generations,
+        &config.paths.nix_profiles_dir,
+    );
+    #[cfg(feature = "secure-boot")]
+    if config.generation_image.as_ref().is_some_and(|g| g.enable) {
+        return active;
+    }
+    let Some(state_dir) = boot_selection_state_dir(config) else {
+        return active;
+    };
+    let available: Vec<u32> = generations.iter().map(|g| g.number).collect();
+    let fallback = generations.get(active).map_or_else(
+        || available.iter().copied().max().unwrap_or(0),
+        |g| g.number,
+    );
+    let target =
+        nmbl_init::boot_selection::resolve_default_number(&state_dir, &available, fallback);
+    generations
+        .iter()
+        .position(|g| g.number == target)
+        .unwrap_or(active)
+}
+
+/// Consume a one-shot selection once the boot commits, on profile hosts only.
+fn consume_one_shot_if_any(config: &Config) {
+    #[cfg(feature = "secure-boot")]
+    if config.generation_image.as_ref().is_some_and(|g| g.enable) {
+        return;
+    }
+    if let Some(state_dir) = boot_selection_state_dir(config) {
+        nmbl_init::boot_selection::consume_one_shot(&state_dir);
+    }
+}
+
+/// The directory the `boot-default` / `boot-once` flag files live in, resolved
+/// against the writable state mount when NMBL has one (stateful hosts bind the
+/// boot fs RW), else the boot mountpoint's `nmbl` subdir. `None` when neither
+/// is available (embedded, non-stateful — the files are then unreachable and
+/// the resolver falls back to the active profile).
+fn boot_selection_state_dir(config: &Config) -> Option<std::path::PathBuf> {
+    #[cfg(feature = "stateful")]
+    if let Some(mp) = config.runtime_state_mountpoint.as_deref() {
+        return Some(mp.join("nmbl"));
+    }
+    config
+        .runtime_boot_mountpoint
+        .as_deref()
+        .map(|b| b.join("nmbl"))
 }
 
 /// Gather the facts that drive the instant-boot decision from the loaded
@@ -179,7 +251,12 @@ fn gather_instant_boot_inputs(
 
     // A boot with neither stateful tracking nor signed-generation state cannot
     // prove the previous boot was healthy, so instant boot stays conservative
-    // and only applies when at least one health source vouches for it.
+    // and only applies when at least one health source vouches for it. `mut`
+    // only when a health source (feature-gated below) can set it true.
+    #[cfg_attr(
+        not(any(feature = "stateful", feature = "secure-boot")),
+        allow(unused_mut)
+    )]
     let mut health_known = false;
 
     #[cfg(feature = "stateful")]

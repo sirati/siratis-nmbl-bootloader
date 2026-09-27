@@ -88,7 +88,7 @@ pub use password_supplier::TuiPasswordSupplier;
 #[cfg(feature = "mocking")]
 pub(crate) use password_supplier::passphrase_prompt_on_console;
 pub(crate) use screen_render::render_current_screen;
-pub use selector::run_selector;
+pub use selector::{run_selector, run_selector_with_default};
 
 #[cfg(feature = "image-splash")]
 pub(crate) use splash_render::{render_splash_frame, render_splash_frame_with};
