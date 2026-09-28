@@ -192,7 +192,15 @@ plus directory fsync protects every state update.
 ## Offline and remote deployment
 
 The production command builds the unsigned image and external runtime config,
-then signs both on the operator machine. Local mode installs the image directly:
+then signs both on the operator machine.
+
+Build artifacts remain under temporary GC roots throughout signing and transfer.
+The command prints a visible `nmbl-erofs-deploy.*` directory in the current
+repository, holding the roots and signed bundle. It removes this directory on
+success or failure. A process killed without cleanup leaves an identifiable
+directory in the repository that the operator can remove.
+
+Local mode installs the image directly:
 
 ```sh
 nix run .#nmbl-erofs-deploy -- \
