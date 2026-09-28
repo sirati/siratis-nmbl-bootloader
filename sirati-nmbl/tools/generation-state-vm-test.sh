@@ -41,7 +41,7 @@ make_disk() {
 
 prepare_layout() {
   local root_store=$2 dir="$work/$1"
-  local state_tree state_root invalid_label artifacts first second third
+  local state_tree state_root invalid_label artifacts first second third leftovers
   mkdir -p "$dir/boot-tree" "$dir/root-tree" "$dir/store-tree"
   if [[ "$root_store" == true ]]; then
     state_tree="$dir/root-tree"
@@ -87,21 +87,44 @@ set -eu
 test "\$1" = --; shift
 test "\$1" = generation-test-target; shift
 test "\$1" = nmbl-erofs-receive
+root_dir=\$(find "$dir" -maxdepth 1 -type d -name 'nmbl-erofs-deploy.*')
+test -n "\$root_dir"
+for artifact in image ctl config system rescue signer; do
+  root="\$root_dir/root-\$artifact"
+  test -L "\$root"
+  roots=\$(nix-store --query --roots "\$(readlink "\$root")" 2>/dev/null)
+  case "\$roots" in *"\$root -> "*) ;; *) exit 1 ;; esac
+done
 exec @receive@/bin/nmbl-erofs-receive "$dir/incoming" "$state_root" "$public"
 EOF
   chmod 0700 "$dir/test-ssh"
-  first=$(NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
+  first=$(cd "$dir"; NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
     NMBL_SIGN_KEY_COMMAND="$key_command" @deploy@/bin/nmbl-erofs-deploy remote \
     "path:$dir#nixosConfigurations.first" - generation-test-target | tail -n1)
-  second=$(NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
+  second=$(cd "$dir"; NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
     @deploy@/bin/nmbl-erofs-deploy remote \
     "path:$dir#nixosConfigurations.second" "$private" generation-test-target | tail -n1)
-  third=$(NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
+  third=$(cd "$dir"; NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
     NMBL_SIGN_KEY_COMMAND="$key_command" @deploy@/bin/nmbl-erofs-deploy remote \
     "path:$dir#nixosConfigurations.third" - generation-test-target | tail -n1)
   test "$first" != "$second"
   test "$second" != "$third"
   test "$first" != "$third"
+  leftovers=$(find "$dir" -maxdepth 1 -type d -name 'nmbl-erofs-deploy.*')
+  test -z "$leftovers"
+  # A failed upload also releases all roots and the visible bundle directory.
+  printf '#!/bin/sh\nexit 23\n' > "$dir/fail-ssh"
+  chmod 0700 "$dir/fail-ssh"
+  if (cd "$dir"; NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/fail-ssh" \
+    NMBL_SIGN_KEY_COMMAND="$key_command" @deploy@/bin/nmbl-erofs-deploy remote \
+    "path:$dir#nixosConfigurations.first" - generation-test-target) \
+      > "$dir/failed-upload.log" 2>&1; then
+    echo 'failed upload unexpectedly succeeded' >&2; exit 1
+  else
+    test "$?" -eq 23
+  fi
+  leftovers=$(find "$dir" -maxdepth 1 -type d -name 'nmbl-erofs-deploy.*')
+  test -z "$leftovers"
   printf '%s\n' "$first" > "$dir/boot-tree/nmbl-test-first"
   printf '%s\n' "$second" > "$dir/boot-tree/nmbl-test-second"
   printf '%s\n' "$third" > "$dir/boot-tree/nmbl-test-third"

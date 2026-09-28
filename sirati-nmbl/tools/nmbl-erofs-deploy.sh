@@ -12,6 +12,9 @@ INSTALLABLE is a NixOS configuration, for example:
 The command builds unsigned generation and runtime-config artifacts and signs
 outside Nix with PRIVATE_KEY. Remote mode streams both signatures and payloads
 to a forced nmbl-erofs-receive command over SSH for verification and activation.
+Temporary GC roots in a visible nmbl-erofs-deploy.* directory in the current
+repository retain every artifact through signing and upload. The directory
+is printed and removed when the command exits.
 PRIVATE_KEY and local IMAGE_ROOT paths must be outside /nix/store.
 
 Pass `-` as PRIVATE_KEY to take the key from NMBL_SIGN_KEY_COMMAND instead: a
@@ -58,25 +61,28 @@ fi
 
 nix_args=()
 if [[ ${NMBL_EROFS_DEPLOY_IMPURE:-0} = 1 ]]; then nix_args+=(--impure); fi
-image=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
-  "$installable.config.system.build.nmblGenerationImage")
-ctl=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
-  "$installable.config.system.build.nmblErofsCtl")
-bundle=$(mktemp -d --tmpdir nmbl-erofs-bundle.XXXXXXXX)
+bundle=$(mktemp -d "$PWD/nmbl-erofs-deploy.XXXXXXXX")
 trap 'chmod -R u+w "$bundle" 2>/dev/null || true; find "$bundle" -delete' EXIT
+printf 'Retaining deployment artifacts and GC roots in %s until completion\n' "$bundle" >&2
+# Keep all closures rooted until signing, upload and activation have finished.
+# The links are indirect GC roots; deleting the bundle releases them on exit.
+image=$(nix build "${nix_args[@]}" --out-link "$bundle/root-image" --print-out-paths \
+  "$installable.config.system.build.nmblGenerationImage")
+ctl=$(nix build "${nix_args[@]}" --out-link "$bundle/root-ctl" --print-out-paths \
+  "$installable.config.system.build.nmblErofsCtl")
 generation=$("$ctl/bin/nmbl-erofsctl" prepare \
   "$image" "$private_key" "$bundle/generation")
 if [[ "$mode" = local ]]; then
   "$ctl/bin/nmbl-erofsctl" install "$bundle/generation" "$destination"
   "$ctl/bin/nmbl-erofsctl" activate "$generation" "$destination"
 else
-  config=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
+  config=$(nix build "${nix_args[@]}" --out-link "$bundle/root-config" --print-out-paths \
     "$installable.config.system.build.nmblConfigToml")
-  toplevel=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
+  toplevel=$(nix build "${nix_args[@]}" --out-link "$bundle/root-system" --print-out-paths \
     "$installable.config.system.build.toplevel")
-  rescue=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
+  rescue=$(nix build "${nix_args[@]}" --out-link "$bundle/root-rescue" --print-out-paths \
     "$installable.config.system.build.nmblRescueSquashfs")
-  signer=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
+  signer=$(nix build "${nix_args[@]}" --out-link "$bundle/root-signer" --print-out-paths \
     "$installable.config.system.build.nmblSign")
   install -m 0444 "$config" "$bundle/config.toml"
   sign_with_key --domain boot-config \
@@ -94,7 +100,7 @@ else
     "$installable.config.boot.nmbl.rescue.fullSystem.networkStage.enable")
   network_size=0 network_signature_size=0
   if [[ "$network_enabled" = true ]]; then
-    network=$(nix build "${nix_args[@]}" --no-link --print-out-paths \
+    network=$(nix build "${nix_args[@]}" --out-link "$bundle/root-network" --print-out-paths \
       "$installable.config.system.build.nmblNetworkStage")
     install -m 0444 "$network" "$bundle/network.erofs"
     sign_with_key --domain network-stage \

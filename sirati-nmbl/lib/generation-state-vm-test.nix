@@ -2,7 +2,7 @@
 
 pkgs.writeShellApplication {
   name = "nmbl-generation-state-vm-test";
-  runtimeInputs = [ pkgs.coreutils pkgs.e2fsprogs pkgs.nix pkgs.python3 ];
+  runtimeInputs = [ pkgs.coreutils pkgs.e2fsprogs pkgs.findutils pkgs.nix pkgs.python3 ];
   text = builtins.replaceStrings
     [ "@source@" "@signer@" "@ctl@" "@receive@" "@deploy@" "@scanner@" "@eval@" "@harness@" "@qemu@" ]
     [
