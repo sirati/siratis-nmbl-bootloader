@@ -145,7 +145,8 @@
           dual-stack) family_args="--waitip" ;;
           *) local_network_only "invalid DHCP address family" ;;
         esac
-        ${dhcpcd}/bin/dhcpcd $family_args -t 20 $ifaces > /dev/console 2>&1 \
+        # Rescue has no udev daemon/database; use kernel interfaces directly.
+        ${dhcpcd}/bin/dhcpcd --nodev $family_args -t 20 $ifaces > /dev/console 2>&1 \
           || log "WARNING: dhcpcd did not bind an address in time"
       fi
 
