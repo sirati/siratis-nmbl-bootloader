@@ -3,6 +3,7 @@
   lib,
   rootPaths,
   label ? "NMBL-NIX",
+  bootstrap ? null,
 }:
 
 let
@@ -20,6 +21,11 @@ pkgs.runCommand "nmbl-generation.erofs" {
   mkdir -p profile/var/NMBLPROFILES
   ln -s ${toplevel} profile/var/NMBLPROFILES/system-1-link
   ln -s system-1-link profile/var/NMBLPROFILES/system
+  ${lib.optionalString (bootstrap != null) ''
+    mkdir -p profile/nmbl-bootstrap
+    cp ${bootstrap.kernel} profile/nmbl-bootstrap/kernel
+    cp ${bootstrap.initrd} profile/nmbl-bootstrap/initrd
+  ''}
   tar --create \
     --absolute-names \
     --verbatim-files-from \
