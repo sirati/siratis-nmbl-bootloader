@@ -6,7 +6,7 @@ use std::path::Path;
 use super::TtyConsole;
 use super::caps::BUNDLED_TERMINFO;
 use super::caps::caps_from_env_with_fallback;
-use super::kd::{KD_TEXT, enter_kd_graphics, restore_kd_mode};
+use super::kd::{KD_TEXT, enter_kd_text, restore_kd_mode};
 
 /// `/dev/null` is not a tty, so opening it as a [`TtyConsole`]
 /// must fail at the `enter_raw` step (ENOTTY).
@@ -20,7 +20,7 @@ fn open_path_on_non_tty_errors() {
 }
 
 #[test]
-fn enter_kd_graphics_on_non_vt_returns_none() {
+fn enter_kd_text_on_non_vt_returns_none() {
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -29,7 +29,7 @@ fn enter_kd_graphics_on_non_vt_returns_none() {
         Ok(f) => f,
         Err(_) => return,
     };
-    let result = enter_kd_graphics(file.as_fd());
+    let result = enter_kd_text(file.as_fd());
     assert!(
         result.is_none(),
         "expected None on non-VT fd (KDGETMODE→ENOTTY), got {result:?}"
