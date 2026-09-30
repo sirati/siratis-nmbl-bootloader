@@ -22,7 +22,7 @@ nixpkgs.lib.nixosSystem {
           exec > /dev/ttyS0 2>&1
           trap 'systemctl --failed --no-pager; systemctl status nmbl-generation-success.service boot-complete.target systemd-boot-check-no-failures.service --no-pager || true; echo NMBL_STATE_STEP_FAILED' ERR
           root=${generationStateRoot}
-          step=$(cat /boot/nmbl-test-step 2>/dev/null || echo 0)
+          step=$(cat /boot/nmbl-test-step 2>/dev/null || echo -2)
           first=$(cat /boot/nmbl-test-first)
           second=$(cat /boot/nmbl-test-second)
           third=$(cat /boot/nmbl-test-third)
@@ -54,6 +54,29 @@ nixpkgs.lib.nixosSystem {
             ${config.systemd.package}/bin/systemctl poweroff
           }
           case "$step" in
+            -2)
+              wait_failed systemd-boot-check-no-failures.service
+              test "$(pointer attempted)" = "$first"
+              test ! -e "$root/tested"
+              ${config.system.build.nmblErofsCtl}/bin/nmbl-erofsctl activate "$second" "$root"
+              test "$(pointer active)" = "$second"
+              test "$(pointer pending)" = "$second"
+              test ! -e "$root/attempted"
+              test ! -e "$root/tested"
+              # The old boot cannot bless the replacement generation.
+              if ${config.system.build.nmblInit}/bin/nmbl-generation-state mark-success "$root"; then
+                exit 1
+              fi
+              rm /boot/nmbl-force-degraded
+              finish NMBL_FIRST_RECOVERY_ACTIVATED -1
+              ;;
+            -1)
+              wait_active nmbl-generation-success.service
+              test "$(pointer tested)" = "$second"
+              test ! -e "$root/attempted"
+              ${config.system.build.nmblErofsCtl}/bin/nmbl-erofsctl activate "$first" "$root"
+              finish NMBL_FIRST_RECOVERY_BLESSED 0
+              ;;
             0)
               wait_active nmbl-generation-success.service
               test "$(pointer tested)" = "$first"

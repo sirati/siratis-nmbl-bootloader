@@ -101,12 +101,23 @@ EOF
   first=$(cd "$dir"; NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
     NMBL_SIGN_KEY_COMMAND="$key_command" @deploy@/bin/nmbl-erofs-deploy remote \
     "path:$dir#nixosConfigurations.first" - generation-test-target | tail -n1)
+  test ! -e "$state_root/tested"
+  ln -s "generations/$first" "$state_root/attempted"
   second=$(cd "$dir"; NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
     @deploy@/bin/nmbl-erofs-deploy remote \
     "path:$dir#nixosConfigurations.second" "$private" generation-test-target | tail -n1)
+  test ! -e "$state_root/attempted"
+  test ! -e "$state_root/tested"
+  # A signed update also preserves a genuinely tested fallback when an
+  # unconfirmed generation is superseded (the VM verifies real blessing).
+  ln -s "generations/$first" "$state_root/tested"
+  ln -s "generations/$second" "$state_root/attempted"
   third=$(cd "$dir"; NMBL_EROFS_DEPLOY_IMPURE=1 NMBL_EROFS_SSH="$dir/test-ssh" \
     NMBL_SIGN_KEY_COMMAND="$key_command" @deploy@/bin/nmbl-erofs-deploy remote \
     "path:$dir#nixosConfigurations.third" - generation-test-target | tail -n1)
+  test ! -e "$state_root/attempted"
+  test "$(readlink "$state_root/tested")" = "generations/$first"
+  rm "$state_root/tested"
   test "$first" != "$second"
   test "$second" != "$third"
   test "$first" != "$third"
@@ -130,6 +141,7 @@ EOF
   printf '%s\n' "$third" > "$dir/boot-tree/nmbl-test-third"
 
   @ctl@/bin/nmbl-erofsctl activate "$first" "$state_root" >/dev/null
+  touch "$dir/boot-tree/nmbl-force-degraded"
 
   make_disk "$dir/boot-tree" "$dir/boot.raw" NMBLBOOT
   make_disk "$dir/root-tree" "$dir/root.raw" NMBLROOT
