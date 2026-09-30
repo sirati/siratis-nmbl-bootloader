@@ -18,7 +18,10 @@ pkgs.runCommand "nmbl-generation.erofs" {
   unsafeDiscardReferences.out = true;
 } ''
   # The placeholder avoids the /nix/ store-path transform rewriting metadata.
-  mkdir -p profile/var/NMBLPROFILES
+  # Explicit parent metadata prevents tar import from synthesizing a writable
+  # store directory, which OpenSSH rejects for AuthorizedKeysCommand paths.
+  mkdir -p profile/store profile/var/NMBLPROFILES
+  chmod 0755 profile profile/store
   ln -s ${toplevel} profile/var/NMBLPROFILES/system-1-link
   ln -s system-1-link profile/var/NMBLPROFILES/system
   ${lib.optionalString (bootstrap != null) ''
