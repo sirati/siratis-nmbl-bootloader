@@ -1,12 +1,23 @@
 { pkgs, lib, cfg, loaderArgs }:
 
+let
+  generation = cfg.generationImage;
+  storeMount = if generation.stage1Store == null then "/boot" else generation.stage1Store.targetMountPoint;
+  relativeState = lib.removePrefix "${if storeMount == "/" then "" else storeMount}/" generation.stateRoot;
+in
+
 pkgs.writeText "nmbl-grub.cfg" ''
   set timeout=${toString loaderArgs.timeout}
   set default=${loaderArgs.default}
   ${loaderArgs.extraConfig}
 
   menuentry "NMBL Bootloader" {
-  ${if cfg.bootUpdate.enable or false then ''
+  ${if generation.enable && generation.bootstrapUpdates then ''
+    search --file --set=nmblroot /${relativeState}/active/bootstrap-kernel
+    set root=$nmblroot
+    linux /${relativeState}/active/bootstrap-kernel ${lib.concatStringsSep " " cfg.kernelParams}
+    initrd /${relativeState}/active/bootstrap-initrd
+  '' else if cfg.bootUpdate.enable or false then ''
     # The fixed GRUB image is only a dispatcher. Mutable boot material lives
     # in complete A/B sets, and a missing or malformed selector fails closed.
     search --file --set=nmblroot /nmbl-boot-sets/active

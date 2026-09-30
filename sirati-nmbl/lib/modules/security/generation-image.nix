@@ -59,6 +59,15 @@ in
 
   options.boot.nmbl.generationImage = {
     enable = lib.mkEnableOption "pre- and post-kexec verification for an atomically selected EROFS generation image";
+    bootstrapUpdates = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Include the bootstrap kernel and initrd in the signed generation.
+        The update receiver extracts them only after image verification;
+        BIOS GRUB selects them through the same active generation symlink.
+      '';
+    };
 
     mountPoint = lib.mkOption {
       type = lib.types.str;
@@ -125,6 +134,14 @@ in
       boot.nmbl.rescue.sfsPath = lib.mkIf cfg.enable "${bootRelativeStateRoot}/active/rescue.sfs";
       boot.nmbl.rescue.fullSystem.networkStage.imagePath = lib.mkIf cfg.enable "${bootRelativeStateRoot}/active/network.erofs";
       assertions = lib.optionals cfg.enable [
+        {
+          assertion = !cfg.bootstrapUpdates || (
+            config.boot.nmbl.bootstrapper.bootMode == "bios"
+            && config.boot.nmbl.bootstrapper.loader == "grub"
+            && !(config.boot.nmbl.bootUpdate.enable or false)
+          );
+          message = "generationImage.bootstrapUpdates requires BIOS GRUB without the separate boot-set updater";
+        }
         {
           assertion = signing.enable && signing.enforce;
           message = "boot.nmbl.generationImage requires signing.enable and signing.enforce";

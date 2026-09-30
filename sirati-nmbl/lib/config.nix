@@ -65,6 +65,10 @@ let
     # Include the external runtime config as an image GC root so any config
     # change also changes the image hash and therefore the atomic bundle ID.
     rootPaths = [ config.system.build.toplevel nmblConfigToml ];
+    bootstrap = if cfg.generationImage.bootstrapUpdates then {
+      kernel = "${config.system.build.nmblKernel}/bzImage";
+      initrd = "${config.system.build.nmblInitramfs}/initrd";
+    } else null;
   };
 
   # Activation options are contributed by ./modules/activation.nix. Read
