@@ -64,6 +64,10 @@ replace_link() {
   mv -Tf "$tmp" "$root/$name"
   sync -f "$root"
 }
+lock_state() {
+  exec {state_lock}< "$1"
+  flock -x "$state_lock"
+}
 
 cmd=${1:-}
 case "$cmd" in
@@ -117,13 +121,11 @@ case "$cmd" in
     ;;
   activate)
     [[ $# -eq 3 ]] || usage
-    id=$2; root=$3; require_root "$root"; validate_generation "$id" "$root"
-    [[ ! -L "$root/attempted" ]] || die "cannot activate while a boot attempt is unresolved"
+    id=$2; root=$3; require_root "$root"
+    lock_state "$root"
+    validate_generation "$id" "$root"
     old=$(target_id active "$root" || true)
     tested=$(target_id tested "$root" || true)
-    if [[ -z "$tested" && -n "$old" ]]; then
-      replace_link tested "generations/$old" "$root"; tested=$old
-    fi
     if [[ -n "$old" && "$old" != "$id" ]]; then replace_link previous "generations/$old" "$root"; fi
     replace_link active "generations/$id" "$root"
     if [[ "$tested" = "$id" ]]; then
@@ -131,11 +133,15 @@ case "$cmd" in
     else
       replace_link pending "generations/$id" "$root"
     fi
-    rm -f -- "$root/rollback-event"; sync -f "$root"
+    # Replacing an unhealthy generation must remain possible. Only a real
+    # successful boot may set tested; supersede the old attempt so the new
+    # generation receives its own first attempt on the next boot.
+    rm -f -- "$root/attempted" "$root/rollback-event"; sync -f "$root"
     ;;
   rollback)
     [[ $# -eq 2 ]] || usage
     root=$2; require_root "$root"
+    lock_state "$root"
     [[ ! -L "$root/attempted" ]] || die "cannot roll back while a boot attempt is unresolved"
     old=$(target_id active "$root" || true); prior=$(target_id previous "$root" || true)
     [[ -n "$prior" ]] || die "no valid previous generation"
@@ -153,6 +159,7 @@ case "$cmd" in
   gc)
     [[ $# -eq 3 ]] || usage
     keep=$2; root=$3; require_root "$root"
+    lock_state "$root"
     [[ "$keep" =~ ^[0-9]+$ ]] || die "KEEP must be a non-negative integer"
     active=$(target_id active "$root" || true); previous=$(target_id previous "$root" || true)
     tested=$(target_id tested "$root" || true); pending=$(target_id pending "$root" || true)

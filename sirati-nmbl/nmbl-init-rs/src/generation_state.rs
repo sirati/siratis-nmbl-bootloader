@@ -24,6 +24,7 @@ pub enum BootStateOutcome {
 }
 
 pub fn prepare_boot(root: &Path, automatic_rollback: bool) -> Result<BootStateOutcome> {
+    let _lock = lock_state(root)?;
     let active = required_id(root, "active")?;
     let attempted = optional_id(root, "attempted")?;
     let pending = optional_id(root, "pending")?;
@@ -51,6 +52,7 @@ pub fn prepare_boot(root: &Path, automatic_rollback: bool) -> Result<BootStateOu
 }
 
 pub fn mark_success(root: &Path) -> Result<()> {
+    let _lock = lock_state(root)?;
     let active = required_id(root, "active")?;
     let attempted = required_id(root, "attempted")?;
     if active != attempted {
@@ -96,6 +98,14 @@ pub fn inspect_health(root: &Path) -> Result<Option<GenerationHealth>> {
         pending_present: pending.is_some(),
         attempted_unresolved: attempted.is_some_and(|a| a != active),
     }))
+}
+
+fn lock_state(root: &Path) -> Result<fs::File> {
+    let directory =
+        fs::File::open(root).map_err(|e| io(e, "opening generation state lock".into()))?;
+    rustix::fs::flock(&directory, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|e| io(e.into(), "locking generation state".into()))?;
+    Ok(directory)
 }
 
 fn optional_id(root: &Path, name: &str) -> Result<Option<String>> {

@@ -4,7 +4,7 @@ let
   signer = if nmblSign == null then "/nmbl-sign-unavailable" else toString nmblSign;
   inner = pkgs.writeShellApplication {
     name = "nmbl-erofsctl";
-    runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.gnugrep pkgs.gnused ];
+    runtimeInputs = [ pkgs.coreutils pkgs.findutils pkgs.gnugrep pkgs.gnused pkgs.util-linux ];
     text = builtins.replaceStrings [ "@nmblSign@" ] [ signer ] (
       builtins.readFile ../tools/nmbl-erofsctl.sh
     );

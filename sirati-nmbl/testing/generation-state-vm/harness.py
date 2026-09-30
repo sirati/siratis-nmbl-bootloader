@@ -71,8 +71,10 @@ def normal_boot(args, marker, transcript):
 
 def happy_path(args):
     with Path(args.transcript).open("wb") as transcript:
-        proc = normal_boot(args, "NMBL_FIRST_BLESSED", transcript)
+        proc = normal_boot(args, "NMBL_FIRST_RECOVERY_ACTIVATED", transcript)
         try:
+            proc = normal_boot(args, "NMBL_FIRST_RECOVERY_BLESSED", transcript)
+            proc = normal_boot(args, "NMBL_FIRST_BLESSED", transcript)
             proc = normal_boot(args, "NMBL_SECOND_BLESSED", transcript)
             proc = normal_boot(args, "NMBL_PENDING_FAILED", transcript)
             proc = normal_boot(args, "NMBL_ROLLBACK_BLESSED", transcript)

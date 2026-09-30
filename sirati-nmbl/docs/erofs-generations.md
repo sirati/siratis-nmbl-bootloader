@@ -177,8 +177,13 @@ Only the public key is an immutable build input. Do not use a private key as a
 Nix path or option value.
 
 Activating a new image marks it pending while preserving the last tested
-generation. NMBL records the attempted selection before kexec. After the normal
-system reaches `multi-user.target`, a delayed `boot-complete.target` health
+generation. Activation remains available when the current boot is unhealthy
+or waiting for secrets: it supersedes the old attempt without marking that
+generation tested. With no successful predecessor, `tested` stays absent.
+Activation and boot-success marking share a state lock, so the old boot cannot
+bless a replacement that it has not run. NMBL records the attempted selection
+before kexec. After the normal system reaches `multi-user.target`, a delayed
+`boot-complete.target` health
 check runs `systemd-boot-check-no-failures`; only then does
 `nmbl-generation-success` mark the selection tested. A degraded boot remains
 attempted. On the next boot an untested failure rolls back first and adds
