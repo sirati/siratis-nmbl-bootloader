@@ -14,12 +14,11 @@
 //! [`OwnedFd`] plus a saved [`Termios`] snapshot and restore it on
 //! [`Drop`].
 //!
-//! ## VT graphics mode
+//! ## VT text mode
 //!
 //! When `/dev/console` is bound to a kernel VT (the framebuffer case,
-//! not a serial line), the kernel keeps writing printk output to the
-//! same framebuffer the TUI is drawing to. We `ioctl(KDSETMODE,
-//! KD_GRAPHICS)` to suppress that until [`Drop`]; on non-VT lines
+//! not a serial line), ANSI output must use `KD_TEXT` to remain visible.
+//! Kernel-printk is silenced separately with `PrintkQuiet`; on non-VT lines
 //! (serial console) the ioctl returns `ENOTTY` and we tolerate it.
 //!
 //! See [`kd`] for the ioctl helpers.
@@ -59,7 +58,7 @@ use crate::ui::console::ConsoleEvent;
 use crate::ui::console::parser::{ResizeFilter, TermwizToCrossterm};
 
 use self::caps::caps_from_env_with_fallback;
-use self::kd::enter_kd_graphics;
+use self::kd::enter_kd_text;
 use self::util::{rustix_io_err, tui_err, tw_err};
 
 mod caps;
@@ -106,7 +105,7 @@ pub struct TtyConsole {
     /// take it without leaving a dangling clone.
     saved_termios: Option<Termios>,
     /// Previous KD VT mode, captured iff we successfully switched the
-    /// VT into `KD_GRAPHICS`.
+    /// VT into `KD_TEXT`.
     previous_kd_mode: Option<libc::c_long>,
     /// Serial-console mitigation for the kernel-printk smear.
     printk_quiet: Option<PrintkQuiet>,
@@ -149,8 +148,8 @@ impl TtyConsole {
         let fd = open_console_fd(path)?;
         let saved = enter_raw(fd.as_fd())?;
         // The primary console may be a kernel VT (framebuffer case):
-        // grab graphics mode so printk stops smearing the framebuffer.
-        let previous_kd_mode = enter_kd_graphics(fd.as_fd());
+        // ANSI output must stay in text mode to remain visible.
+        let previous_kd_mode = enter_kd_text(fd.as_fd());
         let terminal = Self::build_terminal(&fd, None)?;
 
         // Silence kernel-printk to console while we own the screen.

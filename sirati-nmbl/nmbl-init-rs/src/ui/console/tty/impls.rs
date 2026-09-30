@@ -18,7 +18,7 @@ use crate::ui::console::{Console, ConsoleEvent, ConsoleKind};
 use crate::ui::render_current_screen;
 
 use super::TtyConsole;
-use super::kd::{enter_kd_graphics, restore_kd_mode};
+use super::kd::{enter_kd_text, restore_kd_mode};
 use super::util::{duration_to_ms, tui_err};
 
 impl Console for TtyConsole {
@@ -139,7 +139,7 @@ impl Console for TtyConsole {
         // only correct for the primary console that owned them. A remote
         // pty console renders to its own pty and leaves the globals alone.
         if self.owns_global_tui_state {
-            self.previous_kd_mode = enter_kd_graphics(self.fd.as_fd());
+            self.previous_kd_mode = enter_kd_text(self.fd.as_fd());
             self.printk_quiet = Some(PrintkQuiet::engage());
             log::set_tui_active();
         }
