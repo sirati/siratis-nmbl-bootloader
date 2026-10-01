@@ -54,18 +54,18 @@ build_disk() {
 
   # Btrfs root: @nix carries the store, the Nix database and the profiles.
   local root="$dir/root"
-  mkdir -p "$root/@root" "$root/@nix/store" "$root/@nix/var/nix/profiles"
+  mkdir -p "$root/@root" "$root/@nix/store" "$root/@nix/.profiles/nix/profiles"
   xargs -a "$artifacts/closure/store-paths" cp -a -t "$root/@nix/store"
   # The target Nix database, so the booted system sees a registered store.
   nix-store --store "local?root=$root/nix-db-root" --load-db \
     < "$artifacts/closure/registration"
-  mkdir -p "$root/@nix/var/nix/db"
-  cp -a "$root/nix-db-root/nix/var/nix/db/." "$root/@nix/var/nix/db/"
+  mkdir -p "$root/@nix/.profiles/nix/db"
+  cp -a "$root/nix-db-root/nix/var/nix/db/." "$root/@nix/.profiles/nix/db/"
   rm -rf "$root/nix-db-root"
   for n in 1 2 3; do
-    ln -s "$(readlink -f "$artifacts/system-$n")" "$root/@nix/var/nix/profiles/system-$n-link"
+    ln -s "$(readlink -f "$artifacts/system-$n")" "$root/@nix/.profiles/nix/profiles/system-$n-link"
   done
-  ln -s system-3-link "$root/@nix/var/nix/profiles/system"
+  ln -s system-3-link "$root/@nix/.profiles/nix/profiles/system"
   mkdir -p "$root/@root/etc" "$root/@root/nix" "$root/@root/boot"
   chmod -R u+w "$root"
 

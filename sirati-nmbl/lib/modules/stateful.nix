@@ -44,6 +44,14 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    # Stateful handoff uses /nix/var/nix/profiles/system-N-link/init.
+    # Upstream closure discovery only requires the store mount, which can
+    # race a separate /nix/var mount before resolving that profile link.
+    boot.initrd.systemd.services.initrd-find-nixos-closure = lib.mkIf
+      (config.boot.initrd.systemd.enable && !config.system.nixos-init.enable) {
+        unitConfig.RequiresMountsFor = lib.mkAfter [ "/sysroot/nix/var" ];
+      };
+
     # Userspace notifier: once the booted system reaches the operator's
     # chosen target, tell NMBL the attempt succeeded so the next boot
     # uses the current generation as the known-good entry instead of
