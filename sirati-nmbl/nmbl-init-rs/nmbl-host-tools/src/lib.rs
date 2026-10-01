@@ -17,6 +17,7 @@
 //! - [`run`] — dispatch a parsed [`cli::Command`].
 
 pub mod cli;
+pub mod digest_batch;
 pub mod domain;
 pub mod error;
 pub mod keyfile;
@@ -30,6 +31,9 @@ use error::Result;
 /// error to a non-zero exit. [`cli::Command::Help`] prints usage and succeeds.
 pub fn run(cmd: cli::Command) -> Result<()> {
     match cmd {
+        cli::Command::SignDigests => {
+            digest_batch::run(&mut std::io::stdin().lock(), &mut std::io::stdout().lock())
+        }
         cli::Command::Keygen {
             alg,
             out_priv,

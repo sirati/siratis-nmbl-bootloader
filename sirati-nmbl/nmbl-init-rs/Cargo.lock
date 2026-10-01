@@ -1343,9 +1343,12 @@ dependencies = [
 name = "nmbl-host-tools"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "fips204",
  "libc",
  "nmbl-init",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "zeroize",

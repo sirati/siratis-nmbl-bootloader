@@ -195,15 +195,15 @@ fn ml_dsa_sign(
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     match key.alg {
         AlgId::MlDsa65 => {
-            let arr: [u8; ml_dsa_65::SK_LEN] = key
-                .sk
-                .as_slice()
-                .try_into()
-                .map_err(|_| length_error(key.alg, key.sk.len()))?;
+            let mut arr = Zeroizing::new([0u8; ml_dsa_65::SK_LEN]);
+            if key.sk.len() != arr.len() {
+                return Err(length_error(key.alg, key.sk.len()));
+            }
+            arr.copy_from_slice(&key.sk);
             // The decoded secret-key wrapper is dropped at end of scope; the
             // source bytes in `key.sk` stay zeroized by their `Zeroizing`.
             let sk = Zeroizing::new(
-                ml_dsa_65::PrivateKey::try_from_bytes(arr)
+                ml_dsa_65::PrivateKey::try_from_bytes(*arr)
                     .map_err(|e| SignError::crypto("decode ML-DSA-65 private key", e))?,
             );
             let sig = sk
@@ -213,13 +213,13 @@ fn ml_dsa_sign(
             Ok((sig.to_vec(), pk))
         }
         AlgId::MlDsa87 => {
-            let arr: [u8; ml_dsa_87::SK_LEN] = key
-                .sk
-                .as_slice()
-                .try_into()
-                .map_err(|_| length_error(key.alg, key.sk.len()))?;
+            let mut arr = Zeroizing::new([0u8; ml_dsa_87::SK_LEN]);
+            if key.sk.len() != arr.len() {
+                return Err(length_error(key.alg, key.sk.len()));
+            }
+            arr.copy_from_slice(&key.sk);
             let sk = Zeroizing::new(
-                ml_dsa_87::PrivateKey::try_from_bytes(arr)
+                ml_dsa_87::PrivateKey::try_from_bytes(*arr)
                     .map_err(|e| SignError::crypto("decode ML-DSA-87 private key", e))?,
             );
             let sig = sk
