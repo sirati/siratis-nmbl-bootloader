@@ -47,11 +47,15 @@ OUT:    sidecar path; defaults to <INPUT>.sig
 --key-stdin  read the private key from stdin (at most 16 KiB); INPUT must
              then be a file path, never stdin
 
+sign-digests: bounded JSON stdin, signatures JSON stdout; trusted frontend only.
+
 Writes detached NMBLSIG1 sidecars verified by nmbl-init's signature pipeline.";
 
 /// The parsed command line: one of the two subcommands.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Sign an approved digest batch in the trusted frontend.
+    SignDigests,
     /// Generate a keypair.
     Keygen {
         /// Algorithm to generate.
@@ -97,6 +101,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
     };
     match sub {
         "keygen" => parse_keygen(rest),
+        "sign-digests" if rest.is_empty() => Ok(Command::SignDigests),
         "sign" | "sign-image" => parse_sign(rest),
         "verify" => parse_verify(rest),
         "-h" | "--help" | "help" => Ok(Command::Help),

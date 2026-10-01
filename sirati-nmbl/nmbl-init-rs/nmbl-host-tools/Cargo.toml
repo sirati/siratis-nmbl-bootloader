@@ -56,6 +56,10 @@ zeroize = { version = "1", default-features = false }
 # did not open it. Already in the workspace lockfile via nmbl-init.
 libc = "0.2"
 
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
 [dev-dependencies]
 # The cross-crate round-trip KAT (FIX-25/FIX-52) signs with this crate and
 # verifies with `nmbl_init::sig::verify_digest`, exercising BOTH crates' code on
