@@ -79,6 +79,7 @@ nixpkgs.lib.nixosSystem {
       };
 
       boot.kernelParams = [ "console=ttyS0,115200" ];
+      boot.initrd.systemd.enable = true;
       boot.initrd.kernelModules = [ "virtio_pci" "virtio_blk" "btrfs" ];
       boot.initrd.availableKernelModules = [ "crc32c" ];
       boot.supportedFilesystems = [ "btrfs" "vfat" ];
@@ -95,10 +96,33 @@ nixpkgs.lib.nixosSystem {
           neededForBoot = true;
           options = [ "subvol=@nix" ];
         };
+        "/nix/var" = {
+          device = "/nix/.profiles";
+          fsType = "none";
+          options = [ "bind" ];
+          neededForBoot = true;
+          depends = [ "/nix" ];
+        };
         "/boot" = {
           device = "/dev/disk/by-partlabel/disk-main-ESP";
           fsType = "vfat";
           options = [ "umask=0077" ];
+        };
+      };
+
+      # Regression: store readiness must not permit profile traversal while
+      # the independent /nix/var mount is deliberately still blocked.
+      boot.initrd.systemd.services.nmbl-delay-profile-mount = {
+        before = [ "sysroot-nix-var.mount" ];
+        requiredBy = [ "sysroot-nix-var.mount" ];
+        unitConfig = {
+          DefaultDependencies = false;
+          RequiresMountsFor = [ "/sysroot/nix/store" ];
+        };
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "${pkgs.coreutils}/bin/sleep 3";
+          ExecStartPost = "${pkgs.coreutils}/bin/touch /run/nmbl-profile-delay-complete";
         };
       };
 
@@ -112,6 +136,7 @@ nixpkgs.lib.nixosSystem {
         unitConfig.DefaultDependencies = false;
         serviceConfig = {
           Type = "oneshot";
+          ExecStartPre = "${pkgs.coreutils}/bin/test -e /run/nmbl-profile-delay-complete";
           StandardOutput = "tty";
           TTYPath = "/dev/ttyS0";
         };
