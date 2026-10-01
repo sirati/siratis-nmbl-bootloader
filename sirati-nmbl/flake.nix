@@ -1421,6 +1421,13 @@
         nmbl-boot-update-eval = bootUpdateEvalCheck;
         nmbl-key-command-eval = keyCommandEvalCheck;
         generation-image-initrd = generationImageInitrdCheck;
+        generation-success-late-secrets = import ./testing/generation-success-vm.nix {
+          inherit pkgs;
+          nmblInit = mkNmblInit {
+            features = [ "secure-boot" ];
+            requireKeys = false;
+          };
+        };
         generation-root-store-eval = rootStoreEvalCheck;
         nmbl-erofs-bios-host-eval = erofsBiosHostEvalCheck;
         insecure-test-key-absent = insecureKeyAbsentFromProd;

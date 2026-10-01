@@ -52,6 +52,7 @@ in
   # decided automatic rescue on its own path. `boot.nmbl.rescue.automatic`
   # is now the only one; the old name forwards to it.
   imports = [
+    ./generation-success.nix
     (lib.mkRenamedOptionModule
       [ "boot" "nmbl" "generationImage" "automaticRescue" ]
       [ "boot" "nmbl" "rescue" "automatic" ])
@@ -249,48 +250,6 @@ in
           Type = "oneshot";
           RemainAfterExit = true;
           ExecStart = helperArgs;
-        };
-      };
-
-      # systemd's own checker fails when any normal boot unit failed. The
-      # success marker is ordered after it and before boot-complete.target, so
-      # degraded boots retain `attempted` and are handled on the next boot.
-      systemd.services.systemd-boot-check-no-failures = lib.mkIf stateEnabled {
-        description = "Check whether any system unit failed";
-        after = [ "default.target" "graphical.target" "multi-user.target" ];
-        before = [ "boot-complete.target" ];
-        requiredBy = [ "boot-complete.target" ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          ExecStart = "${config.systemd.package}/lib/systemd/systemd-boot-check-no-failures";
-        };
-      };
-
-      systemd.services.nmbl-generation-success = lib.mkIf stateEnabled {
-        description = "Mark the selected NMBL generation tested";
-        after = [ "boot-complete.target" ];
-        requires = [ "boot-complete.target" ];
-        unitConfig.ConditionPathIsMountPoint = "/boot";
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          ExecStart = "${config.system.build.nmblInit}/bin/nmbl-generation-state mark-success ${lib.escapeShellArg cfg.stateRoot}";
-          User = "root";
-          NoNewPrivileges = true;
-          ProtectSystem = "strict";
-          ReadWritePaths = [ cfg.stateRoot ];
-          PrivateTmp = true;
-        };
-      };
-
-      systemd.timers.nmbl-generation-success = lib.mkIf stateEnabled {
-        description = "Assess NMBL generation boot success";
-        wantedBy = [ "timers.target" ];
-        timerConfig = {
-          OnBootSec = "${toString cfg.successDelaySec}s";
-          AccuracySec = "1s";
-          Unit = "nmbl-generation-success.service";
         };
       };
 
