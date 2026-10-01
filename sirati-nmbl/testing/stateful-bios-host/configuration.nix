@@ -121,6 +121,7 @@ nixpkgs.lib.nixosSystem {
         };
         serviceConfig = {
           Type = "oneshot";
+          RemainAfterExit = true;
           ExecStart = "${pkgs.coreutils}/bin/sleep 3";
           ExecStartPost = "${pkgs.coreutils}/bin/touch /run/nmbl-profile-delay-complete";
         };
