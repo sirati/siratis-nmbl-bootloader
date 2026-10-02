@@ -105,10 +105,14 @@ pub(crate) fn child_boot_target(runtime_boot: &Path) -> PathBuf {
 /// mounts outside system_root. Also retain configured mounts outside that prefix.
 pub(crate) fn preserved_roots(config: &Config) -> Result<Vec<PathBuf>> {
     let mut roots = vec![PathBuf::from(PID1_MNT)];
+    #[cfg(feature = "stateful")]
+    let state_mount = config.runtime_state_mountpoint.as_ref();
+    #[cfg(not(feature = "stateful"))]
+    let state_mount = None;
     for path in [
         Some(&config.paths.system_root),
         config.runtime_boot_mountpoint.as_ref(),
-        config.runtime_state_mountpoint.as_ref(),
+        state_mount,
     ]
     .into_iter()
     .flatten()
