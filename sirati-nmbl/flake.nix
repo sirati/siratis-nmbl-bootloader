@@ -1418,6 +1418,9 @@
       # secure-boot-install private-key-absence guard (#57 F6b — the signed test
       # disk is signed at install runtime, so no signing key is in its closure).
       checks.${system} = {
+        nmblctl-vfat-rename-durability = import ./testing/nmblctl-vfat-durability-vm.nix {
+          inherit pkgs nmblCtl;
+        };
         nmbl-erofsctl = nmblErofsCtlCheck;
         nmbl-erofs-receive = nmblErofsReceiveCheck;
         nmbl-boot-update-eval = bootUpdateEvalCheck;
