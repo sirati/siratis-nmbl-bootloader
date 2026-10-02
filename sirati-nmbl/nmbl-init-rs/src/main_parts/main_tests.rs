@@ -322,3 +322,38 @@ fn staged_rerun_driver_image_is_registered_for_teardown() {
     // Capped-shell divert ⇒ left mounted for inspection (no secrets, FIX-55).
     assert!(!should_teardown_driver_images(&execve_action()));
 }
+
+#[test]
+fn pid1_secures_initramfs_root_without_replacing_its_directory() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let directory = tempfile::tempdir().expect("private root");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o1777))
+        .expect("kernel root permissions");
+    let before = std::fs::metadata(directory.path()).expect("before");
+    super::secure_initramfs_root(1, directory.path()).expect("secure root");
+    let after = std::fs::metadata(directory.path()).expect("after");
+    assert_eq!(after.mode() & 0o7777, 0o755);
+    assert_eq!(
+        (before.dev(), before.ino(), before.uid()),
+        (after.dev(), after.ino(), after.uid())
+    );
+}
+
+#[test]
+fn non_pid1_tools_never_change_a_host_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().expect("private host root");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o1777))
+        .expect("host root permissions");
+    super::secure_initramfs_root(42, directory.path()).expect("no-op");
+    assert_eq!(
+        std::fs::metadata(directory.path())
+            .expect("after")
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o1777
+    );
+    super::secure_initramfs_root(42, &directory.path().join("missing"))
+        .expect("no filesystem access");
+}

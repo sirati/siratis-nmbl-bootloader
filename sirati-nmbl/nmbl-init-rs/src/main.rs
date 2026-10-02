@@ -118,6 +118,15 @@ fn early_init() {
         // reopen here is the operative fix, not the mounts by themselves.
         wire_console_stdio();
 
+        // Linux starts the initramfs root as 01777. It becomes the rescue's
+        // /nmbl-root ancestor, where authenticated nmblctl rejects paths below
+        // group/world-writable directories. Secure our own root before any
+        // rescue bind or fork. Non-PID-1 tools and remote clients never chmod
+        // the host root; they skip this entire branch.
+        if let Err(error) = secure_initramfs_root(nix::unistd::getpid().as_raw(), Path::new("/")) {
+            eprintln!("[nmbl] cannot secure initramfs root permissions: {error}");
+        }
+
         // Arm the early-boot keypress tap as soon as /dev/console exists, so a
         // key pressed during ANY pre-selector phase (bootstrap, mounts, device
         // waits, verification) is observed and cancels instant boot. Best-effort
@@ -130,6 +139,16 @@ fn early_init() {
     // caught. Uses the panic module's default report dir; re-installed
     // with the operator's configured dir once the config is loaded.
     install_panic_hook(Path::new(nmbl_init::panic::DEFAULT_PANIC_REPORT_DIR));
+}
+
+/// Secure only the PID 1 initramfs root. The supplied path exists solely to
+/// test the filesystem operation against a private directory.
+fn secure_initramfs_root(pid: i32, root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if pid != 1 {
+        return Ok(());
+    }
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
 }
 
 /// Open `/dev/console` and `dup2` it onto fd 0/1/2 so the process has a
