@@ -413,6 +413,10 @@ pub fn write_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
         file.flush()?;
         file.sync_all()?;
         fs::rename(&tmp, path)?;
+        // VFAT rename creates a new directory slot and dirties the moved file
+        // inode. Persist its size/cluster at that new slot before syncing the
+        // parent: pre-rename file fsync alone can leave an empty file on reset.
+        file.sync_all()?;
         fs::File::open(parent)?.sync_all()
     })();
     if result.is_err() {
