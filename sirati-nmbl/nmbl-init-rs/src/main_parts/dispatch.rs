@@ -89,7 +89,11 @@ pub(super) async fn select_and_act(
     // boots, or a CHECKED submit) falls through to the normal selector.
     // Instant boot takes the SAME default-boot path (no countdown, no menu).
     #[cfg(feature = "stateful")]
-    let decision = if skip_selector.get() || instant {
+    let operator_retry = select_operator_retry(config, &generations)?;
+    #[cfg(feature = "stateful")]
+    let decision = if let Some(decision) = operator_retry {
+        decision
+    } else if skip_selector.get() || instant {
         nmbl_info!("phase 5: selector skipped — booting default generation");
         let default_index = resolve_default_index(config, &generations);
         select_default_with_stateful(config, &generations, default_index)?
@@ -160,6 +164,60 @@ pub(super) async fn select_and_act(
             Ok(TerminalAction::Reboot)
         }
     }
+}
+
+/// Root-authenticated recovery intent bypasses only automatic selection policy.
+/// Consumption and attempt persistence must succeed before reaching kexec's
+/// unchanged signature gate. Never reset budgets or manufacture boot success.
+#[cfg(feature = "stateful")]
+fn select_operator_retry(
+    config: &Config,
+    generations: &[nmbl_init::generations::Generation],
+) -> Result<Option<Decision>> {
+    #[cfg(feature = "secure-boot")]
+    if config.generation_image.as_ref().is_some_and(|g| g.enable) {
+        return Ok(None);
+    }
+    let Some(dir) = boot_selection_state_dir(config) else {
+        return Ok(None);
+    };
+    let available: Vec<u32> = generations.iter().map(|g| g.number).collect();
+    let Some(number) =
+        nmbl_init::boot_selection::take_retry(&dir, &available).map_err(|source| {
+            NmblError::Io {
+                source,
+                context: "consuming operator retry".into(),
+            }
+        })?
+    else {
+        return Ok(None);
+    };
+    let index = generations
+        .iter()
+        .position(|g| g.number == number)
+        .ok_or_else(|| NmblError::ConfigInvalid {
+            reason: "retry profile missing".into(),
+            context: "operator retry".into(),
+        })?;
+    if config.stateful.is_some() {
+        let path = dir.join("state.bin");
+        let mut state = nmbl_init::state::read(&path)?.ok_or_else(|| NmblError::ConfigInvalid {
+            reason: "retry requires supported persistent boot state".into(),
+            context: "operator retry".into(),
+        })?;
+        nmbl_init::state::record_operator_retry(&mut state, generations, number).ok_or_else(
+            || NmblError::ConfigInvalid {
+                reason: "invalid retry generation".into(),
+                context: "operator retry".into(),
+            },
+        )?;
+        nmbl_init::state::write_padded(&path, &state)?;
+    }
+    nmbl_info!("operator retry: generation {number}; automatic failure history preserved");
+    Ok(Some(Decision::Boot {
+        generation_index: index,
+        cmdline_override: None,
+    }))
 }
 
 /// Resolve the effective default generation index for the selector, honouring

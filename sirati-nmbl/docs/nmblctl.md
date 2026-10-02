@@ -102,3 +102,31 @@ The `nmbl-ui-preview-absent` flake check greps every production binary
 and nmbl-boot-update) for the preview's marker string and crate name. The
 check also requires the marker to be present in the preview binary itself,
 so it cannot pass vacuously.
+
+## Retry after automatic recovery exhaustion
+
+`nmblctl retry-generation --generation N` authorizes one attempt of an installed
+profile after repairing the cause of failure. It verifies the bootable closure
+and configured generation signatures, writes a private one-use request, and
+reboots. NMBL consumes that request durably before recording the attempt; the
+normal pinned signature check still runs before kernel loading. Recovery counters
+and known-good history are retained. A failed retry returns to automatic rescue;
+only the ordinary successful-boot health policy rearms automatic recovery.
+Signed EROFS numeric retries are refused.
+
+The production control binary and dependencies are included in full-system
+rescue. From its authenticated root shell, inspect mounted installed state:
+
+```console
+nmblctl --config /nmbl-root/mnt/boot/nmbl/config.toml \
+  --system-root /nmbl-root/mnt/system --state-dir /nmbl-root/mnt/boot-state/nmbl status --json
+```
+
+After repairing the host, use the same mounted paths with
+`retry-generation --generation N --no-reboot`, then reboot the machine using the
+rescue reboot tool. `--no-reboot` records the request without calling systemd.
+`--profiles-dir PATH` can override the installed profiles directory. Explicit
+paths must be canonical, root-owned, and protected against other users writing
+any ancestor. The default installed system root above is `/mnt/system`, and the state twin
+is `/mnt/boot-state`; adapt it to the host's
+configured system root. No state counters or success flags should be edited.

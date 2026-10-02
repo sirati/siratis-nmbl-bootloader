@@ -18,7 +18,7 @@ mod decide;
 mod io;
 mod types;
 
-pub use decide::decide;
+pub use decide::{decide, record_operator_retry};
 pub use io::{init_or_validate, mark_boot_succeeded, read, write_padded};
 pub use types::{State, StatefulDecision};
 

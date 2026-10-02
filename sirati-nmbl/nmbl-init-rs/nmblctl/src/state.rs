@@ -58,6 +58,153 @@ impl System {
         })
     }
 
+    /// Explicit mounted-system discovery for authenticated rescue operators.
+    pub fn discover_for(cli: &nmblctl::Cli) -> Result<Self, String> {
+        let mut sys = Self::discover()?;
+        if let Some(path) = &cli.config {
+            validate_operator_path(path, false)?;
+            sys.config =
+                Some(Config::load(path).map_err(|e| format!("loading operator config: {e}"))?);
+            sys.config_source = Some(path.clone());
+            sys.state_dir = discover_state_dir(sys.config.as_ref());
+        }
+        // The sidecar describes PID 1's pre-kexec namespace. On the running
+        // installed system those mounts are rooted at / rather than /mnt/system.
+        // Rescue operators explicitly supply their mounted namespace below.
+        if cli.config.is_none()
+            && cli.system_root.is_none()
+            && let Some(config) = sys.config.as_mut()
+        {
+            config.paths.system_root = PathBuf::from("/");
+            config.paths.nix_profiles_dir = PathBuf::from("/nix/var/nix/profiles");
+        }
+        if let Some(path) = &cli.system_root {
+            validate_operator_path(path, true)?;
+            let config = sys
+                .config
+                .as_mut()
+                .ok_or("--system-root requires a readable config")?;
+            config.paths.system_root = path.clone();
+            config.paths.nix_profiles_dir = path.join("nix/var/nix/profiles");
+        }
+        if let Some(path) = &cli.profiles_dir {
+            validate_operator_path(path, true)?;
+            let config = sys
+                .config
+                .as_mut()
+                .ok_or("--profiles-dir requires a readable config")?;
+            config.paths.nix_profiles_dir = path.clone();
+        }
+        if let Some(path) = &cli.state_dir {
+            validate_operator_path(path, true)?;
+            sys.state_dir = path.clone();
+        }
+        if let Some(config) = sys.config.as_mut() {
+            config.runtime_boot_mountpoint = if cli.config.is_some() {
+                sys.config_source
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            } else {
+                sys.state_dir.parent().map(Path::to_path_buf)
+            };
+        }
+        (sys.generations, sys.active_generation) = scan_profiles(sys.config.as_ref());
+        sys.rescue_mode = sys.config.as_ref().map(rescue_mode_str);
+        Ok(sys)
+    }
+
+    /// Resolve actual bootable closure and verify signatures before creating
+    /// recovery authorization; boot re-verifies pinned artifacts before load.
+    pub fn validate_retry_target(&self, number: u32) -> Result<(), String> {
+        self.validate_generation(number)?;
+        let config = self
+            .config
+            .as_ref()
+            .ok_or("retry requires a readable NMBL config")?;
+        if config.stateful.is_none() {
+            return Err("retry requires enabled persistent stateful recovery; use reboot-into on non-stateful hosts".into());
+        }
+        nmbl_init::state::read(&self.state_dir.join("state.bin"))
+            .map_err(|e| format!("reading retry state: {e}"))?
+            .ok_or("retry requires supported persistent boot state")?;
+        let mut console = nmbl_init::ui::console::NoopConsole::new();
+        let mut reporter =
+            nmbl_init::ui::BootReporter::new(&mut console, "validating operator retry");
+        let generations = nmbl_init::generations::scan_generations(config, &mut reporter)
+            .map_err(|e| format!("scanning retry closures: {e}"))?;
+        let target = generations
+            .iter()
+            .find(|g| g.number == number)
+            .ok_or("retry generation closure is not bootable")?;
+        let store = fs::canonicalize(config.paths.system_root.join("nix/store"))
+            .map_err(|e| format!("resolving installed store: {e}"))?;
+        let toplevel = fs::canonicalize(&target.toplevel)
+            .map_err(|e| format!("resolving retry closure: {e}"))?;
+        if toplevel.parent() != Some(store.as_path()) {
+            return Err("retry profile must resolve to the installed Nix store".into());
+        }
+        if config.signing.enable {
+            nmbl_init::sig::verify_generation_pinned(config, target)
+                .map_err(|e| format!("retry generation signature verification failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Stable public policy state for operator diagnostics and recovery proof.
+    pub fn status_json(&self) -> Result<String, String> {
+        let state = nmbl_init::state::read(&self.state_dir.join("state.bin"))
+            .map_err(|e| format!("reading persistent boot state: {e}"))?
+            .ok_or("persistent boot state absent or unsupported")?;
+        let maximum = self
+            .config
+            .as_ref()
+            .and_then(|c| c.stateful.as_ref())
+            .map(|s| s.max_recovery_attempts);
+        let retry = std::fs::read_to_string(
+            self.state_dir
+                .join(nmbl_init::boot_selection::RETRY_BASENAME),
+        )
+        .ok()
+        .and_then(|s| nmbl_init::boot_selection::OneShotSelection::parse(&s));
+        let mut decision_state = state.clone();
+        let exhaustion = maximum
+            .map(|budget| -> Result<bool, String> {
+                let config = self
+                    .config
+                    .as_ref()
+                    .ok_or("stateful policy config unavailable")?;
+                let mut console = nmbl_init::ui::console::NoopConsole::new();
+                let mut reporter =
+                    nmbl_init::ui::BootReporter::new(&mut console, "inspect bootable profiles");
+                let generations = nmbl_init::generations::scan_generations(config, &mut reporter)
+                    .map_err(|e| {
+                    format!("cannot inspect bootable profiles for recovery policy: {e}")
+                })?;
+                let active = self
+                    .active_generation
+                    .and_then(|n| generations.iter().position(|g| g.number == n))
+                    .unwrap_or(0);
+                Ok(matches!(
+                    nmbl_init::state::decide(&mut decision_state, &generations, active, budget),
+                    nmbl_init::state::StatefulDecision::Exhausted
+                ))
+            })
+            .transpose()?;
+        serde_json::to_string(&serde_json::json!({
+            "version": 1, "state_format_version": state.state_format_version,
+            "last_attempted_generation": state.last_attempted_generation.map(|n| n.get()),
+            "last_boot_succeeded": state.last_boot_succeeded, "recovery_attempt": state.recovery_attempt,
+            "known_good_generations": state.known_good_generations.map(|n| n.map(|v| v.get())),
+            "max_recovery_attempts": maximum, "automatic_recovery_exhausted": exhaustion,
+            "pending_retry_generation": retry.map(|r| r.generation), "installed_generations": self.generations,
+            "signing_enabled": self.config.as_ref().map(|c| c.signing.enable),
+            "signing_enforced": self.config.as_ref().map(|c| c.signing.enforce),
+            "signed_erofs": self.is_signed_erofs(), "active_generation": self.active_generation
+        })).map_err(|e| format!("serializing policy state: {e}"))
+    }
+
     /// The rescue sentinel path NMBL checks. Prefers the secure-boot config's
     /// `sentinel_path`, else the pinned default.
     #[must_use]
@@ -197,35 +344,81 @@ fn scan_profiles(config: Option<&Config>) -> (Vec<u32>, Option<u32>) {
     (numbers, active)
 }
 
+/// Explicit recovery paths must be canonical, root-owned and not writable by
+/// other users. Ancestor ownership prevents redirecting an authenticated write.
+pub fn validate_operator_path(path: &Path, directory: bool) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let canonical = fs::canonicalize(path).map_err(|e| format!("resolving operator path: {e}"))?;
+    if !path.is_absolute() || canonical != path {
+        return Err("operator path must be absolute without symlinks or traversal".into());
+    }
+    for ancestor in path.ancestors() {
+        let metadata =
+            fs::symlink_metadata(ancestor).map_err(|e| format!("checking operator path: {e}"))?;
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Err(
+                "operator path and ancestors must be root-owned and not writable by other users"
+                    .into(),
+            );
+        }
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
+        return Err("operator path has wrong file type".into());
+    }
+    Ok(())
+}
+
 /// Write `data` to `path` durably: a temp file in the same dir, fsync'd,
 /// renamed over the target, then the directory fsync'd. This is the same
 /// atomic-rename discipline NMBL's own state writers use, so a crash leaves
 /// either the old or the new flag file, never a torn one.
 pub fn write_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
-    let tmp = parent.join(format!(
-        ".{}.nmblctl.tmp.{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("flag"),
-        std::process::id()
-    ));
-    {
-        let mut f = fs::OpenOptions::new()
+    let basename = path.file_name().and_then(|s| s.to_str()).unwrap_or("flag");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_nanos();
+    let mut temporary = None;
+    // Stale crash files and concurrent invocations cannot block a later retry,
+    // and create_new never follows/truncates an attacker-supplied symlink.
+    for collision in 0..32 {
+        let tmp = parent.join(format!(
+            ".{basename}.nmblctl.tmp.{}.{nonce}.{collision}",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(data)?;
-        f.flush()?;
-        f.sync_all()?;
+            .mode(0o600)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => {
+                temporary = Some((tmp, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
     }
-    fs::rename(&tmp, path)?;
-    // fsync the directory so the rename is durable.
-    if let Ok(dir) = fs::File::open(parent) {
-        let _ = dir.sync_all();
+    let (tmp, mut file) = temporary.ok_or_else(|| {
+        std::io::Error::other("could not allocate a unique durable temporary file")
+    })?;
+    let result = (|| {
+        file.write_all(data)?;
+        file.flush()?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -249,5 +442,104 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains("nmblctl.tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp files must be renamed away");
+    }
+    #[test]
+    fn json_status_reads_real_persistent_state_without_blessing_or_mutation() {
+        let dir = tempfile::tempdir().expect("state");
+        let path = dir.path().join("state.bin");
+        let original = nmbl_init::state::State {
+            recovery_attempt: 5,
+            last_boot_succeeded: false,
+            ..nmbl_init::state::State::default()
+        };
+        nmbl_init::state::write_padded(&path, &original).expect("write");
+        let sys = System {
+            config: None,
+            config_source: None,
+            rescue_mode: None,
+            state_dir: dir.path().to_path_buf(),
+            cmdline: String::new(),
+            generations: vec![42],
+            active_generation: Some(42),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&sys.status_json().expect("status")).expect("json");
+        assert_eq!(json.get("version").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            json.get("recovery_attempt").and_then(|v| v.as_u64()),
+            Some(5)
+        );
+        assert_eq!(
+            json.get("last_boot_succeeded").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(nmbl_init::state::read(&path).expect("read"), Some(original));
+    }
+    #[test]
+    fn stale_temporary_file_or_symlink_does_not_block_or_get_truncated() {
+        let dir = tempfile::tempdir().expect("state");
+        let stale = dir.path().join(format!(
+            ".retry-generation.nmblctl.tmp.{}",
+            std::process::id()
+        ));
+        fs::write(&stale, b"original stale intent").expect("stale");
+        let target = dir.path().join("retry-generation");
+        write_durable(&target, b"generation 42\n").expect("retry");
+        assert_eq!(
+            fs::read(&stale).expect("preserved"),
+            b"original stale intent"
+        );
+        fs::remove_file(&stale).expect("remove");
+        std::os::unix::fs::symlink(&target, &stale).expect("stale symlink");
+        write_durable(&target, b"generation 43\n").expect("retry");
+        assert!(
+            fs::symlink_metadata(&stale)
+                .expect("preserved symlink")
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&target).expect("target"), b"generation 43\n");
+    }
+    #[test]
+    fn json_status_refuses_exhaustion_classification_when_scan_is_unavailable() {
+        let dir = tempfile::tempdir().expect("state");
+        let original = nmbl_init::state::State {
+            recovery_attempt: 5,
+            last_boot_succeeded: false,
+            ..nmbl_init::state::State::default()
+        };
+        nmbl_init::state::write_padded(&dir.path().join("state.bin"), &original).expect("state");
+        let mut config = Config::recovery_default();
+        config.stateful = Some(nmbl_init::config::StatefulConfig {
+            max_recovery_attempts: 5,
+            success_target: "multi-user.target".into(),
+        });
+        config.paths.system_root = dir.path().join("installed");
+        config.paths.nix_profiles_dir = dir.path().join("missing-profiles");
+        let mut sys = System {
+            config: Some(config),
+            config_source: None,
+            rescue_mode: None,
+            state_dir: dir.path().to_path_buf(),
+            cmdline: String::new(),
+            generations: vec![42],
+            active_generation: Some(42),
+        };
+        assert!(
+            sys.status_json()
+                .expect_err("missing scan")
+                .contains("cannot inspect bootable profiles")
+        );
+        fs::write(dir.path().join("malformed-profiles"), b"not a directory").expect("malformed");
+        sys.config.as_mut().expect("config").paths.nix_profiles_dir =
+            dir.path().join("malformed-profiles");
+        assert!(
+            sys.status_json()
+                .expect_err("malformed scan")
+                .contains("cannot inspect bootable profiles")
+        );
+        assert_eq!(
+            nmbl_init::state::read(&dir.path().join("state.bin")).expect("read"),
+            Some(original)
+        );
     }
 }

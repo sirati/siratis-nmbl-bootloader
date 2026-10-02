@@ -302,13 +302,24 @@
           cargoExtraArgs = "-p nmblctl";
         };
         nmblctlArtifacts = hostCraneLib.buildDepsOnly nmblctlCommonArgs;
-        nmblctl = hostCraneLib.buildPackage (
-          nmblctlCommonArgs
-          // {
+        mkNmblCtl = { publicKeys ? [ ], requireKeys ? false }:
+          assert pkgs.lib.assertMsg (!requireKeys || publicKeys != [ ])
+            "nmblctl retry verification requires configured baked public keys";
+          let
+            bakedBlobs = mkBakedKeysSrc { inherit publicKeys requireKeys; };
+            srcWithKeys = pkgs.runCommand "nmblctl-src-with-keys" { } ''
+              cp -r --no-preserve=mode ${nmblctlCommonArgs.src} $out
+              cp ${bakedBlobs}/baked_keys.rs $out/src/sig/baked_keys.rs
+              ${builtins.concatStringsSep "\n" (pkgs.lib.imap0 (i: _:
+                "cp ${bakedBlobs}/baked_key_${toString i}.bin $out/src/sig/baked_key_${toString i}.bin"
+              ) publicKeys)}
+            '';
+          in hostCraneLib.buildPackage (nmblctlCommonArgs // {
+            src = srcWithKeys;
             cargoArtifacts = nmblctlArtifacts;
             pname = "nmblctl";
-          }
-        );
+          });
+        nmblctl = mkNmblCtl { };
         # `nmbl-ui-preview` — development-only X11 preview of the boot UI driven
         # by mock scenarios. Its own crate: nothing depends on it, so no
         # production target can link its mock code (see nmbl-ui-preview-absent).
@@ -343,6 +354,7 @@
         # (sirati-nmbl/flake.nix uses it to gate `network-rescue` on
         # `boot.nmbl.rescue.network`).
         legacyPackages.mkNmblInit = mkNmblInit;
+        legacyPackages.mkNmblCtl = mkNmblCtl;
 
         packages = {
           default = nmbl-init;

@@ -92,6 +92,7 @@
       # when NMBL is enabled. `null` on an older sibling flake.
       nmblCtl =
         nmbl-init-rs.packages.${system}.nmblctl or null;
+      mkNmblCtl = nmbl-init-rs.legacyPackages.${system}.mkNmblCtl;
       nmblUiPreview =
         nmbl-init-rs.packages.${system}.nmbl-ui-preview or null;
       nmblSimbox =
@@ -1355,6 +1356,7 @@
           # The system-side control/inspection tool, added to the system
           # closure by lib/config.nix when NMBL is enabled.
           _module.args.nmblCtl = nmblCtl;
+          _module.args.mkNmblCtl = mkNmblCtl;
         };
 
       # Installer-available host tools. `nmbl-tpm-enroll` seals a LUKS volume

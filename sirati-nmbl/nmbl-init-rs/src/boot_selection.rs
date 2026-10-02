@@ -27,6 +27,63 @@ use std::path::{Path, PathBuf};
 pub const ONE_SHOT_BASENAME: &str = "boot-once";
 pub const DEFAULT_BASENAME: &str = "boot-default";
 
+/// Explicit authenticated operator retry; separate from remembered defaults.
+pub const RETRY_BASENAME: &str = "retry-generation";
+
+/// Consume a validated retry before dispatch. Failure is fatal: never permit a
+/// replayable override. This only selects an already discovered profile; the
+/// ordinary signature and pinned kernel/initrd verification remains mandatory.
+pub fn take_retry(state_dir: &Path, available: &[u32]) -> std::io::Result<Option<u32>> {
+    take_retry_owned(state_dir, available, 0)
+}
+
+fn take_retry_owned(
+    state_dir: &Path,
+    available: &[u32],
+    owner: u32,
+) -> std::io::Result<Option<u32>> {
+    use std::io::{Error, ErrorKind, Read};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = state_dir.join(RETRY_BASENAME);
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let parent = std::fs::symlink_metadata(state_dir)?;
+    if !parent.is_dir() || parent.uid() != owner || parent.mode() & 0o022 != 0 {
+        return Err(Error::other("unsafe operator retry directory"));
+    }
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != owner
+        || !matches!(metadata.mode() & 0o7777, 0o600 | 0o700)
+        || metadata.nlink() != 1
+        || metadata.len() > 64
+    {
+        return Err(Error::other("unsafe operator retry marker"));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    let selection = OneShotSelection::parse(&text)
+        .filter(|s| s.generation > 0 && s.generation < u32::MAX && s.render() == text)
+        .ok_or_else(|| Error::other("malformed operator retry marker"))?;
+    // Consume invalid/stale requests too, preventing a later installation from
+    // accidentally inheriting authorization intended for this recovery boot.
+    std::fs::remove_file(&path)?;
+    std::fs::File::open(state_dir)?.sync_all()?;
+    if !available.contains(&selection.generation) {
+        return Err(Error::other(
+            "operator retry target is not a bootable installed profile",
+        ));
+    }
+    Ok(Some(selection.generation))
+}
+
 /// A one-shot "boot this generation next" selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OneShotSelection {
@@ -231,5 +288,43 @@ mod tests {
         assert!(read_one_shot(dir.path()).is_none());
         // Second consume is a no-op, not an error.
         consume_one_shot(dir.path());
+    }
+    #[test]
+    fn retry_is_consumed_once_and_stale_target_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(RETRY_BASENAME);
+        let write = |body: &str| {
+            std::fs::write(&path, body).expect("write");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        };
+        let owner = unsafe { libc::geteuid() };
+        write("generation 3\n");
+        assert_eq!(
+            take_retry_owned(dir.path(), &[3], owner).expect("retry"),
+            Some(3)
+        );
+        assert_eq!(
+            take_retry_owned(dir.path(), &[3], owner).expect("consumed"),
+            None
+        );
+        // VFAT's running-system umask=0077 synthesizes owner execute too.
+        write("generation 3\n");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("FAT mode");
+        assert_eq!(
+            take_retry_owned(dir.path(), &[3], owner).expect("FAT retry"),
+            Some(3)
+        );
+        write("generation 99\n");
+        assert!(take_retry_owned(dir.path(), &[3], owner).is_err());
+        assert!(!path.exists());
+        write("generation 3\njunk\n");
+        assert!(take_retry_owned(dir.path(), &[3], owner).is_err());
+        write("generation 3\n");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        assert!(take_retry_owned(dir.path(), &[3], owner).is_err());
+        std::fs::remove_file(&path).expect("remove");
+        std::os::unix::fs::symlink("/etc/passwd", &path).expect("symlink");
+        assert!(take_retry_owned(dir.path(), &[3], owner).is_err());
     }
 }
