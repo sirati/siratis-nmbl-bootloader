@@ -29,6 +29,7 @@ fn mount_plan_matches_spec_sequence() {
                 src: "/",
                 dst: "/rescue/nmbl-root",
             },
+            MountStep::MakePrivate("/rescue/nmbl-root"),
             MountStep::Bind {
                 src: "/init",
                 dst: "/rescue/bin/nmbl",
@@ -82,4 +83,27 @@ fn child_exec_argv0_falls_back_to_full_path() {
     // full path bytes rather than panicking.
     let exec = ChildExec::build(Path::new("/bin/sh")).expect("exec strings build");
     assert_eq!(exec.argv0_c.as_bytes(), b"sh");
+}
+
+#[test]
+fn preservation_covers_system_root_and_separate_boot_state_mounts() {
+    let mut config = Config::recovery_default();
+    config.paths.system_root = PathBuf::from("/mnt/system");
+    config.runtime_boot_mountpoint = Some(PathBuf::from("/mnt/boot"));
+    config.runtime_state_mountpoint = Some(PathBuf::from("/mnt/state"));
+    assert_eq!(
+        preserved_roots(&config).expect("roots"),
+        vec![PathBuf::from("/mnt")]
+    );
+    assert_eq!(
+        child_boot_target(Path::new("/mnt")),
+        PathBuf::from("/rescue/nmbl-root/mnt")
+    );
+    config.paths.system_root = PathBuf::from("/installed");
+    assert_eq!(
+        preserved_roots(&config).expect("roots"),
+        vec![PathBuf::from("/mnt"), PathBuf::from("/installed")]
+    );
+    config.paths.system_root = PathBuf::from("/");
+    assert!(preserved_roots(&config).is_err());
 }

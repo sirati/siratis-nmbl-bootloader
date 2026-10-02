@@ -25,12 +25,17 @@
   # sibling flake; when non-null and NMBL is enabled it is added to the
   # system packages so `nmblctl chain/status/reboot-*/default` are available.
   nmblCtl ? null,
+  mkNmblCtl ? (_: nmblCtl),
   ...
 }:
 
 let
   cfg = config.boot.nmbl;
   bootstrapper = cfg.bootstrapper;
+  selectedNmblCtl = mkNmblCtl {
+    publicKeys = map (path: { inherit path; alg = if cfg.signing.algorithm == "ml-dsa-87" then "MlDsa87" else "MlDsa65"; }) cfg.signing.publicKeys;
+    requireKeys = cfg.signing.enable && cfg.signing.enforce;
+  };
 
   # UKI build wiring + /init binary selection, extracted into
   # ./signing-build.nix. Produces the SAME `system.build.nmblUki` /
@@ -280,7 +285,10 @@ let
     inherit pkgs lib;
     contents = cfg.rescue.squashfsContents;
     fullSystem = {
-      inherit (cfg.rescue.fullSystem) enable minimal packages sshdPort rootAuthorizedKeys hostKeyPath;
+      inherit (cfg.rescue.fullSystem) enable minimal sshdPort rootAuthorizedKeys hostKeyPath;
+      # Authenticated rescue recovery uses the same production control binary
+      # and its full runtime closure, never a copied diagnostic executable.
+      packages = cfg.rescue.fullSystem.packages ++ lib.optional (selectedNmblCtl != null) selectedNmblCtl;
       networkStage = cfg.rescue.fullSystem.networkStage;
       # NIC drivers the recovery /init modprobes ITSELF after switch_root.
       # NMBL no longer preloads them — the .ko + firmware ship in the
@@ -827,6 +835,7 @@ in
 
     # Custom installation script (imported from module)
     system.build.installNmbl = installScriptModule.installNmbl;
+    system.build.nmblCtl = lib.mkIf (selectedNmblCtl != null) selectedNmblCtl;
 
     # Add install-nmbl to system packages. kexec-tools is no longer required:
     # the Rust /init drives kexec via the kexec_file_load(2) syscall directly.
@@ -842,6 +851,6 @@ in
     ]
     # `nmblctl` — the root-only control/inspection tool. Shipped in the system
     # closure whenever NMBL is enabled and the sibling flake provides it.
-    ++ lib.optional (nmblCtl != null) nmblCtl;
+    ++ lib.optional (selectedNmblCtl != null) selectedNmblCtl;
   };
 }

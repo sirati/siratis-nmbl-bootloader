@@ -35,7 +35,7 @@ const RESCUE_ROOT: &str = "/rescue";
 #[path = "child_mounts.rs"]
 mod mounts;
 #[cfg(test)]
-use mounts::{MountStep, child_boot_target, mount_plan, umount_plan};
+use mounts::{MountStep, child_boot_target, mount_plan, preserved_roots, umount_plan};
 use mounts::{apply_mount_plan, teardown_mounts};
 
 /// Conventional exit code surfaced when the post-fork `execve(2)` (or a

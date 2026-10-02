@@ -17,9 +17,9 @@ const CHILD_MNT: &str = "/rescue/mnt";
 /// after chroot, exposing the TUI socket at
 /// `/nmbl-root/nmbl-run/tui.sock` (matches the rescue-sfs contract).
 const CHILD_NMBL_ROOT: &str = "/rescue/nmbl-root";
-/// Temporary bind that preserves the bootstrap boot mount before the shared
-/// rescue `/mnt` subtree covers PID 1's original `/mnt`.
-const CHILD_BOOT: &str = "/rescue/nmbl-boot";
+/// Private recursive bind preserving all already mounted installed filesystems
+/// before the rescue shared tree covers PID 1's original mount prefix.
+const CHILD_INSTALLED: &str = "/rescue/nmbl-installed";
 /// Prepared regular file in the rescue image that receives a bind mount of
 /// NMBL's running executable for remote TUI clients.
 const CHILD_NMBL_BIN: &str = "/rescue/bin/nmbl";
@@ -42,6 +42,8 @@ pub(crate) enum MountStep {
     },
     /// `mount --make-shared target` (`MS_SHARED`, no fstype/source).
     MakeShared(&'static str),
+    /// Disconnect recursive clone from source propagation before restoring data.
+    MakePrivate(&'static str),
 }
 
 /// The pre-fork mount plan, in execution order. Pure so it can be
@@ -72,6 +74,7 @@ pub(crate) fn mount_plan() -> Vec<MountStep> {
             src: "/",
             dst: CHILD_NMBL_ROOT,
         },
+        MountStep::MakePrivate(CHILD_NMBL_ROOT),
         MountStep::Bind {
             src: "/init",
             dst: CHILD_NMBL_BIN,
@@ -98,14 +101,64 @@ pub(crate) fn child_boot_target(runtime_boot: &Path) -> PathBuf {
         .join(runtime_boot.strip_prefix("/").unwrap_or(runtime_boot))
 }
 
+/// Preserve the complete replaced shared prefix, including bootstrap/state
+/// mounts outside system_root. Also retain configured mounts outside that prefix.
+pub(crate) fn preserved_roots(config: &Config) -> Result<Vec<PathBuf>> {
+    let mut roots = vec![PathBuf::from(PID1_MNT)];
+    for path in [
+        Some(&config.paths.system_root),
+        config.runtime_boot_mountpoint.as_ref(),
+        config.runtime_state_mountpoint.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if path == Path::new("/")
+            || !path.is_absolute()
+            || path.starts_with("/rescue")
+            || path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return Err(NmblError::ConfigInvalid {
+                reason: "unsafe installed mount prefix for rescue".into(),
+                context: "rescue mounts".into(),
+            });
+        }
+        if roots.iter().any(|r| path.starts_with(r)) {
+            continue;
+        }
+        roots.retain(|r| !r.starts_with(path));
+        roots.push(path.clone());
+    }
+    Ok(roots)
+}
+
+fn preserved_target(index: usize) -> PathBuf {
+    PathBuf::from(format!("{CHILD_INSTALLED}-{index}"))
+}
+
 pub(super) fn apply_mount_plan(config: &Config) -> Result<()> {
     let wrap = |source: NmblError| NmblError::Rescue {
         stage: "rescue-child-mount",
         source: Box::new(source),
     };
-    if let Some(runtime_boot) = config.runtime_boot_mountpoint.as_deref() {
-        ensure_dir(Path::new(CHILD_BOOT)).map_err(wrap)?;
-        mount_fs(Some(runtime_boot), Path::new(CHILD_BOOT), "none", "bind").map_err(wrap)?;
+    ensure_dir(Path::new(PID1_MNT)).map_err(wrap)?;
+    let roots: Vec<_> = preserved_roots(config)
+        .map_err(wrap)?
+        .into_iter()
+        .filter(|p| p.is_dir())
+        .collect();
+    for (index, installed) in roots.iter().enumerate() {
+        // Early rescue can precede optional boot/state mounts; preserve only
+        // filesystems already present, without mounting or unlocking anything.
+        let saved = preserved_target(index);
+        ensure_dir(&saved).map_err(wrap)?;
+        mount_fs(Some(installed), &saved, "none", "rbind").map_err(wrap)?;
+        mount_fs(None, &saved, "none", "rprivate").map_err(wrap)?;
     }
     for step in mount_plan() {
         match step {
@@ -117,12 +170,17 @@ pub(super) fn apply_mount_plan(config: &Config) -> Result<()> {
                 mount_fs(Some(Path::new(src)), Path::new(dst), "none", "rbind").map_err(wrap)?;
             }
             MountStep::MakeShared(p) => make_shared(Path::new(p)).map_err(wrap)?,
+            MountStep::MakePrivate(p) => {
+                mount_fs(None, Path::new(p), "none", "rprivate").map_err(wrap)?
+            }
         }
     }
-    if let Some(runtime_boot) = config.runtime_boot_mountpoint.as_deref() {
-        let target = child_boot_target(runtime_boot);
+    for (index, installed) in roots.iter().enumerate() {
+        let saved = preserved_target(index);
+        let target = child_boot_target(installed);
         ensure_dir(&target).map_err(wrap)?;
-        mount_fs(Some(Path::new(CHILD_BOOT)), &target, "none", "bind").map_err(wrap)?;
+        mount_fs(Some(&saved), &target, "none", "rbind").map_err(wrap)?;
+        mount_fs(None, &target, "none", "rprivate").map_err(wrap)?;
     }
     Ok(())
 }
@@ -132,9 +190,9 @@ pub(super) fn apply_mount_plan(config: &Config) -> Result<()> {
 /// proceed regardless.
 pub(super) fn teardown_mounts(config: &Config) {
     use nix::mount::MntFlags;
-    if let Some(runtime_boot) = config.runtime_boot_mountpoint.as_deref() {
-        let target = child_boot_target(runtime_boot);
-        let _ = umount(&target, MntFlags::MNT_DETACH);
+    let roots = preserved_roots(config).unwrap_or_default();
+    for installed in roots.iter().rev() {
+        let _ = umount(&child_boot_target(installed), MntFlags::MNT_DETACH);
     }
     for target in umount_plan() {
         match umount(Path::new(target), MntFlags::MNT_DETACH) {
@@ -142,7 +200,9 @@ pub(super) fn teardown_mounts(config: &Config) {
             Err(e) => nmbl_warn!("rescue child: could not detach {target}: {e}"),
         }
     }
-    let _ = umount(Path::new(CHILD_BOOT), MntFlags::MNT_DETACH);
+    for index in (0..roots.len()).rev() {
+        let _ = umount(&preserved_target(index), MntFlags::MNT_DETACH);
+    }
 }
 
 /// Create `path` (and parents) idempotently. Mirrors `disk::ensure_dir`.

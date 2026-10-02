@@ -91,15 +91,7 @@ pub(super) async fn run_bootstrap_phase(
     // operator's `ro` default is only honoured when no state mount is
     // configured.
     let stateful_rw = section.state.is_some();
-    let boot_options = if stateful_rw {
-        if boot_fs.options.is_empty() {
-            "rw,nosuid,noexec,nodev".to_string()
-        } else {
-            format!("{},rw,nosuid,noexec,nodev", boot_fs.options)
-        }
-    } else {
-        boot_fs.options.clone()
-    };
+    let boot_options = stateful_boot_options(&boot_fs.options, &boot_fs.fstype, stateful_rw);
     nmbl_info!(
         "phase 0.5: mounting boot fs {} at {} (type {}, options {})",
         boot_fs.device,
@@ -224,4 +216,65 @@ pub(super) fn mount_state_twin(config: &mut Config, bootstrap_path: &Path) -> Re
     )?;
     config.runtime_state_mountpoint = Some(mp.clone());
     Ok(())
+}
+
+/// The RW twin shares boot_fs mount metadata. FAT stores no Unix permissions:
+/// protect the entire state directory at mount time, retaining all boot safety
+/// flags, so authenticated one-use recovery requests cannot be forged by users.
+pub(super) fn stateful_boot_options(options: &str, fstype: &str, stateful: bool) -> String {
+    if !stateful {
+        return options.to_string();
+    }
+    let fat = matches!(fstype, "vfat" | "msdos" | "fat");
+    let mut retained: Vec<&str> = options
+        .split(',')
+        .filter(|option| {
+            !(option.is_empty()
+                || matches!(*option, "ro" | "rw")
+                || fat
+                    && ["umask=", "fmask=", "dmask=", "uid=", "gid="]
+                        .iter()
+                        .any(|prefix| option.starts_with(prefix)))
+        })
+        .collect();
+    retained.extend(["rw", "nosuid", "noexec", "nodev"]);
+    if fat {
+        retained.extend(["uid=0", "gid=0", "fmask=0177", "dmask=0077"]);
+    }
+    retained.join(",")
+}
+
+#[cfg(test)]
+mod recovery_mount_tests {
+    use super::stateful_boot_options;
+    #[test]
+    fn fat_stateful_mount_protects_owner_only_marker_and_parent() {
+        let options = stateful_boot_options(
+            "ro,umask=0022,uid=1000,gid=100,fmask=0000,dmask=0000",
+            "vfat",
+            true,
+        );
+        for expected in [
+            "rw",
+            "nosuid",
+            "noexec",
+            "nodev",
+            "uid=0",
+            "gid=0",
+            "fmask=0177",
+            "dmask=0077",
+        ] {
+            assert!(options.split(',').any(|option| option == expected));
+        }
+        assert!(!options.contains("umask="));
+        assert!(!options.contains("uid=1000"));
+        assert_eq!(
+            stateful_boot_options("ro,umask=0022", "vfat", false),
+            "ro,umask=0022"
+        );
+        assert_eq!(
+            stateful_boot_options("ro", "ext4", true),
+            "rw,nosuid,noexec,nodev"
+        );
+    }
 }

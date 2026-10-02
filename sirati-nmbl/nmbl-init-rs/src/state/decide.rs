@@ -145,3 +145,18 @@ fn rotate_known_good(
         }
     }
 }
+
+/// Record an explicit operator-authorized attempt without changing automatic
+/// recovery budget, known-good history, or manufacturing a health blessing.
+/// The caller consumes one-use authorization and persists this before kexec.
+pub fn record_operator_retry(
+    state: &mut State,
+    generations: &[crate::generations::Generation],
+    number: u32,
+) -> Option<usize> {
+    let generation = nonmax::NonMaxU32::new(number).filter(|_| number > 0)?;
+    let index = generations.iter().position(|g| g.number == number)?;
+    state.last_attempted_generation = Some(generation);
+    state.last_boot_succeeded = false;
+    Some(index)
+}

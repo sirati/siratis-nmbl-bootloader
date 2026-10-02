@@ -371,3 +371,35 @@ fn decide_first_boot_default_state_honours_tui() {
     assert_eq!(decision, StatefulDecision::HonourTui);
     assert!(state.last_boot_succeeded);
 }
+
+#[test]
+fn operator_retry_failure_preserves_exhaustion_success_rearms_normally() {
+    let gs = gens(&[42, 7]);
+    let mut state = State {
+        recovery_attempt: 3,
+        last_boot_succeeded: false,
+        last_attempted_generation: nm(7),
+        ..State::default()
+    };
+    state.known_good_generations[0] = nm(7);
+    assert_eq!(decide(&mut state, &gs, 0, 3), StatefulDecision::Exhausted);
+    let before = state.clone();
+    assert_eq!(
+        crate::state::record_operator_retry(&mut state, &gs, 99),
+        None
+    );
+    assert_eq!(state, before);
+    assert_eq!(
+        crate::state::record_operator_retry(&mut state, &gs, 42),
+        Some(0)
+    );
+    assert_eq!(state.last_attempted_generation, nm(42));
+    assert!(!state.last_boot_succeeded);
+    assert_eq!(state.recovery_attempt, 3);
+    assert_eq!(state.known_good_generations[0], nm(7));
+    assert_eq!(decide(&mut state, &gs, 0, 3), StatefulDecision::Exhausted);
+    state.last_boot_succeeded = true; // ordinary health blessing, after real success
+    assert_eq!(decide(&mut state, &gs, 0, 3), StatefulDecision::HonourTui);
+    assert_eq!(state.recovery_attempt, 0);
+    assert_eq!(state.known_good_generations[0], nm(42));
+}

@@ -52,12 +52,19 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &nmblctl::Cli) -> Result<(), String> {
-    let sys = state::System::discover()?;
+    let sys = state::System::discover_for(cli)?;
     match &cli.command {
         Command::Chain => paged(cli, render::chain(&sys, palette(cli, false))),
+        Command::Status if cli.json => {
+            println!("{}", sys.status_json()?);
+            Ok(())
+        }
         Command::Status => paged(cli, render::status(&sys, palette(cli, false))),
         Command::RebootRescue { yes } => reboot_rescue(&sys, *yes),
         Command::RebootInto { generation } => reboot_into(&sys, *generation),
+        Command::RetryGeneration { generation } => {
+            retry_generation(&sys, *generation, cli.no_reboot)
+        }
         Command::Default {
             generation,
             latest,
@@ -174,6 +181,21 @@ fn reboot_into(sys: &state::System, generation: Option<u32>) -> Result<(), Strin
     .map_err(|e| format!("writing one-shot selection {}: {e}", path.display()))?;
     println!("one-shot: generation {target} will boot once next reboot");
     do_reboot()
+}
+
+fn retry_generation(sys: &state::System, generation: u32, no_reboot: bool) -> Result<(), String> {
+    sys.validate_retry_target(generation)?;
+    state::validate_operator_path(&sys.state_dir, true)?;
+    if sys.config.is_none() || !sys.generations.contains(&generation) {
+        return Err("retry requires a readable NMBL config and an installed profile".into());
+    }
+    let path = sys
+        .state_dir
+        .join(nmbl_init::boot_selection::RETRY_BASENAME);
+    state::write_durable(&path, OneShotSelection { generation }.render().as_bytes())
+        .map_err(|e| format!("writing operator retry: {e}"))?;
+    println!("operator retry: generation {generation}, one attempt; failure history preserved");
+    if no_reboot { Ok(()) } else { do_reboot() }
 }
 
 fn default_cmd(
