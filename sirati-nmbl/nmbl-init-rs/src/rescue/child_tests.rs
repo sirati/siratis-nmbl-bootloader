@@ -90,7 +90,10 @@ fn preservation_covers_system_root_and_separate_boot_state_mounts() {
     let mut config = Config::recovery_default();
     config.paths.system_root = PathBuf::from("/mnt/system");
     config.runtime_boot_mountpoint = Some(PathBuf::from("/mnt/boot"));
-    config.runtime_state_mountpoint = Some(PathBuf::from("/mnt/state"));
+    #[cfg(feature = "stateful")]
+    {
+        config.runtime_state_mountpoint = Some(PathBuf::from("/mnt/state"));
+    }
     assert_eq!(
         preserved_roots(&config).expect("roots"),
         vec![PathBuf::from("/mnt")]
