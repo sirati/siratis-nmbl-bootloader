@@ -52,7 +52,10 @@ let
       };
 
       kernel_modules = {
-        explicit = bootstrap.kernelModules.explicit;
+        # Forced rescue and rejected full configs happen before the runtime
+        # early-module phase. Input must already work from trusted initramfs.
+        explicit = lib.filter (name: !(lib.elem name (cfg.blacklistedKernelModules or [ ])))
+          (lib.unique ((import ./console-input-modules.nix) ++ bootstrap.kernelModules.explicit));
         modules_dir = bootstrap.kernelModules.modulesDir;
       };
     } // lib.optionalAttrs signingEnabled {

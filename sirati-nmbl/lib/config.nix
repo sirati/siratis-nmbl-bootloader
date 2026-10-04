@@ -436,14 +436,7 @@ let
   # modal, console picker) is unusable without these — applied to both
   # earlyKernelModules (so they are live before the first prompt) and
   # availableKernelModules (so they ship in the initramfs).
-  defaultKeyboardDrivers = [
-    "i8042"
-    "atkbd"
-    "usbhid"
-    "hid_generic"
-    "xhci_pci"
-    "ehci_pci"
-  ];
+  defaultKeyboardDrivers = import ./console-input-modules.nix;
 
   # Determine legacy boot mode string for compatibility
   legacyBootMode =

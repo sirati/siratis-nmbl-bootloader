@@ -42,6 +42,8 @@ rec {
   allKernelModules = lib.unique (
     lib.filter (m: !(lib.elem m cfg.blacklistedKernelModules)) (
       cfg.availableKernelModules
+      ++ (cfg.bootstrap.kernelModules.explicit or [ ])
+      ++ (import ../console-input-modules.nix)
       ++ explicitKernelModules
       ++ earlyKernelModules
       ++ config.boot.initrd.availableKernelModules

@@ -6,6 +6,8 @@
   iproute2,
   nix,
   openssh,
+  rescueConsole,
+  utilLinux,
   fullSystem,
   startNixDaemon ? true,
 }:
@@ -98,8 +100,7 @@
     guest_ips=$(${iproute2}/bin/ip -o -4 addr show scope global 2>/dev/null \
       | ${coreutils}/bin/cut -d' ' -f7 | ${coreutils}/bin/cut -d/ -f1)
     if [ -z "$guest_ips" ] && [ "$network_family" != "ipv6-only" ]; then
-      log "SELFTEST no global IPv4 address found; falling back to 10.0.2.15"
-      guest_ips="10.0.2.15"
+      log "WARNING: no global IPv4 address is assigned; external IPv4 SSH is unavailable"
     fi
     for gip in $guest_ips; do
       selftest "$gip"
@@ -111,8 +112,7 @@
     done
 
     log "recovery system ready — dropping to console shell"
-    # Local operator shell on the console. exec so bash becomes PID 1's
-    # foreground; when it exits PID 1 (this script) is gone and the
-    # kernel panics — acceptable for a manual recovery session.
-    exec ${bash}/bin/bash -i < /dev/console > /dev/console 2>&1
+    # NMBL remains PID1 outside the chroot. The launcher owns real VGA and
+    # serial controlling terminals and replaces exited operator shells.
+    exec ${rescueConsole}/bin/nmbl-rescue-console ${utilLinux}/bin/setsid ${bash}/bin/bash
 ''

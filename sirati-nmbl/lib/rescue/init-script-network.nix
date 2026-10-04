@@ -1,4 +1,4 @@
-# Rescue /init — signed DHCP or static network-stage application.
+# Rescue /init networking from a signed stage or immutable baked profile.
 {
   bash,
   coreutils,
@@ -7,16 +7,19 @@
   iproute2,
   # Whether this rescue image was built with a signed network stage. Without
   # one (e.g. a Hetzner host whose rescue carries its own NIC drivers) the
-  # rescue uses DHCP on every interface. With one, a missing or rejected
+  # rescue uses its baked static profile or DHCP on every interface. With one, a missing or rejected
   # stage keeps the rescue local-only: only signed network configuration is
   # ever applied.
   networkStageEnabled ? true,
+  bakedNetworkConfig ? null,
+  rescueConsole,
+  utilLinux,
 }:
 ''
   ${""}    # --- networking ---
       local_network_only() {
         log "ERROR: $*; networking and sshd disabled; local console only"
-        exec ${bash}/bin/bash -i < /dev/console > /dev/console 2>&1
+        exec ${rescueConsole}/bin/nmbl-rescue-console ${utilLinux}/bin/setsid ${bash}/bin/bash
       }
 
       if [ -e /etc/nmbl-network-disabled ]; then
@@ -26,6 +29,9 @@
       network_config=/nmbl-network/etc/nmbl-network/network.conf
       ${if networkStageEnabled then ''
         [ -r "$network_config" ] || local_network_only "network profile is missing"
+      '' else if bakedNetworkConfig != null then ''
+        network_config=${bakedNetworkConfig}
+        [ -r "$network_config" ] || local_network_only "baked network profile is missing"
       '' else ''
         # No signed network stage configured: DHCP on every interface.
         network_config=/etc/nmbl-network-default.conf
@@ -36,7 +42,7 @@
       ${iproute2}/bin/ip link set lo up > /dev/console 2>&1 || true
 
       if [ "$network_version" = 2 ]; then
-        log "applying signed static network profiles"
+        log "applying rescue static network profiles"
         : > /etc/resolv.conf || local_network_only "cannot create resolv.conf"
         current_iface=""
         ifaces=""
@@ -109,7 +115,7 @@
         done < "$network_config"
         [ -z "$current_iface" ] || local_network_only "unterminated static profile"
         [ -n "$ifaces" ] || local_network_only "static profile selected no interfaces"
-        log "signed static network configuration applied"
+        log "rescue static network configuration applied"
       else
         log "bringing up rescue networking with DHCP"
         configured_ifaces=""
@@ -146,7 +152,7 @@
           *) local_network_only "invalid DHCP address family" ;;
         esac
         # Rescue has no udev daemon/database; use kernel interfaces directly.
-        ${dhcpcd}/bin/dhcpcd --nodev $family_args -t 20 $ifaces > /dev/console 2>&1 \
+        ${dhcpcd}/bin/dhcpcd --nodev --slaac hwaddr $family_args -t 20 $ifaces > /dev/console 2>&1 \
           || log "WARNING: dhcpcd did not bind an address in time"
       fi
 

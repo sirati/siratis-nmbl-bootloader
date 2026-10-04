@@ -2,13 +2,17 @@
 """Drive NMBL's direct-kernel rescue VM and scan binary artifacts."""
 
 import argparse
+import contextlib
+import json
 import os
 import selectors
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 
 
@@ -52,6 +56,26 @@ def scan(args):
                 raise SystemExit(f"private signing key escaped into {path}")
 
 
+def console_image(args):
+    root = Path(args.initrd)
+    bootstraps = list(root.rglob("*-nmbl-bootstrap.toml"))
+    if len(bootstraps) != 1:
+        raise RuntimeError("complete initramfs must contain one bootstrap profile")
+    profile = tomllib.loads(bootstraps[0].read_text())
+    baseline = {"i8042", "atkbd", "usbhid", "hid_generic", "xhci_pci", "ehci_pci"}
+    if not baseline <= set(profile["bootstrap"]["kernel_modules"]["explicit"]):
+        raise RuntimeError("trusted bootstrap omits console input preload")
+    builtin = set()
+    for path in root.rglob("modules.builtin"):
+        builtin.update(Path(line).name.removesuffix(".ko").replace("-", "_")
+                       for line in path.read_text().splitlines())
+    included = {path.name.split(".ko", 1)[0].replace("-", "_")
+                for path in root.rglob("*.ko*") if path.is_file()}
+    if not baseline <= included | builtin:
+        raise RuntimeError("complete initramfs omits console input modules or builtin evidence")
+    print("complete initramfs console preload and module bytes verified", flush=True)
+
+
 def wait_for(proc, patterns, timeout, transcript, extra_proc=None):
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ, True)
@@ -81,7 +105,7 @@ def wait_for(proc, patterns, timeout, transcript, extra_proc=None):
     raise RuntimeError(f"timed out waiting for {patterns}:\n{seen[-12000:].decode(errors='replace')}")
 
 
-def qemu_command(args, disk, network_socket):
+def qemu_command(args, disk, network_socket, qmp_socket):
     return [
         args.qemu,
         "-machine", "q35,accel=tcg",
@@ -90,22 +114,80 @@ def qemu_command(args, disk, network_socket):
         "-smp", "2",
         "-kernel", args.kernel,
         "-initrd", args.initrd,
-        "-append", "console=ttyS0,115200 earlyprintk=serial,ttyS0,115200",
-        "-drive", f"file={disk},format=raw,if=virtio,readonly=on",
+        "-append", "console=tty0 console=ttyS0,115200 earlyprintk=serial,ttyS0,115200",
+        "-drive", f"file={disk},format=qcow2,if=virtio",
         "-netdev", f"stream,id=net0,server=off,addr.type=unix,addr.path={network_socket}",
         "-device", "virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56",
         "-display", "none",
         "-serial", "stdio",
         "-monitor", "none",
+        "-qmp", f"unix:{qmp_socket},server=on,wait=off",
         "-no-reboot",
     ]
 
 
+def console_proof(proc, qmp_socket, transcript):
+    # An echoed command is never the receipt: quoted marker fragments only
+    # concatenate in the shell after the physical terminal input was read.
+    proc.stdin.write(b"test $(tty) = /dev/ttyS0 && test -r /dev/tty && "
+                     b"test $(ps -o pgid= -p $$) = $(ps -o tpgid= -p $$) "
+                     b"&& echo NMBL_SERIAL_\"CTTY_PASS\"\n")
+    proc.stdin.flush()
+    wait_for(proc, ["NMBL_SERIAL_CTTY_PASS"], 30, transcript)
+    with socket.socket(socket.AF_UNIX) as qmp, contextlib.ExitStack() as resources:
+        qmp.settimeout(10)
+        qmp.connect(str(qmp_socket))
+        stream = resources.enter_context(qmp.makefile("rwb"))
+        json.loads(stream.readline())
+
+        def command(name, arguments=None):
+            stream.write((json.dumps({"execute": name, "arguments": arguments or {}}) + "\n").encode())
+            stream.flush()
+            while True:
+                reply = json.loads(stream.readline())
+                if "error" in reply:
+                    raise RuntimeError(f"QMP console input failed: {reply['error']}")
+                if "return" in reply:
+                    return
+
+        command("qmp_capabilities")
+        # Activate VGA tty1, then type through QEMU's actual keyboard device.
+        command("send-key", {"keys": [{"type": "qcode", "data": key} for key in ("ctrl", "alt", "f1")]})
+        time.sleep(0.5)
+        for char in "tty >/run/vga-tty\n":
+            key = {" ": "spc", "/": "slash", "-": "minus", "\n": "ret", ">": "dot"}.get(char, char)
+            keys = ([{"type": "qcode", "data": "shift"}] if char == ">" else [])
+            keys.append({"type": "qcode", "data": key})
+            command("send-key", {"keys": keys, "hold-time": 25})
+            time.sleep(0.04)
+    # QMP returns after queuing key events, before the guest shell has
+    # necessarily executed the command. Observe its actual side effect.
+    proc.stdin.write(b"for n in $(seq 1 50); do if test -f /run/vga-tty && test $(cat /run/vga-tty) = /dev/tty1; then echo NMBL_VGA_\"INPUT_PASS\"; break; fi; sleep .1; done\n")
+    proc.stdin.flush()
+    wait_for(proc, ["NMBL_VGA_INPUT_PASS"], 30, transcript)
+    proc.stdin.write(b"sleep 60\n")
+    proc.stdin.flush()
+    time.sleep(0.5)
+    proc.stdin.write(b"\x03")
+    proc.stdin.flush()
+    time.sleep(0.3)
+    proc.stdin.write(b"echo NMBL_JOB_\"CONTROL_PASS\"\n")
+    proc.stdin.flush()
+    wait_for(proc, ["NMBL_JOB_CONTROL_PASS"], 15, transcript)
+    proc.stdin.write(b"exit\n")
+    proc.stdin.flush()
+    time.sleep(2)
+    proc.stdin.write(b"test $(cat /proc/1/comm) = init && echo NMBL_RESCUE_\"RESPAWN_PASS\"\n")
+    proc.stdin.flush()
+    wait_for(proc, ["NMBL_RESCUE_RESPAWN_PASS"], 30, transcript)
+
+
 def remote_tui(args, transcript, qemu):
+    host = "::1" if args.mode == "baked-slaac" else "127.0.0.1"
     host_key = Path(args.ssh_host_key).read_text().split()
     known_hosts = Path(args.transcript).with_suffix(".known-hosts")
     known_hosts.write_text(
-        f"[127.0.0.1]:{args.ssh_port} {host_key[0]} {host_key[1]}\n"
+        f"[{host}]:{args.ssh_port} {host_key[0]} {host_key[1]}\n"
     )
     command = [
         args.ssh,
@@ -117,7 +199,7 @@ def remote_tui(args, transcript, qemu):
         "-o", "StrictHostKeyChecking=yes",
         "-o", f"UserKnownHostsFile={known_hosts}",
         "-o", "ConnectTimeout=15",
-        "root@127.0.0.1",
+        f"root@{host}",
         "stty rows 30 cols 100; exec nmbl",
     ]
     environment = os.environ.copy()
@@ -161,18 +243,29 @@ def boot(args):
     with transcript_path.open("wb") as transcript:
         network_dir = Path(tempfile.mkdtemp(prefix="nmbl-passt-", dir="/tmp"))
         network_socket = network_dir / "qemu.sock"
+        qmp_socket = network_dir / "qmp.sock"
+        overlay = transcript_path.with_suffix(".qcow2")
+        subprocess.run([str(Path(args.qemu).with_name("qemu-img")), "create", "-f", "qcow2", "-F", "raw",
+                        "-b", str(Path(args.disk).resolve()), str(overlay)], check=True)
         passt_log = transcript_path.with_suffix(".passt.log")
         passt_output = passt_log.open("wb")
-        passt = subprocess.Popen(
-            [
+        passt_command = [
                 args.passt,
                 "-f", "-s", str(network_socket),
                 "--runas", f"{os.getuid()}:{os.getgid()}",
-                "-a", "10.0.2.15", "-n", "32",
-                "-g", "10.0.2.2", "-M", "52:54:00:12:34:56",
+                "-a", "88.99.80.66" if args.mode == "baked-static" else "10.0.2.15", "-n", "32",
+                "-g", "172.31.1.1" if args.mode == "baked-static" else "10.0.2.2", "-M", "52:54:00:12:34:56",
                 "-D", "10.0.2.3",
                 "-t", f"127.0.0.1/{args.ssh_port}:22222",
-            ],
+            ]
+        if args.mode == "baked-slaac":
+            passt_command = [args.passt, "-f", "-s", str(network_socket),
+                             "--runas", f"{os.getuid()}:{os.getgid()}", "-6",
+                             "-a", "2001:db8::15", "-g", "fe80::2", "-D", "2001:db8::3",
+                             "-M", "52:54:00:12:34:56", "--no-dhcp", "--no-dhcpv6",
+                             "-t", f"::1/{args.ssh_port}:22222"]
+        passt = subprocess.Popen(
+            passt_command,
             stdout=passt_output,
             stderr=subprocess.STDOUT,
         )
@@ -188,15 +281,16 @@ def boot(args):
                 raise RuntimeError("passt did not open its QEMU socket")
             time.sleep(0.1)
         proc = subprocess.Popen(
-            qemu_command(args, args.disk, network_socket),
+            qemu_command(args, overlay, network_socket, qmp_socket),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
         try:
-            if args.mode == "good":
+            if args.mode in ("good", "baked-static", "baked-slaac"):
                 wait_for(proc, ["recovery system ready"], 240, transcript)
+                console_proof(proc, qmp_socket, transcript)
                 commands = r'''
 set -eux
 findmnt -n -o OPTIONS /nmbl-network | grep -w ro | grep -w nodev | grep -w nosuid | grep -w noexec
@@ -225,6 +319,27 @@ grep -qx 'nameserver fec0::3' /etc/resolv.conf
 ! pgrep -x dhcpcd
 echo NMBL_NETWORK_STAGE_VM_"PASS"
 '''
+                if args.mode == "baked-static":
+                    commands = r'''
+test ! -d /nmbl-network/etc/nmbl-network &&
+grep -qx 'version 2' /nix/store/*-nmbl-baked-network.conf &&
+ip -4 addr show dev eth0 | grep -F '88.99.80.66/32' &&
+ip -4 route show | grep -F 'default via 172.31.1.1 dev eth0 onlink' &&
+! pgrep -x dhcpcd &&
+ss -tln | grep ':22222 ' &&
+echo NMBL_NETWORK_STAGE_VM_"PASS"
+'''
+                if args.mode == "baked-slaac":
+                    commands = r'''
+test ! -d /nmbl-network/etc/nmbl-network &&
+grep -qx 'version 1' /nix/store/*-nmbl-baked-network.conf &&
+grep -qx 'address-family ipv6-only' /nix/store/*-nmbl-baked-network.conf &&
+test -z "$(ip -o -4 addr show scope global)" &&
+ip -6 addr show dev eth0 scope global | grep '2001:db8::5054:ff:fe12:3456/64' &&
+ip -6 route show default | grep 'default via ' &&
+ss -tln | grep ':22222 ' &&
+echo NMBL_NETWORK_STAGE_VM_"PASS"
+'''
                 proc.stdin.write(commands.encode())
                 proc.stdin.flush()
                 text = wait_for(proc, ["NMBL_NETWORK_STAGE_VM_PASS"], 90, transcript)
@@ -240,9 +355,40 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
                 )
                 if "recovery system ready" in text:
                     raise RuntimeError("invalid network stage reached the rescue system")
-                proc.stdin.write(b"echo NMBL_LOCAL_CONSOLE_PASS\n")
-                proc.stdin.flush()
-                wait_for(proc, ["NMBL_LOCAL_CONSOLE_PASS"], 30, transcript)
+                console_proof(proc, qmp_socket, transcript)
+        except BaseException:
+            # Preserve original disk plus RAM/CPU/device state before any
+            # operator diagnosis. This is an ordinary test failure snapshot,
+            # never an in-guest repair or a successful test receipt.
+            transcript_path.parent.joinpath(".nmbl-preserve-failure").write_text(str(overlay) + "\n")
+            try:
+                with socket.socket(socket.AF_UNIX) as qmp, contextlib.ExitStack() as resources:
+                    qmp.settimeout(120)
+                    qmp.connect(str(qmp_socket))
+                    stream = resources.enter_context(qmp.makefile("rwb"))
+                    json.loads(stream.readline())
+                    for request in ({"execute": "qmp_capabilities"}, {"execute": "stop"},
+                                    {"execute": "human-monitor-command", "arguments": {"command-line": "savevm rescue-failure"}}):
+                        stream.write((json.dumps(request) + "\n").encode())
+                        stream.flush()
+                        while True:
+                            reply = json.loads(stream.readline())
+                            if "error" in reply:
+                                raise RuntimeError(f"failed to preserve rescue snapshot: {reply['error']}")
+                            if "return" in reply:
+                                if isinstance(reply["return"], str) and reply["return"].strip():
+                                    raise RuntimeError(f"snapshot manager reported: {reply['return']}")
+                                break
+                print(f"failure snapshot preserved in {overlay} (rescue-failure)", flush=True)
+            except Exception as snapshot_error:
+                print(f"SNAPSHOT FAILURE: {snapshot_error}; retaining live QEMU and passt; no manual diagnosis", file=sys.stderr, flush=True)
+                transcript_path.parent.joinpath(".snapshot-failed-live").write_text(f"qemu={proc.pid}\npasst={passt.pid}\nqmp={qmp_socket}\n")
+                # A failed preservation attempt cannot destroy the original
+                # runtime. Keep ownership here until the operator explicitly
+                # resolves preservation or stops this exact test process.
+                while proc.poll() is None:
+                    time.sleep(1)
+            raise
         finally:
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGTERM)
@@ -258,6 +404,7 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
                 passt.kill()
                 passt.wait()
             network_socket.unlink(missing_ok=True)
+            qmp_socket.unlink(missing_ok=True)
             network_dir.rmdir()
 
 
@@ -269,6 +416,8 @@ def main():
     scan_parser.add_argument("--marker", required=True)
     scan_parser.add_argument("--target-list")
     scan_parser.add_argument("targets", nargs="*")
+    image_parser = sub.add_parser("console-image")
+    image_parser.add_argument("--initrd", required=True)
     boot_parser = sub.add_parser("boot")
     boot_parser.add_argument("--qemu", required=True)
     boot_parser.add_argument("--passt", required=True)
@@ -280,9 +429,14 @@ def main():
     boot_parser.add_argument("--ssh-port", type=int, required=True)
     boot_parser.add_argument("--ssh-key", required=True)
     boot_parser.add_argument("--ssh-host-key", required=True)
-    boot_parser.add_argument("--mode", choices=["good", "invalid"], required=True)
+    boot_parser.add_argument("--mode", choices=["good", "invalid", "baked-static", "baked-slaac"], required=True)
     args = parser.parse_args()
-    scan(args) if args.command == "scan" else boot(args)
+    if args.command == "scan":
+        scan(args)
+    elif args.command == "console-image":
+        console_image(args)
+    else:
+        boot(args)
 
 
 if __name__ == "__main__":

@@ -144,25 +144,25 @@ in
     };
   };
 
-  config = lib.mkIf stage.enable {
+  config = lib.mkIf (stage.enable || stage.staticProfiles != [ ]) {
     assertions = [
       {
         assertion = cfg.enable && config.boot.nmbl.rescue.mode == "external";
         message = "The rescue networking stage requires external full-system rescue.";
       }
       {
-        assertion = config.boot.nmbl.signing.enable && config.boot.nmbl.signing.enforce;
+        assertion = !stage.enable || (config.boot.nmbl.signing.enable && config.boot.nmbl.signing.enforce);
         message = "The networking EROFS stage requires enforced NMBL signing.";
       }
       {
-        assertion = hostKey != null && !(lib.hasPrefix builtins.storeDir hostKey);
+        assertion = !stage.enable || (hostKey != null && !(lib.hasPrefix builtins.storeDir hostKey));
         message = ''
           The networking rescue requires fullSystem.hostKeyPath outside
           /nix/store so SSH has a stable, impermanence-safe host identity.
         '';
       }
       {
-        assertion = hostKey != null && lib.hasPrefix "/" hostKey && !(lib.hasInfix ".." hostKey);
+        assertion = !stage.enable || (hostKey != null && lib.hasPrefix "/" hostKey && !(lib.hasInfix ".." hostKey));
         message = "fullSystem.hostKeyPath must be an absolute path without `..`.";
       }
       {
@@ -187,7 +187,7 @@ in
         message = "Static profile addresses must match networkStage.addressFamily.";
       }
       {
-        assertion = !(lib.hasPrefix "/" stage.imagePath) && !(lib.hasInfix ".." stage.imagePath);
+        assertion = !stage.enable || (!(lib.hasPrefix "/" stage.imagePath) && !(lib.hasInfix ".." stage.imagePath));
         message = "networkStage.imagePath must be a safe path relative to /boot.";
       }
     ];

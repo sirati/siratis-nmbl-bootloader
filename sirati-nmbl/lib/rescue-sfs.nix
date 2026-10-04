@@ -71,6 +71,7 @@ let
   # /init script and the /bin shims. Pull them out of the package set so
   # the script does not depend on PATH being set up before it has set up
   # PATH (chicken/egg at PID 1).
+  rescueConsole = import ./rescue/console.nix { inherit pkgs; };
   bash = pkgs.bashInteractive;
   coreutils = pkgs.coreutils-full;
   utilLinux = pkgs.util-linux;
@@ -128,11 +129,14 @@ let
   initScript = pkgs.writeShellScript "nmbl-rescue-init" (
     initScriptPrefix
     + import ./rescue/init-script-network.nix {
-      inherit bash coreutils dhcpcd gawk iproute2;
+      inherit bash coreutils dhcpcd gawk iproute2 rescueConsole utilLinux;
+      bakedNetworkConfig = if !fullSystem.networkStage.enable
+        then pkgs.writeText "nmbl-baked-network.conf" (import ./network-profile.nix { inherit lib; stage = { staticProfiles = [ ]; dnsServers = [ ]; } // fullSystem.networkStage; })
+        else null;
       networkStageEnabled = fullSystem.networkStage.enable;
     }
     + import ./rescue/init-script-net.nix {
-      inherit lib bash coreutils iproute2 nix openssh fullSystem;
+      inherit lib bash coreutils iproute2 nix openssh fullSystem rescueConsole utilLinux;
       startNixDaemon = !fullSystem.minimal;
     }
   );

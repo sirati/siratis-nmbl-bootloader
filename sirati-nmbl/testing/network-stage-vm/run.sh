@@ -5,14 +5,26 @@ harness=@harness@
 qemu=@qemu@
 operator_root=$(mktemp -d /dev/shm/nmbl-network-operator.XXXXXX)
 work_root=$(mktemp -d "${TMPDIR:-/tmp}/nmbl-network-vm.XXXXXX")
+artifact_roots=${NMBL_TEST_ROOTS:-"$work_root/artifact-roots"}
+mkdir -p "$artifact_roots"
 cleanup() {
+  result=$?
+  if [ "$result" -ne 0 ]; then
+    echo "Retained failed test artifacts at $work_root and $artifact_roots" >&2
+    return
+  fi
+  if [ -e "$work_root/.nmbl-preserve-failure" ]; then
+    echo "Retained failed VM snapshot and evidence at $work_root" >&2
+    return
+  fi
   chmod -R u+w "$work_root" 2>/dev/null || true
+  rm -f "$artifact_roots/signer" "$artifact_roots/signed" "$artifact_roots/baked-static" "$artifact_roots/baked-slaac"
   rm -rf "$operator_root" "$work_root"
 }
 trap cleanup EXIT INT TERM
 chmod 0700 "$operator_root"
 
-signer=$(nix build --no-link --print-out-paths "path:$source_tree/nmbl-init-rs#nmbl-sign")
+signer=$(nix build --out-link "$artifact_roots/signer" --print-out-paths "path:$source_tree/nmbl-init-rs#nmbl-sign")
 private_key="$operator_root/image.key"
 public_key="$operator_root/image.pub"
 ssh_private_key="$operator_root/rescue-client-ed25519"
@@ -29,12 +41,24 @@ chmod 0600 "$ssh_private_key"
 
 public_hash=$(nix hash path --type sha256 "$public_key")
 ssh_public_hash=$(nix hash path --type sha256 "$ssh_public_key")
-artifacts=$(nix build --no-link --print-out-paths \
+artifacts=$(nix build --out-link "$artifact_roots/signed" --print-out-paths \
   --file "$source_tree/testing/network-stage-vm/eval.nix" \
   --argstr source "$source_tree" \
   --argstr publicKeyPath "$public_key" \
   --argstr publicKeyHash "$public_hash" \
   --argstr sshPublicKeyPath "$ssh_public_key" \
+  --argstr sshPublicKeyHash "$ssh_public_hash")
+
+baked_artifacts=$(nix build --out-link "$artifact_roots/baked-static" --print-out-paths \
+  --file "$source_tree/testing/network-stage-vm/eval.nix" --arg bakedStatic true \
+  --argstr source "$source_tree" --argstr publicKeyPath "$public_key" \
+  --argstr publicKeyHash "$public_hash" --argstr sshPublicKeyPath "$ssh_public_key" \
+  --argstr sshPublicKeyHash "$ssh_public_hash")
+
+slaac_artifacts=$(nix build --out-link "$artifact_roots/baked-slaac" --print-out-paths \
+  --file "$source_tree/testing/network-stage-vm/eval.nix" --arg bakedSlaac true \
+  --argstr source "$source_tree" --argstr publicKeyPath "$public_key" \
+  --argstr publicKeyHash "$public_hash" --argstr sshPublicKeyPath "$ssh_public_key" \
   --argstr sshPublicKeyHash "$ssh_public_hash")
 
 stage="$work_root/boot"
@@ -115,6 +139,7 @@ done
 
 mkdir "$work_root/initrd" "$work_root/rescue" "$work_root/network" "$work_root/disk"
 (cd "$work_root/initrd" && lsinitrd --unpack "$artifacts/initrd")
+python3 "$harness" console-image --initrd "$work_root/initrd"
 unsquashfs -quiet -dest "$work_root/rescue" "$artifacts/rescue.sfs"
 fsck.erofs --extract="$work_root/network" "$artifacts/network.erofs"
 
@@ -146,6 +171,32 @@ python3 "$harness" scan \
   "$work_root/tampered.img" "$work_root/unsigned.img" \
   "$work_root/malformed.img"
 
+baked_stage="$work_root/baked-boot"
+mkdir -p "$baked_stage/nmbl"
+cp "$baked_artifacts/config.toml" "$baked_stage/nmbl/config.toml"
+cp "$stage/rescue-host-ed25519" "$stage/rescue-host-ed25519.pub" "$baked_stage/"
+# Match unsigned install-bootloader staging: immutable rescue artifact, mode 0644.
+install -m 0644 "$baked_artifacts/rescue.sfs" "$baked_stage/nmbl-rescue.sfs"
+test ! -e "$baked_stage/nmbl-rescue.sfs.sig"
+test ! -e "$baked_stage/nmbl/config.toml.sig"
+test ! -e "$baked_stage/nmbl/network.erofs"
+make_disk "$baked_stage" "$work_root/baked-static.img"
+python3 "$harness" scan --key "$private_key" --key "$ssh_private_key" \
+  --marker "$marker" "$baked_artifacts" "$baked_stage" "$work_root/baked-static.img"
+
+slaac_stage="$work_root/slaac-boot"
+mkdir -p "$slaac_stage/nmbl"
+cp "$slaac_artifacts/config.toml" "$slaac_stage/nmbl/config.toml"
+cp "$stage/rescue-host-ed25519" "$stage/rescue-host-ed25519.pub" "$slaac_stage/"
+# Match unsigned install-bootloader staging: immutable rescue artifact, mode 0644.
+install -m 0644 "$slaac_artifacts/rescue.sfs" "$slaac_stage/nmbl-rescue.sfs"
+test ! -e "$slaac_stage/nmbl-rescue.sfs.sig"
+test ! -e "$slaac_stage/nmbl/config.toml.sig"
+test ! -e "$slaac_stage/nmbl/network.erofs"
+make_disk "$slaac_stage" "$work_root/baked-slaac.img"
+python3 "$harness" scan --key "$private_key" --key "$ssh_private_key" \
+  --marker "$marker" "$slaac_artifacts" "$slaac_stage" "$work_root/baked-slaac.img"
+
 rm -f "$private_key" "$operator_root/do-not-export.marker"
 test ! -e "$private_key"
 
@@ -168,4 +219,16 @@ for scenario in good tampered unsigned malformed; do
     --mode "$mode"
 done
 
-echo "NMBL signed network-stage VM test passed"
+python3 "$harness" boot --qemu "$qemu" --passt @passt@ \
+  --kernel "$baked_artifacts/kernel" --initrd "$baked_artifacts/initrd" \
+  --disk "$work_root/baked-static.img" --transcript "$work_root/baked-static.log" \
+  --ssh @ssh@ --ssh-port "$ssh_port" --ssh-key "$ssh_private_key" \
+  --ssh-host-key "$stage/rescue-host-ed25519.pub" --mode baked-static
+
+python3 "$harness" boot --qemu "$qemu" --passt @passt@ \
+  --kernel "$slaac_artifacts/kernel" --initrd "$slaac_artifacts/initrd" \
+  --disk "$work_root/baked-slaac.img" --transcript "$work_root/baked-slaac.log" \
+  --ssh @ssh@ --ssh-port "$ssh_port" --ssh-key "$ssh_private_key" \
+  --ssh-host-key "$stage/rescue-host-ed25519.pub" --mode baked-slaac
+
+echo "NMBL signed and baked static rescue network VM tests passed"

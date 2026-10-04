@@ -1,5 +1,7 @@
 {
   source,
+  bakedStatic ? false,
+  bakedSlaac ? false,
   publicKeyPath,
   publicKeyHash,
   sshPublicKeyPath,
@@ -18,7 +20,23 @@ let
     name = "nmbl-network-stage-vm-ssh-public.key";
     sha256 = sshPublicKeyHash;
   });
-  config = flake.lib.mkNetworkStageVmConfig { inherit publicKey sshPublicKey; };
+  baseline = flake.lib.mkNetworkStageVmConfig { inherit publicKey sshPublicKey; };
+  config = if !(bakedStatic || bakedSlaac) then baseline else baseline.extendModules {
+    modules = [ {
+      boot.nmbl.signing.enable = lib.mkForce false;
+      boot.nmbl.signing.enforce = lib.mkForce false;
+      boot.nmbl.rescue.fullSystem.networkStage = {
+        enable = lib.mkForce false;
+        addressFamily = lib.mkForce (if bakedSlaac then "ipv6-only" else "dual-stack");
+        dnsServers = lib.mkForce [ "1.1.1.1" ];
+        staticProfiles = lib.mkForce (if bakedSlaac then [ ] else [ {
+          interfaceName = "eth0";
+          ipv4 = { addresses = [ "88.99.80.66/32" ]; gateway = "172.31.1.1"; gatewayOnLink = true; };
+          ipv6 = { addresses = [ "2a01:4f8:1c17:5100::1/64" ]; gateway = "fe80::1"; gatewayOnLink = true; };
+        } ]);
+      };
+    } ];
+  };
   build = config.config.system.build;
   pkgs = flake.inputs.nixpkgs.legacyPackages.x86_64-linux;
   lib = flake.inputs.nixpkgs.lib;
@@ -47,11 +65,11 @@ in
 assert !evaluates bothSelectors;
 assert !evaluates noAddress;
 assert !evaluates wrongFamily;
-pkgs.linkFarm "nmbl-network-stage-vm-artifacts" [
+pkgs.linkFarm "nmbl-network-stage-vm-artifacts" ([
   { name = "kernel"; path = "${build.nmblKernel}/bzImage"; }
   { name = "initrd"; path = "${build.nmblInitramfs}/initrd"; }
   { name = "config.toml"; path = build.nmblConfigToml; }
   { name = "rescue.sfs"; path = build.nmblRescueSquashfs; }
-  { name = "network.erofs"; path = build.nmblNetworkStage; }
+  ] ++ lib.optional (!(bakedStatic || bakedSlaac)) { name = "network.erofs"; path = build.nmblNetworkStage; } ++ lib.optional (!(bakedStatic || bakedSlaac))
   { name = "rescue-installer"; path = build.nmblRescueStageInstaller; }
-]
+)
