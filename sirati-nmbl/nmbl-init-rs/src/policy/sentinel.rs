@@ -88,7 +88,12 @@ pub fn consume_after_rescue_booted(config: &Config) -> std::io::Result<()> {
     let Some(path) = resolve_sentinel_path(config) else {
         return Ok(());
     };
-    match std::fs::remove_file(&path) {
+    consume_pinned_sentinel(&path)
+}
+
+/// Parent-owned path anchor captured before the rescue namespace changes.
+pub(crate) fn consume_pinned_sentinel(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
@@ -105,7 +110,7 @@ pub fn consume_after_rescue_booted(config: &Config) -> std::io::Result<()> {
 /// is absolute and no runtime mountpoint is known (embedded mode). Returns
 /// `None` only when there is neither a runtime mountpoint nor an absolute
 /// configured path to anchor against.
-fn resolve_sentinel_path(config: &Config) -> Option<PathBuf> {
+pub(crate) fn resolve_sentinel_path(config: &Config) -> Option<PathBuf> {
     let configured = configured_sentinel_path(config);
     // The same boot-mountpoint resolution the sidecar scan uses: the bootstrap
     // mount when present, else `<system_root>/boot` once phase 3b has mounted

@@ -73,6 +73,15 @@ def console_image(args):
                 for path in root.rglob("*.ko*") if path.is_file()}
     if not baseline <= included | builtin:
         raise RuntimeError("complete initramfs omits console input modules or builtin evidence")
+    if args.identity_config:
+        config = tomllib.loads(Path(args.identity_config).read_text())
+        identity = config["rescue"]["identity_volume"]
+        required = set(identity.get("required_modules", []))
+        if identity.get("fstype") != "btrfs" or "crc32c-cryptoapi" not in required:
+            raise RuntimeError("native Btrfs identity config omits its exact CRC32C crypto provider")
+        if not {name.replace("-", "_") for name in required} <= included:
+            raise RuntimeError("native identity required modules are absent from the actual initramfs")
+        print("native Btrfs identity CRC32C config and actual module bytes verified", flush=True)
     print("complete initramfs console preload and module bytes verified", flush=True)
 
 
@@ -461,6 +470,7 @@ def main():
     scan_parser.add_argument("targets", nargs="*")
     image_parser = sub.add_parser("console-image")
     image_parser.add_argument("--initrd", required=True)
+    image_parser.add_argument("--identity-config")
     boot_parser = sub.add_parser("boot")
     boot_parser.add_argument("--qemu", required=True)
     boot_parser.add_argument("--passt", required=True)

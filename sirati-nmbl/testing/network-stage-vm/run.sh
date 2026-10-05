@@ -207,6 +207,11 @@ make_disk "$slaac_stage" "$work_root/baked-slaac.img"
 python3 "$harness" scan --key "$private_key" --key "$ssh_private_key" \
   --marker "$marker" "$slaac_artifacts" "$slaac_stage" "$work_root/baked-slaac.img"
 
+mkdir "$work_root/native-initrd"
+(cd "$work_root/native-initrd" && lsinitrd --unpack "$native_artifacts/initrd")
+python3 "$harness" console-image --initrd "$work_root/native-initrd" \
+  --identity-config "$native_artifacts/config.toml"
+
 native_stage="$work_root/native-boot"
 mkdir -p "$native_stage/nmbl" "$work_root/native-state/@persistent/etc/ssh"
 cp "$native_artifacts/config.toml" "$native_stage/nmbl/config.toml"
@@ -225,7 +230,7 @@ grep -F 'name: @persistent' "$work_root/native-state-metadata.log"
 grep -E 'mode 100600 links 1 uid 0 gid 0' "$work_root/native-state-metadata.log"
 qemu-img create -f qcow2 -F raw -b "$work_root/native-state.img" "$work_root/native-state.qcow2"
 python3 "$harness" scan --key "$private_key" --key "$ssh_private_key" --marker "$marker" \
-  "$native_artifacts" "$native_stage"
+  "$native_artifacts" "$native_stage" "$work_root/native-initrd"
 
 rm -f "$private_key" "$operator_root/do-not-export.marker"
 test ! -e "$private_key"

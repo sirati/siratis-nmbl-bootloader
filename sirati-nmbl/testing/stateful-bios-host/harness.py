@@ -288,7 +288,7 @@ def main():
         if args.expect == "rescue":
             baseline = rescue_boot(args, transcript)
             print("powercycle: exactly one failed-generation retry", flush=True)
-            failing_boot(args, transcript, 1, "rescue exit: retrying generation 1 once; failure history preserved")
+            failing_boot(args, transcript, 1, "phase 4: scanning generations")
             consumed = check_rescue_state(offline_state(args), baseline, ready=False)
             print("STATEFUL_RETRY_CONSUMED_STATE", json.dumps(consumed, sort_keys=True), flush=True)
             rescue_boot(args, transcript, baseline)

@@ -35,6 +35,8 @@ use crate::{nmbl_info, nmbl_warn};
 const RESCUE_ROOT: &str = "/rescue";
 #[path = "child_mounts.rs"]
 mod mounts;
+#[path = "child_ready_paths.rs"]
+mod ready_paths;
 #[cfg(test)]
 use mounts::{MountStep, child_boot_target, mount_plan, preserved_roots, umount_plan};
 use mounts::{apply_mount_plan, teardown_mounts};
@@ -239,6 +241,15 @@ pub async fn run_external_rescue_child(
     );
     exec.ready_read_fd = Some(ready_read.as_raw_fd());
     exec.ready_write_fd = Some(ready_write.as_raw_fd());
+    // Pin persistent directories before the shared rescue /mnt covers their
+    // runtime paths. Keep owned CLOEXEC descriptors alive through readiness.
+    let ready_paths = match ready_paths::ReadyPaths::capture(config) {
+        Ok(paths) => Some(paths),
+        Err(e) => {
+            nmbl_warn!("could not pin rescue boot state: {e}");
+            None
+        }
+    };
     // If the mount plan fails partway, tear down whatever it already set
     // up before propagating: the network path can loop back and retry,
     // and re-running bind/make-shared/rbind over surviving mounts would
@@ -266,7 +277,7 @@ pub async fn run_external_rescue_child(
         biased;
         ready = wait_console_ready(ready_read) => {
             match ready {
-                Ok(true) => record_console_ready(config),
+                Ok(true) => record_console_ready(ready_paths.as_ref()),
                 Ok(false) => nmbl_warn!("rescue child closed readiness pipe before console became ready"),
                 Err(e) => nmbl_warn!("rescue readiness failed: {e}"),
             }
@@ -310,33 +321,14 @@ async fn wait_console_ready(pipe: OwnedFd) -> std::io::Result<bool> {
     }
 }
 
-fn record_console_ready(config: &Config) {
-    #[cfg(feature = "stateful")]
-    if config.stateful.is_some() {
-        let Some(mount) = config
-            .runtime_state_mountpoint
-            .as_ref()
-            .or(config.runtime_boot_mountpoint.as_ref())
-        else {
-            nmbl_warn!("rescue ready, but persistent state is not mounted; keeping rescue request");
-            return;
-        };
-        match crate::state::record_rescue_booted(&mount.join("nmbl/state.bin")) {
-            Ok(true) => {}
-            Ok(false) => {
-                nmbl_warn!(
-                    "rescue ready, but supported boot state is unavailable; keeping rescue request"
-                );
-                return;
-            }
-            Err(e) => {
-                nmbl_warn!("rescue ready, but could not persist rescue exit: {e}");
-                return;
-            }
-        }
-    }
-    if let Err(e) = crate::policy::sentinel::consume_after_rescue_booted(config) {
-        nmbl_warn!("rescue ready, but could not consume rescue request: {e}");
+fn record_console_ready(paths: Option<&ready_paths::ReadyPaths>) {
+    let Some(paths) = paths else {
+        nmbl_warn!("rescue ready, but persistent paths were not pinned; keeping rescue request");
+        return;
+    };
+    if let Err(e) = paths.record() {
+        nmbl_warn!("rescue ready, but could not persist rescue exit: {e}");
+        return;
     }
     nmbl_info!("rescue console ready; next boot leaves this rescue request");
 }
