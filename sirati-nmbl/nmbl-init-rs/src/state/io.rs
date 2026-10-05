@@ -122,9 +122,9 @@ pub fn write_padded(path: &Path, state: &State) -> Result<(), NmblError> {
 
 /// Installer entry point. Ensures `dir` exists and contains a valid
 /// `state.bin`. If the file is already there, it's parsed and the
-/// canonical re-encoding is byte-compared against the on-disk content;
-/// any divergence is reported as `StateRoundtripMismatch` so the
-/// installer refuses to silently rewrite drifted state.
+/// original CBOR representation and typed round-trip are validated without
+/// rewriting compatible older fields. Invalid encodings are reported as
+/// `StateRoundtripMismatch`; installer validation never resets boot history.
 ///
 /// If `read` returns `Ok(None)` because the on-disk version is *newer*
 /// than this binary supports, that's a fatal condition here: the
@@ -162,13 +162,13 @@ pub fn init_or_validate(dir: &Path) -> Result<State, NmblError> {
     }
 }
 
-/// Re-encode `state` and byte-compare against on-disk content; any
-/// divergence returns `StateRoundtripMismatch`.
+/// Validate the original encoding without replacing a compatible older schema.
+/// Serde defaults add fields in memory, so current-State bytes need not equal
+/// older on-disk bytes. Preserve the file and compare its canonical CBOR value
+/// and typed round-trip independently.
 fn validate_existing(path: std::path::PathBuf, state: State) -> Result<State, NmblError> {
-    // Re-encode and pad through the same code path
-    // `write_padded` would use, then compare. Mismatch =
-    // either schema drift on disk or a non-canonical
-    // encoder; either way we refuse to overwrite.
+    // Check the current typed codec separately from the original wire schema.
+    // This must preserve the remembered attempt, health and recovery history.
     let mut reencoded: Vec<u8> = Vec::with_capacity(FILE_SIZE);
     ciborium::into_writer(&state, &mut reencoded).map_err(|e| NmblError::Io {
         source: std::io::Error::other(e.to_string()),
@@ -180,7 +180,14 @@ fn validate_existing(path: std::path::PathBuf, state: State) -> Result<State, Nm
             max: FILE_SIZE,
         });
     }
-    reencoded.resize(FILE_SIZE, 0);
+    let round_tripped: State =
+        ciborium::from_reader(reencoded.as_slice()).map_err(|e| NmblError::Io {
+            source: std::io::Error::other(e.to_string()),
+            context: format!("round-tripping state.bin at {}", path.display()),
+        })?;
+    if round_tripped != state {
+        return Err(NmblError::StateRoundtripMismatch { path });
+    }
 
     let mut on_disk: Vec<u8> = Vec::with_capacity(FILE_SIZE);
     let cap = (FILE_SIZE * 2) as u64;
@@ -200,8 +207,36 @@ fn validate_existing(path: std::path::PathBuf, state: State) -> Result<State, Nm
     if n as u64 > cap {
         return Err(NmblError::StateRoundtripMismatch { path: path.clone() });
     }
-    if on_disk != reencoded {
-        return Err(NmblError::StateRoundtripMismatch { path: path.clone() });
+    // Re-reading must not accept a different state after the initial read.
+    let reread: State = ciborium::from_reader(on_disk.as_slice()).map_err(|e| NmblError::Io {
+        source: std::io::Error::other(e.to_string()),
+        context: format!("validating original state.bin at {}", path.display()),
+    })?;
+    if reread != state {
+        return Err(NmblError::StateRoundtripMismatch { path });
+    }
+    // Value retains older missing fields and compatible unknown fields. Its
+    // canonical re-encoding checks the existing padding and representation,
+    // without forcing the current struct's additional default fields to disk.
+    let original: ciborium::Value =
+        ciborium::from_reader(on_disk.as_slice()).map_err(|e| NmblError::Io {
+            source: std::io::Error::other(e.to_string()),
+            context: format!("validating state.bin encoding at {}", path.display()),
+        })?;
+    let mut canonical_existing = Vec::with_capacity(FILE_SIZE);
+    ciborium::into_writer(&original, &mut canonical_existing).map_err(|e| NmblError::Io {
+        source: std::io::Error::other(e.to_string()),
+        context: format!("re-encoding original state.bin at {}", path.display()),
+    })?;
+    if canonical_existing.len() > FILE_SIZE - 1 {
+        return Err(NmblError::StateTooLarge {
+            encoded_len: canonical_existing.len(),
+            max: FILE_SIZE,
+        });
+    }
+    canonical_existing.resize(FILE_SIZE, 0);
+    if on_disk != canonical_existing {
+        return Err(NmblError::StateRoundtripMismatch { path });
     }
     Ok(state)
 }

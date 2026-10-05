@@ -64,6 +64,7 @@
               (craneLib.fileset.commonCargoSources ./.)
               ./src/ui/console/data/xterm-256color
               ./src/splash/data
+              ./src/state/tests/fixtures
             ];
           };
           strictDeps = true;

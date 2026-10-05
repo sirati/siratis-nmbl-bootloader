@@ -223,3 +223,69 @@ fn mark_boot_succeeded_on_too_new_version_is_noop() {
     let after = std::fs::read(&path).expect("read after");
     assert_eq!(after, before);
 }
+
+#[test]
+fn init_state_preserves_actual_prior_ns1_cbor_without_new_rescue_fields() {
+    let bytes = include_bytes!("fixtures/ns1-state-v1-before-rescue-ready.bin");
+    assert_eq!(bytes.len(), FILE_SIZE);
+    let dir = tempdir().expect("old state directory");
+    let path = dir.path().join("state.bin");
+    std::fs::write(&path, bytes).expect("install exact prior NS1 state");
+    let before = read(&path)
+        .expect("read prior state")
+        .expect("supported prior state");
+    assert_eq!(before.rescue_booted_generation, None);
+    assert!(!before.rescue_exit_retry_in_progress);
+    let validated = init_or_validate(dir.path()).expect("validate prior CBOR with serde defaults");
+    assert_eq!(validated, before);
+    assert_eq!(std::fs::read(&path).expect("original bytes"), bytes);
+    // A later ordinary state update may serialize the added fields, while
+    // preserving existing failure/recovery history and remaining readable.
+    write_padded(&path, &validated).expect("ordinary current-format rewrite");
+    assert_eq!(read(&path).expect("current read"), Some(before));
+}
+
+#[test]
+fn compatible_unknown_fields_are_validated_without_rewriting_or_discarding_them() {
+    let mut encoded = Vec::new();
+    ciborium::into_writer(&State::default(), &mut encoded).expect("encode state");
+    let mut value: ciborium::Value =
+        ciborium::from_reader(encoded.as_slice()).expect("state value");
+    let ciborium::Value::Map(fields) = &mut value else {
+        panic!("state map");
+    };
+    fields.push((
+        ciborium::Value::Text("compatible_future_field".into()),
+        ciborium::Value::Integer(17.into()),
+    ));
+    let mut bytes = Vec::new();
+    ciborium::into_writer(&value, &mut bytes).expect("encode compatible value");
+    bytes.resize(FILE_SIZE, 0);
+    let dir = tempdir().expect("directory");
+    let path = dir.path().join("state.bin");
+    std::fs::write(&path, &bytes).expect("write");
+    assert_eq!(
+        init_or_validate(dir.path()).expect("compatible unknown field"),
+        State::default()
+    );
+    assert_eq!(std::fs::read(path).expect("bytes preserved"), bytes);
+}
+
+#[test]
+fn init_state_refuses_nonzero_padding_or_truncated_prior_state_without_rewriting() {
+    let original = include_bytes!("fixtures/ns1-state-v1-before-rescue-ready.bin");
+    for bytes in [
+        {
+            let mut damaged = original.to_vec();
+            *damaged.last_mut().expect("last padding byte") = 1;
+            damaged
+        },
+        original[..original.len() - 1].to_vec(),
+    ] {
+        let dir = tempdir().expect("directory");
+        let path = dir.path().join("state.bin");
+        std::fs::write(&path, &bytes).expect("write damaged prior state");
+        assert!(init_or_validate(dir.path()).is_err());
+        assert_eq!(std::fs::read(path).expect("unchanged damaged bytes"), bytes);
+    }
+}
