@@ -2,6 +2,7 @@
   source,
   bakedStatic ? false,
   bakedSlaac ? false,
+  nativeIdentity ? false,
   publicKeyPath,
   publicKeyHash,
   sshPublicKeyPath,
@@ -21,7 +22,7 @@ let
     sha256 = sshPublicKeyHash;
   });
   baseline = flake.lib.mkNetworkStageVmConfig { inherit publicKey sshPublicKey; };
-  config = if !(bakedStatic || bakedSlaac) then baseline else baseline.extendModules {
+  config = if !(bakedStatic || bakedSlaac || nativeIdentity) then baseline else baseline.extendModules {
     modules = [ {
       boot.nmbl.signing.enable = lib.mkForce false;
       boot.nmbl.signing.enforce = lib.mkForce false;
@@ -35,11 +36,30 @@ let
           ipv6 = { addresses = [ "2a01:4f8:1c17:5100::1/64" ]; gateway = "fe80::1"; gatewayOnLink = true; };
         } ]);
       };
-    } ];
+    } ] ++ lib.optional nativeIdentity {
+      boot.nmbl.bootstrap.kernelModules.explicit = lib.mkAfter [ "btrfs" ];
+      boot.nmbl.rescue.fullSystem.identityVolume = { device = "/dev/vdb"; fsType = "btrfs"; options = [ "subvol=@persistent" ]; };
+      boot.nmbl.rescue.fullSystem.hostKeyPath = lib.mkForce "/nmbl-identity/etc/ssh/ssh_host_ed25519_key";
+      fileSystems."/".device = lib.mkForce "/dev/intentional-missing-generation-root";
+    };
   };
   build = config.config.system.build;
   pkgs = flake.inputs.nixpkgs.legacyPackages.x86_64-linux;
   lib = flake.inputs.nixpkgs.lib;
+  console = import ../../lib/rescue/console.nix { inherit pkgs; };
+  consoleFixture = import ./console-fixture/default.nix { inherit pkgs; };
+  fixtureClosure = pkgs.closureInfo { rootPaths = [ consoleFixture ]; };
+  rescueFixture = pkgs.runCommand "nmbl-rescue-console-regression.sfs" {
+    nativeBuildInputs = [ pkgs.squashfsTools ];
+  } ''
+    unsquashfs -quiet -dest root ${build.nmblRescueSquashfs}
+    chmod -R u+w root
+    substituteInPlace root/init --replace-fail ${console}/bin/nmbl-rescue-console ${consoleFixture}/bin/nmbl-rescue-console
+    while read -r path; do
+      if [ ! -e "root$path" ]; then cp -a "$path" "root/nix/store/"; fi
+    done < ${fixtureClosure}/store-paths
+    mksquashfs root "$out" -noappend -all-root -comp xz -processors 1
+  '';
   invalid = profile: config.extendModules {
     modules = [ {
       boot.nmbl.rescue.fullSystem.networkStage.staticProfiles = lib.mkForce [ profile ];
@@ -69,7 +89,7 @@ pkgs.linkFarm "nmbl-network-stage-vm-artifacts" ([
   { name = "kernel"; path = "${build.nmblKernel}/bzImage"; }
   { name = "initrd"; path = "${build.nmblInitramfs}/initrd"; }
   { name = "config.toml"; path = build.nmblConfigToml; }
-  { name = "rescue.sfs"; path = build.nmblRescueSquashfs; }
-  ] ++ lib.optional (!(bakedStatic || bakedSlaac)) { name = "network.erofs"; path = build.nmblNetworkStage; } ++ lib.optional (!(bakedStatic || bakedSlaac))
+  { name = "rescue.sfs"; path = rescueFixture; }
+  ] ++ lib.optional (!(bakedStatic || bakedSlaac || nativeIdentity)) { name = "network.erofs"; path = build.nmblNetworkStage; } ++ lib.optional (!(bakedStatic || bakedSlaac || nativeIdentity))
   { name = "rescue-installer"; path = build.nmblRescueStageInstaller; }
 )

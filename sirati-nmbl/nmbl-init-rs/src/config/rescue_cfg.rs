@@ -17,6 +17,8 @@ pub struct RescueConfig {
     /// installs that have not opted in to the external squashfs.
     #[serde(default)]
     pub mode: RescueMode,
+    #[serde(default)]
+    pub identity_volume: Option<RescueIdentityVolume>,
 
     /// Path to `nmbl-rescue.sfs` RELATIVE TO THE BOOT PARTITION ROOT.
     /// A leading `/` is tolerated and stripped at resolution time. When
@@ -87,6 +89,7 @@ impl Default for RescueConfig {
     fn default() -> Self {
         Self {
             mode: RescueMode::default(),
+            identity_volume: None,
             sfs_path: None,
             network: false,
             default_url: String::new(),
@@ -118,4 +121,17 @@ pub struct EmergencyShellConfig {
     /// empty so only `/dev/console` is offered out of the box.
     #[serde(default)]
     pub extra_consoles: Vec<String>,
+}
+
+/// Plaintext installed identity volume; never unlocked by rescue.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RescueIdentityVolume {
+    pub device: PathBuf,
+    pub fstype: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Crypto providers not discoverable through filesystem modules.dep.
+    #[serde(default)]
+    pub required_modules: Vec<String>,
 }

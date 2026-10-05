@@ -86,6 +86,17 @@ let
 in
 {
   options.boot.nmbl.rescue.fullSystem = {
+    identityVolume = lib.mkOption {
+      default = null;
+      description = "Plaintext installed SSH identity filesystem mounted read-only before rescue.";
+      type = lib.types.nullOr (lib.types.submodule {
+        options = {
+          device = lib.mkOption { type = lib.types.str; };
+          fsType = lib.mkOption { type = lib.types.enum [ "btrfs" "ext4" "xfs" ]; };
+          options = lib.mkOption { type = lib.types.listOf lib.types.str; default = []; };
+        };
+      });
+    };
     hostKeyPath = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
@@ -144,8 +155,13 @@ in
     };
   };
 
-  config = lib.mkIf (stage.enable || stage.staticProfiles != [ ]) {
+  config = lib.mkIf (stage.enable || stage.staticProfiles != [ ] || cfg.identityVolume != null) {
     assertions = [
+      {
+        assertion = cfg.identityVolume == null || (hostKey != null
+          && lib.hasPrefix "/nmbl-identity/" hostKey && !(lib.hasInfix ".." hostKey));
+        message = "An identity volume requires a stable hostKeyPath below /nmbl-identity; generating a replacement key is forbidden.";
+      }
       {
         assertion = cfg.enable && config.boot.nmbl.rescue.mode == "external";
         message = "The rescue networking stage requires external full-system rescue.";

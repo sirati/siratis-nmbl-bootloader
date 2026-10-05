@@ -123,3 +123,17 @@ fn embedded_mode_reads_the_sentinel_from_the_mounted_boot_entry() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn explicit_rescue_is_consumed_durably_only_on_ready_event() {
+    let dir = tempfile::tempdir().expect("directory");
+    let mut config = Config::recovery_default();
+    config.runtime_boot_mountpoint = Some(dir.path().to_path_buf());
+    super::write_sentinel(&config);
+    assert!(super::sentinel_present(&config));
+    // Merely launching rescue makes no call to the ready consumer.
+    assert!(super::should_force_rescue(false, &config));
+    super::consume_after_rescue_booted(&config).expect("consume ready rescue");
+    assert!(!super::should_force_rescue(false, &config));
+    assert!(super::should_force_rescue(true, &config)); // permanent configuration stays permanent
+}

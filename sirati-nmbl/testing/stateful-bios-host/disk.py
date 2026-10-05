@@ -44,8 +44,13 @@ def main():
     # directories into subvolumes, fakeroot makes every file root-owned.
     root_part = work / "root.btrfs"
     root_part.touch()
-    run("fakeroot", "mkfs.btrfs", "-q", "-L", "NMBLROOT", "--rootdir", args.root,
-        "--subvol", "rw:@root", "--subvol", "rw:@nix", "--shrink", str(root_part))
+    owner = os.environ.get("NMBL_TEST_ROOTDIR_OWNER")
+    command = ["mkfs.btrfs", "-q", "-L", "NMBLROOT", "--rootdir", args.root,
+               "--subvol", "rw:@root", "--subvol", "rw:@nix", "--shrink", str(root_part)]
+    if owner:
+        run(*command, env={**os.environ, "LD_PRELOAD": owner})
+    else:
+        run("fakeroot", *command)
     extra = 768 * 1024 * 1024
     with root_part.open("r+b") as f:
         f.truncate(os.path.getsize(root_part) + extra)

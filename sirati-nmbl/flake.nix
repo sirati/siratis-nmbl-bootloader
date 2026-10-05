@@ -130,6 +130,7 @@
       networkStageVmTest = pkgs.writeShellApplication {
         name = "test-network-stage-vm";
         runtimeInputs = with pkgs; [
+          btrfs-progs
           cpio
           dracut
           e2fsprogs
@@ -147,13 +148,14 @@
           zstd
         ];
         text = builtins.replaceStrings
-          [ "@source@" "@harness@" "@qemu@" "@ssh@" "@passt@" ]
+          [ "@source@" "@harness@" "@qemu@" "@ssh@" "@passt@" "@rootdirOwner@" ]
           [
             "${self}"
             "${./testing/network-stage-vm/harness.py}"
             "${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
             "${pkgs.openssh}/bin/ssh"
             "${pkgs.passt}/bin/passt"
+            "${import ./testing/network-stage-vm/rootdir-owner.nix { inherit pkgs; }}/lib/rootdir-owner.so"
           ]
           (builtins.readFile ./testing/network-stage-vm/run.sh);
       };
@@ -327,7 +329,7 @@
           mtools nix openssh python3
         ];
         text = builtins.replaceStrings
-          [ "@source@" "@disk@" "@harness@" "@grub@" "@qemu@" "@passt@" "@ssh@" ]
+          [ "@source@" "@disk@" "@harness@" "@grub@" "@qemu@" "@passt@" "@ssh@" "@rootdirOwner@" ]
           [
             "${self}"
             "${./testing/stateful-bios-host/disk.py}"
@@ -336,6 +338,7 @@
             "${pkgs.qemu_kvm}/bin/qemu-system-x86_64"
             "${pkgs.passt}/bin/passt"
             "${pkgs.openssh}/bin/ssh"
+            "${import ./testing/network-stage-vm/rootdir-owner.nix { inherit pkgs; }}/lib/rootdir-owner.so"
           ]
           (builtins.readFile ./tools/stateful-bios-host-vm-test.sh);
       };

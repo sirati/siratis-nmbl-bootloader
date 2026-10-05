@@ -148,6 +148,14 @@ let
   rescueDiskModules =
     if cfg.rescue.mode == "external" then
       [ "loop" "squashfs" "overlay" ]
+      ++ lib.optional (cfg.rescue.fullSystem.identityVolume != null)
+        cfg.rescue.fullSystem.identityVolume.fsType
+      ++ lib.optionals (cfg.rescue.fullSystem.identityVolume != null)
+        (import ./rescue/identity-modules.nix {
+          inherit lib;
+          kernelVersion = cfg.kernelPackage.version;
+          inherit (cfg.rescue.fullSystem.identityVolume) fsType;
+        })
       ++ lib.optional cfg.rescue.fullSystem.networkStage.enable "erofs"
     else
       [ ];

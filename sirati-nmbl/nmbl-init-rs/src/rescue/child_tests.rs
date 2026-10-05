@@ -110,3 +110,24 @@ fn preservation_covers_system_root_and_separate_boot_state_mounts() {
     config.paths.system_root = PathBuf::from("/");
     assert!(preserved_roots(&config).is_err());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn readiness_requires_typed_child_message_not_pipe_close_or_invalid_byte() {
+    use nix::fcntl::OFlag;
+    for (message, expected) in [
+        (Some(b'R'), Some(true)),
+        (None, Some(false)),
+        (Some(b'X'), None),
+    ] {
+        let (reader, writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).expect("pipe");
+        if let Some(byte) = message {
+            nix::unistd::write(&writer, &[byte]).expect("write");
+        }
+        drop(writer);
+        let result = wait_console_ready(reader).await;
+        match expected {
+            Some(value) => assert_eq!(result.expect("message"), value),
+            None => assert!(result.is_err()),
+        }
+    }
+}

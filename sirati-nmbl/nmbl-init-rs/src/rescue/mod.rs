@@ -30,6 +30,7 @@ pub mod net;
 pub mod verify;
 
 mod embedded;
+mod identity;
 mod locate;
 #[cfg(feature = "secure-boot")]
 mod network_profile;
@@ -71,6 +72,9 @@ pub fn dispatch(
     console: Box<dyn Console>,
     cause: NmblError,
 ) -> Result<TerminalAction> {
+    // Release the early input tap before any rescue UI or shell takes ownership.
+    // Forced rescue bypasses the normal selector console initialization.
+    crate::ui::early_key_tap::disarm();
     // SEAL ON ENTRY (G4): every rescue mode hands the operator an
     // interactive context (embedded `execve` into a shell, or a chrooted
     // rescue system), so cap the lock PCR + close every TPM-unsealed
@@ -202,6 +206,9 @@ fn run_chrooted_external(
     drop(console);
     let entrypoint = config.rescue.entrypoint.clone();
     let run = crate::ui::block_on_tui_with_poller(move |sender| async move {
+        if let Err(err) = identity::mount(config, &sender).await {
+            crate::nmbl_warn!("rescue identity unavailable; SSH remains disabled: {err}");
+        }
         run_external_rescue_child(config, rescue_dir, &entrypoint, sender).await
     });
     match run {

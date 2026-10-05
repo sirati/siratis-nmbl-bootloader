@@ -19,6 +19,7 @@
 //!    `MNT_DETACH`) and control returns to the recovery flow.
 
 use std::ffi::CString;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 
 use nix::sys::wait::WaitStatus;
@@ -53,6 +54,9 @@ pub(crate) struct ChildExec {
     env_term: CString,
     env_path: CString,
     env_sock: CString,
+    env_ready: Option<CString>,
+    ready_read_fd: Option<i32>,
+    ready_write_fd: Option<i32>,
 }
 
 impl ChildExec {
@@ -88,6 +92,9 @@ impl ChildExec {
             env_term,
             env_path,
             env_sock,
+            env_ready: None,
+            ready_read_fd: None,
+            ready_write_fd: None,
         })
     }
 }
@@ -101,6 +108,18 @@ impl ChildExec {
 /// Must only be called from the child branch of `fork()`. No allocation,
 /// no Rust I/O, no destructors. All `CString`s were built in the parent.
 unsafe fn child_chroot_exec(exec: &ChildExec) -> ! {
+    if let Some(fd) = exec.ready_write_fd {
+        // SAFETY: only the owned pipe writer may cross this child's exec.
+        // fcntl is async-signal-safe; never clear flags on a requester fd.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } < 0 {
+            unsafe { libc::_exit(EXEC_FAILED_EXIT_CODE) };
+        }
+    }
+
+    if let Some(fd) = exec.ready_read_fd {
+        // SAFETY: the child must not retain the parent's readiness reader.
+        let _ = unsafe { libc::close(fd) };
+    }
     // chroot into the writable rescue overlay, then anchor cwd at the
     // new root. setsid() detaches from PID 1's session so the rescue
     // /init owns a fresh session for its console.
@@ -138,10 +157,13 @@ unsafe fn child_chroot_exec(exec: &ChildExec) -> ! {
     // operator by _exit'ing would be worse than inheriting PID 1's fds.
 
     let argv: [*const libc::c_char; 2] = [exec.argv0_c.as_ptr(), std::ptr::null()];
-    let envp: [*const libc::c_char; 4] = [
+    let envp: [*const libc::c_char; 5] = [
         exec.env_term.as_ptr(),
         exec.env_path.as_ptr(),
         exec.env_sock.as_ptr(),
+        exec.env_ready
+            .as_ref()
+            .map_or(std::ptr::null(), |v| v.as_ptr()),
         std::ptr::null(),
     ];
 
@@ -199,7 +221,24 @@ pub async fn run_external_rescue_child(
     debug_assert_eq!(rescue_dir, Path::new(RESCUE_ROOT));
     // Build the exec strings + set up the binds in the PARENT, before
     // fork (fork-safety: all allocation happens here).
-    let exec = ChildExec::build(entrypoint)?;
+    let (ready_read, ready_write) = nix::unistd::pipe2(
+        nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_CLOEXEC,
+    )
+    .map_err(|source| NmblError::Io {
+        source: source.into(),
+        context: "rescue readiness pipe".into(),
+    })?;
+    let mut exec = ChildExec::build(entrypoint)?;
+    exec.env_ready = Some(
+        CString::new(format!("NMBL_RESCUE_READY_FD={}", ready_write.as_raw_fd())).map_err(
+            |_| NmblError::ConfigInvalid {
+                reason: "invalid readiness descriptor".into(),
+                context: "rescue readiness pipe".into(),
+            },
+        )?,
+    );
+    exec.ready_read_fd = Some(ready_read.as_raw_fd());
+    exec.ready_write_fd = Some(ready_write.as_raw_fd());
     // If the mount plan fails partway, tear down whatever it already set
     // up before propagating: the network path can loop back and retry,
     // and re-running bind/make-shared/rbind over surviving mounts would
@@ -218,7 +257,23 @@ pub async fn run_external_rescue_child(
     };
     nmbl_info!("rescue child: forked pid {pid}, reaping while serving remote attach");
 
-    let status = reap_with_server(config, pid, sender).await;
+    drop(ready_write);
+    let reap = reap_with_server(config, pid, sender);
+    tokio::pin!(reap);
+    let status = tokio::select! {
+        // Prefer an already delivered console-ready signal over a concurrent
+        // child exit; readiness is an actual event, not a launch intention.
+        biased;
+        ready = wait_console_ready(ready_read) => {
+            match ready {
+                Ok(true) => record_console_ready(config),
+                Ok(false) => nmbl_warn!("rescue child closed readiness pipe before console became ready"),
+                Err(e) => nmbl_warn!("rescue readiness failed: {e}"),
+            }
+            reap.await
+        }
+        status = &mut reap => status,
+    };
     match status {
         Some(WaitStatus::Exited(_, code)) => {
             nmbl_info!("rescue child: exited with code {code}");
@@ -230,6 +285,60 @@ pub async fn run_external_rescue_child(
     }
     teardown_mounts(config);
     Ok(())
+}
+
+/// The only accepted message is one typed byte from the owned rescue child.
+async fn wait_console_ready(pipe: OwnedFd) -> std::io::Result<bool> {
+    let fd = tokio::io::unix::AsyncFd::new(pipe)?;
+    loop {
+        let mut ready = fd.readable().await?;
+        match ready.try_io(|inner| {
+            let mut byte = [0u8; 1];
+            nix::unistd::read(inner.get_ref().as_raw_fd(), &mut byte)
+                .map(|length| (length, byte[0]))
+                .map_err(std::io::Error::from)
+        }) {
+            Err(_) => continue,
+            Ok(result) => {
+                return match result? {
+                    (0, _) => Ok(false),
+                    (1, b'R') => Ok(true),
+                    _ => Err(std::io::Error::other("invalid rescue readiness message")),
+                };
+            }
+        }
+    }
+}
+
+fn record_console_ready(config: &Config) {
+    #[cfg(feature = "stateful")]
+    if config.stateful.is_some() {
+        let Some(mount) = config
+            .runtime_state_mountpoint
+            .as_ref()
+            .or(config.runtime_boot_mountpoint.as_ref())
+        else {
+            nmbl_warn!("rescue ready, but persistent state is not mounted; keeping rescue request");
+            return;
+        };
+        match crate::state::record_rescue_booted(&mount.join("nmbl/state.bin")) {
+            Ok(true) => {}
+            Ok(false) => {
+                nmbl_warn!(
+                    "rescue ready, but supported boot state is unavailable; keeping rescue request"
+                );
+                return;
+            }
+            Err(e) => {
+                nmbl_warn!("rescue ready, but could not persist rescue exit: {e}");
+                return;
+            }
+        }
+    }
+    if let Err(e) = crate::policy::sentinel::consume_after_rescue_booted(config) {
+        nmbl_warn!("rescue ready, but could not consume rescue request: {e}");
+    }
+    nmbl_info!("rescue console ready; next boot leaves this rescue request");
 }
 
 /// Reap `pid` concurrently with the remote-attach server. The reap arm

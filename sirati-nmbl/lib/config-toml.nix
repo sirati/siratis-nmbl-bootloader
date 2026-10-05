@@ -202,6 +202,17 @@ let
       {
         mode = cfg.rescue.mode;
       }
+      // lib.optionalAttrs (cfg.rescue.fullSystem.identityVolume != null) {
+        identity_volume = {
+          inherit (cfg.rescue.fullSystem.identityVolume) device options;
+          fstype = cfg.rescue.fullSystem.identityVolume.fsType;
+          required_modules = import ./rescue/identity-modules.nix {
+            inherit lib;
+            kernelVersion = cfg.kernelPackage.version;
+            inherit (cfg.rescue.fullSystem.identityVolume) fsType;
+          };
+        };
+      }
       // lib.optionalAttrs (cfg.rescue.sfsPath != "nmbl-rescue.sfs") {
         sfs_path = cfg.rescue.sfsPath;
       }

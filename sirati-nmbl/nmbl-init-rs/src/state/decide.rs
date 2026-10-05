@@ -34,6 +34,11 @@ pub fn decide(
         return StatefulDecision::HonourTui;
     }
 
+    // Failure of the single rescue-exit retry returns directly to rescue.
+    if state.rescue_exit_retry_in_progress {
+        return StatefulDecision::Exhausted;
+    }
+
     // First boot with a fresh state.bin: no prior attempt was recorded,
     // so there is nothing to roll back from. Honour the TUI/timeout pick
     // rather than spending a recovery slot before any failure happens.
@@ -156,6 +161,8 @@ pub fn record_operator_retry(
 ) -> Option<usize> {
     let generation = nonmax::NonMaxU32::new(number).filter(|_| number > 0)?;
     let index = generations.iter().position(|g| g.number == number)?;
+    state.rescue_booted_generation = None;
+    state.rescue_exit_retry_in_progress = false;
     state.last_attempted_generation = Some(generation);
     state.last_boot_succeeded = false;
     Some(index)

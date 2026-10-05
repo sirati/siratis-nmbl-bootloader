@@ -224,6 +224,8 @@ pub fn mark_boot_succeeded(dir: &Path) -> Result<(), NmblError> {
             return Ok(());
         }
     };
+    state.rescue_booted_generation = None;
+    state.rescue_exit_retry_in_progress = false;
     state.last_boot_succeeded = true;
     state.recovery_attempt = 0;
     // state.state_format_version is deliberately NOT touched — see the

@@ -192,10 +192,25 @@ fn retry_generation(sys: &state::System, generation: u32, no_reboot: bool) -> Re
     let path = sys
         .state_dir
         .join(nmbl_init::boot_selection::RETRY_BASENAME);
-    state::write_durable(&path, OneShotSelection { generation }.render().as_bytes())
-        .map_err(|e| format!("writing operator retry: {e}"))?;
+    let config = sys
+        .config
+        .as_ref()
+        .ok_or("operator retry requires config")?;
+    persist_retry_and_clear_rescue(&path, generation, config)?;
     println!("operator retry: generation {generation}, one attempt; failure history preserved");
     if no_reboot { Ok(()) } else { do_reboot() }
+}
+
+fn persist_retry_and_clear_rescue(
+    path: &std::path::Path,
+    generation: u32,
+    config: &nmbl_init::config::Config,
+) -> Result<(), String> {
+    state::write_durable(path, OneShotSelection { generation }.render().as_bytes())
+        .map_err(|e| format!("writing operator retry: {e}"))?;
+    nmbl_init::policy::sentinel::consume_after_rescue_booted(config).map_err(|e| {
+        format!("operator retry recorded but rescue request could not be cleared: {e}")
+    })
 }
 
 fn default_cmd(
@@ -257,5 +272,57 @@ fn do_reboot() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("systemctl reboot exited with {status}"))
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "tests assert retry persistence order"
+)]
+mod rescue_retry_tests {
+    use super::*;
+    #[test]
+    fn persistence_failure_retains_rescue_and_success_clears_only_after_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = nmbl_init::config::Config::recovery_default();
+        config.runtime_boot_mountpoint = Some(dir.path().to_path_buf());
+        nmbl_init::policy::write_sentinel(&config);
+        let invalid = dir.path().join("absent/parent/retry-generation");
+        // A file as parent ensures persistence fails, independent of test uid.
+        std::fs::write(dir.path().join("absent"), b"not a directory").unwrap();
+        assert!(persist_retry_and_clear_rescue(&invalid, 42, &config).is_err());
+        assert!(nmbl_init::policy::sentinel_present(&config));
+        let path = dir.path().join("nmbl/retry-generation");
+        persist_retry_and_clear_rescue(&path, 42, &config).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "generation 42\n");
+        assert!(!nmbl_init::policy::sentinel_present(&config));
+    }
+    #[test]
+    fn validation_failure_retains_existing_rescue_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = nmbl_init::config::Config::recovery_default();
+        config.runtime_boot_mountpoint = Some(dir.path().to_path_buf());
+        config.stateful = None;
+        nmbl_init::policy::write_sentinel(&config);
+        let sys = state::System {
+            config: Some(config),
+            config_source: None,
+            rescue_mode: None,
+            state_dir: dir.path().join("nmbl"),
+            cmdline: String::new(),
+            generations: vec![42],
+            active_generation: Some(42),
+        };
+        assert!(retry_generation(&sys, 42, true).is_err());
+        assert!(nmbl_init::policy::sentinel_present(
+            sys.config.as_ref().expect("configured test system")
+        ));
+        assert!(
+            !sys.state_dir
+                .join(nmbl_init::boot_selection::RETRY_BASENAME)
+                .exists()
+        );
     }
 }

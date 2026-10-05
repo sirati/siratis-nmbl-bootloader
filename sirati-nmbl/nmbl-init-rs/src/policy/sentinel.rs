@@ -83,6 +83,22 @@ pub fn write_sentinel(config: &Config) {
     }
 }
 
+/// Consume explicit rescue only after the console is ready. Failed launches retain it.
+pub fn consume_after_rescue_booted(config: &Config) -> std::io::Result<()> {
+    let Some(path) = resolve_sentinel_path(config) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 /// Resolve the sentinel path for read/write. Prefers the WRITABLE
 /// bootstrap `runtime_boot_mountpoint` joined with the sentinel's
 /// boot-relative tail; falls back to the configured path used as-is when it

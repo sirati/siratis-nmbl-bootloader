@@ -89,7 +89,10 @@ pub(super) async fn select_and_act(
     // boots, or a CHECKED submit) falls through to the normal selector.
     // Instant boot takes the SAME default-boot path (no countdown, no menu).
     #[cfg(feature = "stateful")]
-    let operator_retry = select_operator_retry(config, &generations)?;
+    let operator_retry = match select_operator_retry(config, &generations)? {
+        Some(decision) => Some(decision),
+        None => select_rescue_exit_retry(config, &generations)?,
+    };
     #[cfg(feature = "stateful")]
     let decision = if let Some(decision) = operator_retry {
         decision
@@ -214,6 +217,38 @@ fn select_operator_retry(
         nmbl_init::state::write_padded(&path, &state)?;
     }
     nmbl_info!("operator retry: generation {number}; automatic failure history preserved");
+    Ok(Some(Decision::Boot {
+        generation_index: index,
+        cmdline_override: None,
+    }))
+}
+
+/// A ready rescue permits exactly one subsequent failed-profile attempt.
+#[cfg(feature = "stateful")]
+fn select_rescue_exit_retry(
+    config: &Config,
+    generations: &[nmbl_init::generations::Generation],
+) -> Result<Option<Decision>> {
+    #[cfg(feature = "secure-boot")]
+    if config.generation_image.as_ref().is_some_and(|g| g.enable) {
+        return Ok(None);
+    }
+    if config.stateful.is_none() {
+        return Ok(None);
+    }
+    let Some(dir) = boot_selection_state_dir(config) else {
+        return Ok(None);
+    };
+    let available: Vec<u32> = generations.iter().map(|g| g.number).collect();
+    let Some(number) =
+        nmbl_init::state::take_rescue_exit_retry(&dir.join("state.bin"), &available)?
+    else {
+        return Ok(None);
+    };
+    let Some(index) = generations.iter().position(|g| g.number == number) else {
+        return Ok(None);
+    };
+    nmbl_info!("rescue exit: retrying generation {number} once; failure history preserved");
     Ok(Some(Decision::Boot {
         generation_index: index,
         cmdline_override: None,

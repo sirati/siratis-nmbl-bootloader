@@ -18,7 +18,7 @@ cleanup() {
     return
   fi
   chmod -R u+w "$work_root" 2>/dev/null || true
-  rm -f "$artifact_roots/signer" "$artifact_roots/signed" "$artifact_roots/baked-static" "$artifact_roots/baked-slaac"
+  rm -f "$artifact_roots/signer" "$artifact_roots/signed" "$artifact_roots/baked-static" "$artifact_roots/baked-slaac" "$artifact_roots/native-identity"
   rm -rf "$operator_root" "$work_root"
 }
 trap cleanup EXIT INT TERM
@@ -61,6 +61,12 @@ slaac_artifacts=$(nix build --out-link "$artifact_roots/baked-slaac" --print-out
   --argstr publicKeyHash "$public_hash" --argstr sshPublicKeyPath "$ssh_public_key" \
   --argstr sshPublicKeyHash "$ssh_public_hash")
 
+native_artifacts=$(nix build --out-link "$artifact_roots/native-identity" --print-out-paths \
+  --file "$source_tree/testing/network-stage-vm/eval.nix" --arg nativeIdentity true \
+  --argstr source "$source_tree" --argstr publicKeyPath "$public_key" \
+  --argstr publicKeyHash "$public_hash" --argstr sshPublicKeyPath "$ssh_public_key" \
+  --argstr sshPublicKeyHash "$ssh_public_hash")
+
 stage="$work_root/boot"
 mkdir -p "$stage/nmbl"
 cp "$artifacts/config.toml" "$stage/nmbl/config.toml"
@@ -78,6 +84,10 @@ NMBL_BOOT_ROOT="$stage" NMBL_IMAGE_KEY_FILE="$private_key" "$installer"
 network_inode=$(stat -c %i "$stage/nmbl/network.erofs")
 NMBL_BOOT_ROOT="$stage" NMBL_IMAGE_KEY_FILE="$private_key" "$installer"
 test "$(stat -c %i "$stage/nmbl/network.erofs")" = "$network_inode"
+install -m 0644 "$artifacts/rescue.sfs" "$stage/nmbl-rescue.sfs"
+"$signer/bin/nmbl-sign" sign --key "$private_key" --domain rescue-sfs \
+  --out "$stage/nmbl-rescue.sfs.sig" "$stage/nmbl-rescue.sfs"
+
 
 make_disk() {
   local source_dir="$1"
@@ -197,6 +207,26 @@ make_disk "$slaac_stage" "$work_root/baked-slaac.img"
 python3 "$harness" scan --key "$private_key" --key "$ssh_private_key" \
   --marker "$marker" "$slaac_artifacts" "$slaac_stage" "$work_root/baked-slaac.img"
 
+native_stage="$work_root/native-boot"
+mkdir -p "$native_stage/nmbl" "$work_root/native-state/@persistent/etc/ssh"
+cp "$native_artifacts/config.toml" "$native_stage/nmbl/config.toml"
+cp "$stage/rescue-host-ed25519" "$stage/rescue-host-ed25519.pub" "$native_stage/"
+install -m 0644 "$native_artifacts/rescue.sfs" "$native_stage/nmbl-rescue.sfs"
+make_disk "$native_stage" "$work_root/native-identity.img"
+# The identity differs from the unrelated boot-partition key, proving its source.
+ssh-keygen -q -t ed25519 -N '' -f "$work_root/native-state/@persistent/etc/ssh/ssh_host_ed25519_key"
+chmod 0600 "$work_root/native-state/@persistent/etc/ssh/ssh_host_ed25519_key"
+ssh-keygen -lf "$work_root/native-state/@persistent/etc/ssh/ssh_host_ed25519_key.pub"
+truncate -s 512M "$work_root/native-state.img"
+LD_PRELOAD=@rootdirOwner@ mkfs.btrfs -q -f --rootdir "$work_root/native-state" \
+  --subvol rw:@persistent "$work_root/native-state.img"
+btrfs inspect-internal dump-tree "$work_root/native-state.img" > "$work_root/native-state-metadata.log"
+grep -F 'name: @persistent' "$work_root/native-state-metadata.log"
+grep -E 'mode 100600 links 1 uid 0 gid 0' "$work_root/native-state-metadata.log"
+qemu-img create -f qcow2 -F raw -b "$work_root/native-state.img" "$work_root/native-state.qcow2"
+python3 "$harness" scan --key "$private_key" --key "$ssh_private_key" --marker "$marker" \
+  "$native_artifacts" "$native_stage"
+
 rm -f "$private_key" "$operator_root/do-not-export.marker"
 test ! -e "$private_key"
 
@@ -230,5 +260,16 @@ python3 "$harness" boot --qemu "$qemu" --passt @passt@ \
   --disk "$work_root/baked-slaac.img" --transcript "$work_root/baked-slaac.log" \
   --ssh @ssh@ --ssh-port "$ssh_port" --ssh-key "$ssh_private_key" \
   --ssh-host-key "$stage/rescue-host-ed25519.pub" --mode baked-slaac
+
+python3 "$harness" boot --qemu "$qemu" --passt @passt@ \
+  --kernel "$native_artifacts/kernel" --initrd "$native_artifacts/initrd" \
+  --disk "$work_root/native-identity.img" --identity-disk "$work_root/native-state.qcow2" \
+  --transcript "$work_root/native-identity.log" --ssh @ssh@ --ssh-port "$ssh_port" \
+  --ssh-key "$ssh_private_key" --ssh-host-key "$work_root/native-state/@persistent/etc/ssh/ssh_host_ed25519_key.pub" --mode native-identity
+python3 "$harness" boot --qemu "$qemu" --passt @passt@ \
+  --kernel "$native_artifacts/kernel" --initrd "$native_artifacts/initrd" \
+  --disk "$work_root/native-identity.img" --transcript "$work_root/missing-identity.log" \
+  --ssh @ssh@ --ssh-port "$ssh_port" --ssh-key "$ssh_private_key" \
+  --ssh-host-key "$work_root/native-state/@persistent/etc/ssh/ssh_host_ed25519_key.pub" --mode missing-identity
 
 echo "NMBL signed and baked static rescue network VM tests passed"

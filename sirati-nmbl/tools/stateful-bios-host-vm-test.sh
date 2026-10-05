@@ -9,21 +9,17 @@ umask 077
 # opens the emergency menu.
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/nmbl-stateful-vm.XXXXXXXX")
+artifact_roots=${NMBL_TEST_ROOTS:-"$work/artifact-roots"}
+mkdir -p "$artifact_roots"
 cleanup() {
   status=$?
-  if [[ $status -ne 0 ]]; then
-    for log in "$work"/*/serial.log; do
-      [[ -f "$log" ]] || continue
-      kept="${TMPDIR:-/tmp}/nmbl-stateful-vm-failed-$(basename "$(dirname "$log")").log"
-      cp "$log" "$kept" && echo "serial transcript kept at $kept" >&2
-    done
+  if [[ $status -ne 0 || -e "$work/automatic/.nmbl-preserve-failure" || -e "$work/menu/.nmbl-preserve-failure" || -e "$work/automatic/.snapshot-failed-live" || -e "$work/menu/.snapshot-failed-live" ]]; then
+    echo "Failed stateful test retained at $work; artifact roots $artifact_roots" >&2
+    return
   fi
   chmod -R u+w "$work" 2>/dev/null || true
-  if [[ $status -ne 0 && ${NMBL_KEEP_FAILED:-0} = 1 ]]; then
-    echo "work directory kept at $work" >&2
-  else
-    rm -rf "$work"
-  fi
+  rm -f "$artifact_roots/automatic" "$artifact_roots/menu"
+  rm -rf "$work"
 }
 trap cleanup EXIT INT TERM
 
@@ -34,7 +30,7 @@ ssh_hash=$(nix hash path --type sha256 "$ssh_key.pub")
 build_disk() {
   local automatic=$2 dir="$work/$1" artifacts
   mkdir -p "$dir"
-  artifacts=$(nix build --no-link --print-out-paths \
+  artifacts=$(nix build --out-link "$artifact_roots/$1" --print-out-paths \
     --file @source@/testing/stateful-bios-host/eval.nix --argstr source @source@ \
     --arg automatic "$automatic" \
     --argstr sshPublicKeyPath "$ssh_key.pub" --argstr sshPublicKeyHash "$ssh_hash")
@@ -69,7 +65,7 @@ build_disk() {
   mkdir -p "$root/@root/etc" "$root/@root/nix" "$root/@root/boot"
   chmod -R u+w "$root"
 
-  python3 @disk@ --grub @grub@ --out "$dir/disk.raw" --boot "$boot" --root "$root"
+  NMBL_TEST_ROOTDIR_OWNER=@rootdirOwner@ python3 @disk@ --grub @grub@ --out "$dir/disk.raw" --boot "$boot" --root "$root"
   rm -rf "$root"
 }
 

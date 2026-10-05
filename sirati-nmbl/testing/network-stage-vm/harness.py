@@ -106,7 +106,7 @@ def wait_for(proc, patterns, timeout, transcript, extra_proc=None):
 
 
 def qemu_command(args, disk, network_socket, qmp_socket):
-    return [
+    command = [
         args.qemu,
         "-machine", "q35,accel=tcg",
         "-cpu", "max",
@@ -124,9 +124,15 @@ def qemu_command(args, disk, network_socket, qmp_socket):
         "-qmp", f"unix:{qmp_socket},server=on,wait=off",
         "-no-reboot",
     ]
+    if args.identity_disk:
+        command.extend(["-drive", f"file={args.identity_disk},format=qcow2,if=virtio"])
+    return command
 
 
 def console_proof(proc, qmp_socket, transcript):
+    proc.stdin.write(b"test -f /run/nmbl-console-inherited-state-fixture && echo NMBL_CONSOLE_\"STIMULUS_PASS\"\n")
+    proc.stdin.flush()
+    wait_for(proc, ["NMBL_CONSOLE_STIMULUS_PASS"], 30, transcript)
     # An echoed command is never the receipt: quoted marker fragments only
     # concatenate in the shell after the physical terminal input was read.
     proc.stdin.write(b"test $(tty) = /dev/ttyS0 && test -r /dev/tty && "
@@ -151,9 +157,8 @@ def console_proof(proc, qmp_socket, transcript):
                     return
 
         command("qmp_capabilities")
-        # Activate VGA tty1, then type through QEMU's actual keyboard device.
-        command("send-key", {"keys": [{"type": "qcode", "data": key} for key in ("ctrl", "alt", "f1")]})
-        time.sleep(0.5)
+        # The production launcher must select its own VT. Never repair it
+        # with Ctrl-Alt-F1 before checking physical keyboard input.
         for char in "tty >/run/vga-tty\n":
             key = {" ": "spc", "/": "slash", "-": "minus", "\n": "ret", ">": "dot"}.get(char, char)
             keys = ([{"type": "qcode", "data": "shift"}] if char == ">" else [])
@@ -237,6 +242,18 @@ def remote_tui(args, transcript, qemu):
     raise RuntimeError(f"rescue SSH/TUI did not become ready: {last_error}")
 
 
+def hold_failed_vm(proc, transcript):
+    """Keep the failed runtime and drain serial until its operator ends it."""
+    with selectors.DefaultSelector() as selector:
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        while proc.poll() is None:
+            for key, _ in selector.select(timeout=1):
+                chunk = os.read(key.fd, 65536)
+                if chunk:
+                    transcript.write(chunk)
+                    transcript.flush()
+
+
 def boot(args):
     print(f"booting {args.mode} VM from {args.disk}", flush=True)
     transcript_path = Path(args.transcript)
@@ -253,8 +270,8 @@ def boot(args):
                 args.passt,
                 "-f", "-s", str(network_socket),
                 "--runas", f"{os.getuid()}:{os.getgid()}",
-                "-a", "88.99.80.66" if args.mode == "baked-static" else "10.0.2.15", "-n", "32",
-                "-g", "172.31.1.1" if args.mode == "baked-static" else "10.0.2.2", "-M", "52:54:00:12:34:56",
+                "-a", "88.99.80.66" if args.mode in ("baked-static", "native-identity", "missing-identity") else "10.0.2.15", "-n", "32",
+                "-g", "172.31.1.1" if args.mode in ("baked-static", "native-identity", "missing-identity") else "10.0.2.2", "-M", "52:54:00:12:34:56",
                 "-D", "10.0.2.3",
                 "-t", f"127.0.0.1/{args.ssh_port}:22222",
             ]
@@ -288,7 +305,7 @@ def boot(args):
             start_new_session=True,
         )
         try:
-            if args.mode in ("good", "baked-static", "baked-slaac"):
+            if args.mode in ("good", "baked-static", "baked-slaac", "native-identity", "missing-identity"):
                 wait_for(proc, ["recovery system ready"], 240, transcript)
                 console_proof(proc, qmp_socket, transcript)
                 commands = r'''
@@ -319,7 +336,7 @@ grep -qx 'nameserver fec0::3' /etc/resolv.conf
 ! pgrep -x dhcpcd
 echo NMBL_NETWORK_STAGE_VM_"PASS"
 '''
-                if args.mode == "baked-static":
+                if args.mode in ("baked-static", "native-identity", "missing-identity"):
                     commands = r'''
 test ! -d /nmbl-network/etc/nmbl-network &&
 grep -qx 'version 2' /nix/store/*-nmbl-baked-network.conf &&
@@ -329,6 +346,8 @@ ip -4 route show | grep -F 'default via 172.31.1.1 dev eth0 onlink' &&
 ss -tln | grep ':22222 ' &&
 echo NMBL_NETWORK_STAGE_VM_"PASS"
 '''
+                if args.mode == "missing-identity":
+                    commands = commands.replace("ss -tln | grep ':22222 ' &&", "! pgrep -x sshd &&")
                 if args.mode == "baked-slaac":
                     commands = r'''
 test ! -d /nmbl-network/etc/nmbl-network &&
@@ -340,12 +359,21 @@ ip -6 route show default | grep 'default via ' &&
 ss -tln | grep ':22222 ' &&
 echo NMBL_NETWORK_STAGE_VM_"PASS"
 '''
+                if args.mode == "native-identity":
+                    commands = commands.replace('echo NMBL_NETWORK_STAGE_VM_', 'findmnt -n -o FSTYPE /nmbl-root/nmbl-identity | grep -qx btrfs && findmnt -n -o OPTIONS /nmbl-root/nmbl-identity | grep -w ro | grep -w nodev | grep -w nosuid | grep -w noexec && test ! -e /dev/intentional-missing-generation-root && echo NMBL_NETWORK_STAGE_VM_')
                 proc.stdin.write(commands.encode())
                 proc.stdin.flush()
                 text = wait_for(proc, ["NMBL_NETWORK_STAGE_VM_PASS"], 90, transcript)
                 if "network-stage signature" in text.lower() and "failed" in text.lower():
                     raise RuntimeError("positive VM reported a network-stage signature failure")
-                remote_tui(args, transcript, proc)
+                if args.mode == "missing-identity":
+                    proc.stdin.write(b"test ! -e /etc/ssh/ssh_host_ed25519_key && ! pgrep -x sshd && echo NMBL_IDENTITY_\"FAILCLOSED_PASS\"\n")
+                    proc.stdin.flush()
+                    wait_for(proc, ["NMBL_IDENTITY_FAILCLOSED_PASS"], 30, transcript)
+                    denied = subprocess.run([args.ssh, "-p", str(args.ssh_port), "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "root@127.0.0.1", "true"], capture_output=True, timeout=10)
+                    if denied.returncode == 0: raise RuntimeError("missing persistent identity exposed SSH")
+                else:
+                    remote_tui(args, transcript, proc)
             else:
                 text = wait_for(
                     proc,
@@ -361,6 +389,7 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
             # operator diagnosis. This is an ordinary test failure snapshot,
             # never an in-guest repair or a successful test receipt.
             transcript_path.parent.joinpath(".nmbl-preserve-failure").write_text(str(overlay) + "\n")
+            snapshot_preserved = False
             try:
                 with socket.socket(socket.AF_UNIX) as qmp, contextlib.ExitStack() as resources:
                     qmp.settimeout(120)
@@ -379,15 +408,29 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
                                 if isinstance(reply["return"], str) and reply["return"].strip():
                                     raise RuntimeError(f"snapshot manager reported: {reply['return']}")
                                 break
+                snapshot_preserved = True
                 print(f"failure snapshot preserved in {overlay} (rescue-failure)", flush=True)
             except Exception as snapshot_error:
                 print(f"SNAPSHOT FAILURE: {snapshot_error}; retaining live QEMU and passt; no manual diagnosis", file=sys.stderr, flush=True)
                 transcript_path.parent.joinpath(".snapshot-failed-live").write_text(f"qemu={proc.pid}\npasst={passt.pid}\nqmp={qmp_socket}\n")
-                # A failed preservation attempt cannot destroy the original
-                # runtime. Keep ownership here until the operator explicitly
-                # resolves preservation or stops this exact test process.
-                while proc.poll() is None:
-                    time.sleep(1)
+            # A failure snapshot is a diagnosis checkpoint, not permission
+            # to terminate the original VM. The operator owns its next action.
+            receipt = {
+                "qemu_pid": proc.pid, "passt_pid": passt.pid,
+                "qmp_socket": str(qmp_socket),
+                "serial_stdin": f"/proc/{proc.pid}/fd/0",
+                "qemu_argv": qemu_command(args, overlay, network_socket, qmp_socket),
+                "passt_argv": passt_command,
+                "overlay": str(overlay), "identity_overlay": args.identity_disk,
+                "snapshot": "rescue-failure" if snapshot_preserved else None,
+            }
+            receipt_path = transcript_path.with_suffix(".failure-runtime.json")
+            receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+            receipt_path.chmod(0o600)
+            print(f"FAILED VM RETAINED for manual diagnosis: {receipt_path}", file=sys.stderr, flush=True)
+            # Continue draining serial output so manual shell commands cannot
+            # block on a full pipe. Explicitly ending this VM ends ownership.
+            hold_failed_vm(proc, transcript)
             raise
         finally:
             if proc.poll() is None:
@@ -429,7 +472,8 @@ def main():
     boot_parser.add_argument("--ssh-port", type=int, required=True)
     boot_parser.add_argument("--ssh-key", required=True)
     boot_parser.add_argument("--ssh-host-key", required=True)
-    boot_parser.add_argument("--mode", choices=["good", "invalid", "baked-static", "baked-slaac"], required=True)
+    boot_parser.add_argument("--identity-disk")
+    boot_parser.add_argument("--mode", choices=["good", "invalid", "baked-static", "baked-slaac", "native-identity", "missing-identity"], required=True)
     args = parser.parse_args()
     if args.command == "scan":
         scan(args)

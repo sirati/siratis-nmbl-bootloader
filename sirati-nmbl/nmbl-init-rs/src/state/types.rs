@@ -48,6 +48,14 @@ pub struct State {
     #[serde(default)]
     pub recovery_attempt: u32,
 
+    /// Armed only after the rescue console launcher confirms a live shell.
+    #[serde(default)]
+    pub rescue_booted_generation: Option<NonMaxU32>,
+
+    /// The single rescue-exit attempt has not reached boot success.
+    #[serde(default)]
+    pub rescue_exit_retry_in_progress: bool,
+
     /// Ring of recently-good generations. Sized at 20 — comfortably
     /// covers the default NixOS retention window without blowing the
     /// 16 KiB on-disk slot. Empty slots are `None`.
@@ -73,6 +81,8 @@ impl Default for State {
             last_attempted_generation: None,
             last_boot_succeeded: true,
             recovery_attempt: 0,
+            rescue_booted_generation: None,
+            rescue_exit_retry_in_progress: false,
             known_good_generations: [None; 20],
         }
     }

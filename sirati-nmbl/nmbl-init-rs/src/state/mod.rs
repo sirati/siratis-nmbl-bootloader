@@ -16,10 +16,12 @@
 
 mod decide;
 mod io;
+mod rescue_exit;
 mod types;
 
 pub use decide::{decide, record_operator_retry};
 pub use io::{init_or_validate, mark_boot_succeeded, read, write_padded};
+pub use rescue_exit::{record_rescue_booted, take_rescue_exit_retry};
 pub use types::{State, StatefulDecision};
 
 #[cfg(test)]
