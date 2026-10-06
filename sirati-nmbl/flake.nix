@@ -333,6 +333,18 @@
         assert !(has "mdadm" minimal) && has "mdadm" (withMdraid minimal);
         assert !(has "cryptsetup" (withLuks minimal));
         pkgs.runCommand "nmbl-rescue-storage-tools-eval" { } "touch $out";
+      # The stage-2 compressor must be one the NMBL kernel decompresses without a
+      # rebuild: lz4hc on any EROFS_FS_ZIP kernel, zstd only from 6.10.
+      rescueCompressionKernelEvalCheck =
+        let
+          failed = c: map (a: a.message) (lib.filter (a: !a.assertion) c.config.assertions);
+          zstdFails = c: lib.any (lib.hasInfix "compression = \"zstd\" needs an NMBL kernel") (failed c);
+          withZstd = erofsBiosHost.extendModules { modules = [ { boot.nmbl.rescue.fullSystem.compression = "zstd"; } ]; };
+          oldKernel = lib.versionOlder erofsBiosHost.config.boot.nmbl.kernelPackage.version "6.10";
+        in
+        assert !(zstdFails erofsBiosHost);
+        assert zstdFails withZstd == oldKernel;
+        pkgs.runCommand "nmbl-rescue-compression-kernel-eval" { } "touch $out";
       # The stage-2 rescue image is host-independent: its derivation is the same
       # for hosts that differ in network configuration (baked static profile
       # or a signed networking stage), authorized keys, sshd port, rescue host
@@ -1522,6 +1534,7 @@
         nmbl-erofs-bios-host-eval = erofsBiosHostEvalCheck;
         rescue-ssh-welcome = rescueSshWelcomeCheck;
         rescue-storage-tools-eval = rescueStorageToolsEvalCheck;
+        rescue-compression-kernel-eval = rescueCompressionKernelEvalCheck;
         rescue-image-host-independent = rescueImageHostIndependentCheck;
         insecure-test-key-absent = insecureKeyAbsentFromProd;
         test-secure-boot-no-private-key = secureBootNoPrivateKey;

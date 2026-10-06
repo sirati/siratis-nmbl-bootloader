@@ -520,6 +520,13 @@ in
         assertion = cfg.rescue.fullSystem.console == null || cfg.rescue.forceOnBoot;
         message = "boot.nmbl.rescue.fullSystem.console is a test fixture hook and requires boot.nmbl.rescue.forceOnBoot.";
       }
+      {
+        # EROFS zstd decompression (CONFIG_EROFS_FS_ZIP_ZSTD) exists from 6.10;
+        # lz4hc only needs CONFIG_EROFS_FS_ZIP, which stock kernels enable.
+        assertion = !(cfg.rescue.fullSystem.enable && cfg.rescue.fullSystem.compression == "zstd")
+          || lib.versionAtLeast cfg.kernelPackage.version "6.10";
+        message = "boot.nmbl.rescue.fullSystem.compression = \"zstd\" needs an NMBL kernel of 6.10 or later (boot.nmbl.kernelPackage is ${cfg.kernelPackage.version}).";
+      }
     ];
 
     # Force assertion checking - this will fail the build if any assertions are false
