@@ -93,9 +93,6 @@ let
   gnugrep = pkgs.gnugrep;
   gnused = pkgs.gnused;
   gawk = pkgs.gawk;
-  btop = pkgs.btop;
-  btrfs = pkgs.btrfs-progs;
-  cryptsetup = pkgs.cryptsetup;
   cacert = pkgs.cacert;
 
   # All kernel modules the rescue /init loads ITSELF after switch_root.
@@ -256,7 +253,7 @@ let
     inherit
       pkgs lib closure nixConf nixRegistry sshdConfig authorizedKeys motd
       profileScript cacert initScript bash coreutils utilLinux iproute2
-      procps kmod btrfs cryptsetup btop e2fsprogs gnugrep gnused gawk nix
+      procps kmod e2fsprogs gnugrep gnused gawk nix
       openssh dhcpcd fullSystemPackagePaths moduleClosurePath;
     minimal = fullSystem.minimal;
     compression = fullSystem.compression or "lz4hc";

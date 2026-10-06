@@ -187,15 +187,16 @@ fsck.erofs --extract="$work_root/rescue" "$artifacts/rescue.sfs"
 fsck.erofs --extract="$work_root/network" "$artifacts/network.erofs"
 
 # The constrained-/boot profile must retain the actual recovery tools while
-# keeping package-fetching and unrelated storage stacks out of the image.
-for tool in bash sshd btrfs mdadm nmbl; do
+# keeping package-fetching out, and storage tools for stacks this host does
+# not use (it has no Btrfs, LUKS, LVM or mdraid) out as well.
+for tool in bash sshd nmbl; do
   test -x "$work_root/rescue/bin/$tool"
 done
-for forbidden in nix-daemon btop cryptsetup lvm mkfs.ext4; do
+for forbidden in nix-daemon btop cryptsetup lvm mkfs.ext4 btrfs mdadm; do
   test ! -e "$work_root/rescue/bin/$forbidden"
 done
 if find "$work_root/rescue/nix/store" -mindepth 1 -maxdepth 1 \
-  -printf '%f\n' | grep -Eq '(^|-)nix-|btop|cacert|cryptsetup|lvm|e2fsprogs'; then
+  -printf '%f\n' | grep -Eq '(^|-)nix-|btop|cacert|cryptsetup|lvm|e2fsprogs|btrfs-progs|mdadm'; then
   echo "minimal rescue contains a forbidden package" >&2
   exit 1
 fi

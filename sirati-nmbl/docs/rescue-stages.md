@@ -76,6 +76,15 @@ the minimal DNS-VPS profile (a 188 MB tree):
 | EROFS, LZ4HC (default) | 75 MB |
 | EROFS, zstd-19 | 52 MB |
 
+## Only the storage tools the host uses
+
+The default `fullSystem.packages` include `cryptsetup` only with LUKS (NMBL's
+`activation.luks` or `boot.initrd.luks.devices`), `btrfs-progs` only with a
+Btrfs filesystem (or a Btrfs identity volume), `lvm2` only with NMBL's LVM
+activation, and `mdadm` only with mdraid. The minimal profile likewise loads
+the `btrfs`, `raid1` and `nvme` modules only when the host uses them. The
+`rescue-storage-tools-eval` flake check pins this.
+
 ## The flat rescue
 
 `fullSystem.enable = false` keeps the busybox squashfs, the `squashfs` module
@@ -83,7 +92,8 @@ and an unpinned `[rescue]` section, exactly as before.
 
 ## Tests
 
-* `nix build .#checks.x86_64-linux.rescue-ssh-welcome` (pure);
+* `nix build .#checks.x86_64-linux.rescue-ssh-welcome` and
+  `rescue-storage-tools-eval` (pure);
 * `cargo test --features rescue-stages` covers the config tables and the pin;
 * `nix run .#test-network-stage-vm` boots the signed, baked-static, baked-SLAAC
   and identity variants from the stage-2 EROFS, re-pins a malformed network

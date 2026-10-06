@@ -22,9 +22,6 @@
   iproute2,
   procps,
   kmod,
-  btrfs,
-  cryptsetup,
-  btop,
   e2fsprogs,
   gnugrep,
   gnused,
@@ -155,7 +152,7 @@ let
       chmod 0755                          root/bin/nmbl
       ln -s /bin/nmbl                    root/bin/nmbl-tui
       for tool in ${coreutils}/bin/* ${utilLinux}/bin/* ${iproute2}/bin/* \
-                  ${procps}/bin/* ${kmod}/bin/* ${btrfs}/bin/* \
+                  ${procps}/bin/* ${kmod}/bin/* \
                   ${gnugrep}/bin/* ${gnused}/bin/* ${gawk}/bin/*; do
         name=$(basename "$tool")
         [ -e "root/bin/$name" ] || ln -s "$tool" "root/bin/$name"

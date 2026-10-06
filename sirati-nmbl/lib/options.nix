@@ -15,6 +15,9 @@ let
       (old.buildInputs or [ ]);
   });
 
+  # Storage stacks in use; the rescue only ships tools for these.
+  rescueStorage = import ./rescue/storage-features.nix { inherit lib config; };
+
   # Filesystem-driver modules derived from `config.fileSystems.*.fsType`.
   # NMBL has no udev to auto-load drivers on mount(2), so anything that
   # gets mounted before kexec must appear in the explicit-load list.
@@ -1081,7 +1084,8 @@ in
             Build a small SSH recovery image without Nix, flake support, CA
             certificates, btop, cryptsetup, LVM, or ext filesystem tools.
             Intended for a constrained /boot while retaining networking,
-            the NMBL TUI, Btrfs, mdraid, NVMe modules, and a shell.
+            the NMBL TUI and a shell (plus Btrfs, mdraid and NVMe support
+            when the host uses them).
           '';
         };
 
@@ -1112,11 +1116,12 @@ in
 
         packages = lib.mkOption {
           type = lib.types.listOf lib.types.package;
+          # Storage tools only for the stacks this host uses (see
+          # lib/rescue/storage-features.nix): no cryptsetup without LUKS, no
+          # btrfs-progs without Btrfs, no LVM or mdadm without them.
           default = with pkgs; if cfg.rescue.fullSystem.minimal then [
             bashInteractive
             openssh
-            minimalBtrfsProgs
-            mdadm
             coreutils-full
             util-linux
             iproute2
@@ -1126,16 +1131,15 @@ in
             gawk
             procps
             kmod
-          ] else [
+          ]
+          ++ lib.optional rescueStorage.btrfs minimalBtrfsProgs
+          ++ lib.optional rescueStorage.mdraid mdadm
+          else [
             bashInteractive
             btop
             nixVersions.stable
             openssh
             cacert
-            btrfs-progs
-            cryptsetup
-            lvm2
-            mdadm
             coreutils-full
             util-linux
             e2fsprogs
@@ -1146,9 +1150,15 @@ in
             gawk
             procps
             kmod
-          ];
+          ]
+          ++ lib.optional rescueStorage.btrfs btrfs-progs
+          ++ lib.optional rescueStorage.luks cryptsetup
+          ++ lib.optional rescueStorage.lvm lvm2
+          ++ lib.optional rescueStorage.mdraid mdadm;
           defaultText = lib.literalExpression ''
-            Selected from the full or minimal built-in recovery profile.
+            The full or minimal built-in recovery profile, plus btrfs-progs,
+            cryptsetup, lvm2 and mdadm only when the host uses Btrfs, LUKS,
+            LVM or mdraid.
           '';
           description = lib.mdDoc ''
             Packages whose closures are baked into the full recovery

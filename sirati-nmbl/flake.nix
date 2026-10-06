@@ -308,6 +308,31 @@
           grep -qx 'PrintMotd yes' sshd_config
           touch "$out"
         '';
+      # The full-system rescue ships storage tools only for the stacks the host
+      # uses: no cryptsetup without LUKS, no btrfs-progs without Btrfs, no
+      # lvm2/mdadm without LVM/mdraid. Evaluated on the DNS-VPS topology (ext4,
+      # no LUKS) in both rescue profiles, then with each stack added.
+      rescueStorageToolsEvalCheck =
+        let
+          names = c: map lib.getName c.config.boot.nmbl.rescue.fullSystem.packages;
+          has = name: c: lib.elem name (names c);
+          extend = c: module: c.extendModules { modules = [ module ]; };
+          full = extend erofsBiosHost { boot.nmbl.rescue.fullSystem.minimal = lib.mkForce false; };
+          withLuks = c: extend c { boot.initrd.luks.devices.data.device = "/dev/disk/by-partlabel/data"; };
+          withBtrfs = c: extend c { fileSystems."/srv" = { device = "/dev/vdc"; fsType = "btrfs"; }; };
+          withLvm = c: extend c { boot.nmbl.activation.lvm.enable = true; };
+          withMdraid = c: extend c { boot.swraid.enable = true; };
+          minimal = erofsBiosHost;
+        in
+        assert !(has "cryptsetup" full);
+        assert has "cryptsetup" (withLuks full);
+        assert !(has "btrfs-progs" full) && has "btrfs-progs" (withBtrfs full);
+        assert !(has "lvm2" full) && has "lvm2" (withLvm full);
+        assert !(has "mdadm" full) && has "mdadm" (withMdraid full);
+        assert !(has "btrfs-progs" minimal) && has "btrfs-progs" (withBtrfs minimal);
+        assert !(has "mdadm" minimal) && has "mdadm" (withMdraid minimal);
+        assert !(has "cryptsetup" (withLuks minimal));
+        pkgs.runCommand "nmbl-rescue-storage-tools-eval" { } "touch $out";
       # Boots the DNS-VPS / Stardust topology from a real BIOS disk: GRUB ->
       # NMBL -> stage-1 store -> signed EROFS generation (tmpfs root), then
       # rollback, and rescue with the signed network stage + recovery SSH.
@@ -1456,6 +1481,7 @@
         generation-root-store-eval = rootStoreEvalCheck;
         nmbl-erofs-bios-host-eval = erofsBiosHostEvalCheck;
         rescue-ssh-welcome = rescueSshWelcomeCheck;
+        rescue-storage-tools-eval = rescueStorageToolsEvalCheck;
         insecure-test-key-absent = insecureKeyAbsentFromProd;
         test-secure-boot-no-private-key = secureBootNoPrivateKey;
         test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;

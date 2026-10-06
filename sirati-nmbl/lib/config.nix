@@ -294,6 +294,8 @@ let
   # The derivation is always evaluated (cheap when nothing references it)
   # but only staged onto the boot partition when `cfg.rescue.mode ==
   # "external"`. Embedded / none modes keep today's behaviour.
+  rescueStorage = import ./rescue/storage-features.nix { inherit lib config; };
+
   nmblRescueSquashfs = import ./rescue-sfs.nix {
     inherit pkgs lib;
     contents = cfg.rescue.squashfsContents;
@@ -311,8 +313,12 @@ let
       nicDrivers = lib.unique (cfg.rescue.nicDrivers ++ detectedNicModules);
       # Filesystem / packet modules the recovery /init loads before the
       # overlay + network setup. Loaded from the staged tree, not NMBL's.
+      # Storage modules only for the stacks this host uses.
       coreModules = if cfg.rescue.fullSystem.minimal then
-        [ "overlay" "af_packet" "btrfs" "raid1" "nvme" ]
+        [ "overlay" "af_packet" ]
+        ++ lib.optional rescueStorage.btrfs "btrfs"
+        ++ lib.optional rescueStorage.mdraid "raid1"
+        ++ lib.optional rescueStorage.nvme "nvme"
       else
         [ "overlay" "ext4" "af_packet" ];
       # The makeModulesClosure result (its /lib/modules + /lib/firmware are

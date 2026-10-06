@@ -432,7 +432,8 @@ It starts in two stages (`docs/rescue-stages.md`). Stage 1 is NMBL's own
 initramfs, which carries `erofs.ko`, and its config, which names the stage-2
 image and pins its SHA-512. Stage 2 is an LZ4HC EROFS image with the recovery
 system, its NIC drivers and its baked network profile. NMBL verifies, pins and
-loop-mounts it over one descriptor. An interactive SSH
+loop-mounts it over one descriptor. The image ships storage tools only for the
+stacks the host uses (no `cryptsetup` without LUKS, and so on). An interactive SSH
 login prints a welcome after authentication:
 
 ```text
