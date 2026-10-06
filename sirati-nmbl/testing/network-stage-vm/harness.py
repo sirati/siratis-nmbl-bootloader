@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -196,26 +197,61 @@ def console_proof(proc, qmp_socket, transcript):
     wait_for(proc, ["NMBL_RESCUE_RESPAWN_PASS"], 30, transcript)
 
 
-def remote_tui(args, transcript, qemu):
+def ssh_command(args, *remote, tty=True, connect_timeout=15):
     host = "::1" if args.mode == "baked-slaac" else "127.0.0.1"
     host_key = Path(args.ssh_host_key).read_text().split()
     known_hosts = Path(args.transcript).with_suffix(".known-hosts")
     known_hosts.write_text(
         f"[{host}]:{args.ssh_port} {host_key[0]} {host_key[1]}\n"
     )
-    command = [
+    return [
         args.ssh,
-        "-tt",
+        *(["-tt"] if tty else []),
         "-p", str(args.ssh_port),
         "-i", args.ssh_key,
         "-o", "BatchMode=yes",
         "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=yes",
         "-o", f"UserKnownHostsFile={known_hosts}",
-        "-o", "ConnectTimeout=15",
+        "-o", f"ConnectTimeout={connect_timeout}",
         f"root@{host}",
-        "stty rows 30 cols 100; exec nmbl",
+        *remote,
     ]
+
+
+class SshReadyProbe(threading.Thread):
+    """Record when the rescue first accepts an authenticated SSH command,
+    measured from QEMU start (the boot-to-rescue-SSH figure)."""
+
+    def __init__(self, args, started):
+        super().__init__(daemon=True)
+        self.args = args
+        self.started = started
+        self.ready_after = None
+        self.stopped = threading.Event()
+
+    def run(self):
+        command = ssh_command(self.args, "true", tty=False, connect_timeout=2)
+        while not self.stopped.is_set():
+            try:
+                result = subprocess.run(command, capture_output=True, timeout=15)
+                if result.returncode == 0:
+                    self.ready_after = time.monotonic() - self.started
+                    return
+            except subprocess.TimeoutExpired:
+                pass
+            self.stopped.wait(0.5)
+
+
+def report_timing(args, timings):
+    line = " ".join(f"{name}={value:.1f}s" if isinstance(value, float) else f"{name}={value}"
+                    for name, value in timings.items())
+    print(f"NMBL_TIMING mode={args.mode} {line}", flush=True)
+    Path(args.transcript).with_suffix(".timing.json").write_text(json.dumps(timings) + "\n")
+
+
+def remote_tui(args, transcript, qemu):
+    command = ssh_command(args, "stty rows 30 cols 100; exec nmbl")
     environment = os.environ.copy()
     environment["TERM"] = "xterm-256color"
     deadline = time.monotonic() + 120
@@ -306,6 +342,7 @@ def boot(args):
             if time.monotonic() >= deadline:
                 raise RuntimeError("passt did not open its QEMU socket")
             time.sleep(0.1)
+        started = time.monotonic()
         proc = subprocess.Popen(
             qemu_command(args, overlay, network_socket, qmp_socket),
             stdin=subprocess.PIPE,
@@ -313,9 +350,20 @@ def boot(args):
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        probe = None
+        if args.mode in ("good", "baked-static", "baked-slaac", "native-identity"):
+            probe = SshReadyProbe(args, started)
+            probe.start()
         try:
             if args.mode in ("good", "baked-static", "baked-slaac", "native-identity", "missing-identity"):
                 wait_for(proc, ["recovery system ready"], 240, transcript)
+                timings = {"rescue_ready": time.monotonic() - started}
+                if probe is not None:
+                    probe.join(timeout=240)
+                    if probe.ready_after is None:
+                        raise RuntimeError("rescue SSH never accepted a command")
+                    timings["ssh_ready"] = probe.ready_after
+                report_timing(args, timings)
                 console_proof(proc, qmp_socket, transcript)
                 commands = r'''
 set -eux
@@ -442,6 +490,8 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
             hold_failed_vm(proc, transcript)
             raise
         finally:
+            if probe is not None:
+                probe.stopped.set()
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGTERM)
                 try:
