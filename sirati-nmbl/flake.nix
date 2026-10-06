@@ -348,12 +348,20 @@
       # The stage-2 rescue image is host-independent: its derivation is the same
       # for hosts that differ in network configuration (baked static profile
       # or a signed networking stage), authorized keys, sshd port, rescue host
-      # key and unrelated NixOS options, and changes only with what it is
-      # built from (here: NMBL's kernel, whose module closure it carries).
+      # key, signing public keys and unrelated NixOS options, and changes only
+      # with what it is built from (here: NMBL's kernel, whose module closure it
+      # carries). `nmblctl`, which bakes the signing keys, ships in the separate
+      # tools image, which does change with the keys.
       rescueImageHostIndependentCheck =
         let
           extend = c: module: c.extendModules { modules = [ module ]; };
           image = c: c.config.system.build.nmblRescueSquashfs.drvPath;
+          tools = c: c.config.system.build.nmblRescueTools.drvPath;
+          # A second, real ML-DSA-87 key. Only its store path enters the
+          # evaluation; the check never builds it.
+          otherSigningKey = pkgs.runCommand "nmbl-other-signing-key.pub" { } ''
+            ${nmblSign}/bin/nmbl-sign keygen --alg ml-dsa-87 --out-priv private --out-pub "$out"
+          '';
           withStage = erofsBiosHost;
           baked = extend erofsBiosHost {
             boot.nmbl.rescue.fullSystem.networkStage.enable = lib.mkForce false;
@@ -380,10 +388,19 @@
           otherKernel = extend baked {
             boot.nmbl.kernelPackage = lib.mkForce pkgs.linuxPackages_6_12.kernel;
           };
+          otherKeys = extend otherHost {
+            boot.nmbl.signing.publicKeys = lib.mkForce [ otherSigningKey ];
+          };
         in
         assert image baked == image otherHost;
         assert image baked == image withStage;
+        assert image baked == image otherKeys;
         assert image baked != image otherKernel;
+        # The tools image follows nmblctl alone: new keys, new image; other
+        # host data, the same one.
+        assert tools baked != tools otherKeys;
+        assert tools baked == tools otherHost;
+        assert tools baked == tools otherKernel;
         pkgs.runCommand "nmbl-rescue-image-host-independent" { } "touch $out";
       # Boots the DNS-VPS / Stardust topology from a real BIOS disk: GRUB ->
       # NMBL -> stage-1 store -> signed EROFS generation (tmpfs root), then

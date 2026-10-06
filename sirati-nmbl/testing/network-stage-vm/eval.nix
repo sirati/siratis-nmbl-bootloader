@@ -82,6 +82,7 @@ pkgs.linkFarm "nmbl-network-stage-vm-artifacts" ([
   { name = "initrd"; path = "${build.nmblInitramfs}/initrd"; }
   { name = "config.toml"; path = build.nmblConfigToml; }
   { name = "rescue.sfs"; path = build.nmblRescueSquashfs; }
+  { name = "rescue-tools.erofs"; path = build.nmblRescueTools; }
   ] ++ lib.optional (!(bakedStatic || bakedSlaac || nativeIdentity)) { name = "network.erofs"; path = build.nmblNetworkStage; } ++ lib.optional (!(bakedStatic || bakedSlaac || nativeIdentity))
   { name = "rescue-installer"; path = build.nmblRescueStageInstaller; }
 )

@@ -434,13 +434,13 @@ def boot(args):
             start_new_session=True,
         )
         probe = None
-        if args.mode in ("good", "baked-static", "baked-slaac", "native-identity"):
+        if args.mode in ("good", "baked-static", "baked-slaac", "native-identity", "tools-tampered"):
             probe = SshReadyProbe(args, started)
             probe.start()
         try:
-            if args.mode in ("good", "baked-static", "baked-slaac", "native-identity", "missing-identity"):
+            if args.mode in ("good", "baked-static", "baked-slaac", "native-identity", "missing-identity", "tools-tampered"):
                 marks = {"external rescue: mounting": None}
-                wait_for(proc, ["recovery system ready"], 240, transcript, marks=marks)
+                boot_text = wait_for(proc, ["recovery system ready"], 240, transcript, marks=marks)
                 ready = time.monotonic()
                 timings = {"rescue_ready": ready - started}
                 entered = marks["external rescue: mounting"]
@@ -467,6 +467,12 @@ grep -qx 'profile mac 52:54:00:12:34:56' /nmbl-network/etc/nmbl-network/network.
 grep -qx 'dns 10.0.2.3' /nmbl-network/etc/nmbl-network/network.conf
 grep -qx 'dns fec0::3' /nmbl-network/etc/nmbl-network/network.conf
 lsmod | grep '^dummy '
+findmnt -n -o OPTIONS /nmbl-tools | grep -w ro | grep -w nodev | grep -w nosuid
+test ! -e /etc/nmbl-tools-disabled
+test "$(command -v nmblctl)" = /bin/nmblctl
+nmblctl --config /nmbl-root/mnt/boot/nmbl/config.toml --no-pager --color=never chain > /tmp/nmblctl-chain
+grep -F /nmbl-root/mnt/boot/nmbl/config.toml /tmp/nmblctl-chain
+grep -w external /tmp/nmblctl-chain
 test "$(sha256sum /etc/ssh/ssh_host_ed25519_key | cut -d' ' -f1)" = "$(sha256sum /nmbl-root/mnt/boot/rescue-host-ed25519 | cut -d' ' -f1)"
 test "$(stat -c '%u:%g:%a' /nmbl-root/mnt/boot/rescue-host-ed25519)" = 0:0:600
 sshd -T -f /etc/ssh/sshd_config | grep -qx 'passwordauthentication no'
@@ -488,6 +494,7 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
                 if args.mode in ("baked-static", "native-identity", "missing-identity"):
                     commands = r'''
 test ! -d /nmbl-network/etc/nmbl-network &&
+test "$(command -v nmblctl)" = /bin/nmblctl &&
 grep -qx 'version 2' /etc/nmbl-rescue/network.conf &&
 ip -4 addr show dev eth0 | grep -F '88.99.80.66/32' &&
 ip -4 route show | grep -F 'default via 172.31.1.1 dev eth0 onlink' &&
@@ -497,6 +504,20 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
 '''
                 if args.mode == "missing-identity":
                     commands = commands.replace("ss -tln | grep ':22222 ' &&", "! pgrep -x sshd &&")
+                if args.mode == "tools-tampered":
+                    # Refused before mounting: nothing is mounted at /nmbl-tools
+                    # and no loop device was ever bound to the image, while the
+                    # rest of the rescue (signed network stage, SSH) is intact.
+                    commands = r'''
+set -eux
+grep -F 'rescue stage tools-verify failed' /etc/nmbl-tools-disabled
+! findmnt /nmbl-tools || false
+! grep -s rescue-tools /sys/block/loop*/loop/backing_file || false
+! command -v nmblctl || false
+findmnt -n -o OPTIONS /nmbl-network | grep -w ro
+ss -tln | grep ':22222 '
+echo NMBL_NETWORK_STAGE_VM_"PASS"
+'''
                 if args.mode == "baked-slaac":
                     commands = r'''
 test ! -d /nmbl-network/etc/nmbl-network &&
@@ -515,7 +536,23 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
                 text = wait_for(proc, ["NMBL_NETWORK_STAGE_VM_PASS"], 90, transcript)
                 if "network-stage signature" in text.lower() and "failed" in text.lower():
                     raise RuntimeError("positive VM reported a network-stage signature failure")
-                if args.mode == "missing-identity":
+                tools_refused = "rescue tools image refused" in boot_text
+                if tools_refused != (args.mode == "tools-tampered"):
+                    raise RuntimeError(f"rescue tools image refused={tools_refused} in mode {args.mode}")
+                if args.mode == "tools-tampered" and "rescue stage tools-verify failed" not in boot_text:
+                    raise RuntimeError("tampered tools image was not refused by its signature check")
+                if args.mode == "good":
+                    # The operator's path: nmblctl over rescue SSH.
+                    over_ssh = subprocess.run(
+                        ssh_command(args, "nmblctl --config /nmbl-root/mnt/boot/nmbl/config.toml --no-pager --color=never chain", tty=False),
+                        capture_output=True, timeout=60,
+                    )
+                    transcript.write(over_ssh.stdout + over_ssh.stderr)
+                    if over_ssh.returncode != 0 or b"external" not in over_ssh.stdout:
+                        raise RuntimeError(f"nmblctl over rescue SSH failed: {over_ssh.returncode}")
+                if args.mode == "tools-tampered":
+                    pass  # Its SSH reachability was proven by the readiness probe.
+                elif args.mode == "missing-identity":
                     proc.stdin.write(b"test ! -e /etc/ssh/ssh_host_ed25519_key && ! pgrep -x sshd && echo NMBL_IDENTITY_\"FAILCLOSED_PASS\"\n")
                     proc.stdin.flush()
                     wait_for(proc, ["NMBL_IDENTITY_FAILCLOSED_PASS"], 30, transcript)
@@ -630,7 +667,7 @@ def main():
     boot_parser.add_argument("--ssh-key", required=True)
     boot_parser.add_argument("--ssh-host-key", required=True)
     boot_parser.add_argument("--identity-disk")
-    boot_parser.add_argument("--mode", choices=["good", "invalid", "substituted", "baked-static", "baked-slaac", "native-identity", "missing-identity"], required=True)
+    boot_parser.add_argument("--mode", choices=["good", "invalid", "substituted", "baked-static", "baked-slaac", "native-identity", "missing-identity", "tools-tampered"], required=True)
     args = parser.parse_args()
     if args.command == "scan":
         scan(args)

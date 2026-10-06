@@ -89,6 +89,12 @@ cmp "$artifacts/rescue.sfs" "$stage/nmbl-rescue.sfs"
 grep -qx 'format = "erofs"' "$stage/nmbl/config.toml"
 grep -qx "sha512 = \"$(sha512sum < "$artifacts/rescue.sfs" | cut -d' ' -f1)\"" "$stage/nmbl/config.toml"
 grep -qx "sha512 = \"$(sha512sum < "$artifacts/network.erofs" | cut -d' ' -f1)\"" "$stage/nmbl/config.toml"
+# ...and the separately pinned, signed tools image carrying nmblctl.
+cmp "$artifacts/rescue-tools.erofs" "$stage/nmbl/rescue-tools.erofs"
+test -s "$stage/nmbl/rescue-tools.erofs.sig"
+grep -qx '\[rescue.tools\]' "$stage/nmbl/config.toml"
+grep -qx 'path = "nmbl/rescue-tools.erofs"' "$stage/nmbl/config.toml"
+grep -qx "sha512 = \"$(sha512sum < "$artifacts/rescue-tools.erofs" | cut -d' ' -f1)\"" "$stage/nmbl/config.toml"
 
 
 make_disk() {
@@ -98,8 +104,12 @@ make_disk() {
   used_mb=$(du -sm "$source_dir" | cut -f1)
   truncate -s "$((used_mb + 256))M" "$disk"
   mkfs.ext4 -q -F -d "$source_dir" "$disk"
-  debugfs -w -R "set_inode_field /rescue-host-ed25519 uid 0" "$disk" >/dev/null
-  debugfs -w -R "set_inode_field /rescue-host-ed25519 gid 0" "$disk" >/dev/null
+  # Root-owned like a real /boot: the host key, and the config path nmblctl
+  # accepts as an operator path only when it and its ancestors are root's.
+  for owned in /rescue-host-ed25519 / /nmbl /nmbl/config.toml; do
+    debugfs -w -R "set_inode_field $owned uid 0" "$disk" >/dev/null
+    debugfs -w -R "set_inode_field $owned gid 0" "$disk" >/dev/null
+  done
   e2fsck -fn "$disk"
 }
 
@@ -110,6 +120,11 @@ make_disk "$work_root/tampered-tree" "$work_root/tampered.img"
 cp -a "$stage" "$work_root/unsigned-tree"
 rm -f "$work_root/unsigned-tree/nmbl/network.erofs.sig"
 make_disk "$work_root/unsigned-tree" "$work_root/unsigned.img"
+# A tampered tools image must be refused before it is mounted; the rescue
+# itself (network stage, SSH) still comes up, only without nmblctl.
+cp -a "$stage" "$work_root/tools-tampered-tree"
+printf 'NMBL_TAMPER' >> "$work_root/tools-tampered-tree/nmbl/rescue-tools.erofs"
+make_disk "$work_root/tools-tampered-tree" "$work_root/tools-tampered.img"
 
 # Rebuild and correctly sign an EROFS whose data-only policy is malformed.
 # This exercises the production signature and mount path, then proves the
@@ -153,8 +168,16 @@ make_disk "$work_root/malformed-tree" "$work_root/malformed.img"
 # A different, validly signed rescue image in place of the pinned one (an
 # older or foreign build signed with the same key): the stage-2 pin must
 # refuse it before it is mounted.
+# Stage 2 is shared by every host with this kernel and package set (the baked
+# hosts' image is this very one), so build the other image explicitly: the
+# same tree plus one file, as an older build would differ.
+mkdir "$work_root/substitute-root"
+fsck.erofs --extract="$work_root/substitute-root" "$artifacts/rescue.sfs"
+chmod u+w "$work_root/substitute-root/etc"
+printf 'an older stage-2 build\n' > "$work_root/substitute-root/etc/nmbl-substitute"
+mkfs.erofs --quiet -zlz4hc "$work_root/substitute.erofs" "$work_root/substitute-root"
 cp -a "$stage" "$work_root/substituted-tree"
-install -m 0644 "$baked_artifacts/rescue.sfs" "$work_root/substituted-tree/nmbl-rescue.sfs"
+install -m 0644 "$work_root/substitute.erofs" "$work_root/substituted-tree/nmbl-rescue.sfs"
 "$signer/bin/nmbl-sign" sign --key "$private_key" --domain rescue-sfs \
   --out "$work_root/substituted-tree/nmbl-rescue.sfs.sig" \
   "$work_root/substituted-tree/nmbl-rescue.sfs"
@@ -170,21 +193,43 @@ verify_disk_file() {
   cmp "$expected" "$output"
 }
 
-for disk in good tampered unsigned; do
+for disk in good tampered unsigned tools-tampered; do
   verify_disk_file "$work_root/$disk.img" /nmbl-rescue.sfs "$stage/nmbl-rescue.sfs"
   verify_disk_file "$work_root/$disk.img" /nmbl-rescue.sfs.sig "$stage/nmbl-rescue.sfs.sig"
   verify_disk_file "$work_root/$disk.img" /nmbl/config.toml "$stage/nmbl/config.toml"
 done
 verify_disk_file "$work_root/malformed.img" /nmbl-rescue.sfs "$stage/nmbl-rescue.sfs"
 verify_disk_file "$work_root/malformed.img" /nmbl/config.toml "$work_root/malformed-tree/nmbl/config.toml"
-verify_disk_file "$work_root/substituted.img" /nmbl-rescue.sfs "$baked_artifacts/rescue.sfs"
+verify_disk_file "$work_root/substituted.img" /nmbl-rescue.sfs "$work_root/substitute.erofs"
 verify_disk_file "$work_root/substituted.img" /nmbl/config.toml "$stage/nmbl/config.toml"
 
-mkdir "$work_root/initrd" "$work_root/rescue" "$work_root/network" "$work_root/disk"
+verify_disk_file "$work_root/good.img" /nmbl/rescue-tools.erofs "$artifacts/rescue-tools.erofs"
+if verify_disk_file "$work_root/tools-tampered.img" /nmbl/rescue-tools.erofs "$artifacts/rescue-tools.erofs"; then
+  echo "tools-tampered disk carries the untampered tools image" >&2
+  exit 1
+fi
+
+mkdir "$work_root/initrd" "$work_root/rescue" "$work_root/network" "$work_root/tools" "$work_root/disk"
 (cd "$work_root/initrd" && lsinitrd --unpack "$artifacts/initrd")
 python3 "$harness" console-image --initrd "$work_root/initrd"
 fsck.erofs --extract="$work_root/rescue" "$artifacts/rescue.sfs"
 fsck.erofs --extract="$work_root/network" "$artifacts/network.erofs"
+fsck.erofs --extract="$work_root/tools" "$artifacts/rescue-tools.erofs"
+
+# nmblctl (built with the signing keys) lives only in the tools image, which
+# holds nothing but its closure.
+test ! -e "$work_root/rescue/bin/nmblctl"
+if find "$work_root/rescue/nix/store" -mindepth 1 -maxdepth 1 -name '*-nmblctl-*' | grep -q .; then
+  echo "stage-2 rescue image still carries nmblctl" >&2
+  exit 1
+fi
+test -L "$work_root/tools/bin/nmblctl"
+test -x "$work_root/tools/bin/nmblctl"
+test "$(find "$work_root/tools" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" = "$(printf 'bin\nnix')"
+nmblctl_path=/nix/store/$(readlink "$work_root/tools/bin/nmblctl" | cut -d/ -f4)
+nix-store -qR "$nmblctl_path" | xargs -n1 basename | sort > "$work_root/tools-closure-expected"
+find "$work_root/tools/nix/store" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort > "$work_root/tools-closure-actual"
+cmp "$work_root/tools-closure-expected" "$work_root/tools-closure-actual"
 
 # The constrained-/boot profile must retain the actual recovery tools while
 # keeping package-fetching out, and storage tools for stacks this host does
@@ -209,11 +254,11 @@ python3 "$harness" scan \
   --marker "$marker" \
   --target-list "$work_root/closure-paths" \
   "$source_tree" "$artifacts" "$stage" "$work_root/initrd" \
-  "$work_root/rescue" "$work_root/network" "$work_root/disk" \
+  "$work_root/rescue" "$work_root/network" "$work_root/tools" "$work_root/disk" \
   "$work_root/malformed-root" "$work_root/malformed-tree" \
   "$work_root/malformed.erofs" "$work_root/good.img" \
   "$work_root/tampered.img" "$work_root/unsigned.img" \
-  "$work_root/malformed.img"
+  "$work_root/malformed.img" "$work_root/tools-tampered.img"
 
 baked_stage="$work_root/baked-boot"
 mkdir -p "$baked_stage/nmbl"
@@ -221,6 +266,7 @@ cp "$baked_artifacts/config.toml" "$baked_stage/nmbl/config.toml"
 cp "$stage/rescue-host-ed25519" "$stage/rescue-host-ed25519.pub" "$baked_stage/"
 # Match unsigned install-bootloader staging: immutable rescue artifact, mode 0644.
 install -m 0644 "$baked_artifacts/rescue.sfs" "$baked_stage/nmbl-rescue.sfs"
+install -m 0644 "$baked_artifacts/rescue-tools.erofs" "$baked_stage/nmbl/rescue-tools.erofs"
 test ! -e "$baked_stage/nmbl-rescue.sfs.sig"
 test ! -e "$baked_stage/nmbl/config.toml.sig"
 test ! -e "$baked_stage/nmbl/network.erofs"
@@ -234,6 +280,7 @@ cp "$slaac_artifacts/config.toml" "$slaac_stage/nmbl/config.toml"
 cp "$stage/rescue-host-ed25519" "$stage/rescue-host-ed25519.pub" "$slaac_stage/"
 # Match unsigned install-bootloader staging: immutable rescue artifact, mode 0644.
 install -m 0644 "$slaac_artifacts/rescue.sfs" "$slaac_stage/nmbl-rescue.sfs"
+install -m 0644 "$slaac_artifacts/rescue-tools.erofs" "$slaac_stage/nmbl/rescue-tools.erofs"
 test ! -e "$slaac_stage/nmbl-rescue.sfs.sig"
 test ! -e "$slaac_stage/nmbl/config.toml.sig"
 test ! -e "$slaac_stage/nmbl/network.erofs"
@@ -244,6 +291,10 @@ python3 "$harness" scan --key "$private_key" --key "$ssh_private_key" \
 # The stage-2 rescue image carries no host data: two hosts that differ only
 # in their network configuration share one image (and one store path).
 test "$(readlink -f "$baked_artifacts/rescue.sfs")" = "$(readlink -f "$slaac_artifacts/rescue.sfs")"
+# Nor key data: the enforced-signing host (whose nmblctl requires its baked
+# keys) and the unsigned ones share it too; only their tools images differ.
+test "$(readlink -f "$artifacts/rescue.sfs")" = "$(readlink -f "$baked_artifacts/rescue.sfs")"
+test "$(readlink -f "$artifacts/rescue-tools.erofs")" != "$(readlink -f "$baked_artifacts/rescue-tools.erofs")"
 test ! -e "$work_root/rescue/etc/nmbl-rescue"
 test ! -e "$work_root/rescue/root/.ssh/authorized_keys"
 
@@ -257,6 +308,7 @@ mkdir -p "$native_stage/nmbl" "$work_root/native-state/@persistent/etc/ssh"
 cp "$native_artifacts/config.toml" "$native_stage/nmbl/config.toml"
 cp "$stage/rescue-host-ed25519" "$stage/rescue-host-ed25519.pub" "$native_stage/"
 install -m 0644 "$native_artifacts/rescue.sfs" "$native_stage/nmbl-rescue.sfs"
+install -m 0644 "$native_artifacts/rescue-tools.erofs" "$native_stage/nmbl/rescue-tools.erofs"
 make_disk "$native_stage" "$work_root/native-identity.img"
 # The identity differs from the unrelated boot-partition key, proving its source.
 ssh-keygen -q -t ed25519 -N '' -f "$work_root/native-state/@persistent/etc/ssh/ssh_host_ed25519_key"
@@ -277,10 +329,11 @@ test ! -e "$private_key"
 
 ssh_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 
-for scenario in good tampered unsigned malformed substituted; do
+for scenario in good tampered unsigned malformed substituted tools-tampered; do
   mode=invalid
   test "$scenario" = good && mode=good
   test "$scenario" = substituted && mode=substituted
+  test "$scenario" = tools-tampered && mode=tools-tampered
   python3 "$harness" boot \
     --qemu "$qemu" \
     --passt @passt@ \
