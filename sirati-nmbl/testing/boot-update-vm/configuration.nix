@@ -1,4 +1,6 @@
-{ nixpkgs, nmblModule, publicKey, system ? "x86_64-linux" }:
+# `previousKeys` stay trusted by this NMBL only for a trust-key transition
+# slot, which the previous key signs.
+{ nixpkgs, nmblModule, publicKey, previousKeys ? [ ], system ? "x86_64-linux" }:
 
 nixpkgs.lib.nixosSystem {
   inherit system;
@@ -36,7 +38,7 @@ nixpkgs.lib.nixosSystem {
           enable = true;
           enforce = true;
           algorithm = "ml-dsa-65";
-          publicKeys = [ publicKey ];
+          publicKeys = [ publicKey ] ++ previousKeys;
           generationKeyFile = "/run/operator/offline.key";
           deferInstallSigning = true;
         };
@@ -47,11 +49,15 @@ nixpkgs.lib.nixosSystem {
         };
       };
       boot.initrd.kernelModules = [ "virtio_pci" "virtio_blk" ];
+      # The generation's own kernel reports on the serial console once NMBL
+      # has kexec'd into it.
+      boot.kernelParams = [ "console=ttyS0,115200" ];
+      # vdc carries only the generation's profile, kernel and initrd: NMBL
+      # verifies and kexecs that generation, whose own boot goes no further.
       fileSystems."/" = { device = "/dev/vdc"; fsType = "ext4"; };
       # The install-time GRUB module requires an ESP declaration. The VM's
-      # NMBL bootstrap store is the separate ext4 vdb above; the target NixOS
-      # system is never entered in this selector-path test.
-      fileSystems."/boot" = { device = "/dev/vda"; fsType = "vfat"; };
+      # NMBL bootstrap store is the separate ext4 vdb above.
+      fileSystems."/boot" = { device = "/dev/vda"; fsType = "vfat"; options = [ "ro" ]; };
       boot.loader.grub.enable = false;
       boot.loader.systemd-boot.enable = false;
       system.stateVersion = "24.05";

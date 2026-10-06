@@ -61,9 +61,11 @@ rewriting its files or selector.
 ## Trust-key replacement
 
 The update protocol cannot replace its own trust anchor. Build a replacement
-NMBL initrd/config from independently supplied public key B. Key A signs the
-complete transition slot. After that slot boots, restart the privileged
-service with public key B and accept only B-signed sets. Private keys remain on
+NMBL initrd/config from independently supplied public key B, with the old key
+A still in its `signing.publicKeys`: key A signs the complete transition
+slot, including the config that NMBL verifies at boot. After that slot boots,
+restart the privileged service with public key B and accept only B-signed
+sets, built for B alone. Private keys remain on
 the operator machine or private runtime storage throughout.
 
 The checked VM test boots the exact generated GRUB dispatcher through the UEFI

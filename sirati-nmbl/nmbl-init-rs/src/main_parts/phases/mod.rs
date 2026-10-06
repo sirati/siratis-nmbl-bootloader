@@ -138,10 +138,17 @@ pub(super) async fn run_bootstrap_phase(
         let signature = selected_signature.as_deref().unwrap_or(signature);
         let signature_path = resolve_full_config_path(&boot_fs.mountpoint, signature);
         let text = nmbl_init::sig::boot_config::load_verified(&full_path, &signature_path)
-            .map_err(|source| NmblError::Bootstrap {
-                stage: "verify-config",
-                source: Box::new(source),
+            .map_err(|source| {
+                nmbl_init::nmbl_warn!(
+                    "phase 0.5: boot config {} rejected: {source}",
+                    full_path.display()
+                );
+                NmblError::Bootstrap {
+                    stage: "verify-config",
+                    source: Box::new(source),
+                }
             })?;
+        nmbl_info!("phase 0.5: boot config {} verified", full_path.display());
         let config =
             Config::parse_toml(&text, &full_path).map_err(|source| NmblError::Bootstrap {
                 stage: "read-config",

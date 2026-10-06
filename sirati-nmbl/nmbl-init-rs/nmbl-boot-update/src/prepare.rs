@@ -78,11 +78,15 @@ fn populate(
         identity.update(name.as_bytes());
         identity.update(digest.as_bytes());
         let signature = format!("{name}.sig");
+        // Each signature becomes the slot sidecar its consumer checks, so it
+        // carries that consumer's domain (NMBL verifies config.sig under
+        // boot-config, the rescue and network images under their own).
+        let domain_name = role.domain();
         sign::run_with_key(
             &output.join(name),
             key,
-            domain::domain_for("boot-set-artifact")
-                .ok_or_else(|| Error::Invalid("artifact signature domain missing".into()))?,
+            domain::domain_for(domain_name)
+                .ok_or_else(|| Error::Invalid(format!("signature domain {domain_name} missing")))?,
             Some(&output.join(&signature)),
         )
         .map_err(|e| Error::Invalid(format!("sign {name}: {e}")))?;
@@ -91,7 +95,7 @@ fn populate(
             destination: name.into(),
             payload: name.into(),
             signature,
-            domain: "boot-set-artifact".into(),
+            domain: domain_name.into(),
             sha512: digest,
         });
     }

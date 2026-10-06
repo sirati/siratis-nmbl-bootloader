@@ -85,16 +85,21 @@ impl Fixture {
 }
 
 fn make_bundle(bundle: &Path, key: &Path) {
-    let artifact_domain = domain::domain_for("boot-set-artifact").expect("domain");
     let entries = ["bootloader", "kernel", "initrd", "rescue", "config"]
         .into_iter().map(|name| {
             let bytes = format!("payload-{name}");
             let path = bundle.join(name);
             fs::write(&path, &bytes).expect("payload");
-            sign::run(&path, key, artifact_domain, Some(&bundle.join(format!("{name}.sig"))))
+            let domain_name = match name {
+                "config" => "boot-config",
+                "rescue" => "rescue-sfs",
+                _ => "boot-set-artifact",
+            };
+            let signing_domain = domain::domain_for(domain_name).expect("domain");
+            sign::run(&path, key, signing_domain, Some(&bundle.join(format!("{name}.sig"))))
                 .expect("signature");
             let digest = format!("{:x}", Sha512::digest(bytes.as_bytes()));
-            format!(r#"{{"role":"{name}","destination":"{name}","payload":"{name}","signature":"{name}.sig","domain":"boot-set-artifact","sha512":"{digest}"}}"#)
+            format!(r#"{{"role":"{name}","destination":"{name}","payload":"{name}","signature":"{name}.sig","domain":"{domain_name}","sha512":"{digest}"}}"#)
         }).collect::<Vec<_>>().join(",");
     let set_id = format!("{:x}", Sha512::digest(b"protocol"));
     fs::write(

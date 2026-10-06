@@ -53,17 +53,18 @@ impl Fixture {
             ("rescue", "rescue"),
             ("config", "config"),
         ];
-        let artifact_domain = domain::domain_for("boot-set-artifact").expect("artifact domain");
         let entries = roles.iter().enumerate().map(|(index, (role, file))| {
+            let domain_name = role_domain(role);
             let mut bytes = vec![fill.wrapping_add(index as u8); 8192];
             if *role == "rescue" { bytes.resize(bytes.len() + extra, fill); }
             let path = bundle.join(file);
             fs::write(&path, &bytes).expect("payload");
-            sign::run(&path, key, artifact_domain, Some(&bundle.join(format!("{file}.sig"))))
+            let signing_domain = domain::domain_for(domain_name).expect("artifact domain");
+            sign::run(&path, key, signing_domain, Some(&bundle.join(format!("{file}.sig"))))
                 .expect("sign artifact");
             let digest = format!("{:x}", Sha512::digest(&bytes));
             format!(
-                r#"{{"role":"{role}","destination":"{file}","payload":"{file}","signature":"{file}.sig","domain":"boot-set-artifact","sha512":"{digest}"}}"#
+                r#"{{"role":"{role}","destination":"{file}","payload":"{file}","signature":"{file}.sig","domain":"{domain_name}","sha512":"{digest}"}}"#
             )
         }).collect::<Vec<_>>().join(",");
         let set_id = format!("{:x}", Sha512::digest(name.as_bytes()));
@@ -85,6 +86,13 @@ impl Fixture {
     }
     fn active(&self) -> String {
         fs::read_to_string(self.boot.join("nmbl-boot-sets/active")).expect("active")
+    }
+}
+fn role_domain(role: &str) -> &'static str {
+    match role {
+        "config" => "boot-config",
+        "rescue" => "rescue-sfs",
+        _ => "boot-set-artifact",
     }
 }
 fn generate_key(root: &Path, name: &str) -> (PathBuf, PathBuf) {

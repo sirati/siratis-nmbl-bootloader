@@ -7,7 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use nmbl_host_tools::{cli, keyfile, keygen};
+use nmbl_host_tools::{cli, domain, keyfile, keygen, verify};
 
 const BIN: &str = env!("CARGO_BIN_EXE_nmbl-boot-update");
 
@@ -34,13 +34,14 @@ fn prepare_reads_private_key_from_stdin() {
 
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
-    // `tools` (the rescue tools image) is optional, like `network`.
+    // `network` and `tools` (the rescue tools image) are optional.
     for name in [
         "bootloader",
         "kernel",
         "initrd",
         "rescue",
         "config",
+        "network",
         "tools",
     ] {
         fs::write(source.join(name), format!("{name} payload")).unwrap();
@@ -89,4 +90,28 @@ fn prepare_reads_private_key_from_stdin() {
         "{}",
         String::from_utf8_lossy(&check.stderr)
     );
+
+    // Each signature is installed as the slot sidecar its verifier reads, so
+    // it carries that verifier's domain: NMBL checks config.sig under
+    // boot-config and the rescue, network and tools images under their own.
+    for (name, expected, foreign) in [
+        ("config", "boot-config", "boot-set-artifact"),
+        ("rescue", "rescue-sfs", "boot-set-artifact"),
+        ("network", "network-stage", "boot-set-artifact"),
+        ("tools", "rescue-tools", "boot-set-artifact"),
+        ("kernel", "boot-set-artifact", "boot-config"),
+    ] {
+        let signature = fs::read(output.join(format!("{name}.sig"))).unwrap();
+        let verify_under = |domain_name: &str| {
+            let mut payload = fs::File::open(output.join(name)).unwrap();
+            verify::verify_reader(
+                &mut payload,
+                &public,
+                domain::domain_for(domain_name).unwrap(),
+                &signature,
+            )
+        };
+        verify_under(expected).unwrap_or_else(|e| panic!("{name} under {expected}: {e}"));
+        assert!(verify_under(foreign).is_err(), "{name} also verifies under {foreign}");
+    }
 }

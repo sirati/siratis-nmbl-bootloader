@@ -1,4 +1,4 @@
-{ source, publicKeyPath, publicKeyHash }:
+{ source, publicKeyPath, publicKeyHash, previousKeyPath ? null, previousKeyHash ? null }:
 
 let
   flake = builtins.getFlake "path:${source}";
@@ -7,8 +7,13 @@ let
     name = "nmbl-boot-update-vm-public.key";
     sha256 = publicKeyHash;
   };
+  previousKeys = if previousKeyPath == null then [ ] else [ (builtins.path {
+    path = previousKeyPath;
+    name = "nmbl-boot-update-vm-previous.key";
+    sha256 = previousKeyHash;
+  }) ];
   config = import ./configuration.nix {
-    inherit publicKey;
+    inherit publicKey previousKeys;
     inherit (flake.inputs) nixpkgs;
     nmblModule = flake.nixosModules.default;
   };
@@ -20,4 +25,5 @@ in pkgs.linkFarm "nmbl-boot-update-vm-artifacts" [
   { name = "tool"; path = build.nmblBootSetTool; }
   { name = "update"; path = flake.packages.x86_64-linux.nmbl-boot-update; }
   { name = "grub.cfg"; path = build.nmblGrubConfig; }
+  { name = "toplevel"; path = build.toplevel; }
 ]

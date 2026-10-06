@@ -36,6 +36,22 @@ pub enum Role {
     Config,
 }
 
+impl Role {
+    /// The signature domain the installed file is verified under. The bundle
+    /// signature is installed as the slot's sidecar, so it must match the
+    /// consumer: NMBL checks a slot's config, rescue image, network stage and
+    /// tools image under their own domains; nothing at boot re-checks the rest.
+    pub fn domain(self) -> &'static str {
+        match self {
+            Role::Config => "boot-config",
+            Role::Rescue => "rescue-sfs",
+            Role::Network => "network-stage",
+            Role::Tools => "rescue-tools",
+            Role::Bootloader | Role::Kernel | Role::Initrd => "boot-set-artifact",
+        }
+    }
+}
+
 impl Manifest {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let value: Self = serde_json::from_slice(bytes)
@@ -81,6 +97,13 @@ impl Manifest {
                 return Err(Error::Invalid(format!(
                     "role {:?} must use destination {expected}",
                     entry.role
+                )));
+            }
+            if entry.domain != entry.role.domain() {
+                return Err(Error::Invalid(format!(
+                    "role {:?} must be signed under domain {}",
+                    entry.role,
+                    entry.role.domain()
                 )));
             }
             if entry.sha512.len() != 128 || !entry.sha512.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -131,4 +154,37 @@ fn validate_relative(path: &str, allow_subdirs: bool) -> Result<()> {
         return Err(Error::Invalid(format!("unsafe relative path: {path}")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, reason = "tests")]
+mod tests {
+    use super::*;
+
+    fn manifest(config_domain: &str) -> String {
+        let digest = "0".repeat(128);
+        let files = ["bootloader", "kernel", "initrd", "rescue", "config"]
+            .into_iter()
+            .map(|name| {
+                let domain = match name {
+                    "config" => config_domain,
+                    "rescue" => "rescue-sfs",
+                    _ => "boot-set-artifact",
+                };
+                format!(
+                    r#"{{"role":"{name}","destination":"{name}","payload":"{name}","signature":"{name}.sig","domain":"{domain}","sha512":"{digest}"}}"#
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"version":1,"set_id":"{digest}","target_slot":"A","files":[{files}]}}"#)
+    }
+
+    #[test]
+    fn each_role_must_carry_its_verifier_domain() {
+        Manifest::parse(manifest("boot-config").as_bytes()).expect("matching domains");
+        let error = Manifest::parse(manifest("boot-set-artifact").as_bytes())
+            .expect_err("config under the artifact domain");
+        assert!(error.to_string().contains("boot-config"), "{error}");
+    }
 }
