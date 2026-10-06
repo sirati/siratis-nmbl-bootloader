@@ -87,11 +87,14 @@ deploy() {
 first=$(deploy first)
 second=$(deploy second)
 test "$first" != "$second"
-# The receiver activated the latest deploy and marked the first tested; boot
-# the tested first generation as the baseline.
+# The receiver activated the latest deploy; switch back to the first as the
+# baseline. Activation never blesses a generation: the first stays pending
+# and untested until its own boot succeeds (the step-0 boot checks that).
 @ctl@/bin/nmbl-erofsctl activate "$first" "$state" >/dev/null
-test "$(readlink "$state/tested")" = "generations/$first"
-test ! -e "$state/pending"
+test "$(readlink "$state/active")" = "generations/$first"
+test "$(readlink "$state/pending")" = "generations/$first"
+test ! -e "$state/tested"
+test ! -e "$state/attempted"
 printf '%s\n' "$first" > "$store/nmbl-test/first"
 printf '%s\n' "$second" > "$store/nmbl-test/second"
 # The network stage, rescue image and rescue tools travelled inside the generation.
