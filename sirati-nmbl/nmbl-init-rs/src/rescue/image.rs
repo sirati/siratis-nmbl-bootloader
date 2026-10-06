@@ -12,7 +12,7 @@
 
 use std::fs::File;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
@@ -30,6 +30,31 @@ pub fn open(config: &Config) -> Result<Stage2Image> {
     let path = super::locate_sfs(config)?;
     let file = File::open(&path);
     Ok(Stage2Image { path, file })
+}
+
+/// Parse a boot-partition-relative image path from NMBL's config (the
+/// networking stage, the tools image). One leading `/` is tolerated, as for
+/// `[rescue].sfs_path` (boot-set slots render `/nmbl-boot-sets/<slot>/...`);
+/// an empty path or one that could leave the boot filesystem is `None`.
+pub(crate) fn boot_relative(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    let path = Path::new(trimmed.strip_prefix('/').unwrap_or(trimmed));
+    let safe = !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)));
+    safe.then(|| path.to_path_buf())
+}
+
+/// The detached signature next to `image`: its full file name plus `suffix`.
+#[cfg(feature = "secure-boot")]
+pub(crate) fn sidecar_path(image: &Path, suffix: &str) -> PathBuf {
+    let mut name = image
+        .file_name()
+        .map_or_else(std::ffi::OsString::new, std::ffi::OsString::from);
+    name.push(suffix);
+    image.with_file_name(name)
 }
 
 /// Enforce a configured SHA-512 pin over `file`. `known` is the digest the

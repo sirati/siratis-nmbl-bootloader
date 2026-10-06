@@ -32,6 +32,7 @@ pub enum Role {
     Initrd,
     Rescue,
     Network,
+    Tools,
     Config,
 }
 
@@ -73,6 +74,7 @@ impl Manifest {
                 Role::Initrd => "initrd",
                 Role::Rescue => "rescue",
                 Role::Network => "network",
+                Role::Tools => "tools",
                 Role::Config => "config",
             };
             if entry.destination != expected {

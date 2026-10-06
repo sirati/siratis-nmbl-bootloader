@@ -5,10 +5,9 @@
 //! the rescue image: the config is what NMBL already trusts (embedded, or
 //! signed under the boot-config domain), and it pins the stage's SHA-512.
 
-use std::ffi::OsString;
 use std::io;
 use std::os::fd::AsFd;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
@@ -91,32 +90,19 @@ pub(super) fn disable(error: &NmblError) -> Result<()> {
 }
 
 fn parse_stage_path(marker: &str) -> Result<PathBuf> {
-    // Boot-partition-relative like `[rescue].sfs_path`: one leading `/` is
-    // tolerated (boot-set slots render `/nmbl-boot-sets/<slot>/network`).
-    let trimmed = marker.trim();
-    let path = Path::new(trimmed.strip_prefix('/').unwrap_or(trimmed));
-    let safe = !path.as_os_str().is_empty()
-        && !path.is_absolute()
-        && path
-            .components()
-            .all(|part| matches!(part, Component::Normal(_)));
-    if safe {
-        Ok(path.to_path_buf())
-    } else {
-        Err(wrap(
+    super::image::boot_relative(marker).ok_or_else(|| {
+        wrap(
             "network-stage-path",
             NmblError::ConfigInvalid {
                 reason: format!("unsafe network-stage path `{}`", marker.trim()),
                 context: "[rescue.network_stage].path".into(),
             },
-        ))
-    }
+        )
+    })
 }
 
 fn sibling_with_suffix(image: &Path, suffix: &str) -> PathBuf {
-    let mut name = image.file_name().map_or_else(OsString::new, OsString::from);
-    name.push(suffix);
-    image.with_file_name(name)
+    super::image::sidecar_path(image, suffix)
 }
 
 fn io_error(source: io::Error, path: impl std::fmt::Display) -> NmblError {

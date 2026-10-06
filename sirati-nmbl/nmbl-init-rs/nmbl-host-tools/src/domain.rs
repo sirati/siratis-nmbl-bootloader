@@ -10,7 +10,7 @@
 use nmbl_init::sig::{
     DOMAIN_BOOT_CONFIG, DOMAIN_BOOT_SET_ARTIFACT, DOMAIN_BOOT_SET_MANIFEST, DOMAIN_DRIVER_IMAGE,
     DOMAIN_GEN_INITRD, DOMAIN_GEN_KERNEL, DOMAIN_GENERATION_IMAGE, DOMAIN_NETWORK_STAGE,
-    DOMAIN_PRIORITY_FILE, DOMAIN_RESCUE_SFS, DOMAIN_STAGED_FRAGMENT,
+    DOMAIN_PRIORITY_FILE, DOMAIN_RESCUE_SFS, DOMAIN_RESCUE_TOOLS, DOMAIN_STAGED_FRAGMENT,
 };
 
 /// One selectable signing role, paired with its CLI token and the frozen
@@ -58,6 +58,10 @@ const ROLES: &[Role] = &[
         domain: DOMAIN_NETWORK_STAGE,
     },
     Role {
+        token: "rescue-tools",
+        domain: DOMAIN_RESCUE_TOOLS,
+    },
+    Role {
         token: "generation-image",
         domain: DOMAIN_GENERATION_IMAGE,
     },
@@ -99,6 +103,7 @@ mod tests {
         assert_eq!(domain_for("rescue-sfs"), Some(DOMAIN_RESCUE_SFS));
         assert_eq!(domain_for("boot-config"), Some(DOMAIN_BOOT_CONFIG));
         assert_eq!(domain_for("network-stage"), Some(DOMAIN_NETWORK_STAGE));
+        assert_eq!(domain_for("rescue-tools"), Some(DOMAIN_RESCUE_TOOLS));
         assert_eq!(
             domain_for("generation-image"),
             Some(DOMAIN_GENERATION_IMAGE)
@@ -120,8 +125,8 @@ mod tests {
     }
 
     #[test]
-    fn all_eleven_roles_present() {
-        assert_eq!(ROLES.len(), 11);
+    fn all_twelve_roles_present() {
+        assert_eq!(ROLES.len(), 12);
         // Every role token must be distinct.
         for (i, a) in ROLES.iter().enumerate() {
             for b in ROLES.iter().skip(i + 1) {

@@ -39,7 +39,7 @@ USAGE:
 ALG:    ml-dsa-65 | ml-dsa-87
 ROLE:   gen-kernel | gen-initrd | driver-image | staged-fragment |
         priority-file | rescue-sfs | boot-config | network-stage |
-        generation-image
+        rescue-tools | generation-image
 OUT:    sidecar path; defaults to <INPUT>.sig
 
 --stdio      write the private key to stdout and the raw public key to

@@ -43,6 +43,9 @@ build_disk() {
   cp "$artifacts/nmbl-initrd" "$boot/nmbl-initrd"
   cp "$artifacts/config.toml" "$boot/nmbl/config.toml"
   cp "$artifacts/rescue.sfs" "$boot/nmbl-rescue.sfs"
+  # Like install-bootloader: the tools image (nmblctl) the config pins.
+  [ ! -e "$artifacts/rescue-tools.erofs" ] \
+    || cp "$artifacts/rescue-tools.erofs" "$boot/nmbl/rescue-tools.erofs"
   "$artifacts/nmbl-init/bin/nmbl-init" --init-state "$boot/nmbl" >/dev/null
   # Every generation fails before multi-user.target.
   touch "$boot/nmbl-test/fail-1" "$boot/nmbl-test/fail-2" "$boot/nmbl-test/fail-3"

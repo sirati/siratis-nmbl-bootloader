@@ -281,6 +281,10 @@ sha512 = "{sha}"
 [rescue.network_stage]
 path = "nmbl/network.erofs"
 sha512 = "{sha}"
+
+[rescue.tools]
+path = "nmbl/rescue-tools.erofs"
+sha512 = "{sha}"
 "#
     );
     let cfg: Config = toml::from_str(&raw).expect("stage-2 tables parse");
@@ -291,6 +295,9 @@ sha512 = "{sha}"
     assert_eq!(cfg.rescue.image.sha512.as_deref(), Some(sha.as_str()));
     let stage = cfg.rescue.network_stage.expect("network stage");
     assert_eq!(stage.path, PathBuf::from("nmbl/network.erofs"));
+    let tools = cfg.rescue.tools.expect("tools image");
+    assert_eq!(tools.path, PathBuf::from("nmbl/rescue-tools.erofs"));
+    assert_eq!(tools.sha512, sha);
 }
 
 #[test]
@@ -302,6 +309,7 @@ fn rescue_image_defaults_to_unpinned_squashfs() {
     );
     assert!(cfg.rescue.image.sha512.is_none());
     assert!(cfg.rescue.network_stage.is_none());
+    assert!(cfg.rescue.tools.is_none());
 }
 
 #[test]
@@ -310,6 +318,9 @@ fn rescue_image_rejects_unknown_format_and_fields() {
         "[rescue.image]\nformat = \"ext4\"\n",
         "[rescue.image]\nformat = \"erofs\"\nsha256 = \"00\"\n",
         "[rescue.network_stage]\nsha512 = \"00\"\n",
+        // The tools image is never accepted without its pin.
+        "[rescue.tools]\npath = \"nmbl/rescue-tools.erofs\"\n",
+        "[rescue.tools]\nsha512 = \"00\"\n",
     ] {
         assert!(toml::from_str::<Config>(raw).is_err(), "accepted {raw:?}");
     }

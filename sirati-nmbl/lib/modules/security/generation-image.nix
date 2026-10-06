@@ -134,6 +134,7 @@ in
     {
       boot.nmbl.rescue.sfsPath = lib.mkIf cfg.enable "${bootRelativeStateRoot}/active/rescue.sfs";
       boot.nmbl.rescue.fullSystem.networkStage.imagePath = lib.mkIf cfg.enable "${bootRelativeStateRoot}/active/network.erofs";
+      boot.nmbl.rescue.fullSystem.toolsImagePath = lib.mkIf cfg.enable "${bootRelativeStateRoot}/active/rescue-tools.erofs";
       assertions = lib.optionals cfg.enable [
         {
           assertion = !cfg.bootstrapUpdates || (

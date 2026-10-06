@@ -4,6 +4,8 @@
   cfg,
   nmblRescueSquashfs,
   nmblNetworkStage,
+  # The rescue tools EROFS (`nmblctl`), or null.
+  nmblRescueTools ? null,
   nmblSign,
 }:
 
@@ -18,6 +20,7 @@ let
     if configuredKeyCommand == null then "" else lib.escapeShellArgs configuredKeyCommand;
   rescueDestination = lib.escapeShellArg cfg.rescue.sfsPath;
   networkDestination = lib.escapeShellArg stage.imagePath;
+  toolsDestination = lib.escapeShellArg cfg.rescue.fullSystem.toolsImagePath;
   suffix = lib.escapeShellArg cfg.signing.sigPathSuffix;
 in
 pkgs.writeShellApplication {
@@ -74,6 +77,9 @@ pkgs.writeShellApplication {
     install_signed_image ${nmblRescueSquashfs} ${rescueDestination} rescue-sfs
     ${lib.optionalString stage.enable ''
       install_signed_image ${nmblNetworkStage} ${networkDestination} network-stage
+    ''}
+    ${lib.optionalString (nmblRescueTools != null) ''
+      install_signed_image ${nmblRescueTools} ${toolsDestination} rescue-tools
     ''}
   '';
 }

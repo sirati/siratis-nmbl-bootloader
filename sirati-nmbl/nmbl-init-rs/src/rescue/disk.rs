@@ -134,6 +134,12 @@ pub fn prepare_disk_rescue(
     let loop_dev = PathBuf::from(format!("/dev/loop{index}"));
     mount_overlay_root(&loop_dev, format)?;
 
+    // `nmblctl` lives in its own pinned image (it carries this host's signing
+    // keys). A refused image is never mounted; the rescue runs without it.
+    if let Err(error) = super::tools::prepare(config) {
+        super::tools::disable(&error);
+    }
+
     #[cfg(feature = "secure-boot")]
     if let Err(error) = super::network_stage::prepare(config) {
         super::network_stage::disable(&error)?;

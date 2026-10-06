@@ -24,6 +24,8 @@
   nmblRescueSquashfs,
   nmblUki,
   nmblNetworkStage ? null,
+  # The rescue tools EROFS (`nmblctl`), or null without a full-system rescue.
+  nmblRescueTools ? null,
   nmblGrubConfig ? null,
   rescueStageInstaller ? null,
   # Install-time driver-image staging + `nmbl-sign` signing shell (#25a).
@@ -189,6 +191,20 @@ pkgs.writeScript "install-nmbl-bootloader" ''
       echo "Staging NMBL rescue squashfs to ${escapedDest}..."
       install_nmbl_file_if_changed ${nmblRescueSquashfs} ${escapedDest} 0644
       echo "✓ Rescue squashfs installed: ${escapedDest}"
+    ''
+  )}
+
+  ${lib.optionalString (cfg.rescue.mode == "external" && cfg.rescue.fullSystem.enable && !cfg.rescue.fullSystem.networkStage.enable && !(cfg.bootUpdate.enable or false) && !generationOwnsRuntime) (
+    let
+      toolsDest = lib.escapeShellArg "/boot/${cfg.rescue.fullSystem.toolsImagePath}";
+    in
+    if nmblRescueTools != null then ''
+      # The rescue tools image (nmblctl) the config pins next to stage 2.
+      echo "Staging NMBL rescue tools image to ${toolsDest}..."
+      install_nmbl_file_if_changed ${nmblRescueTools} ${toolsDest} 0644
+    '' else ''
+      # No tools image any more: drop a stale one so nothing unpinned remains.
+      rm -f ${toolsDest} ${toolsDest}${lib.escapeShellArg (cfg.signing.sigPathSuffix or ".sig")}
     ''
   )}
 

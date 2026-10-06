@@ -108,6 +108,19 @@ else
     network_size=$(stat -c %s "$bundle/network.erofs")
     network_signature_size=$(stat -c %s "$bundle/network.erofs.sig")
   fi
+  # nmblctl for the rescue, in its own image (it carries the signing keys).
+  tools_enabled=$(nix eval "${nix_args[@]}" --json \
+    "$installable.config.system.build" --apply 'build: build ? nmblRescueTools')
+  tools_size=0 tools_signature_size=0
+  if [[ "$tools_enabled" = true ]]; then
+    tools=$(nix build "${nix_args[@]}" --out-link "$bundle/root-tools" --print-out-paths \
+      "$installable.config.system.build.nmblRescueTools")
+    install -m 0444 "$tools" "$bundle/rescue-tools.erofs"
+    sign_with_key --domain rescue-tools \
+      --out "$bundle/rescue-tools.erofs.sig" "$bundle/rescue-tools.erofs"
+    tools_size=$(stat -c %s "$bundle/rescue-tools.erofs")
+    tools_signature_size=$(stat -c %s "$bundle/rescue-tools.erofs.sig")
+  fi
   config_id=$(sha512sum "$bundle/config.toml" | cut -d' ' -f1)
   remote_command=${NMBL_EROFS_REMOTE_COMMAND:-nmbl-erofs-receive}
   ssh_command=${NMBL_EROFS_SSH:-ssh}
@@ -129,17 +142,19 @@ else
   rescue_size=$(stat -c %s "$bundle/rescue.sfs")
   rescue_signature_size=$(stat -c %s "$bundle/rescue.sfs.sig")
   {
-    printf 'NMBL-EROFS-BUNDLE-3\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+    printf 'NMBL-EROFS-BUNDLE-4\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
       "$generation" "$image_size" "$signature_size" "$system_size" \
       "$config_id" "$config_size" "$config_signature_size" \
       "$kernel_size" "$kernel_signature_size" "$initrd_size" "$initrd_signature_size" \
-      "$rescue_size" "$rescue_signature_size" "$network_size" "$network_signature_size" "$reboot"
+      "$rescue_size" "$rescue_signature_size" "$network_size" "$network_signature_size" \
+      "$tools_size" "$tools_signature_size" "$reboot"
     cat "$payload/nix.erofs" "$payload/nix.erofs.sig"
     [[ ! -f "$payload/system" ]] || cat "$payload/system"
     cat "$bundle/config.toml" "$bundle/config.toml.sig"
     cat "$bundle/kernel" "$bundle/kernel.sig" "$bundle/initrd" "$bundle/initrd.sig"
     cat "$bundle/rescue.sfs" "$bundle/rescue.sfs.sig"
     [[ "$network_enabled" != true ]] || cat "$bundle/network.erofs" "$bundle/network.erofs.sig"
+    [[ "$tools_enabled" != true ]] || cat "$bundle/rescue-tools.erofs" "$bundle/rescue-tools.erofs.sig"
   } | "$ssh_command" -- "$destination" "$remote_command"
 fi
 printf '%s\n' "$generation"

@@ -42,6 +42,12 @@ pub struct RescueConfig {
     #[serde(default)]
     pub network_stage: Option<RescueNetworkStage>,
 
+    /// `[rescue.tools]`: the separately pinned EROFS carrying `nmblctl` and
+    /// its closure, mounted at `/nmbl-tools`. Kept out of the stage-2 image
+    /// because `nmblctl` is built with this host's signing public keys.
+    #[serde(default)]
+    pub tools: Option<RescueTools>,
+
     /// `[rescue.system]`: host data for the full-system rescue. The stage-2
     /// image is host-independent; NMBL hands these values to its `/init`
     /// at runtime (see `crate::rescue::host`).
@@ -111,6 +117,7 @@ impl Default for RescueConfig {
             sfs_path: None,
             image: RescueImage::default(),
             network_stage: None,
+            tools: None,
             system: None,
             network: false,
             default_url: String::new(),
@@ -169,6 +176,17 @@ pub struct RescueNetworkStage {
     /// Lowercase hex SHA-512 of the exact stage this config was built with.
     #[serde(default)]
     pub sha512: Option<String>,
+}
+
+/// `[rescue.tools]`: the rescue tools EROFS.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RescueTools {
+    /// Boot-partition-relative path of the EROFS image.
+    pub path: PathBuf,
+    /// Lowercase hex SHA-512 of the exact image this config was built with.
+    /// Required: an unpinned tools image is never mounted.
+    pub sha512: String,
 }
 
 /// `[emergency_shell]` section of the runtime config. Controls which

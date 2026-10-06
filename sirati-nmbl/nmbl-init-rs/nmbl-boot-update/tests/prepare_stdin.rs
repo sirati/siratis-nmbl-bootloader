@@ -34,7 +34,15 @@ fn prepare_reads_private_key_from_stdin() {
 
     let source = temp.path().join("source");
     fs::create_dir(&source).unwrap();
-    for name in ["bootloader", "kernel", "initrd", "rescue", "config"] {
+    // `tools` (the rescue tools image) is optional, like `network`.
+    for name in [
+        "bootloader",
+        "kernel",
+        "initrd",
+        "rescue",
+        "config",
+        "tools",
+    ] {
         fs::write(source.join(name), format!("{name} payload")).unwrap();
     }
     let output = temp.path().join("bundle");
@@ -58,6 +66,12 @@ fn prepare_reads_private_key_from_stdin() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(output.join("manifest.json.sig").is_file());
+    assert!(output.join("tools").is_file() && output.join("tools.sig").is_file());
+    let manifest = fs::read_to_string(output.join("manifest.json")).unwrap();
+    assert!(
+        manifest.contains(r#""role":"tools","destination":"tools""#),
+        "{manifest}"
+    );
     // Nothing in the bundle carries the private container.
     for entry in fs::read_dir(&output).unwrap() {
         let bytes = fs::read(entry.unwrap().path()).unwrap();

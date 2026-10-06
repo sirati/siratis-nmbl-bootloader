@@ -113,6 +113,7 @@ let
     };
   initScript = pkgs.writeShellScript "nmbl-rescue-init" (
     initScriptPrefix
+    + import ./rescue/init-tools.nix { inherit coreutils; }
     + import ./rescue/init-script-network.nix {
       inherit bash coreutils dhcpcd gawk iproute2 rescueConsole utilLinux;
     }

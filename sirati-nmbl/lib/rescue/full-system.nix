@@ -36,15 +36,7 @@
 }:
 
 let
-  # Measured on the minimal DNS-VPS profile (188 MB tree): squashfs zstd-19
-  # 57 MB; EROFS lz4hc 64 KiB clusters + tail packing/fragments/dedupe
-  # 75 MB; EROFS zstd-19 128 KiB clusters 52 MB.
-  packing = "-Eztailpacking,fragments,dedupe";
-  compressionFlags = {
-    lz4hc = [ "-zlz4hc,12" "-C65536" packing ];
-    zstd = [ "-zzstd,level=19" "-C131072" packing ];
-    none = [ ];
-  }.${compression} or (throw "unsupported rescue image compression `${compression}`");
+  compressionFlags = import ./erofs-compression.nix compression;
 
   stage2Image = pkgs.runCommand "nmbl-rescue-stage2.erofs"
     {

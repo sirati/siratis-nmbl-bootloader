@@ -84,10 +84,12 @@ modules and the profile from `/nmbl-network` only. The SSH host identity
 comes from the configured key in NMBL's namespace (`/nmbl-root/...`) or is
 generated per boot.
 
-The image also contains `nmblctl` (NMBL's control tool), which is built with
-the signing public keys and enforcement setting it must trust. Hosts sharing
-an image therefore also share those trust anchors, as they do for NMBL
-itself.
+`nmblctl` is built with the signing public keys it must trust, so it is not
+in this image. It ships in a small EROFS of its own
+(`fullSystem.toolsImagePath`, default `nmbl/rescue-tools.erofs`), pinned under
+`[rescue.tools]` and checked like the networking stage. NMBL mounts it at
+`/nmbl-tools` and the rescue puts it on PATH. If NMBL refuses the tools
+image, the rescue runs without `nmblctl`.
 
 The image is compressed with LZ4HC in 64 KiB clusters, with tail packing,
 fragments and deduplication. Decompression is much cheaper than squashfs with

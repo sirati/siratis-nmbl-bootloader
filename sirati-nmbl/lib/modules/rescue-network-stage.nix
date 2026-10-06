@@ -111,6 +111,17 @@ in
       '';
     };
 
+    toolsImagePath = lib.mkOption {
+      type = lib.types.str;
+      default = "nmbl/rescue-tools.erofs";
+      description = ''
+        Path, relative to /boot, of the rescue tools EROFS: `nmblctl` and its
+        closure, kept out of the shared stage-2 image because `nmblctl` carries
+        this host's signing public keys. NMBL's config pins it by SHA-512 and the
+        rescue mounts it at /nmbl-tools.
+      '';
+    };
+
     networkStage = {
       enable = lib.mkEnableOption "the signed rescue networking EROFS stage";
 

@@ -39,6 +39,9 @@
   # The rescue networking EROFS (or null). With a full-system rescue the
   # rendered config names it and pins its SHA-512 (`[rescue.network_stage]`).
   networkStage ? null,
+  # The rescue tools EROFS (`nmblctl`, or null). With a full-system rescue the
+  # rendered config names it and pins its SHA-512 (`[rescue.tools]`).
+  rescueTools ? null,
   # `[rescue.system]`: host data for the host-independent stage-2 image
   # (sshd port, authorized keys, host key path, module list, baked network
   # profile). NMBL validates it and hands it to the rescue at runtime.
@@ -434,11 +437,13 @@ let
   # Staged full-system rescue: NMBL (stage 1) learns what to mount from this
   # config. `[rescue.image]` declares the stage-2 format and pins the exact
   # image by SHA-512; `[rescue.network_stage]` names and pins the networking
-  # EROFS. Both digests are computed from the built images inside the
-  # builder below (no import-from-derivation) and appended as sub-tables,
-  # so the config always describes exactly the images it ships with.
+  # EROFS, `[rescue.tools]` the tools EROFS (`nmblctl`). The digests are
+  # computed from the built images inside the builder below (no
+  # import-from-derivation) and appended as sub-tables, so the config always
+  # describes exactly the images it ships with.
   stagedRescue = rescueSfs != null && cfg.rescue.fullSystem.enable;
   pinNetworkStage = stagedRescue && networkStage != null;
+  pinTools = stagedRescue && rescueTools != null;
   sha512Of = drv: "$(sha512sum < ${drv} | cut -d' ' -f1)";
   stagedRescueTables = lib.optionalString stagedRescue ''
     {
@@ -447,6 +452,11 @@ let
         printf '\n[rescue.network_stage]\npath = %s\nsha512 = "%s"\n' \
           ${lib.escapeShellArg (builtins.toJSON cfg.rescue.fullSystem.networkStage.imagePath)} \
           "${sha512Of networkStage}"
+      ''}
+      ${lib.optionalString pinTools ''
+        printf '\n[rescue.tools]\npath = %s\nsha512 = "%s"\n' \
+          ${lib.escapeShellArg (builtins.toJSON cfg.rescue.fullSystem.toolsImagePath)} \
+          "${sha512Of rescueTools}"
       ''}
     } >> config.toml
   '';

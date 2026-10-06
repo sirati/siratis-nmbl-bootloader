@@ -63,6 +63,7 @@ fn populate(
         (Role::Rescue, "rescue", true),
         (Role::Config, "config", true),
         (Role::Network, "network", false),
+        (Role::Tools, "tools", false),
     ];
     let mut entries = Vec::new();
     let mut identity = Sha512::new();

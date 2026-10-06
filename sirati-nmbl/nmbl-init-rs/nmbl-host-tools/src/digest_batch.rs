@@ -18,6 +18,9 @@ const REQUIRED: [&str; 5] = [
     "gen-initrd",
     "rescue-sfs",
 ];
+/// Present only when the host ships them: the rescue networking stage and the
+/// rescue tools image.
+const OPTIONAL: [&str; 2] = ["network-stage", "rescue-tools"];
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Request<'a> {
@@ -105,13 +108,13 @@ pub fn run(reader: &mut impl Read, writer: &mut impl Write) -> Result<()> {
     let request: Request<'_> =
         serde_json::from_slice(&input).map_err(|_| invalid("invalid signing request JSON"))?;
     let fingerprint = hex::<32>(request.public_key_sha256)?;
-    if !(5..=6).contains(&request.artifacts.len()) {
-        return Err(invalid("expected five or six signing roles"));
+    if !(REQUIRED.len()..=REQUIRED.len() + OPTIONAL.len()).contains(&request.artifacts.len()) {
+        return Err(invalid("expected five to seven signing roles"));
     }
     let mut seen = BTreeSet::new();
     let mut digests = Vec::new();
     for artifact in &request.artifacts {
-        if (!REQUIRED.contains(&artifact.role) && artifact.role != "network-stage")
+        if (!REQUIRED.contains(&artifact.role) && !OPTIONAL.contains(&artifact.role))
             || !seen.insert(artifact.role)
         {
             return Err(invalid("unknown or duplicate signing role"));
@@ -187,6 +190,10 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(serde_json::json!({"role":"network-stage", "sha512":"12".repeat(64), "size":5}));
+        req["artifacts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"role":"rescue-tools", "sha512":"12".repeat(64), "size":7}));
         let output: serde_json::Value = serde_json::from_slice(&execute(&req).unwrap()).unwrap();
         let key = nmbl_init::sig::BakedKey::from_pubkey(&public, AlgId::MlDsa65).unwrap();
         for entry in output["signatures"].as_array().unwrap() {
@@ -230,6 +237,9 @@ mod tests {
         cases.push(bad);
         let mut bad = request.clone();
         bad["artifacts"][1]["role"] = "network-stage".into();
+        cases.push(bad);
+        let mut bad = request.clone();
+        bad["artifacts"][1]["role"] = "rescue-tools".into();
         cases.push(bad);
         let mut bad = request.clone();
         bad["artifacts"][0]["sha512"] = "AB".repeat(64).into();

@@ -94,8 +94,9 @@ test "$(readlink "$state/tested")" = "generations/$first"
 test ! -e "$state/pending"
 printf '%s\n' "$first" > "$store/nmbl-test/first"
 printf '%s\n' "$second" > "$store/nmbl-test/second"
-# The network stage and rescue image travelled inside the generation.
-for member in config.toml config.toml.sig rescue.sfs rescue.sfs.sig network.erofs network.erofs.sig; do
+# The network stage, rescue image and rescue tools travelled inside the generation.
+for member in config.toml config.toml.sig rescue.sfs rescue.sfs.sig network.erofs network.erofs.sig \
+  rescue-tools.erofs rescue-tools.erofs.sig; do
   test -s "$state/generations/$first/$member"
 done
 ssh-keygen -q -t ed25519 -N '' -f "$store/rescue-host-ed25519"

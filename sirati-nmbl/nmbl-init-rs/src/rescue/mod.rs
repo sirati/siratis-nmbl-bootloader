@@ -37,6 +37,7 @@ mod locate;
 mod network_profile;
 #[cfg(feature = "secure-boot")]
 mod network_stage;
+mod tools;
 mod types;
 
 pub use child::run_external_rescue_child;

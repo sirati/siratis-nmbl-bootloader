@@ -28,4 +28,6 @@ pkgs.linkFarm "nmbl-stateful-bios-host-artifacts" ([
   { name = "rescue.sfs"; path = first.nmblRescueSquashfs; }
   { name = "nmbl-init"; path = first.nmblInit; }
   { name = "closure"; path = closure; }
-] ++ pkgs.lib.imap1 (i: t: { name = "system-${toString i}"; path = t; }) toplevels)
+] ++ pkgs.lib.optional (first ? nmblRescueTools)
+  { name = "rescue-tools.erofs"; path = first.nmblRescueTools; }
+  ++ pkgs.lib.imap1 (i: t: { name = "system-${toString i}"; path = t; }) toplevels)

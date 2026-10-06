@@ -2,7 +2,7 @@
 
 pkgs.writeShellApplication {
   name = "nmbl-erofs-receive";
-  runtimeInputs = [ pkgs.coreutils pkgs.diffutils ];
+  runtimeInputs = [ pkgs.coreutils pkgs.diffutils pkgs.gnugrep ];
   text = builtins.replaceStrings
     [ "@ctl@" "@nmblSign@" "@systemctl@" ]
     [ (toString nmblErofsCtl) (toString nmblSign) "${pkgs.systemd}/bin/systemctl" ]

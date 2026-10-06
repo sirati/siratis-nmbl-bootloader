@@ -46,7 +46,7 @@ pub use general::{General, KernelModules};
 pub use generation_image::GenerationImageConfig;
 pub use paths::Paths;
 pub use rescue_cfg::{
-    EmergencyShellConfig, RescueConfig, RescueImage, RescueNetworkStage, RescueSystem,
+    EmergencyShellConfig, RescueConfig, RescueImage, RescueNetworkStage, RescueSystem, RescueTools,
 };
 pub use tpm::{SealedSecret, TpmConfig};
 pub use tui::Tui;

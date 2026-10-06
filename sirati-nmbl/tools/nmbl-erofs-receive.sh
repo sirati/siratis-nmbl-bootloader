@@ -13,7 +13,8 @@ read_line() { IFS= read -r "$1" || die "truncated protocol header"; }
 magic='' id='' image_size='' signature_size='' system_size=''
 config_id='' config_size='' config_signature_size=''
 kernel_size='' kernel_signature_size='' initrd_size='' initrd_signature_size=''
-rescue_size='' rescue_signature_size='' network_size='' network_signature_size='' reboot=''
+rescue_size='' rescue_signature_size='' network_size='' network_signature_size=''
+tools_size='' tools_signature_size='' reboot=''
 read_line magic
 read_line id
 read_line image_size
@@ -30,13 +31,18 @@ read_line rescue_size
 read_line rescue_signature_size
 read_line network_size
 read_line network_signature_size
+[[ "$magic" != NMBL-EROFS-BUNDLE-3 ]] \
+  || die "sender speaks NMBL-EROFS-BUNDLE-3; NMBL-EROFS-BUNDLE-4 adds the rescue tools image"
+[[ "$magic" = NMBL-EROFS-BUNDLE-4 ]] || die "invalid protocol magic"
+read_line tools_size
+read_line tools_signature_size
 read_line reboot
-[[ "$magic" = NMBL-EROFS-BUNDLE-3 ]] || die "invalid protocol magic"
 [[ "$id" =~ ^[0-9a-f]{128}$ ]] || die "invalid generation id"
 [[ "$config_id" =~ ^[0-9a-f]{128}$ ]] || die "invalid config id"
 for size in "$image_size" "$signature_size" "$system_size" "$config_size" "$config_signature_size" \
   "$kernel_size" "$kernel_signature_size" "$initrd_size" "$initrd_signature_size" \
-  "$rescue_size" "$rescue_signature_size" "$network_size" "$network_signature_size"; do
+  "$rescue_size" "$rescue_signature_size" "$network_size" "$network_signature_size" \
+  "$tools_size" "$tools_signature_size"; do
   [[ "$size" =~ ^[0-9]+$ ]] || die "invalid payload size: $size"
   (( size <= 68719476736 )) || die "payload is too large"
 done
@@ -48,6 +54,9 @@ if (( network_size == 0 || network_signature_size == 0 )); then
   (( network_size == 0 && network_signature_size == 0 )) || die "incomplete network payload"
 else
   (( network_size > 0 && network_signature_size > 0 )) || die "empty network payload"
+fi
+if (( tools_size == 0 || tools_signature_size == 0 )); then
+  (( tools_size == 0 && tools_signature_size == 0 )) || die "incomplete rescue tools payload"
 fi
 [[ "$reboot" = 0 || "$reboot" = 1 ]] || die "invalid reboot flag"
 
@@ -75,6 +84,10 @@ if (( network_size > 0 )); then
   receive_file "$network_size" "$tmp/network.erofs"
   receive_file "$network_signature_size" "$tmp/network.erofs.sig"
 fi
+if (( tools_size > 0 )); then
+  receive_file "$tools_size" "$tmp/rescue-tools.erofs"
+  receive_file "$tools_signature_size" "$tmp/rescue-tools.erofs.sig"
+fi
 extra="$tmp/.extra"
 head -c 1 > "$extra" || true
 [[ ! -s "$extra" ]] || die "trailing protocol data"
@@ -83,6 +96,12 @@ actual=$(sha512sum "$tmp/nix.erofs" | cut -d' ' -f1)
 [[ "$actual" = "$id" ]] || die "image hash does not match generation id"
 actual=$(sha512sum "$tmp/config.toml" | cut -d' ' -f1)
 [[ "$actual" = "$config_id" ]] || die "config hash does not match config id"
+# A config that pins a rescue tools image must arrive with it, and only then.
+if grep -qxF '[rescue.tools]' "$tmp/config.toml"; then
+  (( tools_size > 0 )) || die "config pins a rescue tools image the bundle lacks"
+else
+  (( tools_size == 0 )) || die "bundle carries a rescue tools image its config does not pin"
+fi
 @nmblSign@/bin/nmbl-sign verify --key "$public_key" --domain generation-image \
   --sig "$tmp/nix.erofs.sig" "$tmp/nix.erofs" >/dev/null
 @nmblSign@/bin/nmbl-sign verify --key "$public_key" --domain boot-config \
@@ -96,6 +115,10 @@ actual=$(sha512sum "$tmp/config.toml" | cut -d' ' -f1)
 if (( network_size > 0 )); then
   @nmblSign@/bin/nmbl-sign verify --key "$public_key" --domain network-stage \
     --sig "$tmp/network.erofs.sig" "$tmp/network.erofs" >/dev/null
+fi
+if (( tools_size > 0 )); then
+  @nmblSign@/bin/nmbl-sign verify --key "$public_key" --domain rescue-tools \
+    --sig "$tmp/rescue-tools.erofs.sig" "$tmp/rescue-tools.erofs" >/dev/null
 fi
 chmod 0444 "$tmp"/*
 
@@ -115,6 +138,10 @@ if [[ -e "$existing_generation" ]]; then
     cmp -s "$tmp/network.erofs" "$existing_generation/network.erofs" || die "existing network image differs"
     cmp -s "$tmp/network.erofs.sig" "$existing_generation/network.erofs.sig" || die "existing network signature differs"
   fi
+  if (( tools_size > 0 )); then
+    cmp -s "$tmp/rescue-tools.erofs" "$existing_generation/rescue-tools.erofs" || die "existing rescue tools image differs"
+    cmp -s "$tmp/rescue-tools.erofs.sig" "$existing_generation/rescue-tools.erofs.sig" || die "existing rescue tools signature differs"
+  fi
 fi
 @ctl@/bin/nmbl-erofsctl install "$tmp" "$image_root" >/dev/null
 installed="$image_root/generations/$id"
@@ -127,6 +154,10 @@ done
 if (( network_size > 0 )); then
   cmp -s "$tmp/network.erofs" "$installed/network.erofs" || die "installed network image differs"
   cmp -s "$tmp/network.erofs.sig" "$installed/network.erofs.sig" || die "installed network signature differs"
+fi
+if (( tools_size > 0 )); then
+  cmp -s "$tmp/rescue-tools.erofs" "$installed/rescue-tools.erofs" || die "installed rescue tools image differs"
+  cmp -s "$tmp/rescue-tools.erofs.sig" "$installed/rescue-tools.erofs.sig" || die "installed rescue tools signature differs"
 fi
 @ctl@/bin/nmbl-erofsctl activate "$id" "$image_root"
 printf '%s\n' "$id"

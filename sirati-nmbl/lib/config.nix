@@ -234,10 +234,23 @@ let
     moduleClosure = rescueModuleClosure;
   };
 
+  # `nmblctl` for the full-system rescue, in its own pinned image: it is
+  # built with this host's signing public keys, which must not reach the
+  # host-independent stage-2 image. Null without a full-system rescue.
+  nmblRescueTools =
+    if cfg.rescue.mode == "external" && cfg.rescue.fullSystem.enable && selectedNmblCtl != null then
+      import ./rescue/tools-image.nix {
+        inherit pkgs;
+        nmblCtl = selectedNmblCtl;
+        inherit (cfg.rescue.fullSystem) compression;
+      }
+    else
+      null;
+
   rescueStageInstaller =
     if cfg.rescue.fullSystem.networkStage.enable then
       import ./rescue-stage-installer.nix {
-        inherit pkgs lib cfg nmblRescueSquashfs nmblNetworkStage nmblSign;
+        inherit pkgs lib cfg nmblRescueSquashfs nmblNetworkStage nmblRescueTools nmblSign;
       }
     else
       null;
@@ -341,15 +354,13 @@ let
   # partition when `cfg.rescue.mode == "external"`. The full-system image
   # (stage 2) takes NO host data: only the package set, the module closure
   # for NMBL's kernel and fixed scripts, so it does not rebuild when the
-  # host's network, keys or services change.
+  # host's network, keys or services change. `nmblctl` carries the signing
+  # keys and ships in `nmblRescueTools` instead.
   nmblRescueSquashfs = import ./rescue-sfs.nix {
     inherit pkgs lib;
     contents = cfg.rescue.squashfsContents;
     fullSystem = {
-      inherit (cfg.rescue.fullSystem) enable minimal compression console;
-      # Authenticated rescue recovery uses the same production control binary
-      # and its full runtime closure, never a copied diagnostic executable.
-      packages = cfg.rescue.fullSystem.packages ++ lib.optional (selectedNmblCtl != null) selectedNmblCtl;
+      inherit (cfg.rescue.fullSystem) enable minimal compression console packages;
       # The module closure for NMBL's kernel (its /lib/modules + /lib/firmware
       # are staged into the image). Always staged, with or without a
       # networking stage, so the image does not depend on that choice.
@@ -414,6 +425,7 @@ let
     initrdExecutables = initrdExecutablePaths;
     rescueSfs = if cfg.rescue.mode == "external" then nmblRescueSquashfs else null;
     networkStage = nmblNetworkStage;
+    rescueTools = nmblRescueTools;
     inherit rescueSystem;
     # `none` mode ships no emergency shell on purpose (the emergency path
     # halts with a banner), so do not assert paths.shell is staged there.
@@ -430,6 +442,7 @@ let
             networkStage = cfg.rescue.fullSystem.networkStage // {
               imagePath = "${slotRoot}/network";
             };
+            toolsImagePath = "${slotRoot}/tools";
           };
         };
       };
@@ -443,6 +456,7 @@ let
       initrdExecutables = initrdExecutablePaths;
       rescueSfs = if cfg.rescue.mode == "external" then nmblRescueSquashfs else null;
       networkStage = nmblNetworkStage;
+      rescueTools = nmblRescueTools;
       inherit rescueSystem;
       checkEmergencyShell = cfg.rescue.mode != "none";
     };
@@ -458,6 +472,9 @@ let
       cp ${slotConfig} "$out/config"
       ${lib.optionalString cfg.rescue.fullSystem.networkStage.enable ''
         cp ${nmblNetworkStage} "$out/network"
+      ''}
+      ${lib.optionalString (nmblRescueTools != null) ''
+        cp ${nmblRescueTools} "$out/tools"
       ''}
     '';
 
@@ -526,6 +543,12 @@ in
         assertion = !(cfg.rescue.fullSystem.enable && cfg.rescue.fullSystem.compression == "zstd")
           || lib.versionAtLeast cfg.kernelPackage.version "6.10";
         message = "boot.nmbl.rescue.fullSystem.compression = \"zstd\" needs an NMBL kernel of 6.10 or later (boot.nmbl.kernelPackage is ${cfg.kernelPackage.version}).";
+      }
+      {
+        assertion = nmblRescueTools == null || (
+          let p = cfg.rescue.fullSystem.toolsImagePath;
+          in p != "" && !(lib.hasPrefix "/" p) && !(lib.hasInfix ".." p));
+        message = "boot.nmbl.rescue.fullSystem.toolsImagePath must be a safe path relative to /boot.";
       }
     ];
 
@@ -757,6 +780,7 @@ in
     system.build.nmblNetworkStage = lib.mkIf
       cfg.rescue.fullSystem.networkStage.enable
       nmblNetworkStage;
+    system.build.nmblRescueTools = lib.mkIf (nmblRescueTools != null) nmblRescueTools;
     system.build.nmblRescueStageInstaller = lib.mkIf
       cfg.rescue.fullSystem.networkStage.enable
       rescueStageInstaller;
@@ -876,6 +900,7 @@ in
         nmblConfigToml
         nmblRescueSquashfs
         nmblNetworkStage
+        nmblRescueTools
         rescueStageInstaller
         nmblGrubConfig
         ;
