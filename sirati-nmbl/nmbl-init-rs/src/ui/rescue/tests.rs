@@ -11,6 +11,7 @@ use super::helpers::{char_column_for_byte_cursor, clamp_to_char_boundary, group_
 use super::pick_source::render_pick_source;
 use super::progress::render_progress;
 use super::prompt_url::render_prompt_url;
+use super::unpinned::{handle_unpinned_key, render_unpinned};
 
 fn buffer_lines(term: &Terminal<TestBackend>) -> Vec<String> {
     let buf = term.backend().buffer();
@@ -252,5 +253,37 @@ fn handle_hash_key_accepts_a_typed_hex_digest() {
     }
     assert_eq!(state.expected, h);
     let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-    assert_eq!(handle_hash_key(enter, &mut state, h), Some(HashConfirmation::Confirmed));
+    assert_eq!(
+        handle_hash_key(enter, &mut state, h),
+        Some(HashConfirmation::Confirmed)
+    );
+}
+
+#[test]
+fn render_unpinned_shows_both_digests_and_signature_state() {
+    let pinned = "a".repeat(128);
+    let actual = "b".repeat(128);
+    let mut term = new_term(160, 24);
+    term.draw(|f| render_unpinned(f, &pinned, &actual, true))
+        .expect("draw");
+    let text = buffer_text(&term);
+    assert!(text.contains("Not the pinned rescue image"), "{text}");
+    assert!(text.contains(&pinned), "{text}");
+    assert!(text.contains(&actual), "{text}");
+    assert!(text.contains("Signature: verified"), "{text}");
+}
+
+#[test]
+fn only_shift_u_chooses_an_unpinned_image() {
+    let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    assert_eq!(handle_unpinned_key(press(KeyCode::Char('U'))), Some(true));
+    for back in [KeyCode::Esc, KeyCode::Enter, KeyCode::Char('b')] {
+        assert_eq!(handle_unpinned_key(press(back)), Some(false));
+    }
+    for ignored in [KeyCode::Char('u'), KeyCode::Char('y'), KeyCode::Char('0')] {
+        assert_eq!(handle_unpinned_key(press(ignored)), None);
+    }
+    let mut release = press(KeyCode::Char('U'));
+    release.kind = KeyEventKind::Release;
+    assert_eq!(handle_unpinned_key(release), None);
 }

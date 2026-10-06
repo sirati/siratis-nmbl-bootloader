@@ -339,9 +339,25 @@ cp "$stage/rescue-host-ed25519" "$stage/rescue-host-ed25519.pub" "$netrescue_sta
 install -m 0644 "$netrescue_artifacts/rescue-tools.erofs" "$netrescue_stage/nmbl/rescue-tools.erofs"
 grep -qx 'network = true' "$netrescue_stage/nmbl/config.toml"
 grep -qx 'format = "erofs"' "$netrescue_stage/nmbl/config.toml"
+grep -qx "sha512 = \"$(sha512sum < "$netrescue_artifacts/rescue.sfs" | cut -d' ' -f1)\"" "$netrescue_stage/nmbl/config.toml"
 test ! -e "$netrescue_stage/nmbl-rescue.sfs"
+# Signing stays enforced: the config and tools image are signed as the
+# installer signs them, and the downloaded image must verify too.
+"$signer/bin/nmbl-sign" sign --key "$private_key" --domain boot-config \
+  --out "$netrescue_stage/nmbl/config.toml.sig" "$netrescue_stage/nmbl/config.toml"
+"$signer/bin/nmbl-sign" sign --key "$private_key" --domain rescue-tools \
+  --out "$netrescue_stage/nmbl/rescue-tools.erofs.sig" "$netrescue_stage/nmbl/rescue-tools.erofs"
 make_disk "$netrescue_stage" "$work_root/network-rescue.img"
-install -m 0644 "$netrescue_artifacts/rescue.sfs" "$work_root/netrescue-http/nmbl-rescue.sfs"
+netrescue_http="$work_root/netrescue-http"
+install -m 0644 "$netrescue_artifacts/rescue.sfs" "$netrescue_http/nmbl-rescue.sfs"
+"$signer/bin/nmbl-sign" sign --key "$private_key" --domain rescue-sfs \
+  --out "$netrescue_http/nmbl-rescue.sfs.sig" "$netrescue_http/nmbl-rescue.sfs"
+# The pinned image without its signature, and a tampered image served with
+# the genuine image's signature: both must be refused before mounting.
+install -m 0644 "$netrescue_artifacts/rescue.sfs" "$netrescue_http/nmbl-rescue-unsigned.sfs"
+install -m 0644 "$netrescue_artifacts/rescue.sfs" "$netrescue_http/nmbl-rescue-badsig.sfs"
+printf 'NMBL_TAMPER' >> "$netrescue_http/nmbl-rescue-badsig.sfs"
+cp "$netrescue_http/nmbl-rescue.sfs.sig" "$netrescue_http/nmbl-rescue-badsig.sfs.sig"
 python3 "$harness" scan --key "$private_key" --key "$ssh_private_key" --marker "$marker" \
   "$netrescue_artifacts" "$netrescue_stage" "$work_root/network-rescue.img"
 
@@ -355,7 +371,9 @@ python3 "$harness" boot --qemu "$qemu" --passt @passt@ \
   --disk "$work_root/network-rescue.img" --transcript "$work_root/network-rescue.log" \
   --ssh @ssh@ --ssh-port "$ssh_port" --ssh-key "$ssh_private_key" \
   --ssh-host-key "$stage/rescue-host-ed25519.pub" \
-  --rescue-image "$work_root/netrescue-http/nmbl-rescue.sfs" --mode network-rescue
+  --rescue-image "$netrescue_http/nmbl-rescue.sfs" \
+  --unsigned-rescue-image "$netrescue_http/nmbl-rescue-unsigned.sfs" \
+  --badsig-rescue-image "$netrescue_http/nmbl-rescue-badsig.sfs" --mode network-rescue
 
 for scenario in good tampered unsigned malformed substituted tools-tampered; do
   mode=invalid

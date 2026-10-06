@@ -77,6 +77,7 @@ pub use verify::{
     DOMAIN_PRIORITY_FILE, DOMAIN_RESCUE_SFS, DOMAIN_RESCUE_TOOLS, DOMAIN_STAGED_FRAGMENT,
     VerifiedGeneration, VerifyPolicy, ensure_generation_signed, verify_digest,
     verify_generation_pinned, verify_image_fd, verify_image_fd_digest,
+    verify_image_fd_sidecar_bytes,
 };
 
 // ---- Always-compiled feature-presence probes (carried from the F1 stub) ----

@@ -814,9 +814,11 @@ Working:
   pinned stage-2 EROFS of the full-system rescue; see `docs/rescue-stages.md`)
   on the boot partition, with `none` as a halt-only alternative.
 - **Network rescue fallback** (`boot.nmbl.rescue.network = true`):
-  HTTP/1.0 download of the rescue squashfs into a `memfd`, with
-  operator-confirmed SHA-256, behind the `network-rescue` Cargo
-  feature.
+  HTTP/1.0 download of the rescue squashfs into a sealed `memfd`. With
+  signing enabled it must verify under the `rescue-sfs` domain against
+  `<url>.sig`; a config-pinned stage-2 SHA-512 must match unless the
+  operator explicitly boots another image; the operator also confirms
+  its SHA-256. Behind the `network-rescue` Cargo feature.
 - **Graphical splash** (`boot.nmbl.splash.enable`): the same `ratatui`
   menu drawn on a DRM/KMS framebuffer over a PNG background, with
   transparent fallback to the text TUI on serial or any failure

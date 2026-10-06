@@ -123,13 +123,20 @@ fn dispatch_external(
     // The image is opened ONCE here: the signature, the stage-2 digest pin
     // and the loop bind all use this one descriptor.
     let image = image::open(config);
+    // No image on the boot partition is not an untrusted image: with the
+    // network rescue enabled, fall through to it (it verifies the download
+    // the same way) instead of refusing.
     #[cfg(feature = "secure-boot")]
-    let verified_digest = match verify::verify_rescue_image_gated(config, &image) {
-        (crate::sig::PolicyDecision::Refuse(sig_cause), _) => {
-            drop(console);
-            return Ok(crate::policy::refuse_unsigned_blocking(config, sig_cause));
+    let verified_digest = if network_rescue_enabled(config) && image_absent(&image) {
+        None
+    } else {
+        match verify::verify_rescue_image_gated(config, &image) {
+            (crate::sig::PolicyDecision::Refuse(sig_cause), _) => {
+                drop(console);
+                return Ok(crate::policy::refuse_unsigned_blocking(config, sig_cause));
+            }
+            (_, digest) => digest,
         }
-        (_, digest) => digest,
     };
     #[cfg(not(feature = "secure-boot"))]
     let verified_digest = None;
@@ -194,6 +201,25 @@ fn dispatch_external(
         stage: "disk-rescue-failed",
         source: Box::new(disk_err),
     }))
+}
+
+/// Whether a failed disk rescue falls through to the network rescue.
+#[cfg(feature = "secure-boot")]
+fn network_rescue_enabled(config: &Config) -> bool {
+    cfg!(feature = "network-rescue") && config.rescue.network
+}
+
+/// The boot partition holds no rescue image at all (as opposed to one
+/// that is present but fails verification).
+#[cfg(feature = "secure-boot")]
+fn image_absent(image: &Result<image::Stage2Image>) -> bool {
+    match image {
+        Err(_) => true,
+        Ok(image) => image
+            .file
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+    }
 }
 
 /// Run the prepared writable `/rescue` overlay as a chrooted child while
@@ -438,5 +464,27 @@ mod tests {
             }
             other => panic!("expected Rescue variant, got {other:?}"),
         }
+    }
+
+    /// Only a missing image lets enforced signing fall through to the
+    /// network rescue; a present one is always verified.
+    #[cfg(feature = "secure-boot")]
+    #[test]
+    fn only_a_missing_disk_image_counts_as_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = cfg_with(
+            RescueConfig {
+                mode: RescueMode::External,
+                ..RescueConfig::default()
+            },
+            Some(dir.path().to_path_buf()),
+        );
+        assert!(image_absent(&image::open(&cfg)));
+        assert!(image_absent(&image::open(&cfg_with(
+            RescueConfig::default(),
+            None
+        ))));
+        std::fs::write(dir.path().join("nmbl-rescue.sfs"), b"unsigned").expect("write");
+        assert!(!image_absent(&image::open(&cfg)));
     }
 }

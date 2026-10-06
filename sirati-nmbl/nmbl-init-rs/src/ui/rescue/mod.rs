@@ -7,7 +7,7 @@
 //! handle. The fallback [`crate::rescue::net::ConsoleRescueUi`] stays
 //! in `src/rescue/net.rs` as a test/serial-console double.
 //!
-//! Four screens, each in its own private function:
+//! Five screens, each in its own private function:
 //!
 //! * [`pick_source`] — operator chooses Network / Reboot / Halt after
 //!   disk rescue failed. Header surfaces the disk error reason verbatim.
@@ -18,6 +18,8 @@
 //! * [`confirm_hash`] — side-by-side computed vs. expected hex panes
 //!   with an editable expected field and a red MISMATCH banner when
 //!   the two disagree.
+//! * [`unpinned`] — the download is not the pinned stage-2 image;
+//!   Shift+U boots it anyway, anything else goes back.
 //!
 //! Every screen renders through the same `&mut dyn Console` the boot
 //! selector and emergency screen already hold, so no parallel
@@ -36,6 +38,7 @@ mod helpers;
 mod pick_source;
 mod progress;
 mod prompt_url;
+mod unpinned;
 
 #[cfg(test)]
 #[allow(
@@ -154,6 +157,21 @@ impl RescueUi for RatatuiRescueUi<'_> {
         ))?;
         self.expected_cursor = final_cursor;
         Ok(out)
+    }
+
+    fn use_unpinned_image(
+        &mut self,
+        pinned_hex: &str,
+        actual_hex: &str,
+        signed: bool,
+    ) -> Result<bool> {
+        let rt = crate::ui::build_local_runtime()?;
+        rt.block_on(unpinned::run_unpinned(
+            self.console,
+            pinned_hex,
+            actual_hex,
+            signed,
+        ))
     }
 }
 

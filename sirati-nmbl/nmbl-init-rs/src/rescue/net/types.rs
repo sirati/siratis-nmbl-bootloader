@@ -60,4 +60,15 @@ pub trait RescueUi {
         computed_hex: &str,
         prefill_expected: &str,
     ) -> Result<HashConfirmation>;
+
+    /// The download is not the stage-2 image the boot configuration pins
+    /// (both SHA-512, lowercase hex). Returns `true` only when the
+    /// operator explicitly chooses to boot it anyway; `signed` says
+    /// whether its signature verified.
+    fn use_unpinned_image(
+        &mut self,
+        pinned_hex: &str,
+        actual_hex: &str,
+        signed: bool,
+    ) -> Result<bool>;
 }

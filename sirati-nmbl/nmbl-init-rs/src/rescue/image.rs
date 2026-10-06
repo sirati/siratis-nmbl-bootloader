@@ -61,9 +61,9 @@ pub(crate) fn sidecar_path(image: &Path, suffix: &str) -> PathBuf {
 /// signature check already streamed over the same descriptor, so a signed
 /// image is read only once. Without a pin this is a no-op; a malformed pin
 /// or a binary that cannot hash fails closed.
-pub(crate) fn check_pin(
+pub(crate) fn check_pin<F: std::os::fd::AsFd>(
     expected: Option<&str>,
-    file: &File,
+    file: &F,
     known: Option<[u8; 64]>,
     what: &str,
 ) -> Result<()> {
@@ -92,7 +92,7 @@ pub(crate) fn check_pin(
     }
 }
 
-fn parse_pin(pin: &str, what: &str) -> Result<[u8; 64]> {
+pub(crate) fn parse_pin(pin: &str, what: &str) -> Result<[u8; 64]> {
     crate::util::hex::decode_fixed::<64>(pin).ok_or_else(|| NmblError::Rescue {
         stage: "image-digest",
         source: Box::new(NmblError::ConfigInvalid {
@@ -103,8 +103,7 @@ fn parse_pin(pin: &str, what: &str) -> Result<[u8; 64]> {
 }
 
 #[cfg(any(feature = "secure-boot", feature = "rescue-stages"))]
-fn digest_of(file: &File, what: &str) -> Result<[u8; 64]> {
-    use std::os::fd::AsFd;
+pub(crate) fn digest_of<F: std::os::fd::AsFd>(file: &F, what: &str) -> Result<[u8; 64]> {
     let (digest, _len) =
         crate::util::hash::sha512_fd(file.as_fd()).map_err(|source| NmblError::Rescue {
             stage: "image-digest",
@@ -117,7 +116,7 @@ fn digest_of(file: &File, what: &str) -> Result<[u8; 64]> {
 }
 
 #[cfg(not(any(feature = "secure-boot", feature = "rescue-stages")))]
-fn digest_of(_file: &File, what: &str) -> Result<[u8; 64]> {
+pub(crate) fn digest_of<F: std::os::fd::AsFd>(_file: &F, what: &str) -> Result<[u8; 64]> {
     Err(NmblError::Rescue {
         stage: "image-digest",
         source: Box::new(NmblError::ConfigInvalid {

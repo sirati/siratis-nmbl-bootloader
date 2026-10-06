@@ -95,6 +95,26 @@ impl RescueUi for ConsoleRescueUi {
         }
     }
 
+    fn use_unpinned_image(
+        &mut self,
+        pinned_hex: &str,
+        actual_hex: &str,
+        signed: bool,
+    ) -> Result<bool> {
+        let mut stderr = io::stderr();
+        let _ = writeln!(stderr, "--- nmbl rescue: not the pinned stage-2 image ---");
+        let _ = writeln!(stderr, "pinned SHA-512:     {pinned_hex}");
+        let _ = writeln!(stderr, "downloaded SHA-512: {actual_hex}");
+        let signature = if signed { "verified" } else { "not verified" };
+        let _ = writeln!(stderr, "signature: {signature}");
+        let _ = writeln!(
+            stderr,
+            "Type 'use' to boot it anyway, anything else to go back:"
+        );
+        let _ = stderr.flush();
+        Ok(Self::read_line("net-ui-unpinned")?.trim() == "use")
+    }
+
     fn confirm_hash(
         &mut self,
         computed_hex: &str,

@@ -240,15 +240,39 @@ pub fn verify_image_fd_digest(
         source,
         context: format!("read sidecar {} for {image_desc}", sig_path.display()),
     })?;
-    let sidecar = SigSidecar::parse(&sig_bytes).map_err(|e| NmblError::Signature {
+    verify_digest_sidecar_bytes(&digest, image_desc, &sig_bytes, domain, config)?;
+    Ok(digest)
+}
+
+/// Like [`verify_image_fd_digest`] for a sidecar that is already in memory
+/// (fetched over the network rather than read from the boot partition).
+pub fn verify_image_fd_sidecar_bytes(
+    fd: BorrowedFd<'_>,
+    image_desc: &str,
+    sig_bytes: &[u8],
+    domain: &'static [u8],
+    config: &Config,
+) -> Result<[u8; 64]> {
+    let (digest, _bytes_hashed) = hash::sha512_fd(fd)?;
+    verify_digest_sidecar_bytes(&digest, image_desc, sig_bytes, domain, config)?;
+    Ok(digest)
+}
+
+fn verify_digest_sidecar_bytes(
+    digest: &[u8; 64],
+    image_desc: &str,
+    sig_bytes: &[u8],
+    domain: &'static [u8],
+    config: &Config,
+) -> Result<()> {
+    let sidecar = SigSidecar::parse(sig_bytes).map_err(|e| NmblError::Signature {
         stage: "sidecar-parse",
         detail: format!("{image_desc}: {e}"),
     })?;
 
     let baked = keys::parse_baked_keys()?;
     let policy = VerifyPolicy::from_config(config);
-    verify_digest(&digest, domain, &sidecar, &baked, policy)?;
-    Ok(digest)
+    verify_digest(digest, domain, &sidecar, &baked, policy)
 }
 
 /// Ensure a generation's kernel AND initrd both carry a valid signature.

@@ -15,9 +15,13 @@
 //!    SHA-256 hex.
 //! 5. Open a `memfd_create(2)` in-RAM fd and stream the HTTP body
 //!    through `sha2::Sha256` and `rustix::io::write` in one pass.
-//! 6. Show the computed hash to the operator and let them confirm
+//! 6. Seal the memfd. With signing enabled, verify it under the
+//!    rescue-sfs domain against `<url>.sig`; if the config pins the
+//!    stage-2 SHA-512, require that image unless the operator explicitly
+//!    chooses another. A refused image is never mounted.
+//! 7. Show the computed hash to the operator and let them confirm
 //!    against the pre-filled expected value.
-//! 7. Loop-mount the memfd and layer a writable overlay at `/rescue`,
+//! 8. Loop-mount the memfd and layer a writable overlay at `/rescue`,
 //!    then return [`NetOutcome::RunChild`] so the dispatcher runs the
 //!    rescue system as a chrooted child via
 //!    [`crate::rescue::child::run_external_rescue_child`] while NMBL
@@ -164,6 +168,12 @@ fn run_network_attempt<R: RescueUi>(
 
     let (memfd, computed_hex) = download_to_memfd(&url, ui)?;
 
+    // Trust before the operator's hash: the signature under the
+    // rescue-sfs domain, then the stage-2 pin, both over the sealed memfd
+    // that is mounted below.
+    let signed_digest = verify_signature(config, &url_str, &memfd)?;
+    check_stage2_pin(config, ui, &memfd, signed_digest)?;
+
     let prefill_hash = config.rescue.default_sha256.as_str();
     match ui
         .confirm_hash(&computed_hex, prefill_hash)
@@ -188,7 +198,90 @@ fn run_network_attempt<R: RescueUi>(
 
     // Mount the downloaded squashfs as a writable overlay at /rescue and
     // hand the path back; the caller runs the chrooted child against it.
-    mount_overlay_for_child(config, &memfd, config.rescue.image.format).map_err(NetAttemptOutcome::Fatal)
+    mount_overlay_for_child(config, &memfd, config.rescue.image.format)
+        .map_err(NetAttemptOutcome::Fatal)
+}
+
+/// With signing enabled, the download must verify under the rescue-sfs
+/// domain with the baked keys, against the detached signature fetched
+/// from `<url><signing.sig_path_suffix>`, exactly as the disk path checks
+/// `nmbl-rescue.sfs` against its sibling sidecar. Enforce refuses before
+/// anything is mounted; audit warns and proceeds. Returns the SHA-512 the
+/// check streamed over `image`.
+#[cfg(feature = "secure-boot")]
+fn verify_signature(
+    config: &Config,
+    url: &str,
+    image: &rustix::fd::OwnedFd,
+) -> std::result::Result<Option<[u8; 64]>, NetAttemptOutcome> {
+    use std::os::fd::AsFd;
+
+    if !config.signing.enable {
+        return Ok(None);
+    }
+    let sig_url = format!("{url}{}", config.signing.sig_path_suffix);
+    let result = HttpUrl::parse(&sig_url)
+        .and_then(|sig_url| download::fetch_signature(&sig_url))
+        .and_then(|sig| {
+            crate::sig::verify_image_fd_sidecar_bytes(
+                image.as_fd(),
+                "downloaded rescue image",
+                &sig,
+                crate::sig::DOMAIN_RESCUE_SFS,
+                config,
+            )
+        });
+    let digest = result.as_ref().ok().copied();
+    match crate::sig::apply_policy(config, result.map(|_| ())) {
+        crate::sig::PolicyDecision::Proceed => Ok(digest),
+        crate::sig::PolicyDecision::Refuse(cause) => Err(NetAttemptOutcome::Restart(format!(
+            "rescue image signature refused ({sig_url}): {cause}"
+        ))),
+    }
+}
+
+#[cfg(not(feature = "secure-boot"))]
+fn verify_signature(
+    _config: &Config,
+    _url: &str,
+    _image: &rustix::fd::OwnedFd,
+) -> std::result::Result<Option<[u8; 64]>, NetAttemptOutcome> {
+    Ok(None)
+}
+
+/// If the boot configuration pins the stage-2 image, the download must be
+/// that image, unless the operator explicitly chooses to boot another one.
+/// `known` is the digest the signature check already streamed.
+fn check_stage2_pin<R: RescueUi>(
+    config: &Config,
+    ui: &mut R,
+    image: &rustix::fd::OwnedFd,
+    known: Option<[u8; 64]>,
+) -> std::result::Result<(), NetAttemptOutcome> {
+    let Some(pin) = config.rescue.image.sha512.as_deref() else {
+        return Ok(());
+    };
+    let what = "downloaded rescue image";
+    let pinned = crate::rescue::image::parse_pin(pin, what)?;
+    let actual = match known {
+        Some(digest) => digest,
+        None => crate::rescue::image::digest_of(image, what)?,
+    };
+    if actual == pinned {
+        return Ok(());
+    }
+    let pinned_hex = download::hex_lower(&pinned);
+    let actual_hex = download::hex_lower(&actual);
+    if ui.use_unpinned_image(&pinned_hex, &actual_hex, known.is_some())? {
+        crate::nmbl_warn!(
+            "rescue: operator chose a rescue image other than the pinned stage-2 \
+             (pinned {pinned_hex}, got {actual_hex})"
+        );
+        return Ok(());
+    }
+    Err(NetAttemptOutcome::Restart(format!(
+        "downloaded rescue image is not the pinned stage-2 image (SHA-512 {actual_hex})"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +312,8 @@ mod tests {
         confirms: VecDeque<HashConfirmation>,
         progress_calls: u32,
         last_disk_reason: Option<String>,
+        accept_unpinned: bool,
+        unpinned_prompts: Vec<bool>,
     }
 
     impl RescueUi for FakeUi {
@@ -244,6 +339,15 @@ mod tests {
                 .confirms
                 .pop_front()
                 .unwrap_or(HashConfirmation::Aborted))
+        }
+        fn use_unpinned_image(
+            &mut self,
+            _pinned: &str,
+            _actual: &str,
+            signed: bool,
+        ) -> Result<bool> {
+            self.unpinned_prompts.push(signed);
+            Ok(self.accept_unpinned)
         }
     }
 
@@ -308,6 +412,112 @@ mod tests {
     fn hex_lower_pads_single_byte_with_zero() {
         assert_eq!(download::hex_lower(&[0x0a]), "0a");
         assert_eq!(download::hex_lower(&[0xff, 0x00, 0x10]), "ff0010");
+    }
+
+    fn image_with(bytes: &[u8]) -> rustix::fd::OwnedFd {
+        use std::io::Write;
+        let mut tmp = tempfile::tempfile().expect("tempfile");
+        tmp.write_all(bytes).expect("write image");
+        rustix::fd::OwnedFd::from(tmp)
+    }
+
+    #[cfg(any(feature = "secure-boot", feature = "rescue-stages"))]
+    fn pinned_cfg(bytes: &[u8]) -> Config {
+        use sha2::{Digest, Sha512};
+        let mut c = Config::recovery_default();
+        c.rescue.image.sha512 = Some(download::hex_lower(&Sha512::digest(bytes)));
+        c
+    }
+
+    #[cfg(any(feature = "secure-boot", feature = "rescue-stages"))]
+    #[test]
+    fn the_pinned_image_passes_without_asking() {
+        let cfg = pinned_cfg(b"stage two");
+        let mut ui = FakeUi::default();
+        assert!(check_stage2_pin(&cfg, &mut ui, &image_with(b"stage two"), None).is_ok());
+        assert!(ui.unpinned_prompts.is_empty());
+    }
+
+    #[cfg(any(feature = "secure-boot", feature = "rescue-stages"))]
+    #[test]
+    fn another_image_is_refused_unless_the_operator_chooses_it() {
+        let cfg = pinned_cfg(b"stage two");
+        let other = image_with(b"another stage two");
+        let mut ui = FakeUi::default();
+        assert!(matches!(
+            check_stage2_pin(&cfg, &mut ui, &other, None),
+            Err(NetAttemptOutcome::Restart(reason)) if reason.contains("not the pinned stage-2")
+        ));
+        assert_eq!(ui.unpinned_prompts, [false]);
+
+        let mut ui = FakeUi {
+            accept_unpinned: true,
+            ..FakeUi::default()
+        };
+        assert!(check_stage2_pin(&cfg, &mut ui, &other, None).is_ok());
+        assert_eq!(ui.unpinned_prompts, [false]);
+    }
+
+    #[test]
+    fn without_a_pin_any_image_passes() {
+        let cfg = Config::recovery_default();
+        assert!(cfg.rescue.image.sha512.is_none());
+        let mut ui = FakeUi::default();
+        assert!(check_stage2_pin(&cfg, &mut ui, &image_with(b"x"), None).is_ok());
+        assert!(ui.unpinned_prompts.is_empty());
+    }
+
+    #[cfg(feature = "secure-boot")]
+    fn signing_cfg(enable: bool, enforce: bool) -> Config {
+        let mut c = Config::recovery_default();
+        c.signing.enable = enable;
+        c.signing.enforce = enforce;
+        c
+    }
+
+    /// Port 1 on loopback refuses the connection: the signature is
+    /// missing.
+    #[cfg(feature = "secure-boot")]
+    const NO_SIGNATURE_URL: &str = "http://127.0.0.1:1/nmbl-rescue.sfs";
+
+    #[cfg(feature = "secure-boot")]
+    #[test]
+    fn enforced_signing_refuses_a_download_without_signature() {
+        let image = image_with(b"stage two");
+        match verify_signature(&signing_cfg(true, true), NO_SIGNATURE_URL, &image) {
+            Err(NetAttemptOutcome::Restart(reason)) => {
+                assert!(reason.contains("signature refused"), "{reason}");
+                assert!(reason.contains("nmbl-rescue.sfs.sig"), "{reason}");
+            }
+            Err(NetAttemptOutcome::Fatal(e)) => panic!("fatal instead of refused: {e}"),
+            Ok(digest) => panic!("unsigned download accepted: {digest:?}"),
+        }
+    }
+
+    #[cfg(feature = "secure-boot")]
+    #[test]
+    fn enforced_signing_refuses_a_bad_signature() {
+        let image = image_with(b"stage two");
+        let result = crate::sig::verify_image_fd_sidecar_bytes(
+            std::os::fd::AsFd::as_fd(&image),
+            "downloaded rescue image",
+            b"not a signature",
+            crate::sig::DOMAIN_RESCUE_SFS,
+            &signing_cfg(true, true),
+        );
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "secure-boot")]
+    #[test]
+    fn audit_and_disabled_signing_proceed_without_a_verified_digest() {
+        let image = image_with(b"stage two");
+        for cfg in [signing_cfg(true, false), signing_cfg(false, false)] {
+            assert!(matches!(
+                verify_signature(&cfg, NO_SIGNATURE_URL, &image),
+                Ok(None)
+            ));
+        }
     }
 
     /// Anything that needs a real DHCP server / loop device / pivot

@@ -27,14 +27,16 @@ pub(super) fn download_to_memfd<R: RescueUi>(
     url: &HttpUrl,
     ui: &mut R,
 ) -> std::result::Result<(rustix::fd::OwnedFd, String), NetAttemptOutcome> {
-    let memfd = rustix::fs::memfd_create("nmbl-rescue-sfs", MemfdFlags::CLOEXEC).map_err(|e| {
-        NmblError::Rescue {
-            stage: "net-memfd",
-            source: Box::new(NmblError::Io {
-                source: io_error_from_rustix(e),
-                context: "memfd_create(nmbl-rescue-sfs)".to_string(),
-            }),
-        }
+    let memfd = rustix::fs::memfd_create(
+        "nmbl-rescue-sfs",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )
+    .map_err(|e| NmblError::Rescue {
+        stage: "net-memfd",
+        source: Box::new(NmblError::Io {
+            source: io_error_from_rustix(e),
+            context: "memfd_create(nmbl-rescue-sfs)".to_string(),
+        }),
     })?;
 
     let mut hasher = Sha256::new();
@@ -75,6 +77,25 @@ pub(super) fn download_to_memfd<R: RescueUi>(
             source: Box::new(NmblError::Io {
                 source: io_error_from_rustix(e),
                 context: "seek(memfd, 0)".to_string(),
+            }),
+        })
+    })?;
+
+    // Seal the bytes: what the signature and pin checks read is what the
+    // loop device later serves, with no writer left that could change it.
+    rustix::fs::fcntl_add_seals(
+        &memfd,
+        rustix::fs::SealFlags::WRITE
+            | rustix::fs::SealFlags::SHRINK
+            | rustix::fs::SealFlags::GROW
+            | rustix::fs::SealFlags::SEAL,
+    )
+    .map_err(|e| {
+        NetAttemptOutcome::Fatal(NmblError::Rescue {
+            stage: "net-memfd",
+            source: Box::new(NmblError::Io {
+                source: io_error_from_rustix(e),
+                context: "sealing the downloaded rescue image".to_string(),
             }),
         })
     })?;
@@ -176,4 +197,27 @@ pub(super) fn compute_hex_sha256(bytes: &[u8]) -> String {
 /// helper in `sys::loopdev` / `rescue::disk`.
 pub(super) fn io_error_from_rustix(e: RustixErrno) -> io::Error {
     io::Error::from_raw_os_error(e.raw_os_error())
+}
+
+/// Largest detached signature [`fetch_signature`] accepts. A sidecar is a
+/// few KiB; anything bigger is not one.
+#[cfg(feature = "secure-boot")]
+const MAX_SIGNATURE_BYTES: usize = 256 * 1024;
+
+/// Download the detached signature at `url` into memory.
+#[cfg(feature = "secure-boot")]
+pub(super) fn fetch_signature(url: &HttpUrl) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut sink = |chunk: &[u8]| -> Result<()> {
+        if bytes.len().saturating_add(chunk.len()) > MAX_SIGNATURE_BYTES {
+            return Err(NmblError::Signature {
+                stage: "sidecar-parse",
+                detail: format!("signature larger than {MAX_SIGNATURE_BYTES} bytes"),
+            });
+        }
+        bytes.extend_from_slice(chunk);
+        Ok(())
+    };
+    http::get(url, &mut sink, None)?;
+    Ok(bytes)
 }

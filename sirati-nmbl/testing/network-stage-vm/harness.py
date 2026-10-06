@@ -402,22 +402,37 @@ def serve_rescue_image(image):
 
 def network_rescue(args, proc, transcript):
     """F.5 golden path: no rescue image on disk, so the operator downloads
-    it at NMBL's source picker, confirms its hash and the downloaded EROFS
-    image is loop-mounted and started as the rescue."""
+    it at NMBL's source picker. With signing enforced, an image without a
+    signature and a tampered one carrying the genuine signature are refused
+    before anything is mounted; the signed, pinned image is then confirmed
+    by its hash, loop-mounted and started as the rescue."""
     import hashlib
 
     digest = hashlib.sha256(Path(args.rescue_image).read_bytes()).hexdigest()
     with serve_rescue_image(args.rescue_image) as url:
+        base = url.rsplit("/", 1)[0]
         wait_for(proc, ["Choose recovery action"], 240, transcript)
+        for refused in (args.unsigned_rescue_image, args.badsig_rescue_image):
+            proc.stdin.write(b"n")
+            proc.stdin.flush()
+            wait_for(proc, ["Enter rescue URL"], 240, transcript)
+            paste(proc, f"{base}/{Path(refused).name}\r")
+            wait_for(proc, ["signature refused", "Choose recovery action"], 600, transcript,
+                     forbidden=("Computed (SHA-256)", "network-rescue-failed"))
+            print(f"refused {Path(refused).name} before mounting", flush=True)
         proc.stdin.write(b"n")
         proc.stdin.flush()
         wait_for(proc, ["Enter rescue URL"], 240, transcript)
         paste(proc, url + "\r")
-        wait_for(proc, ["Computed (SHA-256)"], 600, transcript)
+        wait_for(proc, ["Computed (SHA-256)"], 600, transcript,
+                 forbidden=("signature refused", "network-rescue-failed"))
         paste(proc, digest + "\r")
         wait_for(proc, ["recovery system ready"], 240, transcript,
                  forbidden=("network-rescue-failed",))
-    proc.stdin.write(b"findmnt -n -o FSTYPE / | grep -qx overlay && echo NMBL_NETWORK_RESCUE_\"PASS\"\n")
+    # Only the accepted download was ever bound to a loop device.
+    proc.stdin.write(b"findmnt -n -o FSTYPE / | grep -qx overlay && "
+                     b"test \"$(cat /sys/block/loop*/loop/backing_file | grep -c memfd:nmbl-rescue-sfs)\" = 1 && "
+                     b"echo NMBL_NETWORK_RESCUE_\"PASS\"\n")
     proc.stdin.flush()
     wait_for(proc, ["NMBL_NETWORK_RESCUE_PASS"], 60, transcript)
 
@@ -723,6 +738,8 @@ def main():
     boot_parser.add_argument("--ssh-host-key", required=True)
     boot_parser.add_argument("--identity-disk")
     boot_parser.add_argument("--rescue-image")
+    boot_parser.add_argument("--unsigned-rescue-image")
+    boot_parser.add_argument("--badsig-rescue-image")
     boot_parser.add_argument("--mode", choices=["good", "invalid", "substituted", "baked-static", "baked-slaac", "native-identity", "missing-identity", "tools-tampered", "network-rescue"], required=True)
     args = parser.parse_args()
     if args.command == "scan":

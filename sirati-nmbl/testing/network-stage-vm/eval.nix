@@ -32,8 +32,9 @@ let
   baked = bakedStatic || bakedSlaac || nativeIdentity || networkRescue;
   config = if !baked then baseline else baseline.extendModules {
     modules = [ {
-      boot.nmbl.signing.enable = lib.mkForce false;
-      boot.nmbl.signing.enforce = lib.mkForce false;
+      # The network rescue keeps signing: the download must verify.
+      boot.nmbl.signing.enable = lib.mkForce networkRescue;
+      boot.nmbl.signing.enforce = lib.mkForce networkRescue;
       boot.nmbl.rescue.fullSystem.networkStage = {
         enable = lib.mkForce false;
         addressFamily = lib.mkForce (if bakedSlaac then "ipv6-only" else "dual-stack");
