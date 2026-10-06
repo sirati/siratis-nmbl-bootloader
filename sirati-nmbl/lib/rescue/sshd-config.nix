@@ -29,6 +29,10 @@ pkgs.writeText "sshd_config" ''
   PermitUserRC no
   X11Forwarding no
   UseDNS no
+  # Interactive logins print /etc/motd (the NMBL rescue welcome) after
+  # authentication; command sessions (`ssh host cmd`) never see it.
+  PrintMotd yes
+  PrintLastLog no
   MaxAuthTries 3
   MaxSessions 2
   LoginGraceTime 30

@@ -291,6 +291,23 @@
           grep -q 'grub-install --target=i386-pc' ${b.installBootLoader}
           touch "$out"
         '';
+      # An interactive SSH login into the full-system rescue greets the
+      # operator with how to reach the bootloader. Checked on the real rescue
+      # image of the DNS-VPS topology: the welcome is in /etc/motd and the
+      # baked sshd_config prints it after authentication.
+      rescueSshWelcomeCheck =
+        let
+          rescue = erofsBiosHost.config.system.build.nmblRescueSquashfs;
+        in
+        pkgs.runCommand "nmbl-rescue-ssh-welcome" {
+          nativeBuildInputs = [ pkgs.squashfsTools ];
+        } ''
+          unsquashfs -cat ${rescue} etc/motd > motd
+          grep -F 'NMBL rescue - run `nmbl` to enter the bootloader.' motd
+          unsquashfs -cat ${rescue} etc/ssh/sshd_config > sshd_config
+          grep -qx 'PrintMotd yes' sshd_config
+          touch "$out"
+        '';
       # Boots the DNS-VPS / Stardust topology from a real BIOS disk: GRUB ->
       # NMBL -> stage-1 store -> signed EROFS generation (tmpfs root), then
       # rollback, and rescue with the signed network stage + recovery SSH.
@@ -1438,6 +1455,7 @@
         };
         generation-root-store-eval = rootStoreEvalCheck;
         nmbl-erofs-bios-host-eval = erofsBiosHostEvalCheck;
+        rescue-ssh-welcome = rescueSshWelcomeCheck;
         insecure-test-key-absent = insecureKeyAbsentFromProd;
         test-secure-boot-no-private-key = secureBootNoPrivateKey;
         test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;

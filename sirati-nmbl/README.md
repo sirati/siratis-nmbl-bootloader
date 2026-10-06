@@ -421,6 +421,22 @@ Example: external rescue with extra debug tooling.
 }
 ```
 
+### Full-system rescue over SSH
+
+`boot.nmbl.rescue.fullSystem.enable = true` replaces the busybox tree with
+a recovery system that starts its own network and `sshd` (port
+`fullSystem.sshdPort`, keys `fullSystem.rootAuthorizedKeys`). NMBL stays
+PID 1 outside it, with its own root at `/nmbl-root`. An interactive SSH
+login prints a welcome after authentication:
+
+```text
+NMBL rescue - run `nmbl` to enter the bootloader.
+```
+
+`nmbl` attaches to NMBL's menu over its root-only socket
+(`/nmbl-root/nmbl-run/tui.sock`). The session survives a slow link and
+ends cleanly (Ctrl+E, or when the client or its SSH session goes away).
+
 ### Automatic rescue after a failed boot
 
 `boot.nmbl.rescue.automatic` is the single setting that decides what

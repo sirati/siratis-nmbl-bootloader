@@ -169,6 +169,19 @@ let
     export NMBL_TUI_SOCK=/nmbl-root/nmbl-run/tui.sock
   '';
 
+  # Shown by sshd after an interactive login (PrintMotd), so an operator who
+  # reached the rescue over SSH knows where they are and how to get back to
+  # the bootloader. Never shown before authentication.
+  motd = pkgs.writeText "nmbl-rescue-motd" ''
+
+    NMBL rescue - run `nmbl` to enter the bootloader.
+
+    This is NMBL's recovery system. NMBL is still running as PID 1 outside
+    it: `nmbl` attaches to its menu (boot a generation, retry, reboot).
+    NMBL's own root is mounted at /nmbl-root; the host disks are under /dev.
+
+  '';
+
   nixConf = pkgs.writeText "nix.conf" ''
     experimental-features = nix-command flakes
     build-users-group =
@@ -233,7 +246,7 @@ let
 
   fullSquashfs = import ./rescue/full-system.nix {
     inherit
-      pkgs lib closure nixConf nixRegistry sshdConfig authorizedKeys
+      pkgs lib closure nixConf nixRegistry sshdConfig authorizedKeys motd
       profileScript cacert initScript bash coreutils utilLinux iproute2
       procps kmod btrfs cryptsetup btop e2fsprogs gnugrep gnused gawk nix
       openssh dhcpcd fullSystemPackagePaths moduleClosurePath;

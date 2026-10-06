@@ -11,6 +11,7 @@
   nixRegistry,
   sshdConfig,
   authorizedKeys,
+  motd,
   profileScript,
   cacert,
   initScript,
@@ -40,6 +41,8 @@ let
   fullSquashfs = pkgs.runCommand "nmbl-rescue.sfs"
     {
       nativeBuildInputs = [ pkgs.squashfsTools pkgs.nix ];
+      # Exposed for evaluation checks of the rendered rescue configuration.
+      passthru = { inherit sshdConfig motd; };
     }
     ''
       mkdir -p root/nix/store root/nix/var/nix/db
@@ -97,6 +100,7 @@ let
       cp ${nixRegistry}    root/etc/nix/registry.json
       ''}
       cp ${sshdConfig}     root/etc/ssh/sshd_config
+      cp ${motd}           root/etc/motd
       ${lib.optionalString (networkStageMarker != "") ''
         printf '%s\n' ${lib.escapeShellArg networkStageMarker} \
           > root/etc/nmbl-network-stage

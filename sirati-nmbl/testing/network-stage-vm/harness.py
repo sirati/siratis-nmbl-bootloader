@@ -332,6 +332,23 @@ def remote_tui_resilience(args, transcript, qemu):
             killed.terminate()
             killed.wait(timeout=10)
 
+    # An interactive login is greeted with how to reach the bootloader.
+    login = subprocess.Popen(
+        ssh_command(args),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=environment,
+    )
+    try:
+        wait_for(login, ["NMBL rescue - run `nmbl` to enter the bootloader."], 60,
+                 transcript, extra_proc=qemu)
+        login.stdin.write(b"exit\n")
+        login.stdin.flush()
+        login.wait(timeout=30)
+    finally:
+        if login.poll() is None:
+            login.terminate()
+            login.wait(timeout=10)
+
     # PID 1 (NMBL, outside the rescue chroot) must be idle and hold no pty.
     qemu.stdin.write(
         b"set -- $(sed 's/.*) //' /proc/1/stat); a=$(( ${12} + ${13} )); sleep 3; "
