@@ -188,6 +188,9 @@ let
       lib.unique (
         lib.filter (m: !(lib.elem m cfg.blacklistedKernelModules)) (
           cfg.rescue.nicDrivers ++ detectedNicModules ++ [ "overlay" "ext4" "af_packet" ]
+          ++ lib.optional rescueStorage.btrfs "btrfs"
+          ++ lib.optional rescueStorage.mdraid "raid1"
+          ++ lib.optional rescueStorage.nvme "nvme"
         )
       )
     else
@@ -296,37 +299,61 @@ let
   # "external"`. Embedded / none modes keep today's behaviour.
   rescueStorage = import ./rescue/storage-features.nix { inherit lib config; };
 
+  # Kernel modules the full-system rescue /init loads itself after
+  # switch_root, from the module closure staged in its image (or from the
+  # networking stage). Core fs/packet modules first (overlay + ext4 back the
+  # writable scratch, af_packet backs dhcpcd's BPF socket), storage modules
+  # only for stacks this host uses, then the NIC drivers. This list is host
+  # data: NMBL hands it to the host-independent image at runtime.
+  rescueModuleList =
+    (if cfg.rescue.fullSystem.minimal then
+      [ "overlay" "af_packet" ]
+      ++ lib.optional rescueStorage.btrfs "btrfs"
+      ++ lib.optional rescueStorage.mdraid "raid1"
+      ++ lib.optional rescueStorage.nvme "nvme"
+    else
+      [ "overlay" "ext4" "af_packet" ])
+    ++ lib.unique (cfg.rescue.nicDrivers ++ detectedNicModules);
+
+  # `[rescue.system]` in NMBL's config: everything that makes the shared
+  # stage-2 image this host's rescue. Null for the flat rescue.
+  rescueSystem =
+    if cfg.rescue.mode == "external" && cfg.rescue.fullSystem.enable then
+      {
+        sshd_port = cfg.rescue.fullSystem.sshdPort;
+        authorized_keys = cfg.rescue.fullSystem.rootAuthorizedKeys;
+        modules = rescueModuleList;
+      }
+      // lib.optionalAttrs (cfg.rescue.fullSystem.hostKeyPath != null) {
+        host_key_path = cfg.rescue.fullSystem.hostKeyPath;
+      }
+      // lib.optionalAttrs (!cfg.rescue.fullSystem.networkStage.enable) {
+        network_profile = import ./network-profile.nix {
+          inherit lib;
+          stage = { staticProfiles = [ ]; dnsServers = [ ]; } // cfg.rescue.fullSystem.networkStage;
+        };
+      }
+    else
+      null;
+
+  # Build the external rescue image. The derivation is always evaluated
+  # (cheap when nothing references it) but only staged onto the boot
+  # partition when `cfg.rescue.mode == "external"`. The full-system image
+  # (stage 2) takes NO host data: only the package set, the module closure
+  # for NMBL's kernel and fixed scripts, so it does not rebuild when the
+  # host's network, keys or services change.
   nmblRescueSquashfs = import ./rescue-sfs.nix {
     inherit pkgs lib;
     contents = cfg.rescue.squashfsContents;
     fullSystem = {
-      inherit (cfg.rescue.fullSystem)
-        enable minimal sshdPort rootAuthorizedKeys hostKeyPath compression console;
+      inherit (cfg.rescue.fullSystem) enable minimal compression console;
       # Authenticated rescue recovery uses the same production control binary
       # and its full runtime closure, never a copied diagnostic executable.
       packages = cfg.rescue.fullSystem.packages ++ lib.optional (selectedNmblCtl != null) selectedNmblCtl;
-      networkStage = cfg.rescue.fullSystem.networkStage;
-      # NIC drivers the recovery /init modprobes ITSELF after switch_root.
-      # NMBL no longer preloads them — the .ko + firmware ship in the
-      # squashfs (moduleClosure below), and the running kernel is still
-      # NMBL's, so `uname -r` matches the staged tree.
-      nicDrivers = lib.unique (cfg.rescue.nicDrivers ++ detectedNicModules);
-      # Filesystem / packet modules the recovery /init loads before the
-      # overlay + network setup. Loaded from the staged tree, not NMBL's.
-      # Storage modules only for the stacks this host uses.
-      coreModules = if cfg.rescue.fullSystem.minimal then
-        [ "overlay" "af_packet" ]
-        ++ lib.optional rescueStorage.btrfs "btrfs"
-        ++ lib.optional rescueStorage.mdraid "raid1"
-        ++ lib.optional rescueStorage.nvme "nvme"
-      else
-        [ "overlay" "ext4" "af_packet" ];
-      # The makeModulesClosure result (its /lib/modules + /lib/firmware are
-      # staged into the squashfs root). null when there is nothing to load
-      # (fullSystem disabled or non-external), in which case rescue-sfs.nix
-      # skips the modprobe + staging.
-      moduleClosure =
-        if cfg.rescue.fullSystem.networkStage.enable then null else rescueModuleClosure;
+      # The module closure for NMBL's kernel (its /lib/modules + /lib/firmware
+      # are staged into the image). Always staged, with or without a
+      # networking stage, so the image does not depend on that choice.
+      moduleClosure = rescueModuleClosure;
     };
   };
 
@@ -387,6 +414,7 @@ let
     initrdExecutables = initrdExecutablePaths;
     rescueSfs = if cfg.rescue.mode == "external" then nmblRescueSquashfs else null;
     networkStage = nmblNetworkStage;
+    inherit rescueSystem;
     # `none` mode ships no emergency shell on purpose (the emergency path
     # halts with a banner), so do not assert paths.shell is staged there.
     checkEmergencyShell = cfg.rescue.mode != "none";
@@ -415,6 +443,7 @@ let
       initrdExecutables = initrdExecutablePaths;
       rescueSfs = if cfg.rescue.mode == "external" then nmblRescueSquashfs else null;
       networkStage = nmblNetworkStage;
+      inherit rescueSystem;
       checkEmergencyShell = cfg.rescue.mode != "none";
     };
 

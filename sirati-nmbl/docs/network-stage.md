@@ -28,8 +28,9 @@ starts; the shell only applies accepted directives and never evaluates file
 content.
 
 Without a network stage (`networkStage.enable = false`, the default) the full
-rescue image carries its own NIC drivers and its baked network profile
-(static profiles, SLAAC, or dual-stack DHCP on every interface). With a stage configured, only the signed stage's configuration is
+rescue image carries its own NIC drivers, and NMBL hands it the host's
+network profile from `[rescue.system]` (static profiles, SLAAC, or dual-stack
+DHCP on every interface), validated by the same strict parser. With a stage configured, only the signed stage's configuration is
 ever applied; a missing or rejected stage keeps the rescue local-console
 only.
 

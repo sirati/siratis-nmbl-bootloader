@@ -30,10 +30,10 @@ pub mod net;
 pub mod verify;
 
 mod embedded;
+mod host;
 mod identity;
 pub mod image;
 mod locate;
-#[cfg(feature = "secure-boot")]
 mod network_profile;
 #[cfg(feature = "secure-boot")]
 mod network_stage;
@@ -214,6 +214,15 @@ fn run_chrooted_external(
     // Drop the boot console so its backend Drop (KD_TEXT, termios) runs
     // before the chrooted child claims /dev/console.
     drop(console);
+    // Host data for the host-independent stage-2 image (sshd port, keys,
+    // modules, network profile) goes into the rescue overlay before /init
+    // runs; whatever cannot be installed stays absent, and /init then keeps
+    // the rescue local-console only.
+    if let Err(err) = host::install(config, rescue_dir) {
+        crate::nmbl_warn!(
+            "rescue host data incomplete; rescue stays local-only where it is missing: {err}"
+        );
+    }
     let entrypoint = config.rescue.entrypoint.clone();
     let run = crate::ui::block_on_tui_with_poller(move |sender| async move {
         if let Err(err) = identity::mount(config, &sender).await {

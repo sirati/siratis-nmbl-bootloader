@@ -32,21 +32,17 @@
   contents,
   # Full-recovery-system parameters. `enable = false` keeps the flat
   # busybox path. The remaining fields are only consumed when enabled.
+  #
+  # The full-system image (stage 2) is HOST-INDEPENDENT: its only inputs are
+  # the rescue package set, the kernel module closure for NMBL's kernel and
+  # fixed scripts. Ports, keys, host identity, module choices and network
+  # profiles are host data; NMBL hands them over at runtime from its own
+  # config (`[rescue.system]`, see docs/rescue-stages.md), so two hosts with
+  # the same kernel and packages share one image store path.
   fullSystem ? {
     enable = false;
     minimal = false;
     packages = [ ];
-    sshdPort = 22222;
-    rootAuthorizedKeys = [ ];
-    hostKeyPath = null;
-    networkStage = {
-      enable = false;
-      imagePath = "nmbl/network.erofs";
-      addressFamily = "ipv4-only";
-      interfaces = [ ];
-    };
-    nicDrivers = [ ];
-    coreModules = [ ];
     moduleClosure = null;
     compression = "lz4hc";
     console = null;
@@ -95,24 +91,10 @@ let
   gawk = pkgs.gawk;
   cacert = pkgs.cacert;
 
-  # All kernel modules the rescue /init loads ITSELF after switch_root.
-  # Core fs/packet modules first (overlay + ext4 back the writable
-  # scratch, af_packet backs dhcpcd's BPF socket), then the NIC drivers.
-  # NMBL no longer preloads any of these — their .ko (+ firmware) ship in
-  # the networking EROFS (or legacy squashfs) under /lib/modules and
-  # /lib/firmware. The running kernel after switch_root is
-  # still NMBL's, so `uname -r` matches the staged module-tree version and
-  # plain `modprobe` (absolute kmod path — PATH is not set up yet) resolves
-  # them via the modules.dep we depmod at build time. Firmware-dependent
-  # NIC drivers (wifi: iwlwifi, ath*, brcmfmac, …) work here because the
-  # matching firmware is present before modprobe and firmware_class's
-  # search path is pointed at it just before these modprobes run — unlike
-  # loading the driver into NMBL's firmware-less initramfs.
-  rescueModprobeList = fullSystem.coreModules ++ fullSystem.nicDrivers;
-  modprobeRoot = lib.optionalString fullSystem.networkStage.enable "-d /nmbl-network";
-  rescueModprobes = lib.concatMapStringsSep "\n"
-    (m: "    ${kmod}/bin/modprobe ${modprobeRoot} ${m} > /dev/console 2>&1 || log \"WARNING: modprobe ${m} failed\"")
-    rescueModprobeList;
+  # Kernel modules: the image carries the module closure (built for NMBL's
+  # kernel, depmod'd) and firmware; WHICH modules to load is host data that
+  # NMBL hands over (/etc/nmbl-rescue/modules). See ./rescue/init-modules.nix.
+  modulesFragment = import ./rescue/init-modules.nix { inherit coreutils kmod; };
 
   # The rescue /init: PID 1 after switch_root. A bash script, baked into
   # the image at /init. References tools by absolute store path so it
@@ -121,27 +103,21 @@ let
   # shell even if (say) DHCP times out.
   initScriptPrefix = if fullSystem.minimal then
     import ./rescue/init-script-minimal.nix {
-      inherit bash coreutils kmod utilLinux rescueModprobes;
-      networkStageEnabled = fullSystem.networkStage.enable;
+      inherit bash coreutils kmod utilLinux modulesFragment;
     }
   else
     import ./rescue/init-script.nix {
       inherit
         bash cacert coreutils e2fsprogs gawk gnugrep gnused nix openssh
-        utilLinux rescueModprobes;
-      networkStageEnabled = fullSystem.networkStage.enable;
+        utilLinux modulesFragment;
     };
   initScript = pkgs.writeShellScript "nmbl-rescue-init" (
     initScriptPrefix
     + import ./rescue/init-script-network.nix {
       inherit bash coreutils dhcpcd gawk iproute2 rescueConsole utilLinux;
-      bakedNetworkConfig = if !fullSystem.networkStage.enable
-        then pkgs.writeText "nmbl-baked-network.conf" (import ./network-profile.nix { inherit lib; stage = { staticProfiles = [ ]; dnsServers = [ ]; } // fullSystem.networkStage; })
-        else null;
-      networkStageEnabled = fullSystem.networkStage.enable;
     }
     + import ./rescue/init-script-net.nix {
-      inherit lib bash coreutils iproute2 nix openssh fullSystem rescueConsole utilLinux;
+      inherit lib bash coreutils iproute2 nix openssh rescueConsole utilLinux;
       startNixDaemon = !fullSystem.minimal;
     }
   );
@@ -156,7 +132,7 @@ let
   };
 
   sshdConfig = import ./rescue/sshd-config.nix {
-    inherit pkgs openssh fullSystem;
+    inherit pkgs openssh;
   };
 
   # Login-shell PATH for a human SSHing in for real recovery. SetEnv in
@@ -221,9 +197,6 @@ let
     ];
   });
 
-  authorizedKeys = pkgs.writeText "authorized_keys"
-    (lib.concatStringsSep "\n" fullSystem.rootAuthorizedKeys + "\n");
-
   # Downstream-supplied recovery packages (e.g. wpa_supplicant, iw added
   # by a laptop config). Their bin/sbin dirs are shimmed onto PATH below,
   # alongside the hardcoded core tools, so any binary the operator added
@@ -251,7 +224,7 @@ let
 
   fullSquashfs = import ./rescue/full-system.nix {
     inherit
-      pkgs lib closure nixConf nixRegistry sshdConfig authorizedKeys motd
+      pkgs lib closure nixConf nixRegistry sshdConfig motd
       profileScript cacert initScript bash coreutils utilLinux iproute2
       procps kmod e2fsprogs gnugrep gnused gawk nix
       openssh dhcpcd fullSystemPackagePaths moduleClosurePath;

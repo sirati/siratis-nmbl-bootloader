@@ -333,6 +333,46 @@
         assert !(has "mdadm" minimal) && has "mdadm" (withMdraid minimal);
         assert !(has "cryptsetup" (withLuks minimal));
         pkgs.runCommand "nmbl-rescue-storage-tools-eval" { } "touch $out";
+      # The stage-2 rescue image is host-independent: its derivation is the same
+      # for hosts that differ in network configuration (baked static profile
+      # or a signed networking stage), authorized keys, sshd port, rescue host
+      # key and unrelated NixOS options, and changes only with what it is
+      # built from (here: NMBL's kernel, whose module closure it carries).
+      rescueImageHostIndependentCheck =
+        let
+          extend = c: module: c.extendModules { modules = [ module ]; };
+          image = c: c.config.system.build.nmblRescueSquashfs.drvPath;
+          withStage = erofsBiosHost;
+          baked = extend erofsBiosHost {
+            boot.nmbl.rescue.fullSystem.networkStage.enable = lib.mkForce false;
+          };
+          otherHost = extend baked {
+            boot.nmbl.rescue.fullSystem = {
+              networkStage = {
+                addressFamily = lib.mkForce "ipv4-only";
+                dnsServers = lib.mkForce [ "192.0.2.53" ];
+                staticProfiles = lib.mkForce [ {
+                  interfaceName = "eth1";
+                  ipv4 = { addresses = [ "203.0.113.7/24" ]; gateway = "203.0.113.1"; };
+                } ];
+              };
+              rootAuthorizedKeys = lib.mkForce [
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq other@host"
+              ];
+              sshdPort = lib.mkForce 2201;
+              hostKeyPath = lib.mkForce "/mnt/boot/other-host-key";
+            };
+            networking.hostName = lib.mkForce "other-host";
+            services.journald.extraConfig = "SystemMaxUse=10M";
+          };
+          otherKernel = extend baked {
+            boot.nmbl.kernelPackage = lib.mkForce pkgs.linuxPackages_6_12.kernel;
+          };
+        in
+        assert image baked == image otherHost;
+        assert image baked == image withStage;
+        assert image baked != image otherKernel;
+        pkgs.runCommand "nmbl-rescue-image-host-independent" { } "touch $out";
       # Boots the DNS-VPS / Stardust topology from a real BIOS disk: GRUB ->
       # NMBL -> stage-1 store -> signed EROFS generation (tmpfs root), then
       # rollback, and rescue with the signed network stage + recovery SSH.
@@ -1482,6 +1522,7 @@
         nmbl-erofs-bios-host-eval = erofsBiosHostEvalCheck;
         rescue-ssh-welcome = rescueSshWelcomeCheck;
         rescue-storage-tools-eval = rescueStorageToolsEvalCheck;
+        rescue-image-host-independent = rescueImageHostIndependentCheck;
         insecure-test-key-absent = insecureKeyAbsentFromProd;
         test-secure-boot-no-private-key = secureBootNoPrivateKey;
         test-secure-boot-driver-no-private-key = secureBootDriverNoPrivateKey;

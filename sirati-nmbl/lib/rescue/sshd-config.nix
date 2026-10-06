@@ -1,11 +1,11 @@
+# Host-independent: the port comes from NMBL at runtime (`sshd -p`, read
+# from /etc/nmbl-rescue/sshd-port) and the keys from the file NMBL writes.
 {
   pkgs,
   openssh,
-  fullSystem,
 }:
 
 pkgs.writeText "sshd_config" ''
-  Port ${toString fullSystem.sshdPort}
   ListenAddress 0.0.0.0
   ListenAddress ::
   PermitRootLogin prohibit-password
@@ -40,7 +40,7 @@ pkgs.writeText "sshd_config" ''
   ClientAliveCountMax 3
   PerSourcePenalties no
   HostKey /etc/ssh/ssh_host_ed25519_key
-  AuthorizedKeysFile /root/.ssh/authorized_keys
+  AuthorizedKeysFile /etc/nmbl-rescue/authorized_keys
   SetEnv PATH=/bin:/sbin:/usr/bin:/usr/sbin NIX_PATH=nixpkgs=flake:nixpkgs NMBL_TUI_SOCK=/nmbl-root/nmbl-run/tui.sock
   Subsystem sftp ${openssh}/libexec/sftp-server
   LogLevel VERBOSE

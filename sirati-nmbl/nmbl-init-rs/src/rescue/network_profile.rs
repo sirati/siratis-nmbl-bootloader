@@ -19,6 +19,7 @@ struct Profile {
     gateway6: bool,
 }
 
+#[cfg(feature = "secure-boot")]
 pub(super) fn validate_file(path: &std::path::Path) -> Result<(), String> {
     let metadata = std::fs::metadata(path).map_err(|error| format!("metadata: {error}"))?;
     if metadata.len() > MAX_CONFIG_BYTES as u64 {
@@ -26,6 +27,15 @@ pub(super) fn validate_file(path: &std::path::Path) -> Result<(), String> {
     }
     let text = std::fs::read_to_string(path).map_err(|error| format!("read: {error}"))?;
     validate(&text)
+}
+
+/// Validate a profile held in memory (the baked profile NMBL's config
+/// carries for a rescue without a networking stage).
+pub(super) fn validate_text(text: &str) -> Result<(), String> {
+    if text.len() > MAX_CONFIG_BYTES {
+        return Err("network profile exceeds 64 KiB".into());
+    }
+    validate(text)
 }
 
 fn validate(text: &str) -> Result<(), String> {

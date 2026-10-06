@@ -488,7 +488,7 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
                 if args.mode in ("baked-static", "native-identity", "missing-identity"):
                     commands = r'''
 test ! -d /nmbl-network/etc/nmbl-network &&
-grep -qx 'version 2' /nix/store/*-nmbl-baked-network.conf &&
+grep -qx 'version 2' /etc/nmbl-rescue/network.conf &&
 ip -4 addr show dev eth0 | grep -F '88.99.80.66/32' &&
 ip -4 route show | grep -F 'default via 172.31.1.1 dev eth0 onlink' &&
 ! pgrep -x dhcpcd &&
@@ -500,8 +500,8 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
                 if args.mode == "baked-slaac":
                     commands = r'''
 test ! -d /nmbl-network/etc/nmbl-network &&
-grep -qx 'version 1' /nix/store/*-nmbl-baked-network.conf &&
-grep -qx 'address-family ipv6-only' /nix/store/*-nmbl-baked-network.conf &&
+grep -qx 'version 1' /etc/nmbl-rescue/network.conf &&
+grep -qx 'address-family ipv6-only' /etc/nmbl-rescue/network.conf &&
 test -z "$(ip -o -4 addr show scope global)" &&
 ip -6 addr show dev eth0 scope global | grep '2001:db8::5054:ff:fe12:3456/64' &&
 ip -6 route show default | grep 'default via ' &&

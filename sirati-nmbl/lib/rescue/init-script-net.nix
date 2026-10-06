@@ -1,4 +1,6 @@
 # Rescue /init — SSH identity, daemon, diagnostics, and console shell.
+# Host data (port, host key path) comes from NMBL at runtime via
+# /etc/nmbl-rescue; nothing host-specific is baked into the image.
 {
   lib,
   bash,
@@ -8,7 +10,6 @@
   openssh,
   rescueConsole,
   utilLinux,
-  fullSystem,
   startNixDaemon ? true,
 }:
 ''
@@ -16,9 +17,16 @@
     log "ensuring ssh host keys"
     ${coreutils}/bin/mkdir -p /etc/ssh
     sshd_ready=1
-    ${
-      if fullSystem.hostKeyPath != null then ''
-        persistent_host_key=${lib.escapeShellArg "/nmbl-root${fullSystem.hostKeyPath}"}
+    sshd_port=$(${coreutils}/bin/cat /etc/nmbl-rescue/sshd-port 2>/dev/null || true)
+    case "$sshd_port" in
+      ""|*[!0-9]*) log "ERROR: NMBL handed over no valid rescue sshd port"; sshd_ready=0 ;;
+    esac
+    if [ ! -s /etc/nmbl-rescue/authorized_keys ]; then
+      log "ERROR: NMBL handed over no authorized keys; remote login disabled"
+      sshd_ready=0
+    fi
+    if [ -r /etc/nmbl-rescue/host-key-path ]; then
+        persistent_host_key="/nmbl-root$(${coreutils}/bin/cat /etc/nmbl-rescue/host-key-path)"
         if [ -L "$persistent_host_key" ]; then
           log "ERROR: persistent rescue SSH host key must not be a symlink"
           sshd_ready=0
@@ -37,13 +45,12 @@
             fi
           fi
         fi
-      '' else ''
+    else
         if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
           ${openssh}/bin/ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" 2>/dev/null \
             || sshd_ready=0
         fi
-      ''
-    }
+    fi
 
     ${lib.optionalString startNixDaemon ''
       # --- nix daemon ---
@@ -52,7 +59,7 @@
     ''}
 
     # --- sshd ---
-    log "starting sshd on port ${toString fullSystem.sshdPort}"
+    log "starting sshd on port $sshd_port"
     # Privilege-separation prerequisites. sshd's pre-auth child chroots into
     # /var/empty and re-execs through /run/sshd; both must exist and (for
     # StrictModes) be owned root:root and NOT group/world-writable, or the
@@ -71,27 +78,27 @@
     # each inbound connection (or NOTHING if no connection arrives at all,
     # which would point at slirp forwarding rather than sshd).
     if [ "$sshd_ready" = 1 ] \
-      && ${openssh}/bin/sshd -t -f /etc/ssh/sshd_config > /dev/console 2>&1; then
-      ${openssh}/bin/sshd -f /etc/ssh/sshd_config -E /dev/console > /dev/console 2>&1 \
+      && ${openssh}/bin/sshd -t -f /etc/ssh/sshd_config -p "$sshd_port" > /dev/console 2>&1; then
+      ${openssh}/bin/sshd -f /etc/ssh/sshd_config -p "$sshd_port" -E /dev/console > /dev/console 2>&1 \
         || log "WARNING: sshd failed to start"
     else
       log "ERROR: sshd not started because its host identity/config is invalid"
     fi
     # Confirm sshd actually bound the port so the next run definitively
-    # shows whether 0.0.0.0:${toString fullSystem.sshdPort} is listening.
+    # shows whether 0.0.0.0:$sshd_port is listening.
     log "listening sockets:"
     ${iproute2}/bin/ss -tlnp > /dev/console 2>&1 || true
 
     # --- guest-side reachability self-probe (decisive) ---
     # Probe sshd from inside the guest, on loopback and on the leased eth0
     # IP, using bash's /dev/tcp. This isolates the failure: if loopback OK
-    # but the orchestrator still can't reach :${toString fullSystem.sshdPort}, the problem is slirp
+    # but the orchestrator still can't reach the port, the problem is slirp
     # forwarding, not sshd; if loopback FAILs too, sshd never bound/serves.
     log "running sshd reachability self-probe"
     selftest() {
-      ( exec 3<>"/dev/tcp/$1/${toString fullSystem.sshdPort}" ) 2>/dev/null \
-        && log "SELFTEST $1:${toString fullSystem.sshdPort} TCP OK" \
-        || log "SELFTEST $1:${toString fullSystem.sshdPort} TCP FAIL"
+      ( exec 3<>"/dev/tcp/$1/$sshd_port" ) 2>/dev/null \
+        && log "SELFTEST $1:$sshd_port TCP OK" \
+        || log "SELFTEST $1:$sshd_port TCP FAIL"
     }
     selftest 127.0.0.1
     selftest ::1

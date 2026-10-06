@@ -6,7 +6,7 @@
 # only — the orchestrator concatenates it with the net fragment and feeds the
 # result to a single `pkgs.writeShellScript "nmbl-rescue-init"`, so the rendered
 # /init is byte-identical to the pre-split body. This fragment carries the
-# `${rescueModprobes}` line at column 0, which anchors the indented-string dedent
+# `${modulesFragment}` line at column 0, which anchors the indented-string dedent
 # to zero so every other line keeps its literal indentation.
 {
   bash,
@@ -19,8 +19,7 @@
   nix,
   openssh,
   utilLinux,
-  rescueModprobes,
-  networkStageEnabled,
+  modulesFragment,
 }:
 ''
     #!${bash}/bin/bash
@@ -74,14 +73,7 @@
     # finds its blob. Best-effort: the sysfs knob is absent if
     # CONFIG_FW_LOADER_USER_HELPER is off, but the in-kernel loader also
     # searches /lib/firmware by default, so the override is belt-and-braces.
-    log "pointing firmware loader at ${if networkStageEnabled then "/nmbl-network/lib/firmware" else "/lib/firmware"}"
-    if [ -w /sys/module/firmware_class/parameters/path ]; then
-      ${coreutils}/bin/printf '%s' ${if networkStageEnabled then "/nmbl-network/lib/firmware" else "/lib/firmware"} \
-        > /sys/module/firmware_class/parameters/path 2>/dev/null \
-        || log "WARNING: could not set firmware_class search path"
-    fi
-    log "loading rescue kernel modules (overlay, ext4, af_packet, NIC drivers)"
-${rescueModprobes}
+${modulesFragment}
 
     # --- ext4 scratch backing the overlay upper/work dirs ---
     # The squashfs root (/, /nix, /etc, /var) is read-only, so the scratch

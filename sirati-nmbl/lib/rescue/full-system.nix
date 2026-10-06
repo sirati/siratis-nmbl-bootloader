@@ -11,7 +11,6 @@
   nixConf,
   nixRegistry,
   sshdConfig,
-  authorizedKeys,
   motd,
   profileScript,
   cacert,
@@ -110,7 +109,6 @@ let
       ''}
       cp ${sshdConfig}     root/etc/ssh/sshd_config
       cp ${motd}           root/etc/motd
-      cp ${authorizedKeys} root/root/.ssh/authorized_keys
 
       # Login-shell PATH for interactive recovery sessions (SetEnv in
       # sshd_config handles the non-interactive case). /etc/profile is sourced
@@ -220,7 +218,6 @@ let
       # --- permissions on the ssh dir/key file ---
       chmod 0700 root/root
       chmod 0700 root/root/.ssh
-      chmod 0600 root/root/.ssh/authorized_keys
       # sshd privsep dir: root:root, not group/world-writable (StrictModes).
       chmod 0711 root/var/empty
 
@@ -229,8 +226,12 @@ let
       # SHA-512 the runtime config pins. LZ4HC by default: the fastest
       # decompressor, so the recovery system starts and runs from the image
       # without squashfs's large-block zstd decompression.
+      # --workers=1: erofs-utils' multi-threaded compression does not produce
+      # reproducible images (measured with erofs-utils 1.9.4), and the
+      # runtime config pins this image's SHA-512.
       mkfs.erofs \
         --quiet \
+        --workers=1 \
         --force-uid=0 \
         --force-gid=0 \
         -T 0 \

@@ -24,6 +24,13 @@ sha512 = "<128 hex digits>"         # the exact stage-2 image this config was bu
 [rescue.network_stage]              # only with fullSystem.networkStage.enable
 path = "nmbl/network.erofs"
 sha512 = "<128 hex digits>"
+
+[rescue.system]                     # this host's rescue settings
+sshd_port = 22222
+authorized_keys = ["ssh-ed25519 AAAA... operator"]
+host_key_path = "/nmbl-identity/etc/ssh/ssh_host_ed25519_key"
+modules = ["overlay", "ext4", "af_packet", "e1000e"]
+network_profile = "version 2\naddress-family dual-stack\n..."   # without a networking stage
 ```
 
 The build computes both digests from the images it ships and appends these
@@ -46,7 +53,11 @@ On rescue entry NMBL:
    at `/rescue`;
 5. with a networking stage, verifies, pins and mounts it at
    `/rescue/nmbl-network` the same way;
-6. starts `/init` from the image as a chrooted child, with NMBL's root
+6. validates `[rescue.system]` and writes it as plain data files into the
+   rescue overlay at `/etc/nmbl-rescue/`. The baked network profile goes
+   through the same strict parser as a networking stage's profile; a value
+   that fails validation is not written;
+7. starts `/init` from the image as a chrooted child, with NMBL's root
    bind-mounted at `/nmbl-root`.
 
 A pin that cannot be checked (malformed, or a binary built without the
@@ -57,11 +68,26 @@ whenever it renders a pin.
 
 An EROFS image holding the whole recovery system: its own `/nix/store` (and,
 for the full profile, a Nix database), the kernel modules and firmware for its
-NICs (built for NMBL's kernel), the baked static/SLAAC/DHCP network profile,
-sshd with its own authorized keys, and the operator tools. Without a
-networking stage it brings up its baked network itself. With one, it loads
-modules and the profile from `/nmbl-network`. The SSH host identity still
-comes from `fullSystem.hostKeyPath` in NMBL's namespace.
+NICs (built for NMBL's kernel), sshd, and the operator tools.
+
+The image is host-independent, so it does not rebuild when a host's
+configuration changes (EROFS compression is the slow part of a rescue build).
+Its only inputs are the rescue package set, the module closure for NMBL's
+kernel, and fixed scripts. It contains no addresses or network profile, no
+authorized keys, no sshd port, no host key path, no module choice and no
+hostname. Two hosts with the same NMBL kernel and rescue packages share one
+image store path. Its fixed `/init` reads the host data NMBL handed over in
+`/etc/nmbl-rescue/` and fails closed: a missing network profile or port keeps
+the rescue local-console only, and missing keys disable remote login. With a
+networking stage configured (`/etc/nmbl-rescue/network-stage`) it loads
+modules and the profile from `/nmbl-network` only. The SSH host identity
+comes from the configured key in NMBL's namespace (`/nmbl-root/...`) or is
+generated per boot.
+
+The image also contains `nmblctl` (NMBL's control tool), which is built with
+the signing public keys and enforcement setting it must trust. Hosts sharing
+an image therefore also share those trust anchors, as they do for NMBL
+itself.
 
 The image is compressed with LZ4HC in 64 KiB clusters, with tail packing,
 fragments and deduplication. Decompression is much cheaper than squashfs with
@@ -70,11 +96,17 @@ zstd-19 in 128 KiB blocks, which the rescue used before.
 partition (kernel 6.10 or later); `"none"` stores it uncompressed. Measured on
 the minimal DNS-VPS profile (a 188 MB tree):
 
-| Image | Size |
-| --- | --- |
-| squashfs, zstd-19 (before) | 57 MB |
-| EROFS, LZ4HC (default) | 75 MB |
-| EROFS, zstd-19 | 52 MB |
+| Image | Size | Build |
+| --- | --- | --- |
+| squashfs, zstd-19 (before) | 57 MB | 4 s |
+| EROFS, LZ4HC (default) | 76 MB | 29 s |
+| EROFS, zstd-19 | 53 MB | 424 s |
+
+The build times are forced rebuilds, including copying the closure.
+`mkfs.erofs` compresses single-threaded because its multi-threaded output is
+not reproducible, which is slower than `mksquashfs`. Because the image is
+host-independent (below), it is rebuilt only when NMBL's kernel or the rescue
+package set changes, not on every host configuration change.
 
 ## Only the storage tools the host uses
 
@@ -92,9 +124,13 @@ and an unpinned `[rescue]` section, exactly as before.
 
 ## Tests
 
-* `nix build .#checks.x86_64-linux.rescue-ssh-welcome` and
+* `nix build .#checks.x86_64-linux.rescue-image-host-independent`, which
+  asserts that the image derivation is identical across hosts differing in
+  network configuration, keys, port, host key and unrelated options, and
+  differs for another kernel; plus `rescue-ssh-welcome` and
   `rescue-storage-tools-eval` (pure);
-* `cargo test --features rescue-stages` covers the config tables and the pin;
+* `cargo test --features rescue-stages` covers the config tables, the pin
+  and the hand-over of host data;
 * `nix run .#test-network-stage-vm` boots the signed, baked-static, baked-SLAAC
   and identity variants from the stage-2 EROFS, re-pins a malformed network
   stage so the strict profile parser still rejects it, and boots a validly

@@ -39,6 +39,10 @@
   # The rescue networking EROFS (or null). With a full-system rescue the
   # rendered config names it and pins its SHA-512 (`[rescue.network_stage]`).
   networkStage ? null,
+  # `[rescue.system]`: host data for the host-independent stage-2 image
+  # (sshd port, authorized keys, host key path, module list, baked network
+  # profile). NMBL validates it and hands it to the rescue at runtime.
+  rescueSystem ? null,
 }:
 
 let
@@ -230,6 +234,9 @@ let
       # the Rust-side default.
       // lib.optionalAttrs (cfg.rescue.mode == "external" && cfg.rescue.fullSystem.enable) {
         entrypoint = "/init";
+      }
+      // lib.optionalAttrs (rescueSystem != null) {
+        system = rescueSystem;
       }
       # Deterministic rescue trigger. Emitted only when set so the wire
       # shape stays unchanged for the common case; the Rust serde default

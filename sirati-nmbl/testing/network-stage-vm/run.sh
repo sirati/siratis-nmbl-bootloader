@@ -241,6 +241,12 @@ make_disk "$slaac_stage" "$work_root/baked-slaac.img"
 python3 "$harness" scan --key "$private_key" --key "$ssh_private_key" \
   --marker "$marker" "$slaac_artifacts" "$slaac_stage" "$work_root/baked-slaac.img"
 
+# The stage-2 rescue image carries no host data: two hosts that differ only
+# in their network configuration share one image (and one store path).
+test "$(readlink -f "$baked_artifacts/rescue.sfs")" = "$(readlink -f "$slaac_artifacts/rescue.sfs")"
+test ! -e "$work_root/rescue/etc/nmbl-rescue"
+test ! -e "$work_root/rescue/root/.ssh/authorized_keys"
+
 mkdir "$work_root/native-initrd"
 (cd "$work_root/native-initrd" && lsinitrd --unpack "$native_artifacts/initrd")
 python3 "$harness" console-image --initrd "$work_root/native-initrd" \

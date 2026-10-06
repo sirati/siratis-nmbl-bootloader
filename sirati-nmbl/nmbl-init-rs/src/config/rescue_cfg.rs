@@ -42,6 +42,12 @@ pub struct RescueConfig {
     #[serde(default)]
     pub network_stage: Option<RescueNetworkStage>,
 
+    /// `[rescue.system]`: host data for the full-system rescue. The stage-2
+    /// image is host-independent; NMBL hands these values to its `/init`
+    /// at runtime (see `crate::rescue::host`).
+    #[serde(default)]
+    pub system: Option<RescueSystem>,
+
     /// Master switch for the network-rescue fallback. When `false`
     /// (the default) the External arm of [`crate::rescue::dispatch`]
     /// halts after the disk-rescue attempt fails, even if the
@@ -105,6 +111,7 @@ impl Default for RescueConfig {
             sfs_path: None,
             image: RescueImage::default(),
             network_stage: None,
+            system: None,
             network: false,
             default_url: String::new(),
             default_sha256: String::new(),
@@ -128,6 +135,29 @@ pub struct RescueImage {
     /// older image signed with the same key cannot be substituted.
     #[serde(default)]
     pub sha512: Option<String>,
+}
+
+/// `[rescue.system]`: what makes the shared stage-2 rescue image this
+/// host's rescue.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RescueSystem {
+    /// TCP port the rescue sshd listens on.
+    pub sshd_port: u16,
+    /// `authorized_keys` lines for root.
+    #[serde(default)]
+    pub authorized_keys: Vec<String>,
+    /// Persistent SSH host key in NMBL's namespace (seen by the rescue
+    /// under `/nmbl-root`). Without it the rescue generates an ephemeral
+    /// key.
+    #[serde(default)]
+    pub host_key_path: Option<PathBuf>,
+    /// Kernel modules the rescue loads from its own module tree.
+    #[serde(default)]
+    pub modules: Vec<String>,
+    /// The data-only network profile, when no networking stage carries it.
+    #[serde(default)]
+    pub network_profile: Option<String>,
 }
 
 /// `[rescue.network_stage]`: the signed networking EROFS for the rescue.

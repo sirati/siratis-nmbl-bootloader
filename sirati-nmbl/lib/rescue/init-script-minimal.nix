@@ -3,8 +3,7 @@
   coreutils,
   kmod,
   utilLinux,
-  rescueModprobes,
-  networkStageEnabled,
+  modulesFragment,
 }:
 ''
   #!${bash}/bin/bash
@@ -23,12 +22,7 @@
   ${utilLinux}/bin/mount -t tmpfs tmpfs /run 2>/dev/null || true
   ${utilLinux}/bin/mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 
-  log "pointing firmware loader at ${if networkStageEnabled then "/nmbl-network/lib/firmware" else "/lib/firmware"}"
-  if [ -w /sys/module/firmware_class/parameters/path ]; then
-    ${coreutils}/bin/printf '%s' ${if networkStageEnabled then "/nmbl-network/lib/firmware" else "/lib/firmware"} \
-      > /sys/module/firmware_class/parameters/path 2>/dev/null || true
-  fi
-${rescueModprobes}
+${modulesFragment}
 
   # Only configuration and daemon state need writes. Keep the store and all
   # recovery binaries read-only; tmpfs-backed overlays disappear on reboot.
