@@ -328,13 +328,16 @@ sudo -n /run/current-system/sw/bin/nmbl-erofs-receive \
 ```
 
 The sudo rule must permit only that exact command with fixed paths. The
-receiver reads the length-delimited `NMBL-EROFS-BUNDLE-3` stream into a
+receiver is a compiled program from `nmbl-host-tools`, never a script, since
+it runs as root on uploaded data. It reads the length-delimited
+`NMBL-EROFS-BUNDLE-4` stream into a
 private temporary directory, rejects payloads over 64 GiB and trailing data,
 and checks the image and config digests. It verifies every signature against
 the fixed public key before installation. If the generation directory already
 exists, its contents must match the upload. The receiver then installs the
-generation, compares and verifies the installed copies, and activates it. It
-discards the uploaded `kernel` and `initrd` and keeps only their signatures.
+generation, compares and verifies the installed copies, and activates it
+with the same state transitions as `nmbl-erofsctl activate`. It discards the
+uploaded `kernel` and `initrd` and keeps only their signatures.
 
 Point the bootstrap config at the active generation and make the bootstrap
 filesystem the one that contains the tree:

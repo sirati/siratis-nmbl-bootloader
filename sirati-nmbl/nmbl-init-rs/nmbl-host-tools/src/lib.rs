@@ -22,6 +22,7 @@ pub mod domain;
 pub mod error;
 pub mod keyfile;
 pub mod keygen;
+pub mod receive;
 pub mod sign;
 pub mod verify;
 

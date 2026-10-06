@@ -891,6 +891,6 @@ runs the unmodified PID 1 in a rootless container with simulated syscalls
 | `nmbl-sign` | `nmbl-init-rs/nmbl-host-tools` | ML-DSA signer for every signed role |
 | `nmbl-boot-update` | `nmbl-init-rs/nmbl-boot-update` | atomic two-slot boot-set updates ([`docs/boot-set-updates.md`](docs/boot-set-updates.md)) |
 | `nmbl-generation-mount`, `nmbl-generation-state` | `nmbl-init-rs/src/bin` | target-initrd image mount and generation state |
-| `nmbl-erofsctl`, `nmbl-erofs-deploy`, `nmbl-erofs-receive` | `tools/`, `lib/erofs*.nix` | EROFS generation activation and remote deployment |
+| `nmbl-erofsctl`, `nmbl-erofs-deploy`, `nmbl-erofs-receive` | `tools/`, `lib/erofs*.nix`, `nmbl-host-tools/src/receive.rs` | EROFS generation activation and remote deployment |
 | `nmbl-tpm-enroll` | `lib/tpm-enroll.nix` | seals a LUKS key to the predicted PCR-11 |
 | `nmbl-simbox`, `nmbl-ui-preview` | `nmbl-init-rs/` | development only |
