@@ -119,3 +119,42 @@ fn absolute_cursor_move_is_row_then_col() {
         "transposed (col-first) cursor address \\x1b[8;4H must NOT appear: {out:?}"
     );
 }
+
+/// A console that tolerates input EOF (the primary console) must still
+/// not spin once its terminal hung up: each async poll waits out its
+/// slice instead of resolving instantly forever.
+#[test]
+fn tolerated_hangup_does_not_spin() {
+    use crate::ui::console::Console;
+    use std::time::{Duration, Instant};
+
+    let pty = nix::pty::openpty(None, None).expect("openpty");
+    let mut console = TtyConsole::from_pty(pty.slave, (24, 80)).expect("console");
+    console.hangup_is_disconnect = false;
+    drop(pty.master);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build_local(tokio::runtime::LocalOptions::default())
+        .expect("runtime");
+    let started = Instant::now();
+    let mut polls = 0u32;
+    rt.block_on(async {
+        while started.elapsed() < Duration::from_millis(500) {
+            // A hung-up pty slave may also report EIO; either way the
+            // loop must not iterate thousands of times.
+            if console
+                .poll_event(Duration::from_millis(100))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            polls += 1;
+        }
+    });
+    assert!(
+        polls < 20,
+        "polled {polls} times in 500ms: busy loop on EOF"
+    );
+}

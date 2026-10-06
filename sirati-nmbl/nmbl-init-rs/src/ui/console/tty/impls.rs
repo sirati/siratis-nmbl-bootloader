@@ -5,8 +5,6 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::pin::Pin;
 use std::time::Duration;
 
-use ratatui::backend::Backend;
-
 use crate::error::Result;
 use crate::log;
 use crate::nmbl_warn;
@@ -25,8 +23,8 @@ impl Console for TtyConsole {
     fn render(&mut self, app: &App<'_>) -> Result<()> {
         self.terminal
             .draw(|f| render_current_screen(f, app))
-            .map(|_| ())
-            .map_err(tui_err)
+            .map_err(tui_err)?;
+        self.pump_output()
     }
 
     fn poll_event<'a>(
@@ -45,13 +43,29 @@ impl Console for TtyConsole {
             // path's internal 100ms cap is harmless after we've already
             // waited: a ready fd reads immediately, a timeout drains
             // nothing. No borrow is held across the `.await`.
+            //
+            // While rendered output is still queued (a slow terminal),
+            // also wake on writability so the queue drains promptly.
             let slice = timeout.min(POLL_SLICE);
-            crate::ui::console::await_fd_readable(self.fd.as_fd(), slice).await?;
-            self.poll_event_blocking(Duration::from_millis(0))
+            let started = std::time::Instant::now();
+            crate::ui::console::await_fd_ready(self.fd.as_fd(), self.output_pending(), slice)
+                .await?;
+            let event = self.poll_event_blocking(Duration::from_millis(0))?;
+            if event.is_none() && self.input_at_eof {
+                // The primary console tolerates EOF, but its fd now polls
+                // ready forever: wait out the slice rather than spin.
+                if let Some(rest) = slice.checked_sub(started.elapsed()) {
+                    tokio::time::sleep(rest).await;
+                }
+            }
+            Ok(event)
         })
     }
 
     fn poll_event_blocking(&mut self, timeout: Duration) -> Result<Option<ConsoleEvent>> {
+        // Move queued output along whenever the terminal accepts it; a
+        // write error here is the peer disconnecting.
+        self.pump_output()?;
         // First: drain any keys / scrolls already classified from a
         // previous poll cycle without going to the fd again.
         if let Some(k) = self.pending_keys.pop_front() {
@@ -92,10 +106,11 @@ impl Console for TtyConsole {
         if let Some((cols, rows)) = self.last_resize {
             return (cols, rows);
         }
-        match self.terminal.backend().size() {
-            Ok(s) => (s.width, s.height),
-            Err(_) => (0, 0),
-        }
+        let (cols, rows) = self.terminal.backend().dimensions();
+        (
+            u16::try_from(cols).unwrap_or(u16::MAX),
+            u16::try_from(rows).unwrap_or(u16::MAX),
+        )
     }
 
     fn kind(&self) -> ConsoleKind {
@@ -103,10 +118,17 @@ impl Console for TtyConsole {
     }
 
     fn draw_with(&mut self, body: &mut dyn FnMut(&mut ratatui::Frame<'_>)) -> Result<()> {
-        self.terminal.draw(|f| body(f)).map(|_| ()).map_err(tui_err)
+        self.terminal.draw(|f| body(f)).map_err(tui_err)?;
+        self.pump_output()
     }
 
     fn suspend(&mut self) -> Result<()> {
+        // Whoever takes the display next must not interleave with a
+        // half-written frame.
+        let budget = self.drain_budget();
+        if let Err(e) = self.drain_output(budget) {
+            nmbl_warn!("TtyConsole::suspend: could not flush queued output: {e}");
+        }
         if let Some(mut q) = self.printk_quiet.take() {
             q.restore();
         }
@@ -144,7 +166,7 @@ impl Console for TtyConsole {
             log::set_tui_active();
         }
         self.terminal.clear().map_err(tui_err)?;
-        Ok(())
+        self.pump_output()
     }
 
     fn caps_lock_active(&self) -> Option<bool> {
@@ -158,6 +180,10 @@ impl Console for TtyConsole {
 
 impl Drop for TtyConsole {
     fn drop(&mut self) {
+        // Best effort: let the last frame reach the terminal, bounded so
+        // a stalled peer cannot hold PID 1.
+        let budget = self.drain_budget();
+        let _ = self.drain_output(budget);
         if let Some(mut q) = self.printk_quiet.take() {
             q.restore();
         }
@@ -172,6 +198,16 @@ impl Drop for TtyConsole {
         {
             nmbl_warn!(
                 "failed to restore termios on tty console fd {}: {e}",
+                self.fd.as_raw_fd()
+            );
+        }
+        // A remote pty's open file description is shared with the
+        // operator's shell: hand it back blocking, as we found it.
+        if let Some(flags) = self.saved_flags.take()
+            && let Err(e) = rustix::fs::fcntl_setfl(self.fd.as_fd(), flags)
+        {
+            nmbl_warn!(
+                "failed to restore file flags on tty console fd {}: {e}",
                 self.fd.as_raw_fd()
             );
         }

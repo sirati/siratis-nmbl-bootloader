@@ -320,3 +320,393 @@ fn server_returns_on_pre_signalled_shutdown_and_unlinks() {
         "socket must be unlinked after server shutdown"
     );
 }
+
+// ---- Real-pty regression: a slow remote peer must not kill the session ----
+//
+// Production symptom: an operator in the full-system rescue ran `nmbl` over
+// SSH and PID 1 logged `remote-tui: session ended (client likely gone): TUI
+// failed: Resource temporarily unavailable (os error 11)` right after the
+// first frame. The pty's slave->master buffer was full (sshd had not yet
+// drained it), the non-blocking pty write returned EAGAIN, and the session
+// treated that back-pressure as a disconnect. These tests drive the same
+// `run_remote_menu` + `TtyConsole::from_pty` path on a real pty whose
+// output buffer is already full, with the test acting as the slow peer.
+
+/// Allocate a pty pair sized `rows`x`cols`.
+fn real_pty(rows: u16, cols: u16) -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    let ws = nix::pty::Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pty = nix::pty::openpty(Some(&ws), None).expect("openpty");
+    (pty.master, pty.slave)
+}
+
+/// Simulate a peer that is not reading: write filler through the slave
+/// until the kernel refuses more (EAGAIN), so the next write the server
+/// attempts hits back-pressure. Returns how many filler bytes are queued.
+fn fill_pty_output(slave: std::os::fd::BorrowedFd<'_>) -> usize {
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+    let flags = fcntl_getfl(slave).expect("getfl");
+    fcntl_setfl(slave, flags | OFlags::NONBLOCK).expect("setfl");
+    // Raw output: no ONLCR expansion so the byte count is exact.
+    let mut termios = rustix::termios::tcgetattr(slave).expect("tcgetattr");
+    termios.make_raw();
+    rustix::termios::tcsetattr(slave, rustix::termios::OptionalActions::Now, &termios)
+        .expect("tcsetattr");
+    let chunk = [b'.'; 4096];
+    let mut queued = 0usize;
+    loop {
+        match rustix::io::write(slave, &chunk) {
+            Ok(n) => queued += n,
+            Err(rustix::io::Errno::AGAIN) => break,
+            Err(e) => panic!("filling pty failed: {e}"),
+        }
+    }
+    fcntl_setfl(slave, flags).expect("restore flags");
+    assert!(queued > 0, "pty accepted no filler");
+    queued
+}
+
+/// The slow peer: wait a while (the server must keep the session alive
+/// meanwhile), then drain the pty master. Once the emergency menu has
+/// arrived intact, press Enter (Reboot is the first item) and keep
+/// draining so the server never blocks on later frames.
+async fn slow_peer(master: std::os::fd::OwnedFd, filler: usize, transcript: Rc<RefCell<Vec<u8>>>) {
+    use tokio::io::unix::AsyncFd;
+    rustix::fs::fcntl_setfl(&master, rustix::fs::OFlags::NONBLOCK).expect("master nonblock");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let master = AsyncFd::new(master).expect("register master");
+    let mut pressed = false;
+    loop {
+        let mut guard = master.readable().await.expect("master readiness");
+        let mut chunk = [0u8; 8192];
+        match guard
+            .try_io(|fd| rustix::io::read(fd.get_ref(), &mut chunk).map_err(std::io::Error::from))
+        {
+            Ok(Ok(0)) | Ok(Err(_)) => {
+                // Server closed its side; nothing more to read.
+                std::future::pending::<()>().await;
+            }
+            Ok(Ok(n)) => transcript.borrow_mut().extend_from_slice(&chunk[..n]),
+            Err(_would_block) => continue,
+        }
+        let seen = transcript.borrow();
+        let frame = seen.get(filler..).unwrap_or(&[]);
+        if !pressed && String::from_utf8_lossy(frame).contains("Retry boot from config") {
+            drop(seen);
+            pressed = true;
+            rustix::io::write(master.get_ref(), b"\r").expect("press Enter");
+        }
+    }
+}
+
+#[test]
+fn remote_session_survives_eagain_from_a_slow_peer() {
+    use crate::ui::console::TtyConsole;
+
+    let (master, slave) = real_pty(60, 200);
+    let filler = fill_pty_output(std::os::fd::AsFd::as_fd(&slave));
+    let mut console = TtyConsole::from_pty(slave, (60, 200)).expect("console on pty");
+    let transcript = Rc::new(RefCell::new(Vec::new()));
+
+    let config = Config::recovery_default();
+    let session = SessionInteraction::new();
+    session.set();
+    let mut app = app_in_session(&session);
+    let mut errs = 0u32;
+    let sender = crate::sys::poller::build().1;
+
+    let action = block(async {
+        let menu = run_remote_menu(
+            &mut console,
+            &mut app,
+            &config,
+            &session,
+            Duration::from_secs(60),
+            &mut errs,
+            &sender,
+        );
+        let peer = slow_peer(master, filler, transcript.clone());
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::select! {
+                action = menu => action,
+                () = peer => None,
+            }
+        })
+        .await
+        .expect("remote session neither finished nor failed within 30s")
+    });
+
+    let seen = transcript.borrow();
+    assert!(
+        seen.iter().take(filler).all(|b| *b == b'.'),
+        "the peer's earlier output must arrive intact before the menu"
+    );
+    assert!(
+        String::from_utf8_lossy(seen.get(filler..).unwrap_or(&[]))
+            .contains("Retry boot from config"),
+        "the full menu must reach the slow peer"
+    );
+    assert!(
+        matches!(action, Some(TerminalAction::Reboot)),
+        "a slow peer is back-pressure, not a disconnect: the session must stay \
+         alive and act on the peer's Enter, got {action:?}"
+    );
+}
+
+#[test]
+fn remote_session_ends_when_the_peer_really_disconnects() {
+    use crate::ui::console::TtyConsole;
+
+    // Closing the master is a real hang-up: the session must end with no
+    // action (never a silent machine-wide Reboot), and must not hang.
+    let (master, slave) = real_pty(30, 100);
+    let mut console = TtyConsole::from_pty(slave, (30, 100)).expect("console on pty");
+    drop(master);
+    let session = SessionInteraction::new();
+    session.set();
+    let started = std::time::Instant::now();
+    let action = run_menu_with_session(&mut console, &session, Duration::from_secs(60));
+    assert!(
+        action.is_none(),
+        "a hung-up peer must not commit an action, got {action:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "a hung-up peer must end the session promptly"
+    );
+}
+
+#[test]
+fn remote_console_restores_the_operators_blocking_tty() {
+    use crate::ui::console::TtyConsole;
+
+    // The pty arrives over SCM_RIGHTS and shares its open file description
+    // with the operator's shell. The session must not leave that shell's
+    // terminal non-blocking (a later `cat` would fail with EAGAIN).
+    let (_master, slave) = real_pty(30, 100);
+    let shell_view = rustix::io::dup(&slave).expect("dup slave");
+    let before = rustix::fs::fcntl_getfl(&shell_view).expect("getfl");
+    assert!(!before.contains(rustix::fs::OFlags::NONBLOCK));
+    let console = TtyConsole::from_pty(slave, (30, 100)).expect("console on pty");
+    drop(console);
+    let after = rustix::fs::fcntl_getfl(&shell_view).expect("getfl");
+    assert!(
+        !after.contains(rustix::fs::OFlags::NONBLOCK),
+        "the operator's tty must be blocking again after the session"
+    );
+}
+
+// ---- Server-level regression: disconnects release everything ----------
+//
+// Production symptom: after two failed `nmbl` sessions PID 1 spun a full
+// core forever, still holding the accepted socket, the session's pty fds
+// and termwiz's socketpairs although the client was gone. This drives the
+// real accept loop + session code with real ptys and the real client.
+
+/// User+system CPU ticks consumed so far by the calling thread (the
+/// current-thread runtime that runs the server in these tests).
+fn thread_cpu_ticks() -> u64 {
+    let stat = std::fs::read_to_string("/proc/thread-self/stat").expect("thread stat");
+    let after_comm = stat.rsplit_once(')').expect("stat comm").1;
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // After the comm: [0]=state ... [11]=utime [12]=stime (fields 14/15).
+    let utime: u64 = fields[11].parse().expect("utime");
+    let stime: u64 = fields[12].parse().expect("stime");
+    utime + stime
+}
+
+/// How many of this process's fds refer to the tty at `path`.
+fn open_fds_on(path: &std::path::Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .expect("fd dir")
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter(|target| target == path)
+        .count()
+}
+
+fn tty_path(fd: std::os::fd::BorrowedFd<'_>) -> std::path::PathBuf {
+    use std::os::fd::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())).expect("tty path")
+}
+
+async fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    for _ in 0..250 {
+        if done() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting until {what}");
+}
+
+/// Let the server idle for a second and assert it did not burn CPU.
+async fn assert_server_idle(after: &str) {
+    let before = thread_cpu_ticks();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let used = thread_cpu_ticks() - before;
+    assert!(
+        used <= 10,
+        "server busy-waited after {after}: {used} CPU ticks in one idle second"
+    );
+}
+
+/// A hand-driven client: connect, pass `slave`, and await the ack.
+async fn attach(path: &std::path::Path, slave: std::os::fd::OwnedFd) -> tokio::net::UnixStream {
+    use std::os::fd::AsFd;
+    let stream = std::os::unix::net::UnixStream::connect(path).expect("connect");
+    let handshake = crate::ipc::tui_socket::Handshake {
+        term: "xterm-256color".to_string(),
+        winsize: (30, 100),
+    };
+    crate::ipc::tui_socket::send_fd_and_handshake(stream.as_fd(), slave.as_fd(), &handshake)
+        .expect("send pty");
+    drop(slave);
+    stream.set_nonblocking(true).expect("nonblocking");
+    let stream = tokio::net::UnixStream::from_std(stream).expect("register client");
+    let mut status = [0u8; 1];
+    loop {
+        stream.readable().await.expect("client readiness");
+        match stream.try_read(&mut status) {
+            Ok(1) => break,
+            Ok(_) => panic!("server closed before acknowledging"),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("reading the ack failed: {e}"),
+        }
+    }
+    assert_eq!(status[0], b'K', "server must accept the trusted peer");
+    stream
+}
+
+/// Read the operator side of a session's pty until `needle` appears.
+async fn read_until(master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>, needle: &str) {
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains(needle) {
+        let mut guard = master.readable().await.expect("master readiness");
+        let mut chunk = [0u8; 8192];
+        match guard
+            .try_io(|fd| rustix::io::read(fd.get_ref(), &mut chunk).map_err(std::io::Error::from))
+        {
+            Ok(Ok(n)) if n > 0 => seen.extend_from_slice(&chunk[..n]),
+            Ok(other) => panic!("session pty closed before {needle:?}: {other:?}"),
+            Err(_would_block) => {}
+        }
+    }
+}
+
+fn async_master(master: std::os::fd::OwnedFd) -> tokio::io::unix::AsyncFd<std::os::fd::OwnedFd> {
+    rustix::fs::fcntl_setfl(&master, rustix::fs::OFlags::NONBLOCK).expect("master nonblock");
+    tokio::io::unix::AsyncFd::new(master).expect("register master")
+}
+
+#[test]
+fn server_releases_disconnected_sessions_and_serves_a_fresh_client() {
+    use std::os::fd::AsFd;
+
+    let dir = tempfile_dir();
+    let path = dir.join("tui.sock");
+    crate::ipc::tui_socket::test_peer::TRUSTED_UID
+        .with(|uid| uid.set(Some(rustix::process::geteuid().as_raw())));
+
+    let config = Config::recovery_default();
+    let shutdown = Shutdown::new();
+    let sink: ActionSink = Rc::new(RefCell::new(None));
+    let sender = crate::sys::poller::build().1;
+
+    block(async {
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind test socket");
+        let server = super::driver::accept_loop(&listener, &config, &shutdown, &sink, &sender);
+        let script = async {
+            // 1. A client that disconnects mid-handshake.
+            drop(std::os::unix::net::UnixStream::connect(&path).expect("connect"));
+            assert_server_idle("a mid-handshake disconnect").await;
+
+            // 2. The production case: the operator's pty is full (a slow
+            // peer), then the client process goes away. The session must
+            // survive the back-pressure, then release the pty on hang-up.
+            let (master, slave) = real_pty(30, 100);
+            fill_pty_output(slave.as_fd());
+            let pts = tty_path(slave.as_fd());
+            let client = attach(&path, slave).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                open_fds_on(&pts) > 0,
+                "back-pressure must not end the session"
+            );
+            drop(client);
+            eventually("the session released the full pty", || {
+                open_fds_on(&pts) == 0
+            })
+            .await;
+            assert_server_idle("a client vanished behind a full pty").await;
+            drop(master);
+
+            // 3. The operator's terminal hangs up while the client socket
+            // stays open: the server must end the session and close the
+            // client's socket instead of polling a dead pty forever.
+            let (master, slave) = real_pty(30, 100);
+            let pts = tty_path(slave.as_fd());
+            let client = attach(&path, slave).await;
+            let master = async_master(master);
+            read_until(&master, "Retry boot from config").await;
+            drop(master);
+            let mut buf = [0u8; 16];
+            let eof = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    client.readable().await.expect("client readiness");
+                    match client.try_read(&mut buf) {
+                        Ok(n) => return n,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => return 0,
+                    }
+                }
+            })
+            .await
+            .expect("server kept the session of a hung-up terminal");
+            assert_eq!(eof, 0, "server must close the client's socket");
+            eventually("the hung-up pty was released", || open_fds_on(&pts) == 0).await;
+            assert_server_idle("the operator's terminal hung up").await;
+
+            // 4. A fresh, real `nmbl` client still gets a working session.
+            let (master, slave) = real_pty(30, 100);
+            let pts = tty_path(slave.as_fd());
+            let client_path = path.clone();
+            let client = std::thread::spawn(move || {
+                crate::ipc::tui_socket::serve_controlling_tty(&client_path, move || Ok(slave))
+            });
+            let master = async_master(master);
+            read_until(&master, "Retry boot from config").await;
+            // Ctrl+E leaves the remote session without any action.
+            rustix::io::write(master.get_ref(), b"\x05").expect("Ctrl+E");
+            eventually("the real client exited", || client.is_finished()).await;
+            let code = client.join().expect("client thread").expect("client I/O");
+            assert_eq!(code, std::process::ExitCode::SUCCESS);
+            eventually("the finished session released its pty", || {
+                open_fds_on(&pts) == 0
+            })
+            .await;
+            assert!(sink.borrow().is_none(), "Ctrl+E must not commit an action");
+            assert_server_idle("a completed session").await;
+
+            shutdown.signal();
+        };
+        tokio::join!(server, script);
+    });
+    crate::ipc::tui_socket::test_peer::TRUSTED_UID.with(|uid| uid.set(None));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A private scratch directory for the test socket.
+fn tempfile_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "nmbl-remote-test-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    dir
+}

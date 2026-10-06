@@ -287,6 +287,66 @@ def remote_tui(args, transcript, qemu):
     raise RuntimeError(f"rescue SSH/TUI did not become ready: {last_error}")
 
 
+def remote_tui_resilience(args, transcript, qemu):
+    """Regression for the production remote-TUI failure: a slow peer must be
+    back-pressure (not a disconnect), a vanished client must release its
+    session, PID 1 must go idle afterwards, and a fresh client must work."""
+    environment = os.environ.copy()
+    environment["TERM"] = "xterm-256color"
+
+    # A large terminal whose first frame exceeds the pty buffer, read only
+    # after a stall: the server's pty writes hit EAGAIN.
+    slow = subprocess.Popen(
+        ssh_command(args, "stty rows 100 cols 300; exec nmbl"),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=environment,
+    )
+    try:
+        time.sleep(3)
+        wait_for(slow, ["Reboot", "Raw Shell", "Retry boot from config"], 60,
+                 transcript, extra_proc=qemu)
+        time.sleep(2)
+        if slow.poll() is not None:
+            raise RuntimeError("remote TUI session died under pty back-pressure")
+        slow.stdin.write(b"\x05")
+        slow.stdin.flush()
+        if slow.wait(timeout=30) != 0:
+            raise RuntimeError("slow-peer remote TUI session did not end cleanly")
+    finally:
+        if slow.poll() is None:
+            slow.terminate()
+            slow.wait(timeout=10)
+
+    # The client process dies mid-session while its SSH pty stays open.
+    killed = subprocess.Popen(
+        ssh_command(args, "stty rows 30 cols 100; nmbl & c=$!; sleep 3; "
+                          "kill -9 $c; wait $c; echo NMBL_KILLED_CLIENT_\"DONE\""),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=environment,
+    )
+    try:
+        wait_for(killed, ["NMBL_KILLED_CLIENT_DONE"], 60, transcript, extra_proc=qemu)
+        killed.wait(timeout=30)
+    finally:
+        if killed.poll() is None:
+            killed.terminate()
+            killed.wait(timeout=10)
+
+    # PID 1 (NMBL, outside the rescue chroot) must be idle and hold no pty.
+    qemu.stdin.write(
+        b"set -- $(sed 's/.*) //' /proc/1/stat); a=$(( ${12} + ${13} )); sleep 3; "
+        b"set -- $(sed 's/.*) //' /proc/1/stat); b=$(( ${12} + ${13} )); "
+        b"echo pid1-cpu-ticks=$((b-a)); ls -l /proc/1/fd; "
+        b"test $((b-a)) -le 30 && ! ls -l /proc/1/fd | grep -q /dev/pts/ "
+        b"&& echo NMBL_REMOTE_TUI_IDLE_\"PASS\"\n"
+    )
+    qemu.stdin.flush()
+    wait_for(qemu, ["NMBL_REMOTE_TUI_IDLE_PASS"], 60, transcript)
+
+    # And a fresh client still gets a working session.
+    remote_tui(args, transcript, qemu)
+
+
 def hold_failed_vm(proc, transcript):
     """Keep the failed runtime and drain serial until its operator ends it."""
     with selectors.DefaultSelector() as selector:
@@ -431,6 +491,7 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
                     if denied.returncode == 0: raise RuntimeError("missing persistent identity exposed SSH")
                 else:
                     remote_tui(args, transcript, proc)
+                    remote_tui_resilience(args, transcript, proc)
             else:
                 text = wait_for(
                     proc,

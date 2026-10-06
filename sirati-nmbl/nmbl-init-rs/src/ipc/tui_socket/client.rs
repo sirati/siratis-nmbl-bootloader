@@ -40,8 +40,17 @@ pub fn connect_and_serve() -> ExitCode {
 /// Fallible body of [`connect_and_serve`].
 fn run_client() -> io::Result<ExitCode> {
     let path = resolve_socket_path()?;
-    let mut stream = StdUnixStream::connect(&path)?;
-    let tty = open_controlling_tty()?;
+    serve_controlling_tty(&path, open_controlling_tty)
+}
+
+/// Connect to the server at `path`, pass the terminal obtained from
+/// `open_tty` across, and stay quiescent until the server hangs up.
+pub(crate) fn serve_controlling_tty(
+    path: &Path,
+    open_tty: impl FnOnce() -> io::Result<OwnedFd>,
+) -> io::Result<ExitCode> {
+    let mut stream = StdUnixStream::connect(path)?;
+    let tty = open_tty()?;
     let handshake = build_handshake(tty.as_fd());
     send_fd_and_handshake(stream.as_fd(), tty.as_fd(), &handshake)?;
     drop(tty); // the server holds its own copy now.
@@ -128,7 +137,7 @@ fn build_handshake(tty: BorrowedFd<'_>) -> Handshake {
 }
 
 /// `sendmsg` the handshake payload plus the tty fd via `SCM_RIGHTS`.
-pub(super) fn send_fd_and_handshake(
+pub(crate) fn send_fd_and_handshake(
     sock: BorrowedFd<'_>,
     tty: BorrowedFd<'_>,
     handshake: &Handshake,

@@ -231,10 +231,10 @@ async fn handle_connection(
 ///   * a render/poll error occurs (typically the client disconnected),
 ///     which also just ends the session.
 ///
-/// `_stream` is held only to keep the socket open for the session's
-/// lifetime; it is consumed by value so it drops on return.
+/// `stream` is held for the session's lifetime (it drops on return,
+/// EOFing the client) and watched for the client going away.
 async fn serve_session(
-    _stream: UnixStream,
+    stream: UnixStream,
     handle: RemoteHandle,
     config: &Config,
     shutdown: &Shutdown,
@@ -298,16 +298,26 @@ async fn serve_session(
     let mut console: Box<dyn Console> =
         Box::new(LatchingConsole::new(Box::new(console), session.clone()));
 
-    let action = run_remote_menu(
-        &mut *console,
-        &mut app,
-        config,
-        &session,
-        emergency_timeout,
-        &mut error_count,
-        sender,
-    )
-    .await;
+    // The client stays connected for the whole session and never sends
+    // anything after the handshake. Its socket closing (the `nmbl`
+    // process died, its SSH session dropped) ends the session at once,
+    // even while the pty itself is still open or full.
+    let action = tokio::select! {
+        biased;
+        () = client_gone(&stream) => {
+            nmbl_warn!("remote-tui: client disconnected; ending its session");
+            None
+        }
+        action = run_remote_menu(
+            &mut *console,
+            &mut app,
+            config,
+            &session,
+            emergency_timeout,
+            &mut error_count,
+            sender,
+        ) => action,
+    };
 
     if let Some(action) = action {
         shutdown.signal();
@@ -315,6 +325,26 @@ async fn serve_session(
         let mut slot = sink.borrow_mut();
         if slot.is_none() {
             *slot = Some(action);
+        }
+    }
+}
+
+/// Resolve once the client's end of the control socket is closed (EOF,
+/// reset or error). The client never writes after the handshake, so any
+/// stray bytes are discarded. Readiness is edge-driven through tokio's
+/// reactor: this never spins.
+async fn client_gone(stream: &UnixStream) {
+    let mut sink = [0u8; 64];
+    loop {
+        if stream.readable().await.is_err() {
+            return;
+        }
+        match stream.try_read(&mut sink) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
         }
     }
 }

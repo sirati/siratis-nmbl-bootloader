@@ -84,7 +84,7 @@ pub(super) fn verify_run_dir(path: &str) -> io::Result<()> {
 pub async fn authenticate_and_receive(stream: &mut UnixStream) -> io::Result<Option<RemoteHandle>> {
     // The peercred check is immediate, so it stays untimed.
     let cred = rustix::net::sockopt::get_socket_peercred(stream.as_fd())?;
-    if !cred.uid.is_root() {
+    if !peer_is_authorised(cred.uid) {
         write_rejection(stream).await?;
         return Ok(None);
     }
@@ -101,6 +101,17 @@ pub async fn authenticate_and_receive(stream: &mut UnixStream) -> io::Result<Opt
     stream.writable().await?;
     write_all_async(stream, &[STATUS_OK]).await?;
     Ok(Some(handle))
+}
+
+/// Only root may attach. Unit tests (compiled out of every real build)
+/// may name their own unprivileged uid on the current thread so the
+/// accept loop can be exercised end to end without root.
+fn peer_is_authorised(uid: rustix::process::Uid) -> bool {
+    #[cfg(test)]
+    if let Some(trusted) = test_peer::TRUSTED_UID.with(std::cell::Cell::get) {
+        return uid.as_raw() == trusted;
+    }
+    uid.is_root()
 }
 
 /// Wait (up to [`RECV_TIMEOUT`]) for one readable event and recv the fd +
@@ -182,4 +193,14 @@ pub(super) fn recv_fd_and_handshake(fd: BorrowedFd<'_>) -> io::Result<RemoteHand
         term: hs.term,
         winsize: hs.winsize,
     })
+}
+
+#[cfg(test)]
+pub(crate) mod test_peer {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Test-only: the uid accepted on this thread instead of root.
+        pub(crate) static TRUSTED_UID: Cell<Option<u32>> = const { Cell::new(None) };
+    }
 }

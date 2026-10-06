@@ -204,19 +204,45 @@ pub trait Console {
 /// on construction and deregisters on drop, so no long-lived reactor
 /// state leaks between polls and the fd ownership stays with the
 /// backend.
+#[cfg(any(feature = "image-splash", feature = "mocking"))]
 pub(crate) async fn await_fd_readable(
     fd: std::os::fd::BorrowedFd<'_>,
+    timeout: Duration,
+) -> Result<bool> {
+    await_fd_ready(fd, false, timeout).await
+}
+
+/// Like [`await_fd_readable`], but when `writable` is set also resolves
+/// as soon as the fd accepts output. Backends with queued output use
+/// this so a slow terminal drains as soon as it can take more bytes.
+pub(crate) async fn await_fd_ready(
+    fd: std::os::fd::BorrowedFd<'_>,
+    writable: bool,
     timeout: Duration,
 ) -> Result<bool> {
     use tokio::io::Interest;
     use tokio::io::unix::AsyncFd;
 
-    let async_fd = AsyncFd::with_interest(fd, Interest::READABLE).map_err(|e| NmblError::Tui {
+    let interest = if writable {
+        Interest::READABLE | Interest::WRITABLE
+    } else {
+        Interest::READABLE
+    };
+    let async_fd = AsyncFd::with_interest(fd, interest).map_err(|e| NmblError::Tui {
         source: std::io::Error::other(format!("AsyncFd registration failed: {e}")),
     })?;
-    let ready = async_fd.readable();
+    let ready = async {
+        if writable {
+            tokio::select! {
+                r = async_fd.readable() => r,
+                w = async_fd.writable() => w,
+            }
+        } else {
+            async_fd.readable().await
+        }
+    };
     match tokio::time::timeout(timeout, ready).await {
-        // Readable: clear the readiness so the next poll re-arms, then
+        // Ready: clear the readiness so the next poll re-arms, then
         // tell the caller to drain. A reactor error surfaces as Tui.
         Ok(Ok(mut guard)) => {
             guard.clear_ready();

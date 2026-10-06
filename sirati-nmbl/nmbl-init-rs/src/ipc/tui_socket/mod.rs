@@ -21,16 +21,20 @@ mod client;
 mod codec;
 mod server;
 
+#[cfg(test)]
+pub(crate) use client::serve_controlling_tty;
 pub use client::{
     TUI_SOCK_DIR, TUI_SOCK_ENV, TUI_SOCK_PATH, TUI_SOCK_PATH_CHROOT, connect_and_serve,
 };
 pub use codec::{Handshake, RemoteHandle};
+#[cfg(test)]
+pub(crate) use server::test_peer;
 pub use server::{authenticate_and_receive, bind_listener};
 
 // Re-exports for the unit tests' `use super::*` (internal items they
 // assert on: constants, the codec helpers, and the recv/send/verify fns).
 #[cfg(test)]
-use client::send_fd_and_handshake;
+pub(crate) use client::send_fd_and_handshake;
 #[cfg(test)]
 use codec::{MAX_TERM_LEN, REJECT_MSG, STATUS_NO};
 #[cfg(test)]

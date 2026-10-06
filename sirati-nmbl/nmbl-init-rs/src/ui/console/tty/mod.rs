@@ -1,10 +1,14 @@
 //! Raw-mode tty backend for the [`Console`] abstraction.
 //!
-//! Opens `/dev/console`, enters raw mode, and drives a
-//! [`ratatui::Terminal`] over a [`TermwizBackend`] that writes through
-//! a [`BufferedTerminal`] wrapping a [`UnixTerminal`] built from our
-//! owned fd. Crossterm's `OnceLock`-backed stdin reader is never
-//! involved.
+//! Opens `/dev/console` (or adopts a remote operator's pty), enters raw
+//! mode, and drives a [`ratatui::Terminal`] over a [`QueuedBackend`]: a
+//! termwiz `Surface` + terminfo renderer that renders into an in-memory
+//! queue. The fd is non-blocking because NMBL is a single-threaded PID 1;
+//! the queue is written with non-blocking writes and drained when the fd
+//! becomes writable, so a slow terminal is back-pressure (frames
+//! coalesce) rather than an error, and one stalled remote peer can never
+//! park the whole init. Crossterm's `OnceLock`-backed stdin reader is
+//! never involved.
 //!
 //! ## Why we don't reuse [`RawModeGuard`]
 //!
@@ -13,6 +17,14 @@
 //! struct. We mirror [`crate::splash::input::SplashInput`]: own the
 //! [`OwnedFd`] plus a saved [`Termios`] snapshot and restore it on
 //! [`Drop`].
+//!
+//! ## Hang-up
+//!
+//! A remote pty whose operator went away reads EOF (or `EIO`) and polls
+//! `POLLHUP` forever. For a remote console that is a disconnect: input
+//! polling fails so the session ends and every fd is released, instead
+//! of treating EOF as "no input" and spinning. The primary console keeps
+//! its historic tolerance but waits out the poll slice after EOF.
 //!
 //! ## VT text mode
 //!
@@ -25,10 +37,7 @@
 //!
 //! ## Input pipeline
 //!
-//! Termwiz's `UnixTerminal` installs its own SIGWINCH signal handler
-//! and would happily read input bytes itself via `poll_input`. We
-//! don't call `poll_input`: instead we own the read path. Bytes come
-//! off the same fd through `rustix::io::read`, get pre-filtered by
+//! We own the read path. Bytes come off the same fd through `rustix::io::read`, get pre-filtered by
 //! [`ResizeFilter`] to extract `CSI 8;rows;cols t` host-size reports
 //! (which termwiz drops because it only synthesises `Resized` from
 //! SIGWINCH, never from the in-band report a serial-attached
@@ -39,15 +48,13 @@
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crossterm::event::KeyEvent;
 use ratatui::Terminal;
-use ratatui::backend::TermwizBackend;
 use rustix::event::{PollFd, PollFlags, poll};
-use rustix::fs::{OFlags, fcntl_setfl};
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::termios::Termios;
-use termwiz::terminal::buffered::BufferedTerminal;
-use termwiz::terminal::unix::UnixTerminal;
 
 use crate::error::Result;
 use crate::log;
@@ -59,11 +66,13 @@ use crate::ui::console::parser::{ResizeFilter, TermwizToCrossterm};
 
 use self::caps::caps_from_env_with_fallback;
 use self::kd::enter_kd_text;
-use self::util::{rustix_io_err, tui_err, tw_err};
+use self::queued::QueuedBackend;
+use self::util::{duration_to_ms, rustix_io_err, tui_err};
 
 mod caps;
 mod impls;
 mod kd;
+mod queued;
 mod util;
 
 #[cfg(test)]
@@ -94,13 +103,28 @@ fn pty_seed_size(winsize: (u16, u16)) -> (u16, u16) {
     (rows, cols)
 }
 
+/// How long dropping or suspending a console may wait for queued output
+/// to reach the primary console (a slow serial line) before giving up.
+const PRIMARY_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+/// The same bound for a remote pty. The session is over by then; a
+/// stalled peer must not hold PID 1 for long.
+const REMOTE_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+
 /// Raw-mode tty backend. See module docs for the lifetime story.
 pub struct TtyConsole {
-    /// Owns the `/dev/console` fd for the lifetime of the console.
-    /// Termwiz's `UnixTerminal` `dup()`s this internally for its own
-    /// writer; the input path reads through `self.fd` directly via
-    /// rustix non-blocking I/O.
+    /// Owns the console fd for the lifetime of the console. Input and
+    /// output both go through it with non-blocking rustix I/O.
     fd: OwnedFd,
+    /// File-status flags found on the fd's open file description before
+    /// we forced `O_NONBLOCK`. A remote pty's description is shared with
+    /// the operator's shell, so drop restores these.
+    saved_flags: Option<OFlags>,
+    /// Whether input EOF / hang-up ends the console (remote pty) or is
+    /// tolerated (the primary console).
+    hangup_is_disconnect: bool,
+    /// Set when the last input poll saw EOF on a console that tolerates
+    /// it, so the async poll waits out its slice instead of spinning.
+    input_at_eof: bool,
     /// Termios snapshot to restore on drop. `Option` so [`Drop`] can
     /// take it without leaving a dangling clone.
     saved_termios: Option<Termios>,
@@ -109,8 +133,8 @@ pub struct TtyConsole {
     previous_kd_mode: Option<libc::c_long>,
     /// Serial-console mitigation for the kernel-printk smear.
     printk_quiet: Option<PrintkQuiet>,
-    /// Ratatui terminal over the termwiz backend wrapping our owned fd.
-    terminal: Terminal<TermwizBackend>,
+    /// Ratatui terminal over the queued termwiz renderer.
+    terminal: Terminal<QueuedBackend>,
     /// Input pre-filter for `CSI 8;rows;cols t` host-resize reports.
     /// Drains bytes between `rustix::io::read` and the termwiz parser.
     resize_filter: ResizeFilter,
@@ -150,6 +174,7 @@ impl TtyConsole {
         // The primary console may be a kernel VT (framebuffer case):
         // ANSI output must stay in text mode to remain visible.
         let previous_kd_mode = enter_kd_text(fd.as_fd());
+        let saved_flags = Self::make_nonblocking(&fd);
         let terminal = Self::build_terminal(&fd, None)?;
 
         // Silence kernel-printk to console while we own the screen.
@@ -159,6 +184,9 @@ impl TtyConsole {
 
         Ok(TtyConsole {
             fd,
+            saved_flags,
+            hangup_is_disconnect: false,
+            input_at_eof: false,
             saved_termios: Some(saved),
             previous_kd_mode,
             printk_quiet,
@@ -192,9 +220,15 @@ impl TtyConsole {
         // `winsize` is `(rows, cols)` (handshake order). `build_terminal`
         // takes the same order; `last_resize`/`size()` use `(cols, rows)`.
         let (rows, cols) = pty_seed_size(winsize);
+        let saved_flags = Self::make_nonblocking(&fd);
         let terminal = Self::build_terminal(&fd, Some((rows, cols)))?;
         Ok(TtyConsole {
             fd,
+            saved_flags,
+            // The remote operator's terminal hanging up IS the session
+            // ending: never keep polling a dead pty.
+            hangup_is_disconnect: true,
+            input_at_eof: false,
             saved_termios: Some(saved),
             previous_kd_mode: None,
             printk_quiet: None,
@@ -211,61 +245,125 @@ impl TtyConsole {
         })
     }
 
-    /// Shared termwiz/ratatui terminal construction for both
-    /// constructors. `seed` overrides the surface size when the fd
-    /// reports no winsize (serial line or pty); `None` falls back to the
-    /// historic 80x24 default.
-    fn build_terminal(fd: &OwnedFd, seed: Option<(u16, u16)>) -> Result<Terminal<TermwizBackend>> {
-        // We read input from `self.fd` directly via rustix poll/read
-        // in `poll_event`, so the fd must be non-blocking.
-        if let Err(e) = fcntl_setfl(fd.as_fd(), OFlags::NONBLOCK) {
+    /// Put the console fd's open file description into non-blocking
+    /// mode and return the flags it had before, for restoration on drop.
+    fn make_nonblocking(fd: &OwnedFd) -> Option<OFlags> {
+        let saved = match fcntl_getfl(fd.as_fd()) {
+            Ok(flags) => flags,
+            Err(e) => {
+                nmbl_warn!(
+                    "TtyConsole: F_GETFL on console fd {} failed: {e}",
+                    fd.as_raw_fd()
+                );
+                return None;
+            }
+        };
+        if let Err(e) = fcntl_setfl(fd.as_fd(), saved | OFlags::NONBLOCK) {
             nmbl_warn!(
                 "TtyConsole: F_SETFL(O_NONBLOCK) on console fd {} failed: {e}; \
-                 reads may briefly block on partial sequences",
+                 reads and writes may block",
                 fd.as_raw_fd()
             );
         }
+        Some(saved)
+    }
 
-        // Build a termwiz UnixTerminal pointing at our fd. `new_with`
-        // duplicates the fd internally for its own writer; the dup'd
-        // reader is never used because we never call `poll_input` —
-        // input flows through our own rustix loop and the parser.
+    /// Shared ratatui terminal construction for both constructors.
+    /// `seed` overrides the surface size when the fd reports no winsize
+    /// (serial line or pty); `None` falls back to the historic 80x24.
+    fn build_terminal(fd: &OwnedFd, seed: Option<(u16, u16)>) -> Result<Terminal<QueuedBackend>> {
         // We feed explicit caps (bundled terminfo + truecolor) rather
         // than reading `$TERM`, since NMBL boots with no environment.
         let caps = caps_from_env_with_fallback()?;
-        let unix_term = UnixTerminal::new_with(caps, fd, fd).map_err(tw_err)?;
-        let mut buf = BufferedTerminal::new(unix_term).map_err(tw_err)?;
 
-        // `UnixTerminal::new_with` `dup()`s our fd and, during
-        // construction, calls `set_blocking(Wait)` on the read dup.
-        // `O_NONBLOCK` lives on the shared open-file-description, so
-        // that clears the flag we set above for *every* fd pointing at
-        // this OFD — including the one our rustix read loop polls.
-        // Re-assert it so `poll_event`'s reads never block.
-        if let Err(e) = fcntl_setfl(fd.as_fd(), OFlags::NONBLOCK) {
-            nmbl_warn!(
-                "TtyConsole: re-asserting O_NONBLOCK on console fd {} after termwiz \
-                 construction failed: {e}; reads may briefly block on partial sequences",
-                fd.as_raw_fd()
-            );
-        }
-
-        // `BufferedTerminal::new` seeds its `Surface` from
-        // `TIOCGWINSZ`. A serial line / freshly-allocated pty may report
-        // no winsize (0x0), so the surface would have zero area:
-        // ratatui's `draw()` autoresizes to 0x0, renders into an empty
-        // frame, the diff is empty, and *nothing* is ever written — the
-        // empty-pane regression. Seed sane dimensions so the very first
+        // A serial line / freshly-allocated pty may report no winsize
+        // (0x0): a zero-area surface renders nothing at all (the
+        // empty-pane regression). Seed sane dimensions so the very first
         // frame paints; the host's `CSI 8;rows;cols t` report later
         // corrects the geometry via `apply_resize`.
-        let (cols0, rows0) = buf.dimensions();
-        if cols0 == 0 || rows0 == 0 {
-            let (rows, cols) = seed.unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
-            buf.resize(usize::from(cols), usize::from(rows));
+        let (mut cols, mut rows) = rustix::termios::tcgetwinsize(fd.as_fd())
+            .map(|ws| (ws.ws_col, ws.ws_row))
+            .unwrap_or((0, 0));
+        if cols == 0 || rows == 0 {
+            (rows, cols) = seed.unwrap_or((DEFAULT_ROWS, DEFAULT_COLS));
         }
 
-        let backend = TermwizBackend::with_buffered_terminal(buf);
+        let backend = QueuedBackend::new(caps, usize::from(cols), usize::from(rows));
         Terminal::new(backend).map_err(tui_err)
+    }
+
+    /// Whether rendered output is still waiting for the terminal.
+    fn output_pending(&self) -> bool {
+        !self.terminal.backend().pending().is_empty()
+    }
+
+    /// Write as much queued output as the terminal accepts right now,
+    /// rendering deferred frames whenever the queue empties. `EAGAIN` is
+    /// back-pressure: the rest stays queued for the next writable event.
+    /// Any other error (`EIO` from a hung-up pty, ...) is a disconnect.
+    fn pump_output(&mut self) -> Result<()> {
+        loop {
+            let backend = self.terminal.backend_mut();
+            if backend.pending().is_empty() && !backend.render_deferred().map_err(tui_err)? {
+                return Ok(());
+            }
+            match rustix::io::write(&self.fd, backend.pending()) {
+                Ok(0) => {
+                    return Err(tui_err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "console accepted no output",
+                    )));
+                }
+                Ok(n) => backend.consume(n),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::WOULDBLOCK => {
+                    return Ok(());
+                }
+                Err(e) => return Err(rustix_io_err(e)),
+            }
+        }
+    }
+
+    /// Synchronously wait (bounded by `budget`) until queued output has
+    /// been written. Used before the console is handed to someone else
+    /// or dropped, where no later writable event will drain it.
+    fn drain_output(&mut self, budget: Duration) -> Result<()> {
+        let deadline = Instant::now() + budget;
+        loop {
+            self.pump_output()?;
+            if !self.output_pending() {
+                return Ok(());
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(());
+            };
+            let mut pfd = [PollFd::new(&self.fd, PollFlags::OUT)];
+            match poll(&mut pfd, duration_to_ms(left).max(1)) {
+                Ok(_) | Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(rustix_io_err(e)),
+            }
+        }
+    }
+
+    fn drain_budget(&self) -> Duration {
+        if self.hangup_is_disconnect {
+            REMOTE_DRAIN_BUDGET
+        } else {
+            PRIMARY_DRAIN_BUDGET
+        }
+    }
+
+    /// Input EOF: a disconnect for a remote pty, tolerated (but noted so
+    /// the async poll does not spin) on the primary console.
+    fn input_eof(&mut self) -> Result<Option<ConsoleEvent>> {
+        if self.hangup_is_disconnect {
+            return Err(tui_err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "remote terminal hung up",
+            )));
+        }
+        self.input_at_eof = true;
+        self.drain_after_eagain()
     }
 
     /// Read whatever bytes are ready on `self.fd`, run them through
@@ -275,6 +373,7 @@ impl TtyConsole {
     /// extracted from the byte stream (the pre-filter emits at most
     /// one per call).
     fn refill(&mut self, timeout_ms: i32) -> Result<Option<ConsoleEvent>> {
+        self.input_at_eof = false;
         let mut pfd = [PollFd::new(&self.fd, PollFlags::IN)];
         let ready = poll(&mut pfd, timeout_ms).map_err(rustix_io_err)?;
         if ready == 0 {
@@ -296,8 +395,8 @@ impl TtyConsole {
             let mut chunk = [0u8; 256];
             match rustix::io::read(&self.fd, &mut chunk) {
                 Ok(0) => {
-                    // EOF — flush and stop.
-                    return self.drain_after_eagain();
+                    // EOF: the terminal hung up.
+                    return self.input_eof();
                 }
                 Ok(n) => {
                     let slice = chunk.get(..n).unwrap_or(&[]);
@@ -368,7 +467,6 @@ impl TtyConsole {
         // the stale surface size, so the surface is the source of truth.
         self.terminal
             .backend_mut()
-            .buffered_terminal_mut()
             .resize(usize::from(cols), usize::from(rows));
         if let Err(e) = self
             .terminal
