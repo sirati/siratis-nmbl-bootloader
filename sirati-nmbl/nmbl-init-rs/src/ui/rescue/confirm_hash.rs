@@ -34,7 +34,7 @@ impl HashConfirmState {
 }
 
 /// Pure input-handler for the hash-confirm screen. Returns `Some(outcome)`
-/// when the operator has committed (Y/N/Enter/Esc/A) and `None` when
+/// when the operator has committed (Y/N/Enter/Esc) and `None` when
 /// the loop should re-render and read the next event. Editing keys
 /// mutate `state` in place.
 ///
@@ -61,7 +61,9 @@ pub(crate) fn handle_hash_key(
             }
         }
         KeyCode::Char('n') | KeyCode::Char('N') => Some(HashConfirmation::Mismatch),
-        KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Esc => Some(HashConfirmation::Aborted),
+        // Esc only: 'a'/'A' are hex digits the operator types into the
+        // expected hash, so they must not abort.
+        KeyCode::Esc => Some(HashConfirmation::Aborted),
         KeyCode::Enter => {
             let outcome = if computed_hex.eq_ignore_ascii_case(state.expected.as_str()) {
                 HashConfirmation::Confirmed
@@ -203,6 +205,6 @@ pub(crate) fn render_confirm_hash(
         .wrap(Wrap { trim: false });
     frame.render_widget(expected_para, right);
 
-    let hint = "Y=confirm  N=mismatch  A/Esc=abort  Enter=auto  edit expected to override";
+    let hint = "Y=confirm  N=mismatch  Esc=abort  Enter=auto  edit expected to override";
     frame.render_widget(Paragraph::new(hint).alignment(Alignment::Right), footer);
 }

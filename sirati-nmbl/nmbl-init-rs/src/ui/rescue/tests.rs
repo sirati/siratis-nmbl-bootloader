@@ -239,3 +239,18 @@ fn make_rescue_ui_returns_default_state() {
     assert_eq!(ui.spinner_phase, 0);
     assert!(ui.last_redraw.is_none());
 }
+
+/// A typed expected hash may contain every hex digit, including `a`/`A`:
+/// typing the digest and pressing Enter confirms it.
+#[test]
+fn handle_hash_key_accepts_a_typed_hex_digest() {
+    let h = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let mut state = HashConfirmState::new("", 0);
+    for c in h.chars() {
+        let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert_eq!(handle_hash_key(key, &mut state, h), None, "typing {c:?}");
+    }
+    assert_eq!(state.expected, h);
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(handle_hash_key(enter, &mut state, h), Some(HashConfirmation::Confirmed));
+}

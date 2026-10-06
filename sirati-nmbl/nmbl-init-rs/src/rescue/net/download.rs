@@ -130,10 +130,16 @@ fn write_all_to_fd<F: rustix::fd::AsFd>(fd: F, mut buf: &[u8]) -> Result<()> {
 /// the chrooted rescue `/init` needs to write into the root, which a
 /// bare read-only squashfs mount cannot support.
 pub(super) fn mount_overlay_for_child(
+    config: &crate::config::Config,
     backing: &rustix::fd::OwnedFd,
     format: crate::rescue::RescueImageFormat,
 ) -> Result<&'static std::path::Path> {
     use std::path::{Path, PathBuf};
+
+    // `loop`, the image filesystem and `overlay` are loaded on demand, not
+    // at boot; the disk path loads them after its pin check, this path
+    // never reaches that, so load them here before touching loop-control.
+    crate::rescue::disk::ensure_rescue_disk_modules(config, format);
 
     // Shared allocate→open→configure dance (`sys::loopdev::loop_bind_ro`);
     // re-wrap its stage tag verbatim so the network-rescue banner matches the

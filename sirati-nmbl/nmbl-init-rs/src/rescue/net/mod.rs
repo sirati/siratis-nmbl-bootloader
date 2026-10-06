@@ -188,7 +188,7 @@ fn run_network_attempt<R: RescueUi>(
 
     // Mount the downloaded squashfs as a writable overlay at /rescue and
     // hand the path back; the caller runs the chrooted child against it.
-    mount_overlay_for_child(&memfd, config.rescue.image.format).map_err(NetAttemptOutcome::Fatal)
+    mount_overlay_for_child(config, &memfd, config.rescue.image.format).map_err(NetAttemptOutcome::Fatal)
 }
 
 // ---------------------------------------------------------------------------

@@ -94,9 +94,9 @@ pub fn prepare_disk_rescue(
     // loop + squashfs are NO LONGER eagerly loaded on every boot (they
     // were dropped from NMBL's runtime explicit-load list in
     // lib/options.nix). NMBL needs them only to loop-mount this blob, so
-    // we load them ON DEMAND right here — the single choke point every
-    // rescue entry path (interactive emergency + force_on_boot) funnels
-    // through before touching /dev/loop-control. Their .ko still ship in
+    // we load them ON DEMAND below, before touching /dev/loop-control (the
+    // network rescue path, which never reaches this function, loads them
+    // in `net::download::mount_overlay_for_child`). Their .ko still ship in
     // the initramfs (lib/config.nix `rescueDiskModules` keeps them in the
     // staged closure), so this load resolves. Best-effort: if the normal
     // boot path already loaded them (e.g. root on squashfs) this is a
@@ -178,7 +178,7 @@ fn rescue_disk_modules(format: super::RescueImageFormat) -> [&'static str; 3] {
 /// squashfs `mount`, or `overlay` `mount` fails with a far more
 /// actionable, stage-tagged [`NmblError::Rescue`] than a premature bail
 /// here would give.
-fn ensure_rescue_disk_modules(config: &Config, format: super::RescueImageFormat) {
+pub(crate) fn ensure_rescue_disk_modules(config: &Config, format: super::RescueImageFormat) {
     let modules: Vec<String> = rescue_disk_modules(format)
         .iter()
         .map(|m| m.to_string())

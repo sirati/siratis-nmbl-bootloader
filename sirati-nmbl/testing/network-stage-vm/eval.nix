@@ -3,6 +3,7 @@
   bakedStatic ? false,
   bakedSlaac ? false,
   nativeIdentity ? false,
+  networkRescue ? false,
   publicKeyPath,
   publicKeyHash,
   sshPublicKeyPath,
@@ -28,7 +29,8 @@ let
   baseline = (flake.lib.mkNetworkStageVmConfig { inherit publicKey sshPublicKey; }).extendModules {
     modules = [ { boot.nmbl.rescue.fullSystem.console = consoleFixture; } ];
   };
-  config = if !(bakedStatic || bakedSlaac || nativeIdentity) then baseline else baseline.extendModules {
+  baked = bakedStatic || bakedSlaac || nativeIdentity || networkRescue;
+  config = if !baked then baseline else baseline.extendModules {
     modules = [ {
       boot.nmbl.signing.enable = lib.mkForce false;
       boot.nmbl.signing.enforce = lib.mkForce false;
@@ -42,7 +44,12 @@ let
           ipv6 = { addresses = [ "2a01:4f8:1c17:5100::1/64" ]; gateway = "fe80::1"; gatewayOnLink = true; };
         } ]);
       };
-    } ] ++ lib.optional nativeIdentity {
+    } ] ++ lib.optional networkRescue {
+      # The disk carries no rescue image: NMBL falls back to downloading it
+      # over its own DHCP-configured NIC (the F.5 golden path).
+      boot.nmbl.rescue.network = true;
+      boot.nmbl.rescue.nicDrivers = lib.mkForce [ "virtio_net" ];
+    } ++ lib.optional nativeIdentity {
       boot.nmbl.bootstrap.kernelModules.explicit = lib.mkAfter [ "btrfs" ];
       boot.nmbl.rescue.fullSystem.identityVolume = { device = "/dev/vdb"; fsType = "btrfs"; options = [ "subvol=@persistent" ]; };
       boot.nmbl.rescue.fullSystem.hostKeyPath = lib.mkForce "/nmbl-identity/etc/ssh/ssh_host_ed25519_key";
@@ -83,6 +90,6 @@ pkgs.linkFarm "nmbl-network-stage-vm-artifacts" ([
   { name = "config.toml"; path = build.nmblConfigToml; }
   { name = "rescue.sfs"; path = build.nmblRescueSquashfs; }
   { name = "rescue-tools.erofs"; path = build.nmblRescueTools; }
-  ] ++ lib.optional (!(bakedStatic || bakedSlaac || nativeIdentity)) { name = "network.erofs"; path = build.nmblNetworkStage; } ++ lib.optional (!(bakedStatic || bakedSlaac || nativeIdentity))
+  ] ++ lib.optional (!baked) { name = "network.erofs"; path = build.nmblNetworkStage; } ++ lib.optional (!baked)
   { name = "rescue-installer"; path = build.nmblRescueStageInstaller; }
 )

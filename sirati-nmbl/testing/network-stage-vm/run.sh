@@ -18,7 +18,7 @@ cleanup() {
     return
   fi
   chmod -R u+w "$work_root" 2>/dev/null || true
-  rm -f "$artifact_roots/signer" "$artifact_roots/signed" "$artifact_roots/baked-static" "$artifact_roots/baked-slaac" "$artifact_roots/native-identity"
+  rm -f "$artifact_roots/signer" "$artifact_roots/signed" "$artifact_roots/baked-static" "$artifact_roots/baked-slaac" "$artifact_roots/native-identity" "$artifact_roots/network-rescue"
   rm -rf "$operator_root" "$work_root"
 }
 trap cleanup EXIT INT TERM
@@ -63,6 +63,12 @@ slaac_artifacts=$(nix build --out-link "$artifact_roots/baked-slaac" --print-out
 
 native_artifacts=$(nix build --out-link "$artifact_roots/native-identity" --print-out-paths \
   --file "$source_tree/testing/network-stage-vm/eval.nix" --arg nativeIdentity true \
+  --argstr source "$source_tree" --argstr publicKeyPath "$public_key" \
+  --argstr publicKeyHash "$public_hash" --argstr sshPublicKeyPath "$ssh_public_key" \
+  --argstr sshPublicKeyHash "$ssh_public_hash")
+
+netrescue_artifacts=$(nix build --out-link "$artifact_roots/network-rescue" --print-out-paths \
+  --file "$source_tree/testing/network-stage-vm/eval.nix" --arg networkRescue true \
   --argstr source "$source_tree" --argstr publicKeyPath "$public_key" \
   --argstr publicKeyHash "$public_hash" --argstr sshPublicKeyPath "$ssh_public_key" \
   --argstr sshPublicKeyHash "$ssh_public_hash")
@@ -324,10 +330,32 @@ qemu-img create -f qcow2 -F raw -b "$work_root/native-state.img" "$work_root/nat
 python3 "$harness" scan --key "$private_key" --key "$ssh_private_key" --marker "$marker" \
   "$native_artifacts" "$native_stage" "$work_root/native-initrd"
 
+# Network rescue: the boot partition carries no rescue image, so NMBL must
+# download the stage-2 EROFS image and loop-mount it itself.
+netrescue_stage="$work_root/netrescue-boot"
+mkdir -p "$netrescue_stage/nmbl" "$work_root/netrescue-http"
+cp "$netrescue_artifacts/config.toml" "$netrescue_stage/nmbl/config.toml"
+cp "$stage/rescue-host-ed25519" "$stage/rescue-host-ed25519.pub" "$netrescue_stage/"
+install -m 0644 "$netrescue_artifacts/rescue-tools.erofs" "$netrescue_stage/nmbl/rescue-tools.erofs"
+grep -qx 'network = true' "$netrescue_stage/nmbl/config.toml"
+grep -qx 'format = "erofs"' "$netrescue_stage/nmbl/config.toml"
+test ! -e "$netrescue_stage/nmbl-rescue.sfs"
+make_disk "$netrescue_stage" "$work_root/network-rescue.img"
+install -m 0644 "$netrescue_artifacts/rescue.sfs" "$work_root/netrescue-http/nmbl-rescue.sfs"
+python3 "$harness" scan --key "$private_key" --key "$ssh_private_key" --marker "$marker" \
+  "$netrescue_artifacts" "$netrescue_stage" "$work_root/network-rescue.img"
+
 rm -f "$private_key" "$operator_root/do-not-export.marker"
 test ! -e "$private_key"
 
 ssh_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+
+python3 "$harness" boot --qemu "$qemu" --passt @passt@ \
+  --kernel "$netrescue_artifacts/kernel" --initrd "$netrescue_artifacts/initrd" \
+  --disk "$work_root/network-rescue.img" --transcript "$work_root/network-rescue.log" \
+  --ssh @ssh@ --ssh-port "$ssh_port" --ssh-key "$ssh_private_key" \
+  --ssh-host-key "$stage/rescue-host-ed25519.pub" \
+  --rescue-image "$work_root/netrescue-http/nmbl-rescue.sfs" --mode network-rescue
 
 for scenario in good tampered unsigned malformed substituted tools-tampered; do
   mode=invalid

@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import json
 import os
+import select
 import selectors
 import signal
 import socket
@@ -86,9 +87,10 @@ def console_image(args):
     print("complete initramfs console preload and module bytes verified", flush=True)
 
 
-def wait_for(proc, patterns, timeout, transcript, extra_proc=None, marks=None):
+def wait_for(proc, patterns, timeout, transcript, extra_proc=None, marks=None, forbidden=()):
     """Wait until every pattern was printed. `marks` maps further patterns to
-    None and receives the monotonic time each one first appeared."""
+    None and receives the monotonic time each one first appeared; any of
+    `forbidden` appearing fails at once."""
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ, True)
     if extra_proc is not None:
@@ -112,6 +114,9 @@ def wait_for(proc, patterns, timeout, transcript, extra_proc=None, marks=None):
                 sys.stdout.buffer.write(chunk)
                 sys.stdout.buffer.flush()
         text = seen.decode(errors="replace")
+        for bad in forbidden:
+            if bad in text:
+                raise RuntimeError(f"unexpected {bad!r}:\n{text[-12000:]}")
         if marks is not None:
             for mark, when in marks.items():
                 if when is None and mark in text:
@@ -370,6 +375,64 @@ def remote_tui_resilience(args, transcript, qemu):
     remote_tui(args, transcript, qemu)
 
 
+def type_keys(proc, text, transcript):
+    """Type into NMBL's serial TUI one key at a time, as an operator would.
+    A 65-byte burst into the TCG guest stalled after 42 keys."""
+    for index, key in enumerate(text):
+        proc.stdin.write(key.encode())
+        proc.stdin.flush()
+        if index == len(text) - 1:
+            return  # what the last key triggers belongs to the caller's wait
+        deadline = time.monotonic() + 0.15
+        while (left := deadline - time.monotonic()) > 0:
+            ready, _, _ = select.select([proc.stdout], [], [], left)
+            if ready:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                transcript.write(chunk)
+                transcript.flush()
+
+
+@contextlib.contextmanager
+def serve_rescue_image(image):
+    """Serve the rescue image over HTTP on the host loopback, which passt
+    exposes to the guest at its gateway address."""
+    import functools
+    import http.server
+
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler,
+                                directory=str(Path(image).parent))
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://10.0.2.2:{server.server_address[1]}/{Path(image).name}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def network_rescue(args, proc, transcript):
+    """F.5 golden path: no rescue image on disk, so the operator downloads
+    it at NMBL's source picker, confirms its hash and the downloaded EROFS
+    image is loop-mounted and started as the rescue."""
+    import hashlib
+
+    digest = hashlib.sha256(Path(args.rescue_image).read_bytes()).hexdigest()
+    with serve_rescue_image(args.rescue_image) as url:
+        wait_for(proc, ["Choose recovery action"], 240, transcript)
+        proc.stdin.write(b"n")
+        proc.stdin.flush()
+        wait_for(proc, ["Enter rescue URL"], 240, transcript)
+        type_keys(proc, url + "\r", transcript)
+        wait_for(proc, ["Computed (SHA-256)"], 600, transcript)
+        type_keys(proc, digest + "\r", transcript)
+        wait_for(proc, ["recovery system ready"], 240, transcript,
+                 forbidden=("network-rescue-failed",))
+    proc.stdin.write(b"findmnt -n -o FSTYPE / | grep -qx overlay && echo NMBL_NETWORK_RESCUE_\"PASS\"\n")
+    proc.stdin.flush()
+    wait_for(proc, ["NMBL_NETWORK_RESCUE_PASS"], 60, transcript)
+
+
 def hold_failed_vm(proc, transcript):
     """Keep the failed runtime and drain serial until its operator ends it."""
     with selectors.DefaultSelector() as selector:
@@ -398,7 +461,8 @@ def boot(args):
                 args.passt,
                 "-f", "-s", str(network_socket),
                 "--runas", f"{os.getuid()}:{os.getgid()}",
-                "-a", "88.99.80.66" if args.mode in ("baked-static", "native-identity", "missing-identity") else "10.0.2.15", "-n", "32",
+                "-a", "88.99.80.66" if args.mode in ("baked-static", "native-identity", "missing-identity") else "10.0.2.15",
+                "-n", "24" if args.mode == "network-rescue" else "32",
                 "-g", "172.31.1.1" if args.mode in ("baked-static", "native-identity", "missing-identity") else "10.0.2.2", "-M", "52:54:00:12:34:56",
                 "-D", "10.0.2.3",
                 "-t", f"127.0.0.1/{args.ssh_port}:22222",
@@ -438,7 +502,9 @@ def boot(args):
             probe = SshReadyProbe(args, started)
             probe.start()
         try:
-            if args.mode in ("good", "baked-static", "baked-slaac", "native-identity", "missing-identity", "tools-tampered"):
+            if args.mode == "network-rescue":
+                network_rescue(args, proc, transcript)
+            elif args.mode in ("good", "baked-static", "baked-slaac", "native-identity", "missing-identity", "tools-tampered"):
                 marks = {"external rescue: mounting": None}
                 boot_text = wait_for(proc, ["recovery system ready"], 240, transcript, marks=marks)
                 ready = time.monotonic()
@@ -667,7 +733,8 @@ def main():
     boot_parser.add_argument("--ssh-key", required=True)
     boot_parser.add_argument("--ssh-host-key", required=True)
     boot_parser.add_argument("--identity-disk")
-    boot_parser.add_argument("--mode", choices=["good", "invalid", "substituted", "baked-static", "baked-slaac", "native-identity", "missing-identity", "tools-tampered"], required=True)
+    boot_parser.add_argument("--rescue-image")
+    boot_parser.add_argument("--mode", choices=["good", "invalid", "substituted", "baked-static", "baked-slaac", "native-identity", "missing-identity", "tools-tampered", "network-rescue"], required=True)
     args = parser.parse_args()
     if args.command == "scan":
         scan(args)

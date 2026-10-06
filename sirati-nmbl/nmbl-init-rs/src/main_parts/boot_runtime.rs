@@ -78,7 +78,17 @@ pub(crate) fn run_force_rescue(
         }
     }
     nmbl_info!("force_on_boot: loaded rescue modules");
-    let console: Box<dyn Console> = Box::new(NoopConsole::new());
+    // The network fallback asks the operator for the image source, URL and
+    // hash, so it needs the real console; everything else here runs without
+    // operator input. The disk path drops the console before its child runs.
+    let console: Box<dyn Console> = if config.rescue.network {
+        open_console(&config, false).unwrap_or_else(|err| {
+            nmbl_warn!("force_on_boot: no console for the network rescue: {err}");
+            Box::new(NoopConsole::new())
+        })
+    } else {
+        Box::new(NoopConsole::new())
+    };
     match rescue::dispatch(&config, console, cause) {
         Ok(action) => Ok(action),
         Err(err) => {
