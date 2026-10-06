@@ -1,6 +1,7 @@
 //! Mount namespace setup for the chrooted external rescue child.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
@@ -145,6 +146,28 @@ fn preserved_target(index: usize) -> PathBuf {
     PathBuf::from(format!("{CHILD_INSTALLED}-{index}"))
 }
 
+/// Set while the rescue's shared `/mnt` covers PID 1's own `/mnt`, hiding
+/// the installed mounts below it (the boot volume, the system root).
+static PID1_MNT_COVERED: AtomicBool = AtomicBool::new(false);
+
+/// Give PID 1 back its installed mounts while the rescue keeps running.
+///
+/// A boot retried from a remote `nmbl` session inside the rescue needs the
+/// real boot volume (signature sidecars, generation state, rescue sentinel)
+/// and system root, not the rescue's `/mnt`. Detaching the cover only
+/// changes PID 1's view; the rescue's own `/mnt` is untouched. A no-op
+/// outside a rescue and when already revealed.
+pub(crate) fn reveal_installed_mounts() {
+    use nix::mount::MntFlags;
+    if !PID1_MNT_COVERED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    match umount(Path::new(PID1_MNT), MntFlags::MNT_DETACH) {
+        Ok(()) => nmbl_info!("rescue child: PID 1 uses its installed mounts again"),
+        Err(e) => nmbl_warn!("rescue child: could not uncover {PID1_MNT}: {e}"),
+    }
+}
+
 pub(super) fn apply_mount_plan(config: &Config) -> Result<()> {
     let wrap = |source: NmblError| NmblError::Rescue {
         stage: "rescue-child-mount",
@@ -172,6 +195,9 @@ pub(super) fn apply_mount_plan(config: &Config) -> Result<()> {
             }
             MountStep::RBind { src, dst } => {
                 mount_fs(Some(Path::new(src)), Path::new(dst), "none", "rbind").map_err(wrap)?;
+                if dst == PID1_MNT {
+                    PID1_MNT_COVERED.store(true, Ordering::SeqCst);
+                }
             }
             MountStep::MakeShared(p) => make_shared(Path::new(p)).map_err(wrap)?,
             MountStep::MakePrivate(p) => {
@@ -199,6 +225,10 @@ pub(super) fn teardown_mounts(config: &Config) {
         let _ = umount(&child_boot_target(installed), MntFlags::MNT_DETACH);
     }
     for target in umount_plan() {
+        // Once revealed, PID 1's `/mnt` is its own again: never detach it.
+        if target == PID1_MNT && !PID1_MNT_COVERED.swap(false, Ordering::SeqCst) {
+            continue;
+        }
         match umount(Path::new(target), MntFlags::MNT_DETACH) {
             Ok(()) => nmbl_info!("rescue child: detached {target}"),
             Err(e) => nmbl_warn!("rescue child: could not detach {target}: {e}"),

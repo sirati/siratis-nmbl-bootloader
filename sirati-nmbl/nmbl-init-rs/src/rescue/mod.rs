@@ -206,7 +206,8 @@ fn dispatch_external(
 /// chrooted child opens its own `/dev/console`, and the boot console's
 /// Drop must run so KD_TEXT/termios are restored before the child paints.
 /// On child exit we reboot — the configured post-rescue default — so the
-/// system does not sit at an idle PID 1.
+/// system does not sit at an idle PID 1. An action committed from a
+/// remote `nmbl` session inside the rescue is returned instead.
 fn run_chrooted_external(
     config: &Config,
     console: Box<dyn Console>,
@@ -232,10 +233,12 @@ fn run_chrooted_external(
         run_external_rescue_child(config, rescue_dir, &entrypoint, sender).await
     });
     match run {
-        // Runtime built and the child ran to completion (or the bind /
-        // fork failed and was reported). Either way NMBL stayed PID 1;
-        // reboot back into the normal flow.
-        Ok(Ok(())) => Ok(TerminalAction::Reboot),
+        // A remote `nmbl` session inside the rescue committed an action;
+        // the rescue is already stopped and unmounted.
+        Ok(Ok(Some(action))) => Ok(action),
+        // Runtime built and the child ran to completion. NMBL stayed
+        // PID 1; reboot back into the normal flow.
+        Ok(Ok(None)) => Ok(TerminalAction::Reboot),
         Ok(Err(e)) => Ok(halt_with_banner(NmblError::Rescue {
             stage: "rescue-child-failed",
             source: Box::new(e),

@@ -6,7 +6,8 @@ umask 077
 # stage-1 persistent ext4 store -> signed config + EROFS /nix generation
 # selected by `active` -> kexec into NixOS on a tmpfs root. Then exercises
 # rollback of a failed untested generation and, after a tested generation
-# fails, the signed rescue with the signed network stage and recovery SSH.
+# fails, the signed rescue with the signed network stage and recovery SSH,
+# from which `nmbl` run over SSH boots the generation again.
 # Generations are signed through key commands and delivered by the production
 # nmbl-erofs-deploy -> nmbl-erofs-receive stream.
 

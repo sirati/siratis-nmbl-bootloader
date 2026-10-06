@@ -90,6 +90,9 @@ pub async fn retry_boot(
     sender: &crate::sys::poller::LocalSender,
 ) -> Result<TerminalAction> {
     nmbl_info!("emergency action: retry boot from config");
+    // Retried from `nmbl` inside a running rescue: boot from the installed
+    // boot volume and system root, which the rescue's `/mnt` covers.
+    crate::rescue::child::reveal_installed_mounts();
 
     // Phase 3: activations. The reporter overlays the emergency menu
     // App so the menu remains visible behind the progress indicator;

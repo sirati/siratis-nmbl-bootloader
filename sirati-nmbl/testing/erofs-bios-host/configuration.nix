@@ -78,6 +78,14 @@ nixpkgs.lib.nixosSystem {
               rm /persistent/nmbl-test/degraded
               finish NMBL_BIOS_TESTED_FAILED 4
               ;;
+            4)
+              # Booted by `nmbl` run over SSH inside the rescue: the
+              # committed choice stopped the rescue and kexec'd here.
+              wait_unit is-active nmbl-generation-success.service
+              test "$(pointer active)" = "$(cat /persistent/nmbl-test/first)"
+              test "$(pointer tested)" = "$(cat /persistent/nmbl-test/first)"
+              finish NMBL_BIOS_RESCUE_BOOTED 5
+              ;;
             *) exit 1 ;;
           esac
         '';

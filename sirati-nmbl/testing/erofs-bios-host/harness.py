@@ -5,7 +5,8 @@ Each boot starts QEMU with SeaBIOS on the whole disk (no -kernel), so GRUB,
 the NMBL kernel/initrd on vfat /boot, the stage-1 persistent store and the
 kexec into the selected EROFS generation are all real. The target system's
 step service advances the state and powers off; the final boot must land in
-the signed rescue with the signed network stage and serve recovery SSH.
+the signed rescue with the signed network stage and serve recovery SSH, and
+`nmbl` run over that SSH must boot the chosen generation.
 """
 
 import argparse
@@ -21,18 +22,25 @@ GRUB = "Booting `NMBL Bootloader'"
 CONFIG_LOAD = "loading full config from /mnt/boot/nmbl-generations/active/config.toml"
 
 
-def wait_for(proc, patterns, timeout, transcript, forbidden=()):
+def wait_for(proc, patterns, timeout, transcript, forbidden=(), extra_proc=None):
+    """Wait for `patterns` in `proc`'s output; `extra_proc` (the VM while an
+    SSH client is watched) is drained into the transcript meanwhile."""
     selector = selectors.DefaultSelector()
-    selector.register(proc.stdout, selectors.EVENT_READ)
+    selector.register(proc.stdout, selectors.EVENT_READ, True)
+    if extra_proc is not None:
+        selector.register(extra_proc.stdout, selectors.EVENT_READ, False)
     deadline = time.monotonic() + timeout
     seen = bytearray()
     while time.monotonic() < deadline:
+        if extra_proc is not None and extra_proc.poll() is not None:
+            raise RuntimeError(f"QEMU exited {extra_proc.returncode} during SSH")
         for key, _ in selector.select(timeout=1):
             chunk = os.read(key.fd, 65536)
             if chunk:
                 transcript.write(chunk)
                 transcript.flush()
-                seen.extend(chunk)
+                if key.data:
+                    seen.extend(chunk)
                 if os.environ.get("NMBL_VM_VERBOSE") == "1":
                     os.write(1, chunk)
         text = seen.decode(errors="replace")
@@ -106,17 +114,48 @@ def start_passt(args, network_dir):
     return passt, socket_path
 
 
-def remote_rescue(args, transcript, qemu):
+def ssh_command(args, remote, tty=False):
     host_key = Path(args.ssh_host_key).read_text().split()
     known_hosts = Path(args.transcript).with_suffix(".known-hosts")
     known_hosts.write_text(f"[127.0.0.1]:{args.ssh_port} {host_key[0]} {host_key[1]}\n")
-    command = [
-        args.ssh, "-p", str(args.ssh_port), "-i", args.ssh_key,
+    return [
+        args.ssh, *(["-tt"] if tty else []), "-p", str(args.ssh_port), "-i", args.ssh_key,
         "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
         "-o", "StrictHostKeyChecking=yes", "-o", f"UserKnownHostsFile={known_hosts}",
-        "-o", "ConnectTimeout=15", "root@127.0.0.1",
-        "findmnt -n -o OPTIONS /nmbl-network | grep -qw ro && echo NMBL_BIOS_REMOTE_OK",
+        "-o", "ConnectTimeout=15", "root@127.0.0.1", remote,
     ]
+
+
+def remote_boot(args, transcript, qemu):
+    """The operator's path out of the rescue: SSH in, run `nmbl`, retry the
+    boot and pick the generation. The committed choice must stop the rescue
+    and kexec into that generation inside this same QEMU run."""
+    environment = os.environ.copy()
+    environment["TERM"] = "xterm-256color"
+    client = subprocess.Popen(
+        ssh_command(args, "stty rows 30 cols 100; exec nmbl", tty=True),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        env=environment,
+    )
+    try:
+        wait_for(client, ["Retry boot from config"], 60, transcript, extra_proc=qemu)
+        client.stdin.write(b"t")
+        client.stdin.flush()
+        wait_for(client, ["Generations"], 120, transcript, extra_proc=qemu)
+        client.stdin.write(b"\r")
+        client.stdin.flush()
+        wait_for(qemu, ["NMBL_BIOS_RESCUE_BOOTED"], 420, transcript,
+                 forbidden=("NMBL_BIOS_STEP_FAILED", "external rescue: mounting"))
+        qemu.wait(timeout=60)
+    finally:
+        if client.poll() is None:
+            client.terminate()
+            client.wait(timeout=10)
+
+
+def remote_rescue(args, transcript, qemu):
+    command = ssh_command(
+        args, "findmnt -n -o OPTIONS /nmbl-network | grep -qw ro && echo NMBL_BIOS_REMOTE_OK")
     deadline = time.monotonic() + 120
     last = ""
     while time.monotonic() < deadline:
@@ -156,6 +195,8 @@ echo NMBL_BIOS_RESCUE_"PASS"
         proc.stdin.flush()
         wait_for(proc, ["NMBL_BIOS_RESCUE_PASS"], 90, transcript)
         remote_rescue(args, transcript, proc)
+        print("boot: expecting the generation chosen through remote nmbl", flush=True)
+        remote_boot(args, transcript, proc)
     finally:
         stop(proc)
         passt.terminate()

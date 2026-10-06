@@ -17,6 +17,9 @@
 //!    so an operator can attach over the socket while the rescue child
 //!    runs. On child exit the bind mounts are torn down (lazy
 //!    `MNT_DETACH`) and control returns to the recovery flow.
+//! 4. When a remote `nmbl` session inside the rescue commits an action
+//!    (boot a generation, reboot, ...), the rescue is stopped, synced and
+//!    unmounted, and that action is performed instead.
 
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -28,6 +31,7 @@ use nix::unistd::{ForkResult, Pid, fork};
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::sys::poller::{LocalSender, reap_child};
+use crate::terminal::TerminalAction;
 use crate::{nmbl_info, nmbl_warn};
 
 /// Where the writable rescue overlay is staged (mirrors
@@ -37,9 +41,12 @@ const RESCUE_ROOT: &str = "/rescue";
 mod mounts;
 #[path = "child_ready_paths.rs"]
 mod ready_paths;
+#[path = "child_stop.rs"]
+mod stop;
 #[cfg(test)]
 use mounts::{MountStep, child_boot_target, mount_plan, preserved_roots, umount_plan};
 use mounts::{apply_mount_plan, teardown_mounts};
+pub(crate) use mounts::reveal_installed_mounts;
 
 /// Conventional exit code surfaced when the post-fork `execve(2)` (or a
 /// pre-exec syscall) fails in the child. Matches `sys::pty`.
@@ -207,10 +214,21 @@ fn fork_rescue_child(exec: &ChildExec) -> Result<Pid> {
     }
 }
 
+/// How a rescue child run ended.
+enum RescueEnd {
+    /// The rescue exited by itself.
+    Exited(Option<WaitStatus>),
+    /// A remote `nmbl` session inside the rescue committed an action.
+    #[cfg_attr(not(feature = "remote-tui"), allow(dead_code))]
+    Committed(TerminalAction),
+}
+
 /// Run the external rescue squashfs as a chrooted child while NMBL stays
 /// PID 1, reaping it asynchronously (concurrently with the remote-attach
-/// server). Returns once the child has exited and the binds are torn
-/// down; the caller resumes the recovery flow.
+/// server). Returns `None` once the child has exited and the binds are
+/// torn down; the caller resumes the recovery flow. When a remote `nmbl`
+/// session commits an action (boot a generation, reboot, ...) the rescue
+/// is stopped and unmounted first and the action is returned.
 ///
 /// `rescue_dir` is the writable overlay from `disk::prepare_disk_rescue`
 /// (always `/rescue`); `entrypoint` is `config.rescue.entrypoint`.
@@ -219,7 +237,7 @@ pub async fn run_external_rescue_child(
     rescue_dir: &Path,
     entrypoint: &Path,
     sender: LocalSender,
-) -> Result<()> {
+) -> Result<Option<TerminalAction>> {
     debug_assert_eq!(rescue_dir, Path::new(RESCUE_ROOT));
     // Build the exec strings + set up the binds in the PARENT, before
     // fork (fork-safety: all allocation happens here).
@@ -271,7 +289,7 @@ pub async fn run_external_rescue_child(
     drop(ready_write);
     let reap = reap_with_server(config, pid, sender);
     tokio::pin!(reap);
-    let status = tokio::select! {
+    let end = tokio::select! {
         // Prefer an already delivered console-ready signal over a concurrent
         // child exit; readiness is an actual event, not a launch intention.
         biased;
@@ -283,19 +301,32 @@ pub async fn run_external_rescue_child(
             }
             reap.await
         }
-        status = &mut reap => status,
+        end = &mut reap => end,
     };
-    match status {
-        Some(WaitStatus::Exited(_, code)) => {
+    let committed = match end {
+        RescueEnd::Exited(Some(WaitStatus::Exited(_, code))) => {
             nmbl_info!("rescue child: exited with code {code}");
+            None
         }
-        Some(WaitStatus::Signaled(_, sig, _)) => {
+        RescueEnd::Exited(Some(WaitStatus::Signaled(_, sig, _))) => {
             nmbl_warn!("rescue child: killed by signal {sig}");
+            None
         }
-        other => nmbl_warn!("rescue child: reaped with status {other:?}"),
-    }
+        RescueEnd::Exited(other) => {
+            nmbl_warn!("rescue child: reaped with status {other:?}");
+            None
+        }
+        RescueEnd::Committed(action) => {
+            nmbl_info!("rescue child: remote session committed an action; stopping the rescue");
+            stop::stop_processes(pid);
+            Some(action)
+        }
+    };
     teardown_mounts(config);
-    Ok(())
+    if committed.is_some() {
+        stop::release_root(Path::new(RESCUE_ROOT));
+    }
+    Ok(committed)
 }
 
 /// The only accepted message is one typed byte from the owned rescue child.
@@ -333,19 +364,21 @@ fn record_console_ready(paths: Option<&ready_paths::ReadyPaths>) {
     nmbl_info!("rescue console ready; next boot leaves this rescue request");
 }
 
-/// Reap `pid` concurrently with the remote-attach server. The reap arm
-/// is terminal; the server runs only as long as the child lives and is
-/// dropped (its `SocketUnlinkGuard` unlinks the socket) once the child
-/// exits. Without `remote-tui` there is no server — just reap.
+/// Reap `pid` concurrently with the remote-attach server. The server runs
+/// only as long as the child lives and is dropped (its `SocketUnlinkGuard`
+/// unlinks the socket) once the child exits. A remote `nmbl` session that
+/// commits an action ends the run with that action; the caller then stops
+/// the rescue and performs it. Without `remote-tui` there is no server —
+/// just reap.
 #[cfg(feature = "remote-tui")]
-async fn reap_with_server(config: &Config, pid: Pid, sender: LocalSender) -> Option<WaitStatus> {
+async fn reap_with_server(config: &Config, pid: Pid, sender: LocalSender) -> RescueEnd {
     use crate::ui::remote::{ActionSink, Shutdown, run_remote_server};
 
     let shutdown = Shutdown::new();
     let sink: ActionSink = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let server = run_remote_server(config, shutdown.clone(), sink, &sender);
-    // Clone the sender so the rare "server returned first" branch can
-    // still reap the child (LocalSender is a cheap Rc handle).
+    let server = run_remote_server(config, shutdown.clone(), sink.clone(), &sender);
+    // Clone the sender so the "server returned without an action" branch
+    // can still reap the child (LocalSender is a cheap Rc handle).
     let reap = reap_child(pid, sender.clone());
 
     tokio::select! {
@@ -353,20 +386,24 @@ async fn reap_with_server(config: &Config, pid: Pid, sender: LocalSender) -> Opt
         // Child exited: tell the server to unlink + stop, then return.
         status = reap => {
             shutdown.signal();
-            status
+            RescueEnd::Exited(status)
         }
-        // The server only returns if a remote session committed an
-        // action (or bind failed); rescue ownership belongs to the
-        // child, so ignore any committed action and keep reaping the
-        // child to completion on a fresh reap future.
-        () = server => reap_child(pid, sender).await,
+        // The server returns once a remote session committed an action,
+        // or when it could not bind; only then keep reaping the child.
+        () = server => {
+            let committed = sink.borrow_mut().take();
+            match committed {
+                Some(action) => RescueEnd::Committed(action),
+                None => RescueEnd::Exited(reap_child(pid, sender).await),
+            }
+        }
     }
 }
 
 /// Reap without the remote server (feature off).
 #[cfg(not(feature = "remote-tui"))]
-async fn reap_with_server(_config: &Config, pid: Pid, sender: LocalSender) -> Option<WaitStatus> {
-    reap_child(pid, sender).await
+async fn reap_with_server(_config: &Config, pid: Pid, sender: LocalSender) -> RescueEnd {
+    RescueEnd::Exited(reap_child(pid, sender).await)
 }
 
 #[cfg(test)]
