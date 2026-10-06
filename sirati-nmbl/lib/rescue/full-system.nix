@@ -1,8 +1,9 @@
-# Full recovery system rescue image (`fullSystem.enable = true`): a real
-# /nix/store + nix-db squashfs with bash, btop, a root nix-daemon (flakes on),
-# and sshd. The Rust loader execs `/init` (the bash script baked in by the
-# orchestrator). Split out of lib/rescue-sfs.nix per FIX-19; the build body is
-# byte-identical to the pre-split `fullSquashfs` binding.
+# Full recovery system rescue image (`fullSystem.enable = true`): stage 2 of
+# the staged rescue. An EROFS image with a real /nix/store (+ nix db for the
+# full profile), its own kernel modules, firmware and network profile, sshd
+# and the operator's tools. NMBL (stage 1) mounts it with the `erofs` module
+# from its own initramfs, verified and digest-pinned over one descriptor, and
+# execs `/init` (the bash script baked in by the orchestrator).
 {
   pkgs,
   lib,
@@ -33,14 +34,25 @@
   dhcpcd,
   fullSystemPackagePaths,
   moduleClosurePath,
-  networkStageMarker ? "",
+  # mkfs.erofs compressor for the image (`lz4hc`, `zstd` or `none`).
+  compression ? "lz4hc",
   minimal ? false,
 }:
 
 let
-  fullSquashfs = pkgs.runCommand "nmbl-rescue.sfs"
+  # Measured on the minimal DNS-VPS profile (188 MB tree): squashfs zstd-19
+  # 57 MB; EROFS lz4hc 64 KiB clusters + tail packing/fragments/dedupe
+  # 75 MB; EROFS zstd-19 128 KiB clusters 52 MB.
+  packing = "-Eztailpacking,fragments,dedupe";
+  compressionFlags = {
+    lz4hc = [ "-zlz4hc,12" "-C65536" packing ];
+    zstd = [ "-zzstd,level=19" "-C131072" packing ];
+    none = [ ];
+  }.${compression} or (throw "unsupported rescue image compression `${compression}`");
+
+  stage2Image = pkgs.runCommand "nmbl-rescue-stage2.erofs"
     {
-      nativeBuildInputs = [ pkgs.squashfsTools pkgs.nix ];
+      nativeBuildInputs = [ pkgs.erofs-utils pkgs.nix ];
       # Exposed for evaluation checks of the rendered rescue configuration.
       passthru = { inherit sshdConfig motd; };
     }
@@ -101,10 +113,6 @@ let
       ''}
       cp ${sshdConfig}     root/etc/ssh/sshd_config
       cp ${motd}           root/etc/motd
-      ${lib.optionalString (networkStageMarker != "") ''
-        printf '%s\n' ${lib.escapeShellArg networkStageMarker} \
-          > root/etc/nmbl-network-stage
-      ''}
       cp ${authorizedKeys} root/root/.ssh/authorized_keys
 
       # Login-shell PATH for interactive recovery sessions (SetEnv in
@@ -219,14 +227,20 @@ let
       # sshd privsep dir: root:root, not group/world-writable (StrictModes).
       chmod 0711 root/var/empty
 
-      # zstd image; -all-root makes every entry uid=0 gid=0 (the kernel
-      # gives us no choice in a sandbox anyway). -no-progress keeps the
-      # build log clean.
-      mksquashfs root "$out" \
-        -comp zstd -Xcompression-level 19 \
-        -noappend \
-        -all-root \
-        -no-progress
+      # EROFS: every entry owned by root (the sandbox gives us no choice
+      # anyway), fixed timestamp and UUID for a reproducible image whose
+      # SHA-512 the runtime config pins. LZ4HC by default: the fastest
+      # decompressor, so the recovery system starts and runs from the image
+      # without squashfs's large-block zstd decompression.
+      mkfs.erofs \
+        --quiet \
+        --force-uid=0 \
+        --force-gid=0 \
+        -T 0 \
+        -U 6e6d626c-7265-7363-7565-737461676532 \
+        -L nmbl-rescue \
+        ${lib.escapeShellArgs compressionFlags} \
+        "$out" root
     '';
 in
-fullSquashfs
+stage2Image

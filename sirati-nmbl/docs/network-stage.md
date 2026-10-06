@@ -1,15 +1,16 @@
 # Rescue networking EROFS stage
 
 `boot.nmbl.rescue.fullSystem.networkStage.enable = true` moves the recovery
-kernel-module closure, firmware, and network policy out of
-`nmbl-rescue.sfs` into `/boot/nmbl/network.erofs`.
+kernel-module closure, firmware, and network policy out of the stage-2
+rescue image into `/boot/nmbl/network.erofs` (see `rescue-stages.md`).
 
-The rescue squashfs contains a trusted marker naming the boot-relative EROFS
-path. Before the rescue child starts, NMBL:
+NMBL's runtime config names the boot-relative EROFS path and pins its
+SHA-512 (`[rescue.network_stage]`). Before the rescue child starts, NMBL:
 
 1. opens the EROFS once;
 2. verifies that pinned file descriptor under the distinct
-   `nmbl:network-stage:v1` ML-DSA domain;
+   `nmbl:network-stage:v1` ML-DSA domain, then checks the configured
+   SHA-512 against the digest that check streamed;
 3. loads the minimal `erofs` filesystem module from the initramfs;
 4. binds the same descriptor read-only to a loop device; and
 5. mounts it at `/rescue/nmbl-network` with `nodev,nosuid,noexec`.
@@ -27,8 +28,8 @@ starts; the shell only applies accepted directives and never evaluates file
 content.
 
 Without a network stage (`networkStage.enable = false`, the default) the full
-rescue carries its own NIC drivers and runs dual-stack DHCP on every
-interface. With a stage configured, only the signed stage's configuration is
+rescue image carries its own NIC drivers and its baked network profile
+(static profiles, SLAAC, or dual-stack DHCP on every interface). With a stage configured, only the signed stage's configuration is
 ever applied; a missing or rejected stage keeps the rescue local-console
 only.
 
@@ -68,7 +69,9 @@ NMBL_IMAGE_KEY_FILE=/secure/off-host/image.key \
 
 `system.build.nmblRescueStageInstaller` provides that command. It signs and
 atomically installs both `nmbl-rescue.sfs` and `network.erofs` under their
-separate signature domains. The private key path must be outside `/nix/store`.
+separate signature domains. Both are pinned by the `config.toml` built with
+them, so the installed config, images and signatures must come from one
+build. The private key path must be outside `/nix/store`.
 Setting `signing.imageKeyFile` supplies the default imperative path;
 `NMBL_IMAGE_KEY_FILE` overrides it without making the key a Nix input.
 Alternatively set `signing.imageKeyCommand` to an argv that prints the key;

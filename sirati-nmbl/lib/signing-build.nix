@@ -52,6 +52,9 @@ let
     lib.optional cfg.splash.enable "image-splash"
     ++ lib.optional cfg.rescue.network "network-rescue"
     ++ lib.optional cfg.rescue.fullSystem.enable "remote-tui"
+    # The staged full-system rescue pins its stage-2 image (and networking
+    # stage) by SHA-512 in config.toml; the binary must be able to check it.
+    ++ lib.optional (cfg.rescue.mode == "external" && cfg.rescue.fullSystem.enable) "rescue-stages"
     ++ lib.optional cfg.stateful.enable "stateful"
     # IMPLICATION (FIX-16): enabling any security table pulls the
     # `secure-boot` feature into the built /init. `secureBootActive` is

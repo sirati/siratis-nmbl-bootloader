@@ -145,9 +145,14 @@ let
   # flow into the staged closure here (via `extraExplicitModules` ->
   # `allKernelModules` -> `modulesClosure`) without entering NMBL's runtime
   # eager-load list.
+  #
+  # Stage 1 of the full-system rescue is this initramfs: it carries `erofs`
+  # (the stage-2 image's filesystem) instead of `squashfs`, which only the
+  # flat busybox rescue still uses.
   rescueDiskModules =
     if cfg.rescue.mode == "external" then
-      [ "loop" "squashfs" "overlay" ]
+      [ "loop" "overlay" ]
+      ++ [ (if cfg.rescue.fullSystem.enable then "erofs" else "squashfs") ]
       ++ lib.optional (cfg.rescue.fullSystem.identityVolume != null)
         cfg.rescue.fullSystem.identityVolume.fsType
       ++ lib.optionals (cfg.rescue.fullSystem.identityVolume != null)
@@ -293,7 +298,8 @@ let
     inherit pkgs lib;
     contents = cfg.rescue.squashfsContents;
     fullSystem = {
-      inherit (cfg.rescue.fullSystem) enable minimal sshdPort rootAuthorizedKeys hostKeyPath;
+      inherit (cfg.rescue.fullSystem)
+        enable minimal sshdPort rootAuthorizedKeys hostKeyPath compression console;
       # Authenticated rescue recovery uses the same production control binary
       # and its full runtime closure, never a copied diagnostic executable.
       packages = cfg.rescue.fullSystem.packages ++ lib.optional (selectedNmblCtl != null) selectedNmblCtl;
@@ -374,6 +380,7 @@ let
     nmblInit = selectedNmblInit;
     initrdExecutables = initrdExecutablePaths;
     rescueSfs = if cfg.rescue.mode == "external" then nmblRescueSquashfs else null;
+    networkStage = nmblNetworkStage;
     # `none` mode ships no emergency shell on purpose (the emergency path
     # halts with a banner), so do not assert paths.shell is staged there.
     checkEmergencyShell = cfg.rescue.mode != "none";
@@ -401,6 +408,7 @@ let
       nmblInit = selectedNmblInit;
       initrdExecutables = initrdExecutablePaths;
       rescueSfs = if cfg.rescue.mode == "external" then nmblRescueSquashfs else null;
+      networkStage = nmblNetworkStage;
       checkEmergencyShell = cfg.rescue.mode != "none";
     };
 
@@ -470,7 +478,14 @@ in
     # assertions are written to `assertions` by ./modules/activation.nix
     # itself; do not re-append them here or every activation assertion
     # would fire twice.
-    assertions = assertionsModule.assertions;
+    assertions = assertionsModule.assertions ++ [
+      {
+        # The console replacement exists for the deterministic rescue VM
+        # tests only; a production rescue always runs the real launcher.
+        assertion = cfg.rescue.fullSystem.console == null || cfg.rescue.forceOnBoot;
+        message = "boot.nmbl.rescue.fullSystem.console is a test fixture hook and requires boot.nmbl.rescue.forceOnBoot.";
+      }
+    ];
 
     # Force assertion checking - this will fail the build if any assertions are false
     # NixOS checks assertions in system.build.toplevel, but we need to ensure they're

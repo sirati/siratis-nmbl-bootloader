@@ -28,9 +28,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{Mode, OFlags};
-use rustix::io::Errno as RustixErrno;
-
 use crate::config::Config;
 use crate::error::{NmblError, Result};
 use crate::sys::loopdev::loop_bind_ro;
@@ -67,8 +64,14 @@ const RESCUE_WORK: &str = "/run/nmbl-rescue/rw/work";
 /// `cause` is the error that triggered the rescue. It is logged
 /// before the loop-mount dance so the operator can see what failed
 /// even if the squashfs mount itself misbehaves.
-pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'static Path> {
-    let sfs_path = super::locate_sfs(config)?;
+pub fn prepare_disk_rescue(
+    config: &Config,
+    cause: &NmblError,
+    image: Result<super::image::Stage2Image>,
+    verified_digest: Option<[u8; 64]>,
+) -> Result<&'static Path> {
+    let image = image?;
+    let sfs_path = image.path;
     eprintln!(
         "[nmbl] external rescue: mounting {} (triggered by: {})",
         sfs_path.display(),
@@ -99,16 +102,26 @@ pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'stati
     // boot path already loaded them (e.g. root on squashfs) this is a
     // cheap no-op; on failure we log and proceed so `allocate_loop_device`
     // surfaces the real error with its own `loop-alloc` stage.
-    ensure_loop_squashfs_modules(config);
+    let sfs_fd = image.file.map_err(|source| NmblError::Rescue {
+        stage: "sfs-open",
+        source: Box::new(NmblError::Io {
+            source,
+            context: format!("opening {}", sfs_path.display()),
+        }),
+    })?;
 
-    let sfs_fd = rustix::fs::open(&sfs_path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-        .map_err(|e| NmblError::Rescue {
-            stage: "sfs-open",
-            source: Box::new(NmblError::Io {
-                source: io_error_from_rustix(e),
-                context: format!("opening {}", sfs_path.display()),
-            }),
-        })?;
+    // Stage-2 integrity: the config pins the exact image it was built with.
+    // Checked over the descriptor that is bound below (and, when signing is
+    // on, reusing the digest the signature check streamed over it).
+    super::image::check_pin(
+        config.rescue.image.sha512.as_deref(),
+        &sfs_fd,
+        verified_digest,
+        "rescue image",
+    )?;
+
+    let format = config.rescue.image.format;
+    ensure_rescue_disk_modules(config, format);
 
     // Shared allocate→open→configure dance (`sys::loopdev::loop_bind_ro`);
     // re-wrap its stage tag verbatim so the emergency banner reads exactly as
@@ -119,7 +132,7 @@ pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'stati
     })?;
 
     let loop_dev = PathBuf::from(format!("/dev/loop{index}"));
-    mount_overlay_root(&loop_dev)?;
+    mount_overlay_root(&loop_dev, format)?;
 
     #[cfg(feature = "secure-boot")]
     if let Err(error) = super::network_stage::prepare(config) {
@@ -130,16 +143,19 @@ pub fn prepare_disk_rescue(config: &Config, cause: &NmblError) -> Result<&'stati
 }
 
 /// Modules NMBL ITSELF needs to stage the writable rescue root before
-/// switch_root: `loop` for `LOOP_CTL_GET_FREE` on `/dev/loop-control`,
-/// `squashfs` for the read-only lower mount, and `overlay` for the
+/// switch_root: `loop` for `LOOP_CTL_GET_FREE` on `/dev/loop-control`, the
+/// image's filesystem (`erofs` for the full-system rescue, `squashfs` for
+/// the flat one) for the read-only lower mount, and `overlay` for the
 /// live-CD `/rescue` overlay ([`mount_overlay_root`]) layered over that
-/// lower with a tmpfs upper. All three are loaded into NMBL's running
-/// kernel here — the rescue `/init` runs only AFTER switch_root, far too
-/// late to provide the `overlay` this dispatch already depends on.
-const RESCUE_DISK_MODULES: [&str; 3] = ["loop", "squashfs", "overlay"];
+/// lower with a tmpfs upper. All are loaded into NMBL's running kernel
+/// here — the rescue `/init` runs only AFTER switch_root, far too late to
+/// provide the `overlay` this dispatch already depends on.
+fn rescue_disk_modules(format: super::RescueImageFormat) -> [&'static str; 3] {
+    ["loop", format.fstype(), "overlay"]
+}
 
-/// Load `loop` + `squashfs` + `overlay` on demand, immediately before the
-/// loop-mount + overlay dance.
+/// Load `loop`, the image filesystem and `overlay` on demand, immediately
+/// before the loop-mount + overlay dance.
 ///
 /// These are deliberately absent from NMBL's eager boot-time module list
 /// (lib/options.nix) — NMBL needs them only on a rescue dispatch, at most
@@ -156,15 +172,18 @@ const RESCUE_DISK_MODULES: [&str; 3] = ["loop", "squashfs", "overlay"];
 /// squashfs `mount`, or `overlay` `mount` fails with a far more
 /// actionable, stage-tagged [`NmblError::Rescue`] than a premature bail
 /// here would give.
-fn ensure_loop_squashfs_modules(config: &Config) {
-    let modules: Vec<String> = RESCUE_DISK_MODULES.iter().map(|m| m.to_string()).collect();
+fn ensure_rescue_disk_modules(config: &Config, format: super::RescueImageFormat) {
+    let modules: Vec<String> = rescue_disk_modules(format)
+        .iter()
+        .map(|m| m.to_string())
+        .collect();
     if let Err(err) = crate::modules::load_modules(
         &config.kernel_modules.modules_dir,
         &modules,
         &config.kernel_modules.blacklist,
     ) {
         eprintln!(
-            "[nmbl] external rescue: on-demand load of loop+squashfs failed \
+            "[nmbl] external rescue: on-demand load of {modules:?} failed \
              ({err}); continuing — the loop-mount will surface the real error"
         );
     }
@@ -185,7 +204,7 @@ fn ensure_loop_squashfs_modules(config: &Config) {
 /// All mount failures are wrapped in [`NmblError::Rescue`] with the
 /// `mount-rescue` stage so the emergency banner reads the same as the
 /// previous read-only path.
-pub(crate) fn mount_overlay_root(loop_dev: &Path) -> Result<()> {
+pub(crate) fn mount_overlay_root(loop_dev: &Path, format: super::RescueImageFormat) -> Result<()> {
     let wrap = |source: NmblError| NmblError::Rescue {
         stage: "mount-rescue",
         source: Box::new(source),
@@ -196,8 +215,14 @@ pub(crate) fn mount_overlay_root(loop_dev: &Path) -> Result<()> {
         ensure_dir(Path::new(dir)).map_err(wrap)?;
     }
 
-    // 1. squashfs (read-only) at the overlay lower layer.
-    mount_fs(Some(loop_dev), Path::new(RESCUE_LOWER), "squashfs", "ro").map_err(wrap)?;
+    // 1. The image (read-only) at the overlay lower layer.
+    mount_fs(
+        Some(loop_dev),
+        Path::new(RESCUE_LOWER),
+        format.fstype(),
+        "ro",
+    )
+    .map_err(wrap)?;
 
     // 2. tmpfs for the writable upper + work dirs, then carve both out.
     mount_fs(None, Path::new(RESCUE_RW), "tmpfs", "nosuid,nodev,mode=755").map_err(wrap)?;
@@ -230,12 +255,6 @@ fn ensure_dir(path: &Path) -> Result<()> {
             context: format!("creating {}", path.display()),
         }),
     }
-}
-
-/// Map a `rustix::io::Errno` to `std::io::Error` so it can ride inside
-/// `NmblError::Io`. Same shape as the helper in `sys::loopdev`.
-fn io_error_from_rustix(e: RustixErrno) -> io::Error {
-    io::Error::from_raw_os_error(e.raw_os_error())
 }
 
 #[cfg(test)]
@@ -290,7 +309,8 @@ mod tests {
             Some(PathBuf::from(&bogus_name)),
             Some(dir.path().to_path_buf()),
         );
-        let err = prepare_disk_rescue(&cfg, &cause).expect_err("missing sfs must error");
+        let err = prepare_disk_rescue(&cfg, &cause, super::super::image::open(&cfg), None)
+            .expect_err("missing sfs must error");
         match err {
             NmblError::Rescue { stage, source } => {
                 assert_eq!(stage, "locate-sfs");
@@ -314,7 +334,7 @@ mod tests {
             context: "test".to_string(),
         };
         let cfg = cfg_with_sfs(None, None);
-        let err = prepare_disk_rescue(&cfg, &cause)
+        let err = prepare_disk_rescue(&cfg, &cause, super::super::image::open(&cfg), None)
             .expect_err("missing runtime boot mountpoint must error");
         match err {
             NmblError::Rescue { stage, source } => {
@@ -355,7 +375,8 @@ mod tests {
             reason: "synthetic".to_string(),
             context: "test".to_string(),
         };
-        let err = prepare_disk_rescue(&cfg, &cause).expect_err("no loop-control must error");
+        let err = prepare_disk_rescue(&cfg, &cause, super::super::image::open(&cfg), None)
+            .expect_err("no loop-control must error");
         match err {
             NmblError::Rescue { stage, .. } => {
                 assert_eq!(stage, "loop-alloc");

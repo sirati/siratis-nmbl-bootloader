@@ -86,7 +86,9 @@ def console_image(args):
     print("complete initramfs console preload and module bytes verified", flush=True)
 
 
-def wait_for(proc, patterns, timeout, transcript, extra_proc=None):
+def wait_for(proc, patterns, timeout, transcript, extra_proc=None, marks=None):
+    """Wait until every pattern was printed. `marks` maps further patterns to
+    None and receives the monotonic time each one first appeared."""
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ, True)
     if extra_proc is not None:
@@ -110,6 +112,10 @@ def wait_for(proc, patterns, timeout, transcript, extra_proc=None):
                 sys.stdout.buffer.write(chunk)
                 sys.stdout.buffer.flush()
         text = seen.decode(errors="replace")
+        if marks is not None:
+            for mark, when in marks.items():
+                if when is None and mark in text:
+                    marks[mark] = time.monotonic()
         if all(pattern in text for pattern in patterns):
             return text
     raise RuntimeError(f"timed out waiting for {patterns}:\n{seen[-12000:].decode(errors='replace')}")
@@ -433,13 +439,22 @@ def boot(args):
             probe.start()
         try:
             if args.mode in ("good", "baked-static", "baked-slaac", "native-identity", "missing-identity"):
-                wait_for(proc, ["recovery system ready"], 240, transcript)
-                timings = {"rescue_ready": time.monotonic() - started}
+                marks = {"external rescue: mounting": None}
+                wait_for(proc, ["recovery system ready"], 240, transcript, marks=marks)
+                ready = time.monotonic()
+                timings = {"rescue_ready": ready - started}
+                entered = marks["external rescue: mounting"]
+                if entered is not None:
+                    # NMBL starts mounting the rescue -> rescue /init ready.
+                    timings["rescue_phase"] = ready - entered
                 if probe is not None:
                     probe.join(timeout=240)
                     if probe.ready_after is None:
                         raise RuntimeError("rescue SSH never accepted a command")
                     timings["ssh_ready"] = probe.ready_after
+                    if entered is not None:
+                        # NMBL starts mounting the rescue -> rescue SSH answers.
+                        timings["rescue_phase_ssh"] = started + probe.ready_after - entered
                 report_timing(args, timings)
                 console_proof(proc, qmp_socket, transcript)
                 commands = r'''
@@ -509,6 +524,10 @@ echo NMBL_NETWORK_STAGE_VM_"PASS"
                 else:
                     remote_tui(args, transcript, proc)
                     remote_tui_resilience(args, transcript, proc)
+            elif args.mode == "substituted":
+                text = wait_for(proc, ["pinned by the boot configuration"], 180, transcript)
+                if "recovery system ready" in text:
+                    raise RuntimeError("a substituted rescue image reached the rescue system")
             else:
                 text = wait_for(
                     proc,
@@ -611,7 +630,7 @@ def main():
     boot_parser.add_argument("--ssh-key", required=True)
     boot_parser.add_argument("--ssh-host-key", required=True)
     boot_parser.add_argument("--identity-disk")
-    boot_parser.add_argument("--mode", choices=["good", "invalid", "baked-static", "baked-slaac", "native-identity", "missing-identity"], required=True)
+    boot_parser.add_argument("--mode", choices=["good", "invalid", "substituted", "baked-static", "baked-slaac", "native-identity", "missing-identity"], required=True)
     args = parser.parse_args()
     if args.command == "scan":
         scan(args)

@@ -426,7 +426,13 @@ Example: external rescue with extra debug tooling.
 `boot.nmbl.rescue.fullSystem.enable = true` replaces the busybox tree with
 a recovery system that starts its own network and `sshd` (port
 `fullSystem.sshdPort`, keys `fullSystem.rootAuthorizedKeys`). NMBL stays
-PID 1 outside it, with its own root at `/nmbl-root`. An interactive SSH
+PID 1 outside it, with its own root at `/nmbl-root`.
+
+It starts in two stages (`docs/rescue-stages.md`). Stage 1 is NMBL's own
+initramfs, which carries `erofs.ko`, and its config, which names the stage-2
+image and pins its SHA-512. Stage 2 is an LZ4HC EROFS image with the recovery
+system, its NIC drivers and its baked network profile. NMBL verifies, pins and
+loop-mounts it over one descriptor. An interactive SSH
 login prints a welcome after authentication:
 
 ```text
@@ -778,7 +784,7 @@ measured or kexec'd. The sentinel forces rescue regardless of
 | `lib/modules/activation.nix` | Activation options + computed outputs. |
 | `lib/modules/kernel-modules.nix` | Module closure and `modprobe.conf`. |
 | `lib/install-bootloader.nix`, `lib/install-signing.nix`, `lib/install-gen-signing.nix` | Install hooks; install-runtime signing. |
-| `lib/rescue-sfs.nix`, `lib/staged-install.nix`, `lib/modules/driver-image.nix` | Build the rescue / staged / driver squashfs images. |
+| `lib/rescue-sfs.nix`, `lib/staged-install.nix`, `lib/modules/driver-image.nix` | Build the rescue (flat squashfs or stage-2 EROFS) / staged / driver images. |
 | `lib/tpm-enroll.nix`, `lib/security-consts.nix` | `nmbl-tpm-enroll` helper; single source of security constants. |
 | `testing/` | VM harnesses and `nix run .#test-*` apps. |
 | `ARCHITECTURE.md` | Longer-form architecture notes. |
@@ -799,8 +805,9 @@ Working:
   (`boot.nmbl.configLocation = "external"`): tiny bootstrap.toml
   embedded in the initramfs, full config.toml staged on /boot and
   edit-and-reboot at runtime.
-- **External rescue squashfs** (`boot.nmbl.rescue.mode = "external"`):
-  loop-mount + switch_root into a zstd-compressed `nmbl-rescue.sfs`
+- **External rescue** (`boot.nmbl.rescue.mode = "external"`):
+  loop-mount + switch_root into `nmbl-rescue.sfs` (a busybox squashfs, or the
+  pinned stage-2 EROFS of the full-system rescue; see `docs/rescue-stages.md`)
   on the boot partition, with `none` as a halt-only alternative.
 - **Network rescue fallback** (`boot.nmbl.rescue.network = true`):
   HTTP/1.0 download of the rescue squashfs into a `memfd`, with

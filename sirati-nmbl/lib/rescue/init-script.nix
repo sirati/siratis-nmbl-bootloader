@@ -61,11 +61,11 @@
     ${utilLinux}/bin/mount -t tmpfs    tmpfs    /tmp     2>/dev/null || true
 
     # --- kernel modules (loaded by THE RESCUE, not NMBL) ---
-    # NMBL no longer preloads the rescue's drivers; it only loads loop +
-    # squashfs (on demand) so it can loop-mount this blob. Everything the
-    # recovery system needs — overlay + ext4 (the writable scratch),
+    # NMBL does not preload the rescue's drivers; it only loads loop + erofs
+    # + overlay (on demand) so it can mount this stage-2 image. Everything
+    # the recovery system needs — overlay + ext4 (the writable scratch),
     # af_packet (dhcpcd's BPF socket) and the NIC drivers — is shipped in
-    # the signed networking stage (or legacy squashfs) and modprobe'd HERE. Done
+    # the signed networking stage (or this image) and modprobe'd HERE. Done
     # before the ext4 scratch / overlays / networking below, which depend
     # on these modules. /sys is mounted above, so firmware_class exists.
     #

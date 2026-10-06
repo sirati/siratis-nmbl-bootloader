@@ -7,5 +7,9 @@
 
 pub mod hex;
 
-#[cfg(any(feature = "network-rescue", feature = "secure-boot"))]
+#[cfg(any(
+    feature = "network-rescue",
+    feature = "secure-boot",
+    feature = "rescue-stages"
+))]
 pub mod hash;

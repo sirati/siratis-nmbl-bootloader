@@ -118,6 +118,12 @@ remote-tui = ["dep:futures-util"]
 # ML-DSA-65/87 are guaranteed present (FIX-50). `staged-boot` depends on
 # `secure-boot`.
 secure-boot = ["dep:fips204", "dep:sha2"]
+# Staged full-system rescue: the stage-2 rescue image and its networking
+# stage are pinned by SHA-512 in the runtime config. Pulls `sha2` (shared
+# with `secure-boot`) so the pin is checked even on unsigned builds. Enabled
+# by the Nix build whenever it emits a pin; a pin in a binary without this
+# feature (or `secure-boot`) fails closed.
+rescue-stages = ["dep:sha2"]
 # Opt-in staged boot (a signed config fragment + drivers on a verified
 # priority volume). Structurally implies `secure-boot`: there is no staged
 # path without signature verification (R-3 / R-6).

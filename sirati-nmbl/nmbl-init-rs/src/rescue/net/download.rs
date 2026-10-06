@@ -131,6 +131,7 @@ fn write_all_to_fd<F: rustix::fd::AsFd>(fd: F, mut buf: &[u8]) -> Result<()> {
 /// bare read-only squashfs mount cannot support.
 pub(super) fn mount_overlay_for_child(
     backing: &rustix::fd::OwnedFd,
+    format: crate::rescue::RescueImageFormat,
 ) -> Result<&'static std::path::Path> {
     use std::path::{Path, PathBuf};
 
@@ -143,7 +144,7 @@ pub(super) fn mount_overlay_for_child(
     })?;
 
     let loop_dev = PathBuf::from(format!("/dev/loop{index}"));
-    crate::rescue::disk::mount_overlay_root(&loop_dev)?;
+    crate::rescue::disk::mount_overlay_root(&loop_dev, format)?;
 
     Ok(Path::new(RESCUE_MOUNT))
 }

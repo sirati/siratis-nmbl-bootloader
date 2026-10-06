@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::rescue::RescueMode;
+use crate::rescue::{RescueImageFormat, RescueMode};
 
 /// `[rescue]` section of the operator's runtime config. Selects the
 /// rescue mode (see [`RescueMode`]) and optionally pins the on-disk
@@ -29,6 +29,18 @@ pub struct RescueConfig {
     /// regardless of where the operator's boot is mounted.
     #[serde(default)]
     pub sfs_path: Option<PathBuf>,
+
+    /// `[rescue.image]`: format and pinned digest of the image at
+    /// `sfs_path`. Rendered by the Nix build next to the image it
+    /// describes, so a config always names exactly one rescue image.
+    #[serde(default)]
+    pub image: RescueImage,
+
+    /// `[rescue.network_stage]`: the signed rescue networking EROFS the
+    /// full-system rescue mounts at `/nmbl-network`. Absent when the
+    /// rescue carries its own drivers and network profile.
+    #[serde(default)]
+    pub network_stage: Option<RescueNetworkStage>,
 
     /// Master switch for the network-rescue fallback. When `false`
     /// (the default) the External arm of [`crate::rescue::dispatch`]
@@ -91,6 +103,8 @@ impl Default for RescueConfig {
             mode: RescueMode::default(),
             identity_volume: None,
             sfs_path: None,
+            image: RescueImage::default(),
+            network_stage: None,
             network: false,
             default_url: String::new(),
             default_sha256: String::new(),
@@ -99,6 +113,32 @@ impl Default for RescueConfig {
             automatic: false,
         }
     }
+}
+
+/// `[rescue.image]`: what NMBL mounts as the rescue root.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RescueImage {
+    /// Filesystem of the image; NMBL loads only this module to mount it.
+    #[serde(default)]
+    pub format: RescueImageFormat,
+    /// Lowercase hex SHA-512 of the exact image this config was built
+    /// with. When present the image is refused unless its bytes (read
+    /// over the same pinned fd that is then loop-bound) match, so even an
+    /// older image signed with the same key cannot be substituted.
+    #[serde(default)]
+    pub sha512: Option<String>,
+}
+
+/// `[rescue.network_stage]`: the signed networking EROFS for the rescue.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RescueNetworkStage {
+    /// Boot-partition-relative path of the EROFS image.
+    pub path: PathBuf,
+    /// Lowercase hex SHA-512 of the exact stage this config was built with.
+    #[serde(default)]
+    pub sha512: Option<String>,
 }
 
 /// `[emergency_shell]` section of the runtime config. Controls which

@@ -1,4 +1,5 @@
-# Builds the external NMBL rescue squashfs blob.
+# Builds the external NMBL rescue image (flat squashfs, or the full-system
+# EROFS stage 2; see docs/rescue-stages.md).
 #
 # When `boot.nmbl.rescue.mode = "external"`, the initramfs no longer
 # carries busybox + storage activation binaries; instead, those tools
@@ -13,9 +14,9 @@
 #     a `buildEnv` + `cp -aL` FHS tree with NO /nix/store. The Rust
 #     loader execs `/bin/sh` (busybox). This is the historic behaviour.
 #
-#   * Full recovery system (`fullSystem.enable = true`): a real
-#     /nix/store + nix-db image with bash, btop, a root nix-daemon
-#     (flakes on), and sshd. The Rust loader execs `/init` (a bash
+#   * Full recovery system (`fullSystem.enable = true`): an EROFS image
+#     (stage 2) with a real /nix/store + nix-db, bash, a root nix-daemon
+#     (flakes on), sshd, its own kernel modules and network profile. The Rust loader execs `/init` (a bash
 #     script baked into the image) which brings up pseudo-filesystems,
 #     an overlay'd writable store, networking, ssh host keys, the
 #     nix-daemon and sshd, then drops to an interactive bash on the
@@ -47,6 +48,8 @@
     nicDrivers = [ ];
     coreModules = [ ];
     moduleClosure = null;
+    compression = "lz4hc";
+    console = null;
   },
 }:
 
@@ -71,7 +74,12 @@ let
   # /init script and the /bin shims. Pull them out of the package set so
   # the script does not depend on PATH being set up before it has set up
   # PATH (chicken/egg at PID 1).
-  rescueConsole = import ./rescue/console.nix { inherit pkgs; };
+  # The rescue console launcher. `fullSystem.console` replaces it only for
+  # the test-only console fixture (an internal option guarded to
+  # forceOnBoot test builds); production always uses the real launcher.
+  rescueConsole =
+    if (fullSystem.console or null) != null then fullSystem.console
+    else import ./rescue/console.nix { inherit pkgs; };
   bash = pkgs.bashInteractive;
   coreutils = pkgs.coreutils-full;
   utilLinux = pkgs.util-linux;
@@ -251,8 +259,7 @@ let
       procps kmod btrfs cryptsetup btop e2fsprogs gnugrep gnused gawk nix
       openssh dhcpcd fullSystemPackagePaths moduleClosurePath;
     minimal = fullSystem.minimal;
-    networkStageMarker = lib.optionalString fullSystem.networkStage.enable
-      fullSystem.networkStage.imagePath;
+    compression = fullSystem.compression or "lz4hc";
   };
 in
 if fullSystem.enable then fullSquashfs else flatSquashfs

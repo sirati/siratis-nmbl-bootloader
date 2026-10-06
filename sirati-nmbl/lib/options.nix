@@ -1085,6 +1085,31 @@ in
           '';
         };
 
+        compression = lib.mkOption {
+          type = lib.types.enum [ "lz4hc" "zstd" "none" ];
+          default = "lz4hc";
+          description = lib.mdDoc ''
+            Compressor for the stage-2 EROFS rescue image. `lz4hc` (the
+            default) decompresses fastest. `zstd` gives a smaller image for a
+            tight boot partition but needs a kernel with
+            `CONFIG_EROFS_FS_ZIP_ZSTD` (6.10 or later). `none` stores the
+            image uncompressed.
+          '';
+        };
+
+        console = lib.mkOption {
+          type = lib.types.nullOr lib.types.package;
+          default = null;
+          internal = true;
+          visible = false;
+          description = lib.mdDoc ''
+            Test-only replacement for the rescue console launcher
+            (`nmbl-rescue-console`). Only accepted together with
+            `rescue.forceOnBoot`, the deterministic test trigger, so a
+            production rescue always runs the real launcher.
+          '';
+        };
+
         packages = lib.mkOption {
           type = lib.types.listOf lib.types.package;
           default = with pkgs; if cfg.rescue.fullSystem.minimal then [
@@ -1185,8 +1210,10 @@ in
         default = "nmbl-rescue.sfs";
         description = lib.mdDoc ''
           Path on the boot partition, relative to the boot partition
-          root, where the rescue squashfs is staged when
-          `rescue.mode = "external"`. Leading slash is tolerated and
+          root, where the rescue image is staged when
+          `rescue.mode = "external"` (a squashfs for the flat rescue, the
+          stage-2 EROFS for `fullSystem.enable`; the format is declared in
+          NMBL's config, not by the file name). Leading slash is tolerated and
           stripped at install time and at runtime. The Rust disk-rescue
           path joins this against the runtime boot mountpoint
           (`bootstrap.bootFs.mountpoint` in bootstrap mode).

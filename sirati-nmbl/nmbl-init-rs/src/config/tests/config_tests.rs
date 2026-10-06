@@ -261,6 +261,61 @@ sfs_path = "/mnt/boot/nmbl-rescue.sfs"
 }
 
 #[test]
+fn rescue_stage2_tables_parse_when_appended_after_other_tables() {
+    // The Nix build appends `[rescue.image]` / `[rescue.network_stage]`
+    // (with digests computed from the built images) after the rendered
+    // document, i.e. after unrelated tables. TOML allows that; pin it.
+    let sha = "ab".repeat(64);
+    let raw = format!(
+        r#"
+[rescue]
+mode = "external"
+entrypoint = "/init"
+
+[tui]
+
+[rescue.image]
+format = "erofs"
+sha512 = "{sha}"
+
+[rescue.network_stage]
+path = "nmbl/network.erofs"
+sha512 = "{sha}"
+"#
+    );
+    let cfg: Config = toml::from_str(&raw).expect("stage-2 tables parse");
+    assert_eq!(
+        cfg.rescue.image.format,
+        crate::rescue::RescueImageFormat::Erofs
+    );
+    assert_eq!(cfg.rescue.image.sha512.as_deref(), Some(sha.as_str()));
+    let stage = cfg.rescue.network_stage.expect("network stage");
+    assert_eq!(stage.path, PathBuf::from("nmbl/network.erofs"));
+}
+
+#[test]
+fn rescue_image_defaults_to_unpinned_squashfs() {
+    let cfg: Config = toml::from_str("[rescue]\nmode = \"external\"\n").expect("parses");
+    assert_eq!(
+        cfg.rescue.image.format,
+        crate::rescue::RescueImageFormat::Squashfs
+    );
+    assert!(cfg.rescue.image.sha512.is_none());
+    assert!(cfg.rescue.network_stage.is_none());
+}
+
+#[test]
+fn rescue_image_rejects_unknown_format_and_fields() {
+    for raw in [
+        "[rescue.image]\nformat = \"ext4\"\n",
+        "[rescue.image]\nformat = \"erofs\"\nsha256 = \"00\"\n",
+        "[rescue.network_stage]\nsha512 = \"00\"\n",
+    ] {
+        assert!(toml::from_str::<Config>(raw).is_err(), "accepted {raw:?}");
+    }
+}
+
+#[test]
 fn rescue_section_rejects_unknown_field() {
     let toml = r#"
 [rescue]

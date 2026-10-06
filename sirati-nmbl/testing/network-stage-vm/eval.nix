@@ -21,7 +21,13 @@ let
     name = "nmbl-network-stage-vm-ssh-public.key";
     sha256 = sshPublicKeyHash;
   });
-  baseline = flake.lib.mkNetworkStageVmConfig { inherit publicKey sshPublicKey; };
+  # The console-inheritance fixture replaces the rescue console launcher
+  # through the guarded test hook, so the rescue image, its signature and
+  # the digest NMBL's config pins are all built by the production path.
+  consoleFixture = import ./console-fixture/default.nix { inherit pkgs; };
+  baseline = (flake.lib.mkNetworkStageVmConfig { inherit publicKey sshPublicKey; }).extendModules {
+    modules = [ { boot.nmbl.rescue.fullSystem.console = consoleFixture; } ];
+  };
   config = if !(bakedStatic || bakedSlaac || nativeIdentity) then baseline else baseline.extendModules {
     modules = [ {
       boot.nmbl.signing.enable = lib.mkForce false;
@@ -46,20 +52,6 @@ let
   build = config.config.system.build;
   pkgs = flake.inputs.nixpkgs.legacyPackages.x86_64-linux;
   lib = flake.inputs.nixpkgs.lib;
-  console = import ../../lib/rescue/console.nix { inherit pkgs; };
-  consoleFixture = import ./console-fixture/default.nix { inherit pkgs; };
-  fixtureClosure = pkgs.closureInfo { rootPaths = [ consoleFixture ]; };
-  rescueFixture = pkgs.runCommand "nmbl-rescue-console-regression.sfs" {
-    nativeBuildInputs = [ pkgs.squashfsTools ];
-  } ''
-    unsquashfs -quiet -dest root ${build.nmblRescueSquashfs}
-    chmod -R u+w root
-    substituteInPlace root/init --replace-fail ${console}/bin/nmbl-rescue-console ${consoleFixture}/bin/nmbl-rescue-console
-    while read -r path; do
-      if [ ! -e "root$path" ]; then cp -a "$path" "root/nix/store/"; fi
-    done < ${fixtureClosure}/store-paths
-    mksquashfs root "$out" -noappend -all-root -comp xz -processors 1
-  '';
   invalid = profile: config.extendModules {
     modules = [ {
       boot.nmbl.rescue.fullSystem.networkStage.staticProfiles = lib.mkForce [ profile ];
@@ -89,7 +81,7 @@ pkgs.linkFarm "nmbl-network-stage-vm-artifacts" ([
   { name = "kernel"; path = "${build.nmblKernel}/bzImage"; }
   { name = "initrd"; path = "${build.nmblInitramfs}/initrd"; }
   { name = "config.toml"; path = build.nmblConfigToml; }
-  { name = "rescue.sfs"; path = rescueFixture; }
+  { name = "rescue.sfs"; path = build.nmblRescueSquashfs; }
   ] ++ lib.optional (!(bakedStatic || bakedSlaac || nativeIdentity)) { name = "network.erofs"; path = build.nmblNetworkStage; } ++ lib.optional (!(bakedStatic || bakedSlaac || nativeIdentity))
   { name = "rescue-installer"; path = build.nmblRescueStageInstaller; }
 )

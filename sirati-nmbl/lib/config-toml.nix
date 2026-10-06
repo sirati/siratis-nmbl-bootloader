@@ -36,6 +36,9 @@
   # rescue handoff entrypoint exists inside, so an external-rescue build
   # is verified against its actual rescue target.
   rescueSfs ? null,
+  # The rescue networking EROFS (or null). With a full-system rescue the
+  # rendered config names it and pins its SHA-512 (`[rescue.network_stage]`).
+  networkStage ? null,
 }:
 
 let
@@ -421,6 +424,26 @@ let
 
   rawToml = tomlFormat.generate "nmbl-config.toml" tomlValue;
 
+  # Staged full-system rescue: NMBL (stage 1) learns what to mount from this
+  # config. `[rescue.image]` declares the stage-2 format and pins the exact
+  # image by SHA-512; `[rescue.network_stage]` names and pins the networking
+  # EROFS. Both digests are computed from the built images inside the
+  # builder below (no import-from-derivation) and appended as sub-tables,
+  # so the config always describes exactly the images it ships with.
+  stagedRescue = rescueSfs != null && cfg.rescue.fullSystem.enable;
+  pinNetworkStage = stagedRescue && networkStage != null;
+  sha512Of = drv: "$(sha512sum < ${drv} | cut -d' ' -f1)";
+  stagedRescueTables = lib.optionalString stagedRescue ''
+    {
+      printf '\n[rescue.image]\nformat = "erofs"\nsha512 = "%s"\n' "${sha512Of rescueSfs}"
+      ${lib.optionalString pinNetworkStage ''
+        printf '\n[rescue.network_stage]\npath = %s\nsha512 = "%s"\n' \
+          ${lib.escapeShellArg (builtins.toJSON cfg.rescue.fullSystem.networkStage.imagePath)} \
+          "${sha512Of networkStage}"
+      ''}
+    } >> config.toml
+  '';
+
   # NixOS filesystem closure as `builtins.toJSON` of a LIST of per-fs
   # objects, the exact shape the Rust `--validate-nix-filesystem-closure`
   # struct (`NixFilesystem`) deserialises: mountPoint, device, fsType,
@@ -444,14 +467,19 @@ let
 in
 pkgs.runCommand "nmbl-config.toml"
   {
-    nativeBuildInputs = lib.optional (rescueSfs != null) pkgs.squashfsTools;
+    nativeBuildInputs = lib.optional (rescueSfs != null)
+      (if stagedRescue then pkgs.erofs-utils else pkgs.squashfsTools);
   }
   (
     ''
+    cp ${rawToml} config.toml
+    chmod u+w config.toml
+    ${stagedRescueTables}
+
     # 1. Schema validation: the Rust binary parses the TOML against the
     #    runtime structs (`serde(deny_unknown_fields)`). A schema mismatch
     #    crashes `nix build` rather than surprising the operator at boot.
-    ${nmblInit}/bin/nmbl-init --validate-config=${rawToml}
+    ${nmblInit}/bin/nmbl-init --validate-config=config.toml
 
     # 1b. NixOS-closure correspondence: confirm the staged config.toml
     #     MATCHES the NixOS filesystem configuration — every root /
@@ -459,7 +487,7 @@ pkgs.runCommand "nmbl-config.toml"
     #     and mountpoint, and the toml declares no filesystem the NixOS
     #     config does not. Runs against the SAME rawToml the bootloader
     #     ships, so a mismatch fails `nix build` before any install.
-    ${nmblInit}/bin/nmbl-init --validate-nix-filesystem-closure=${fsClosureJson} --config-toml=${rawToml}
+    ${nmblInit}/bin/nmbl-init --validate-nix-filesystem-closure=${fsClosureJson} --config-toml=config.toml
   '' + lib.optionalString checkEmergencyShell ''
     # 2. Target-aware emergency-shell check. `paths.shell` (${shellPath}) is
     #    execve'd by the emergency menu's Raw Shell while NMBL is PID 1 in
@@ -482,7 +510,20 @@ pkgs.runCommand "nmbl-config.toml"
       exit 1
     fi
     echo "nmbl: emergency shell ${shellPath} is present in the initramfs."
-  '' + lib.optionalString (rescueSfs != null) ''
+  '' + lib.optionalString stagedRescue ''
+    # 3. Staged full-system rescue: inspect the ACTUAL stage-2 EROFS image
+    #    (dump.erofs reads it without mounting) and confirm the handoff
+    #    entrypoint (${rescueEntrypoint}) is a regular file in it.
+    echo "nmbl: inspecting stage-2 rescue image ${rescueSfs}"
+    dump.erofs --path=${rescueEntrypoint} ${rescueSfs} > entrypoint.txt 2>&1 || true
+    if ! grep -qxF 'Path : ${rescueEntrypoint}' entrypoint.txt \
+      || ! grep -q 'regular file' entrypoint.txt; then
+      cat entrypoint.txt >&2
+      echo "nmbl: stage-2 rescue image is missing its handoff entrypoint ${rescueEntrypoint}." >&2
+      exit 1
+    fi
+    echo "nmbl: stage-2 rescue image provides its handoff entrypoint ${rescueEntrypoint}."
+  '' + lib.optionalString (rescueSfs != null && !stagedRescue) ''
     # 3. External rescue: inspect the ACTUAL rescue squashfs without
     #    mounting it (the nix sandbox has no /dev/fuse, so squashfuse
     #    cannot mount — `unsquashfs -l` lists the contents instead).
@@ -499,6 +540,6 @@ pkgs.runCommand "nmbl-config.toml"
     fi
     echo "nmbl: rescue squashfs provides its handoff entrypoint ${rescueEntrypoint}."
   '' + ''
-    cp ${rawToml} $out
+    cp config.toml $out
   ''
   )

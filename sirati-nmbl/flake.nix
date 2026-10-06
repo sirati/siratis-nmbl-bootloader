@@ -300,11 +300,11 @@
           rescue = erofsBiosHost.config.system.build.nmblRescueSquashfs;
         in
         pkgs.runCommand "nmbl-rescue-ssh-welcome" {
-          nativeBuildInputs = [ pkgs.squashfsTools ];
+          nativeBuildInputs = [ pkgs.erofs-utils ];
         } ''
-          unsquashfs -cat ${rescue} etc/motd > motd
+          dump.erofs --cat --path=/etc/motd ${rescue} > motd
           grep -F 'NMBL rescue - run `nmbl` to enter the bootloader.' motd
-          unsquashfs -cat ${rescue} etc/ssh/sshd_config > sshd_config
+          dump.erofs --cat --path=/etc/ssh/sshd_config ${rescue} > sshd_config
           grep -qx 'PrintMotd yes' sshd_config
           touch "$out"
         '';

@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256, Sha512};
 
 use crate::error::{NmblError, Result};
 
-#[cfg(feature = "secure-boot")]
+#[cfg(any(feature = "secure-boot", feature = "rescue-stages"))]
 use std::os::fd::BorrowedFd;
 
 /// Chunk size for the streaming read loop. 64 KiB matches the typical pipe
@@ -65,7 +65,7 @@ pub fn sha512_file(path: &Path) -> Result<[u8; 64]> {
 /// never slurps the image into RAM. The returned `bytes_hashed` lets the caller
 /// assert it equals the file length (FIX-51), catching a short read or a racing
 /// truncation before trusting the digest.
-#[cfg(feature = "secure-boot")]
+#[cfg(any(feature = "secure-boot", feature = "rescue-stages"))]
 pub fn sha512_fd(fd: BorrowedFd<'_>) -> Result<([u8; 64], u64)> {
     rustix::fs::seek(fd, rustix::fs::SeekFrom::Start(0)).map_err(|e| NmblError::Io {
         source: std::io::Error::from_raw_os_error(e.raw_os_error()),

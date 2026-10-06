@@ -8,6 +8,10 @@
 //! [`crate::policy::refuse_unsigned`] → `RebootIntoRescue` (R-1) — a refuse,
 //! NOT a silent halt and NOT entering the rescue.
 //!
+//! The image is opened ONCE by [`super::image::open`]; the signature is
+//! verified over that descriptor, which is then the one bound to the loop
+//! device, and the SHA-512 streamed here is reused for the stage-2 pin.
+//!
 //! The hook mirrors the generation guard's shape ([`crate::sig::gate`]): the
 //! cryptographic decision is entirely the frozen [`crate::sig::verify`]
 //! pipeline's; this module only resolves the sidecar, opens the image once,
@@ -56,7 +60,10 @@ use crate::sig::{self, DOMAIN_RESCUE_SFS, PolicyDecision};
 /// image — this function only produces the decision, it never mounts, caps,
 /// or constructs a `TerminalAction`.
 #[must_use]
-pub fn verify_rescue_sfs_gated(config: &Config) -> PolicyDecision {
+pub fn verify_rescue_image_gated(
+    config: &Config,
+    image: &Result<super::image::Stage2Image>,
+) -> (PolicyDecision, Option<[u8; 64]>) {
     // signing safety: signing-disabled is the operator declining the feature,
     // NOT an allow-unsigned bypass of an enabled one (FIX-04). The legacy
     // (feature-free) rescue verifies nothing; this matches that posture.
@@ -64,31 +71,37 @@ pub fn verify_rescue_sfs_gated(config: &Config) -> PolicyDecision {
         crate::nmbl_info!(
             "rescue: signature verification disabled (signing.enable = false); skipping gate"
         );
-        return PolicyDecision::Proceed;
+        return (PolicyDecision::Proceed, None);
     }
-    sig::apply_policy(config, verify_rescue_sfs(config))
+    let result = verify_rescue_image(config, image);
+    let digest = result.as_ref().ok().copied();
+    (sig::apply_policy(config, result.map(|_| ())), digest)
 }
 
-/// Resolve the sidecar, open the squashfs once, and verify it over a single
-/// pinned fd under [`DOMAIN_RESCUE_SFS`]. Returns the raw verify `Result` for
-/// [`verify_rescue_sfs_gated`] to map through the policy gate.
-fn verify_rescue_sfs(config: &Config) -> Result<()> {
-    let sfs_path = super::locate_sfs(config)?;
-    let sig_path = rescue_sig_sidecar(&sfs_path, &config.signing.sig_path_suffix);
-
-    // Open the image ONCE and hand the pinned fd straight to the verify
-    // pipeline (FIX-02/FIX-64): the path is never reopened for hashing, so the
-    // bytes verified are exactly the bytes this fd refers to. `prepare_disk_rescue`
-    // opens its own fd for the loop bind afterwards; both resolve the same
-    // boot-partition path, and the enforce-refuse short-circuits before any
-    // mount so a tampered image is never loop-bound.
-    let file = std::fs::File::open(&sfs_path).map_err(|source| NmblError::Io {
-        source,
-        context: format!("open rescue squashfs {} for verify", sfs_path.display()),
+/// Resolve the sidecar and verify the image over the descriptor
+/// [`super::image::open`] pinned, under [`DOMAIN_RESCUE_SFS`]. Returns the
+/// SHA-512 streamed over that descriptor so the stage-2 pin reuses it.
+fn verify_rescue_image(
+    config: &Config,
+    image: &Result<super::image::Stage2Image>,
+) -> Result<[u8; 64]> {
+    let image = image.as_ref().map_err(|e| NmblError::Rescue {
+        stage: "locate-sfs",
+        source: Box::new(NmblError::ConfigInvalid {
+            reason: e.to_string(),
+            context: "locating the rescue image for signature verification".to_string(),
+        }),
     })?;
-    sig::verify_image_fd(
+    let sig_path = rescue_sig_sidecar(&image.path, &config.signing.sig_path_suffix);
+    // The SAME descriptor is loop-bound afterwards by `prepare_disk_rescue`
+    // (FIX-02/FIX-64): the bytes verified are exactly the bytes mounted.
+    let file = image.file.as_ref().map_err(|e| NmblError::Io {
+        source: std::io::Error::new(e.kind(), e.to_string()),
+        context: format!("open rescue image {} for verify", image.path.display()),
+    })?;
+    sig::verify_image_fd_digest(
         file.as_fd(),
-        "rescue squashfs",
+        "rescue image",
         Some(&sig_path),
         DOMAIN_RESCUE_SFS,
         config,
@@ -118,6 +131,10 @@ mod tests {
     use crate::config::RescueConfig;
     use crate::rescue::RescueMode;
     use std::path::Path;
+
+    fn gate(c: &Config) -> PolicyDecision {
+        verify_rescue_image_gated(c, &crate::rescue::image::open(c)).0
+    }
 
     fn cfg(enable: bool, enforce: bool, mountpoint: Option<PathBuf>) -> Config {
         let mut c = Config::recovery_default();
@@ -154,7 +171,7 @@ mod tests {
         // not an allow-unsigned bypass — FIX-04). A mountpoint pointing at a
         // path with no rescue image proves verify never ran.
         let c = cfg(false, false, Some(PathBuf::from("/nonexistent")));
-        assert!(verify_rescue_sfs_gated(&c).is_proceed());
+        assert!(gate(&c).is_proceed());
     }
 
     #[test]
@@ -164,10 +181,7 @@ mod tests {
         // refuse_unsigned. No baked keys are needed: the open fails first.
         let dir = tempfile::tempdir().expect("tempdir");
         let c = cfg(true, true, Some(dir.path().to_path_buf()));
-        assert!(matches!(
-            verify_rescue_sfs_gated(&c),
-            PolicyDecision::Refuse(_)
-        ));
+        assert!(matches!(gate(&c), PolicyDecision::Refuse(_)));
     }
 
     #[test]
@@ -178,7 +192,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let c = cfg(true, false, Some(dir.path().to_path_buf()));
         assert!(
-            verify_rescue_sfs_gated(&c).is_proceed(),
+            gate(&c).is_proceed(),
             "audit mode must proceed on a missing/bad rescue signature"
         );
     }
@@ -192,9 +206,6 @@ mod tests {
         let sfs = dir.path().join("nmbl-rescue.sfs");
         std::fs::write(&sfs, b"not-really-a-squashfs").expect("write sfs");
         let c = cfg(true, true, Some(dir.path().to_path_buf()));
-        assert!(matches!(
-            verify_rescue_sfs_gated(&c),
-            PolicyDecision::Refuse(_)
-        ));
+        assert!(matches!(gate(&c), PolicyDecision::Refuse(_)));
     }
 }

@@ -45,7 +45,7 @@ pub use general::{General, KernelModules};
 #[cfg(feature = "secure-boot")]
 pub use generation_image::GenerationImageConfig;
 pub use paths::Paths;
-pub use rescue_cfg::{EmergencyShellConfig, RescueConfig};
+pub use rescue_cfg::{EmergencyShellConfig, RescueConfig, RescueImage, RescueNetworkStage};
 pub use tpm::{SealedSecret, TpmConfig};
 pub use tui::Tui;
 

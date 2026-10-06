@@ -84,9 +84,11 @@ NMBL_BOOT_ROOT="$stage" NMBL_IMAGE_KEY_FILE="$private_key" "$installer"
 network_inode=$(stat -c %i "$stage/nmbl/network.erofs")
 NMBL_BOOT_ROOT="$stage" NMBL_IMAGE_KEY_FILE="$private_key" "$installer"
 test "$(stat -c %i "$stage/nmbl/network.erofs")" = "$network_inode"
-install -m 0644 "$artifacts/rescue.sfs" "$stage/nmbl-rescue.sfs"
-"$signer/bin/nmbl-sign" sign --key "$private_key" --domain rescue-sfs \
-  --out "$stage/nmbl-rescue.sfs.sig" "$stage/nmbl-rescue.sfs"
+# The installer staged the exact stage-2 image the signed config pins.
+cmp "$artifacts/rescue.sfs" "$stage/nmbl-rescue.sfs"
+grep -qx 'format = "erofs"' "$stage/nmbl/config.toml"
+grep -qx "sha512 = \"$(sha512sum < "$artifacts/rescue.sfs" | cut -d' ' -f1)\"" "$stage/nmbl/config.toml"
+grep -qx "sha512 = \"$(sha512sum < "$artifacts/network.erofs" | cut -d' ' -f1)\"" "$stage/nmbl/config.toml"
 
 
 make_disk() {
@@ -129,7 +131,34 @@ cp "$work_root/malformed.erofs" "$work_root/malformed-tree/nmbl/network.erofs"
   --domain network-stage \
   --out "$work_root/malformed-tree/nmbl/network.erofs.sig" \
   "$work_root/malformed-tree/nmbl/network.erofs"
+# NMBL's config pins the networking stage by SHA-512, so an operator
+# deploying this (malformed) stage also pins and re-signs the config; only
+# then does the strict profile parser get to reject it.
+chmod u+w "$work_root/malformed-tree/nmbl/config.toml"
+python3 - "$work_root/malformed-tree/nmbl/config.toml" \
+  "$(sha512sum < "$work_root/malformed.erofs" | cut -d' ' -f1)" <<'PY'
+import re, sys
+path, digest = sys.argv[1:]
+head, table, stage = open(path).read().rpartition("[rescue.network_stage]")
+assert table, "config pins no network stage"
+stage, count = re.subn(r'^sha512 = "[0-9a-f]{128}"$', f'sha512 = "{digest}"', stage, count=1, flags=re.M)
+assert count == 1, "network stage carries no pin"
+open(path, "w").write(head + table + stage)
+PY
+"$signer/bin/nmbl-sign" sign --key "$private_key" --domain boot-config \
+  --out "$work_root/malformed-tree/nmbl/config.toml.sig" \
+  "$work_root/malformed-tree/nmbl/config.toml"
 make_disk "$work_root/malformed-tree" "$work_root/malformed.img"
+
+# A different, validly signed rescue image in place of the pinned one (an
+# older or foreign build signed with the same key): the stage-2 pin must
+# refuse it before it is mounted.
+cp -a "$stage" "$work_root/substituted-tree"
+install -m 0644 "$baked_artifacts/rescue.sfs" "$work_root/substituted-tree/nmbl-rescue.sfs"
+"$signer/bin/nmbl-sign" sign --key "$private_key" --domain rescue-sfs \
+  --out "$work_root/substituted-tree/nmbl-rescue.sfs.sig" \
+  "$work_root/substituted-tree/nmbl-rescue.sfs"
+make_disk "$work_root/substituted-tree" "$work_root/substituted.img"
 
 verify_disk_file() {
   local disk="$1"
@@ -141,16 +170,20 @@ verify_disk_file() {
   cmp "$expected" "$output"
 }
 
-for disk in good tampered unsigned malformed; do
+for disk in good tampered unsigned; do
   verify_disk_file "$work_root/$disk.img" /nmbl-rescue.sfs "$stage/nmbl-rescue.sfs"
   verify_disk_file "$work_root/$disk.img" /nmbl-rescue.sfs.sig "$stage/nmbl-rescue.sfs.sig"
   verify_disk_file "$work_root/$disk.img" /nmbl/config.toml "$stage/nmbl/config.toml"
 done
+verify_disk_file "$work_root/malformed.img" /nmbl-rescue.sfs "$stage/nmbl-rescue.sfs"
+verify_disk_file "$work_root/malformed.img" /nmbl/config.toml "$work_root/malformed-tree/nmbl/config.toml"
+verify_disk_file "$work_root/substituted.img" /nmbl-rescue.sfs "$baked_artifacts/rescue.sfs"
+verify_disk_file "$work_root/substituted.img" /nmbl/config.toml "$stage/nmbl/config.toml"
 
 mkdir "$work_root/initrd" "$work_root/rescue" "$work_root/network" "$work_root/disk"
 (cd "$work_root/initrd" && lsinitrd --unpack "$artifacts/initrd")
 python3 "$harness" console-image --initrd "$work_root/initrd"
-unsquashfs -quiet -dest "$work_root/rescue" "$artifacts/rescue.sfs"
+fsck.erofs --extract="$work_root/rescue" "$artifacts/rescue.sfs"
 fsck.erofs --extract="$work_root/network" "$artifacts/network.erofs"
 
 # The constrained-/boot profile must retain the actual recovery tools while
@@ -237,9 +270,10 @@ test ! -e "$private_key"
 
 ssh_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 
-for scenario in good tampered unsigned malformed; do
+for scenario in good tampered unsigned malformed substituted; do
   mode=invalid
   test "$scenario" = good && mode=good
+  test "$scenario" = substituted && mode=substituted
   python3 "$harness" boot \
     --qemu "$qemu" \
     --passt @passt@ \

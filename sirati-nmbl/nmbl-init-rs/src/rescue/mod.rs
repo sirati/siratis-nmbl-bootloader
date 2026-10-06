@@ -31,6 +31,7 @@ pub mod verify;
 
 mod embedded;
 mod identity;
+pub mod image;
 mod locate;
 #[cfg(feature = "secure-boot")]
 mod network_profile;
@@ -41,7 +42,7 @@ mod types;
 pub use child::run_external_rescue_child;
 pub use embedded::{exec_embedded, halt_with_banner};
 pub use locate::locate_sfs;
-pub use types::RescueMode;
+pub use types::{RescueImageFormat, RescueMode};
 
 use crate::config::Config;
 use crate::error::{NmblError, Result};
@@ -117,16 +118,25 @@ fn dispatch_external(
     // through the SHARED `refuse_unsigned` terminus (cap → close-mappers →
     // sentinel → relock → RebootIntoRescue). Audit mode warns + proceeds; the
     // gate is `secure-boot`-only, so a feature-free build verifies nothing.
+    //
+    // The image is opened ONCE here: the signature, the stage-2 digest pin
+    // and the loop bind all use this one descriptor.
+    let image = image::open(config);
     #[cfg(feature = "secure-boot")]
-    if let crate::sig::PolicyDecision::Refuse(sig_cause) = verify::verify_rescue_sfs_gated(config) {
-        drop(console);
-        return Ok(crate::policy::refuse_unsigned_blocking(config, sig_cause));
-    }
+    let verified_digest = match verify::verify_rescue_image_gated(config, &image) {
+        (crate::sig::PolicyDecision::Refuse(sig_cause), _) => {
+            drop(console);
+            return Ok(crate::policy::refuse_unsigned_blocking(config, sig_cause));
+        }
+        (_, digest) => digest,
+    };
+    #[cfg(not(feature = "secure-boot"))]
+    let verified_digest = None;
 
     // Phase 1: mount the rescue squashfs as a writable overlay. We hold
     // onto the console across this call so a mount failure can fall
     // through to the network-rescue UI without re-opening /dev/console.
-    let disk_err = match disk::prepare_disk_rescue(config, &cause) {
+    let disk_err = match disk::prepare_disk_rescue(config, &cause, image, verified_digest) {
         Ok(rescue_dir) => {
             // Mount succeeded. Run the rescue system as a CHROOTED CHILD
             // while NMBL stays PID 1: no execve handoff, so the console's
