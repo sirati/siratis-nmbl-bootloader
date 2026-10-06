@@ -331,7 +331,15 @@ journalctl -b -t nmbl-init
 If the ring overflowed, the imported log starts with
 `=== nmbl-init: log truncated, earlier <N> bytes dropped ===`.
 
-`nix run .#check-log-import` checks this path in a VM.
+The unit runs `nmbl-log-import` from nmbl-host-tools. It reads at most 2 MiB
+(keeping the newest lines, with the same header if it cut any), escapes
+control characters, invalid UTF-8 and backslashes as `\xNN`, `\u{N}` and
+`\\`, caps each line at 4 KiB, and sends it over journald's native socket.
+If journald refuses a line, the line goes to `/dev/kmsg` instead. The file is
+kept if a line could not be logged.
+
+`nix run .#check-log-import` (scripted initrd) and
+`nix run .#check-log-import-systemd` check this path in a VM.
 
 ## Stateful boot tracking
 

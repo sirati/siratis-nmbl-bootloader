@@ -73,7 +73,7 @@ CONFIG_NAME="test-secure-boot"
 ENROLL_CONFIG_NAME="test-secure-boot-enroll"
 
 # The booted system's journal tag NMBL's pre-kexec transcript is replayed under
-# (lib/modules/log-import.nix, drained one line per entry via systemd-cat -t).
+# (lib/modules/log-import.nix, one entry per line via nmbl-log-import).
 # The phase-2 unseal CONFIRMATION is read from HERE (best-effort, see UNSEAL note).
 JOURNAL_TAG="nmbl-init"
 # Auto-unseal SUCCESS confirmation: a TPM-token-SPECIFIC marker NMBL emits ONLY on

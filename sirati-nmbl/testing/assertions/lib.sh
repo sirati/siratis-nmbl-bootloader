@@ -241,7 +241,7 @@ assert_journal_tag() {
 
   # Print a count sentinel that wait_for can match exactly. Using a unique
   # token avoids confusing the echoed command with its output.
-  send_cmd "journalctl -t ${tag} --no-pager | wc -l | sed 's/^/NMBL_LINES_/'"
+  send_cmd "journalctl -q -t ${tag} --no-pager | wc -l | sed 's/^/NMBL_LINES_/'"
 
   # A populated journal yields NMBL_LINES_<positive>. An empty journal
   # yields NMBL_LINES_0, which this pattern deliberately does NOT match,

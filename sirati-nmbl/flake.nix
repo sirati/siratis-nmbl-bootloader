@@ -629,15 +629,17 @@
       # kexec into a booted NixOS, no install) and drives it with the
       # assertion scripts under testing/assertions. Asserts the pre-kexec
       # NMBL log lands in the booted journal under tag `nmbl-init`.
-      logImportRunner = testRunners.mkRunner {
-        name = "test-gpt-qemu-kernel-invoke";
-        config = testing.mkTestConfigurations."test-gpt-qemu-kernel-invoke";
-        inherit vmSerialMan;
-        bootMode = null;
-      };
-
-      checkLogImport = pkgs.writeShellApplication {
-        name = "check-log-import";
+      # The test config uses the scripted initrd; the `-systemd` variant runs
+      # the same boot with the systemd initrd, so both import paths are
+      # covered.
+      mkCheckLogImport = name: config: let
+        logImportRunner = testRunners.mkRunner {
+          name = "test-gpt-qemu-kernel-invoke";
+          inherit config vmSerialMan;
+          bootMode = null;
+        };
+      in pkgs.writeShellApplication {
+        inherit name;
         runtimeInputs = [
           vmSerialMan
           pkgs.screen
@@ -656,6 +658,12 @@
             bash "$assertions/log-import.sh"
         '';
       };
+      checkLogImport = mkCheckLogImport "check-log-import"
+        testing.mkTestConfigurations."test-gpt-qemu-kernel-invoke";
+      checkLogImportSystemd = mkCheckLogImport "check-log-import-systemd"
+        (testing.mkTestVM (testing.configs."test-gpt-qemu-kernel-invoke" // {
+          extraModules = [ { boot.initrd.systemd.enable = true; } ];
+        }));
 
       # INSECURE TEST-ONLY signing keypair glue (#56). Exposes the committed
       # PUBLIC ML-DSA-87 key (the baked trust anchor) and `assertAbsentFromClosure`
@@ -1577,6 +1585,7 @@
       # Run with: nix run .#test-rescue-ssh -- [--pubkey-file PATH] [--port N]
       # Run with: nix run .#tmux-serial-test-gpt-uefi-grub-luks-password
       # Run with: nix run .#check-log-import  (asserts NMBL pre-kexec log in journal)
+      # Run with: nix run .#check-log-import-systemd  (same, systemd initrd)
       # Apps: legacy names first, then the three-axis matrix grafted
       # on. Legacy names keep working unchanged (operators may have
       # them in muscle memory). New matrix apps use the dotted
@@ -1602,6 +1611,10 @@
         check-log-import = {
           type = "app";
           program = "${checkLogImport}/bin/check-log-import";
+        };
+        check-log-import-systemd = {
+          type = "app";
+          program = "${checkLogImportSystemd}/bin/check-log-import-systemd";
         };
         # Secure-Boot enforcement smoke test (#55 / R-10): asserts the firmware
         # refuses an unsigned UKI. Run by #57. `nix run .#check-sb-unsigned-uki`.

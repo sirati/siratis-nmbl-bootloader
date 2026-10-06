@@ -6,21 +6,26 @@
 # system's journal tagged `nmbl-init` so operators can read what NMBL did
 # before the handover.
 #
+# The transcript carries kernel and device strings, so it is read by the
+# compiled `nmbl-log-import` (nmbl-host-tools), never by a shell: it bounds
+# the size, escapes control bytes and invalid UTF-8, caps each line, and
+# sends every line over journald's native socket (falling back to
+# /dev/kmsg with the same `nmbl-init` prefix).
+#
 # It supports BOTH NixOS initrd styles:
 #
-#   * systemd initrd  — a stage-1 oneshot drains the file directly into
-#     the journal via systemd-cat while still in the initramfs.
+#   * systemd initrd  — a stage-1 oneshot imports the file into the
+#     initrd journal, which is carried into the booted system.
 #
 #   * scripted initrd — the initramfs has no journald, so a
 #     postMountCommands hook copies the file across the switch-root
-#     boundary into the booted root's /run, and a stage-2 oneshot then
-#     replays it once journald is up.
+#     boundary onto the booted root, and a stage-2 oneshot imports it
+#     once journald is up.
 #
 # Either way the file is removed after a successful import so no pre-boot
-# artifact lingers. Both paths fall back to /dev/kmsg if systemd-cat is
-# unavailable, keeping the same `nmbl-init` prefix.
+# artifact lingers.
 
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, nmblSign ? null, ... }:
 
 let
   initrdSystemd = config.boot.initrd.systemd.enable;
@@ -32,50 +37,52 @@ let
   # wiped before the unit could read it.
   stage2Src = "/var/lib/nmbl/nmbl-log.txt";
 
-  # Drain <src> into the journal, one line per entry, tagged `nmbl-init`.
-  # `read -r` preserves backslashes; the kmsg fallback prefix matches the
-  # systemd-cat tag so log consumers see one identifier either way.
-  importScript = systemdCat: src: ''
-    set -u
-    src=${src}
-    if [ ! -f "$src" ]; then
-      exit 0
-    fi
-    while IFS= read -r line || [ -n "$line" ]; do
-      if ! printf '%s\n' "$line" | ${systemdCat} -t nmbl-init -p info; then
-        printf 'nmbl-init: %s\n' "$line" > /dev/kmsg || true
-      fi
-    done < "$src"
-    rm -f "$src"
-    rmdir "$(dirname "$src")" 2>/dev/null || true
+  # Just the importer binary, so the initrd does not carry the signer. It
+  # has no RUNPATH and finds libgcc_s only through ld.so's built-in libgcc
+  # dir, which the systemd initrd does not copy; the RUNPATH lets the initrd
+  # builder resolve and copy it.
+  logImport = pkgs.runCommand "nmbl-log-import" {
+    nativeBuildInputs = [ pkgs.patchelf ];
+    meta.mainProgram = "nmbl-log-import";
+  } ''
+    install -Dm755 ${nmblSign}/bin/nmbl-log-import $out/bin/nmbl-log-import
+    patchelf --add-rpath ${lib.getLib pkgs.stdenv.cc.cc}/lib $out/bin/nmbl-log-import
   '';
-
-  initrdSystemdBin = "${config.boot.initrd.systemd.package}/bin/systemd-cat";
-  stage2SystemdCat = "${config.systemd.package}/bin/systemd-cat";
+  importBin = "${logImport}/bin/nmbl-log-import";
 in
 {
   config = lib.mkIf config.boot.nmbl.enable (lib.mkMerge [
-    # --- systemd initrd: drain straight from the initramfs. ---
+    {
+      assertions = [ {
+        assertion = nmblSign != null;
+        message = "boot.nmbl: the NMBL log import needs nmbl-host-tools (_module.args.nmblSign).";
+      } ];
+    }
+
+    # --- systemd initrd: import straight from the initramfs. ---
     (lib.mkIf initrdSystemd {
+      boot.initrd.systemd.storePaths = [ importBin ];
       boot.initrd.systemd.services.nmbl-log-import = {
         description = "Import NMBL pre-kexec log into the booted journal";
         wantedBy = [ "initrd.target" ];
-        after = [ "cryptsetup.target" ];
+        wants = [ "systemd-journald.socket" ];
+        after = [ "cryptsetup.target" "systemd-journald.socket" ];
         before = [ "initrd-switch-root.target" "sysroot.mount" ];
         unitConfig.DefaultDependencies = false;
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
+          ExecStart = "${importBin} /nmbl-log/nmbl.log";
         };
-        script = importScript initrdSystemdBin "/nmbl-log/nmbl.log";
       };
     })
 
-    # --- scripted initrd: carry the file across switch-root, then replay
+    # --- scripted initrd: carry the file across switch-root, then import
     # in stage 2 once journald exists. ---
     (lib.mkIf (!initrdSystemd) {
       # Runs after the root fs is mounted at /mnt-root, before switch-root,
-      # while the initramfs /nmbl-log/nmbl.log is still reachable.
+      # while the initramfs /nmbl-log/nmbl.log is still reachable. The file
+      # is only copied here, never read.
       boot.initrd.postMountCommands = ''
         if [ -f /nmbl-log/nmbl.log ]; then
           mkdir -p /mnt-root${builtins.dirOf stage2Src}
@@ -90,8 +97,8 @@ in
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
+          ExecStart = "${importBin} ${stage2Src}";
         };
-        script = importScript stage2SystemdCat stage2Src;
       };
     })
   ]);

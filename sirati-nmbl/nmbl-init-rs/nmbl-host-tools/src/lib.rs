@@ -13,6 +13,7 @@
 //! - [`error`] — the operator-facing [`error::SignError`].
 //! - [`keyfile`] — public/private key-file I/O (`Zeroizing` secrets).
 //! - [`keygen`] — the `keygen` subcommand.
+//! - [`log_import`] — `nmbl-log-import`, the boot-transcript journal replay.
 //! - [`sign`] — the `sign`/`sign-image` subcommand (digest → sidecar).
 //! - [`run`] — dispatch a parsed [`cli::Command`].
 
@@ -22,6 +23,7 @@ pub mod domain;
 pub mod error;
 pub mod keyfile;
 pub mod keygen;
+pub mod log_import;
 pub mod receive;
 pub mod sign;
 pub mod verify;

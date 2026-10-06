@@ -7,11 +7,14 @@
 #      and exits once the control socket is up. This is the fastest path:
 #      QEMU direct-kernel boots the real NMBL Rust init, which runs phases
 #      1-6, flushes its log ring to /nmbl-log/nmbl.log, and kexecs into a
-#      booted NixOS whose stage-1 nmbl-log-import oneshot replays every
-#      line via `systemd-cat -t nmbl-init`.
+#      booted NixOS whose nmbl-log-import unit (stage 1 with the systemd
+#      initrd, stage 2 with the scripted one) replays every line into the
+#      journal tagged `nmbl-init`.
 #   2. Wait for the post-kexec root shell (autologin on ttyS0).
 #   3. Assert `journalctl -t nmbl-init` is non-empty AND contains a NMBL
-#      phase marker — proving the handoff actually carried real content.
+#      phase marker — proving the handoff actually carried real content —
+#      that the entries came over the native journal protocol, and that the
+#      transcript was deleted afterwards.
 #   4. Tear the VM down and clean up everything THIS script started.
 #
 # Exit 0 on success, 1 on any failure. Never kills screen sessions it did
@@ -135,6 +138,24 @@ fi
 echo "=== asserting journalctl -t ${JOURNAL_TAG} carries NMBL's pre-kexec log ===" >&2
 if ! assert_journal_tag "${JOURNAL_TAG}" "${PHASE_MARKER}"; then
   echo "FAIL: NMBL pre-kexec log did not reach the booted journal" >&2
+  exit 1
+fi
+
+# The entries must come from the compiled importer over the native journal
+# protocol, not a systemd-cat pipeline (stdout) or the kmsg fallback (kernel).
+# _COMM is no proof: in the systemd initrd the importer runs before journald
+# and has exited by the time its queued datagrams are read.
+send_cmd "journalctl -t ${JOURNAL_TAG} _TRANSPORT=journal -o cat --no-pager | grep -c '${PHASE_MARKER}' | sed 's/^/NMBL_NATIVE_/'"
+if ! wait_for 'NMBL_NATIVE_[1-9][0-9]*' 30; then
+  echo "FAIL: ${JOURNAL_TAG} entries did not come over the native journal protocol" >&2
+  exit 1
+fi
+
+# A successful import deletes the transcript (the scripted initrd's copy on
+# the root filesystem; the systemd initrd's copy dies with the initramfs).
+send_cmd "test ! -e /var/lib/nmbl/nmbl-log.txt && echo NMBL_GONE_\$((6*7))"
+if ! wait_for 'NMBL_GONE_42' 30; then
+  echo "FAIL: the imported transcript was not removed" >&2
   exit 1
 fi
 

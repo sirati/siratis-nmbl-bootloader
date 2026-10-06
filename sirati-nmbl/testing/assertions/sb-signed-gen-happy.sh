@@ -77,7 +77,7 @@ REFUSE_RE='RebootIntoRescue|refuse|Refusing|signature (verification )?failed|Pol
 # from live serial: NMBL holds the interactive console during verify
 # (set_tui_active), which suppresses the `nmbl_*!` stderr branch, so the marker
 # never reaches LIVE serial on this console-holding boot — but it is recoverable
-# post-kexec via the journal. `JOURNAL_TAG` is the systemd-cat tag; the phrase is
+# post-kexec via the journal. `JOURNAL_TAG` is the journal tag; the phrase is
 # a plain substring (no regex metachars) safe for assert_journal_tag's grep.
 JOURNAL_TAG="nmbl-init"
 VERIFY_OK_PHRASE="signature verified"
