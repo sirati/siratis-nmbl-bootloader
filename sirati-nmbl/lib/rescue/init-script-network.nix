@@ -3,6 +3,7 @@
   bash,
   coreutils,
   dhcpcd,
+  dhcpHook,
   gawk,
   iproute2,
   rescueConsole,
@@ -144,7 +145,13 @@
           *) local_network_only "invalid DHCP address family" ;;
         esac
         # Rescue has no udev daemon/database; use kernel interfaces directly.
-        ${dhcpcd}/bin/dhcpcd --nodev --slaac hwaddr $family_args -t 20 $ifaces > /dev/console 2>&1 \
+        # The script is not the stock bash hooks: it only turns the resolver
+        # options into resolv.conf, and never runs a shell on network input.
+        # dhcpcd.conf is empty, so the resolver options are requested here.
+        ${dhcpcd}/bin/dhcpcd --script ${dhcpHook}/bin/nmbl-rescue-dhcp-hook \
+          --option domain_name_servers --option domain_search \
+          --option dhcp6_name_servers --option dhcp6_domain_search \
+          --nodev --slaac hwaddr $family_args -t 20 $ifaces > /dev/console 2>&1 \
           || log "WARNING: dhcpcd did not bind an address in time"
       fi
 

@@ -116,6 +116,7 @@ let
     + import ./rescue/init-tools.nix { inherit coreutils; }
     + import ./rescue/init-script-network.nix {
       inherit bash coreutils dhcpcd gawk iproute2 rescueConsole utilLinux;
+      dhcpHook = import ./rescue/dhcp-hook.nix { inherit pkgs; };
     }
     + import ./rescue/init-script-net.nix {
       inherit lib bash coreutils iproute2 nix openssh rescueConsole utilLinux;
