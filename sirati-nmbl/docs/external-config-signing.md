@@ -1,41 +1,74 @@
 # External configuration signing
 
-With `boot.nmbl.configLocation = "external"`, NMBL keeps its full runtime
-configuration at `boot.nmbl.bootstrap.configPath` on `/boot`. When
-`boot.nmbl.signing.enable = true`, the embedded bootstrap configuration also
-names a detached `<configPath><sigPathSuffix>` signature. Early boot verifies
-the external configuration under the distinct `nmbl:boot-config:v1` ML-DSA
-domain before parsing any of its bytes.
+With `boot.nmbl.configLocation = "external"` (the default is `"embedded"`),
+NMBL's initramfs carries only `/etc/nmbl/bootstrap.toml`. That file names the
+boot filesystem (`bootstrap.bootFs`) and the path of the full runtime config
+on it, `bootstrap.configPath` (default `/nmbl/config.toml`). NMBL mounts the
+boot filesystem at `bootstrap.bootFs.mountpoint` (default `/mnt/boot`) and
+reads the config from there.
 
-The installer signs the staged file with `signing.generationKeyFile`. Supply
-that option as a string path outside `/nix/store`; evaluation rejects a store
-path. The private key contents are read only by the imperative bootloader
-installation step.
+When `boot.nmbl.signing.enable = true`, the bootstrap file also names the
+detached signature `<configPath><sigPathSuffix>`. NMBL opens the config once,
+hashes it, and verifies the signature under the `nmbl:boot-config:v1` ML-DSA
+domain with the public keys baked into `nmbl-init`. It parses the file only
+after that check passes. This check always enforces, also in audit mode,
+because the signing policy in the external config is untrusted until the
+file verifies. A missing or invalid signature stops the boot with a bootstrap
+error.
 
-For generation-image hosts, set `signing.deferInstallSigning = true` and use a
-versioned config path:
+## Install-time signing
+
+The bootloader installer copies the config to `/boot/<configPath>` and signs
+it under the `boot-config` domain. The key comes from one of two options:
+
+| Option | Form |
+| --- | --- |
+| `signing.generationKeyFile` | Path of the private key, read at install time. |
+| `signing.generationKeyCommand` | argv that prints the key. The installer runs it once per signature and pipes the output into `nmbl-sign sign --key-stdin`. |
+
+The two options are mutually exclusive. Pass `generationKeyFile` as a string
+path outside `/nix/store`; evaluation fails when it resolves into the store.
+Only the installer reads the key. Neither the key nor its contents are
+derivation inputs. With `signing.deferInstallSigning = true`, the installer
+stages the config unsigned and prints a warning, and the signature must be
+produced out of band.
+
+## Generation-image hosts
+
+On hosts with `generationImage.enable`, the installer stages no external
+config at all. Point the bootstrap config into the active generation:
 
 ```nix
 boot.nmbl.bootstrap.configPath = "/nmbl-generations/active/config.toml";
+boot.nmbl.signing.deferInstallSigning = true;
 ```
 
 `nmbl-erofs-deploy remote` builds the unsigned config and generation image,
-signs both on the operator host, and streams them to the restricted receiver.
-The receiver verifies the `boot-config` and `generation-image` domains against
-its fixed public-key argument before activation. The bootstrap filesystem must
-be the same filesystem that holds `generationImage.stateRoot`; the relative
-path above points into the same generation directory as `nix.erofs`. The
-single `active` rename therefore switches config and image atomically. The
-update SSH key should have only that exact receiver command through a forced
-command and a fixed sudo rule.
+signs both on the operator machine, and streams them to the restricted
+receiver. The receiver verifies the `boot-config` and `generation-image`
+signatures against its fixed public-key argument before activation. The
+bootstrap filesystem must be the filesystem that contains
+`generationImage.stateRoot`, so the path above points into the same
+generation directory as `nix.erofs`. One rename of `active` therefore
+switches the config and the image together. Give the update SSH key only that
+receiver command, through a forced command and a fixed sudo rule. See
+[erofs-generations.md](erofs-generations.md#deployment).
 
-An existing installation needs one final bootloader-image update to embed the
-public key and the versioned bootstrap `configPath`. After that enrollment,
-ordinary runtime-config and generation updates use the restricted stream and
-do not place the private key on the target or rebuild the immutable boot image.
+An existing installation needs one last bootloader update that embeds the
+public key and the generation `configPath`. After that, runtime config and
+generation updates use the restricted stream. The private key stays off the
+target, and the NMBL kernel and initrd stay unchanged.
 
-For a manual off-host signing flow, copy the unsigned configuration to the
-signing host, then run:
+## Boot-set hosts
+
+With `boot.nmbl.bootUpdate.enable`, GRUB passes
+`nmbl.config=/nmbl-boot-sets/<slot>/config`. NMBL uses that path in place of
+`configPath` and verifies the sidecar at the same path plus `.sig`. See
+[boot-set-updates.md](boot-set-updates.md).
+
+## Manual off-host signing
+
+Copy the unsigned config to the signing host and run:
 
 ```console
 nmbl-sign sign \
@@ -45,18 +78,14 @@ nmbl-sign sign \
   config.toml
 ```
 
-The key can also arrive on stdin, so it never has to exist as a file on the
-signing host:
+The key can also arrive on stdin, so it does not have to exist as a file on
+the signing host:
 
 ```console
 nix-secrets pipe-secret nmbl-generation-key \
   | nmbl-sign sign --key-stdin --domain boot-config --out config.toml.sig config.toml
 ```
 
-The install-time signer uses the same pipe when
-`boot.nmbl.signing.generationKeyCommand` is set instead of `generationKeyFile`.
-
-Install the configuration and sidecar together at their advertised paths.
-Until a matching sidecar exists, the enforcing boot path refuses the external
-configuration. The embedded public key remains the trust anchor; neither the
-private key nor its contents are Nix derivation inputs.
+Install the config and the sidecar together at their configured paths. Until
+a matching sidecar exists, NMBL refuses the external config. The baked public
+keys are the trust anchor.

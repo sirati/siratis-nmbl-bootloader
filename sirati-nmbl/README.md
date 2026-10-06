@@ -1,175 +1,156 @@
-# sirati's NMBL — no more boot loader
+# sirati's NMBL, no more boot loader
 
-**Using Linux as a bootloader.** A conventional bootloader (GRUB,
-systemd-boot) is a second, lesser operating system: it reimplements
-filesystem drivers, a disk/partition stack, and a scripting language,
-all just to locate a kernel and hand off to it. But Linux already
-ships every driver for the filesystem it runs on — so the most capable
-thing to boot Linux with is Linux itself.
+NMBL uses Linux as the bootloader for NixOS. A conventional bootloader such
+as GRUB or systemd-boot carries its own filesystem drivers, its own disk
+stack and its own scripting language. Linux already has drivers for every
+filesystem and storage stack it can run on, so NMBL boots Linux with Linux.
 
-NMBL boots a tiny pinned Linux kernel plus a minimal initramfs, lets
-the operator pick a NixOS generation, and `kexec`s straight into it.
-Because a *real* kernel mounts the *real* root with the *real* driver,
-two long-standing bootloader restrictions simply disappear:
+NMBL boots a small pinned kernel and a minimal initramfs. Its PID 1 mounts
+the target system, lets the operator pick a NixOS generation and then
+`kexec`s into it. Because a full kernel mounts the real root with the real
+driver, two bootloader limits go away:
 
-- **No restriction on where the system lives.** Any storage stack
-  Linux can mount is bootable — LVM, LUKS, mdraid, ZFS, btrfs
-  subvolumes, network block devices — with no bootloader-side driver
-  to reimplement or keep up to date.
-- **No copying the kernel and initrd onto a boot partition.** NMBL
-  reads them in place from the target system's
-  `/nix/var/nix/profiles/system-N-link/`, so the boot partition never
-  has to be kept in sync with every NixOS generation. That is the
-  whole point of NMBL.
+- Any storage stack Linux can mount is bootable. This includes LVM, LUKS,
+  mdraid, ZFS and Btrfs subvolumes.
+- The boot partition does not need a copy of every generation's kernel and
+  initrd. NMBL reads them in place from
+  `/nix/var/nix/profiles/system-N-link/` on the target system.
 
-The userspace in that initramfs is a single static Rust binary,
-`nmbl-init`, that runs as PID 1.
+The boot partition holds the NMBL kernel and initramfs (or a UKI). With
+external configuration, external rescue or signed EROFS generations it also
+holds NMBL's runtime config and images.
 
-## Why?
-
-Conventional bootloaders (GRUB, systemd-boot) duplicate kernel
-images onto an ESP and reimplement filesystem drivers in their own
-codebase. NMBL skips both: a real Linux kernel mounts the real
-root filesystem with the real kernel driver, walks the real Nix
-profile symlinks, and kexecs the generation the operator chose.
-
-That buys you:
-
-- Any storage stack Linux can mount is bootable (LVM, LUKS, mdraid,
-  ZFS, btrfs subvolumes, network block devices once you load the
-  module, …).
-- The boot partition only needs the NMBL kernel and initramfs; it
-  does not need to be kept in sync with every NixOS generation.
-- Boot-time interactivity (cmdline editing, passphrase entry,
-  emergency shell) lives in a TUI instead of a half-broken
-  bootloader scripting language.
+PID 1 in the initramfs is `nmbl-init`, a static musl Rust binary.
 
 ## What's in the initramfs
 
 | Path | Purpose |
 |------|---------|
-| `/init` | `nmbl-init` — static musl Rust binary, runs as PID 1. |
-| `/etc/nmbl/config.toml` | Runtime config rendered by Nix at build time. |
-| `/lib/modules/<ver>/…` | Kernel modules closure. |
-| `/etc/modprobe.d/nixos.conf` | Module blacklists. |
-| `/bin/sh` | busybox — **only** used as the emergency shell. |
-| `/etc/splash/{font.ttf,image.png}` | Splash font + background — only when `boot.nmbl.splash.enable` is set. |
+| `/init` | `nmbl-init`, the static Rust PID 1. |
+| `/etc/nmbl/config.toml` | Runtime config rendered by `lib/config-toml.nix` (with `configLocation = "embedded"`). |
+| `/etc/nmbl/bootstrap.toml` | Small bootstrap config that locates the full config on the boot partition (with `configLocation = "external"`). |
+| `/bin/blkid` | util-linux `blkid`. `nmbl-init` runs it to create `/dev/disk/by-*` links, because the initramfs has no udev. |
+| `/bin/sh` | busybox, for the emergency menu's Raw Shell. Present for `rescue.mode = "embedded"` and `"external"`, absent for `"none"`. |
+| `/lib/modules/<ver>/...` | The kernel module closure. |
+| `/etc/modprobe.d/nixos.conf` | Module blacklist. |
+| `/etc/splash/font.ttf`, `/etc/splash/image.png` | Splash font and background, only with `boot.nmbl.splash.enable`. The PNG moves to the boot partition with `splash.backgroundLocation = "boot-partition"`. |
 
-`nmbl-init` performs every boot-time operation itself via direct
-syscalls (`mount(2)`, `finit_module(2)`, `kexec_file_load(2)`,
-`reboot(2)`). It does not shell out to `mount`, `modprobe`, or
-`kexec`. The only binary the Rust init may `execve` is the
-emergency shell, and that only when a fatal error occurs.
+Storage tools (`cryptsetup`, `lvm2`, `mdadm`, `zfs`) are added only when
+`boot.nmbl.activation.*` needs them. The build prefers the `pkgsStatic`
+variant of each tool and falls back to the dynamic one with a warning. A
+LUKS volume with `unlock = "tpm"` needs the dynamic `cryptsetup`, because
+the static build cannot load the `systemd-tpm2` token plugin.
 
-busybox is in the initramfs to satisfy the emergency-shell contract
-and nothing else.
+## How nmbl-init works
 
-Storage-activation helpers (`cryptsetup`, `vgchange`/`lvchange`,
-`mdadm`, `zpool`/`zfs`) are added to the initramfs **only** when
-the corresponding `boot.nmbl.activation.*` options request them,
-and `pkgsStatic` variants are preferred when available.
+`nmbl-init` mounts filesystems, loads modules and starts the next kernel with
+direct system calls: `mount(2)`, `init_module(2)` and `kexec_file_load(2)`.
+It decompresses `.ko.xz`, `.ko.zst` and `.ko.gz` modules itself with pure
+Rust decoders. The initramfs contains no `kmod` and no `kexec-tools`. It runs external programs for three jobs: `blkid` for device
+links, the storage tools for activation, and a shell or rescue system when
+the operator asks for one.
 
-## What changed from the bash bootloader
+The crate denies `unwrap`, `expect`, `panic!`, raw indexing, `todo!`,
+`unimplemented!`, `unreachable!` and `dbg!` through clippy lints in
+`nmbl-init-rs/Cargo.toml`. A panic hook still exists. It writes a report and
+re-executes `/proc/self/exe` with `--errored=<path>`, and the new process
+shows the emergency menu with the report attached.
 
-The pre-Rust NMBL was a busybox shell script driven by Nix string
-interpolation. That is gone. Concretely:
+Optional code sits behind Cargo features. The Nix build turns each one on
+from your options (`lib/signing-build.nix`):
 
-- `init` is the `nmbl-init` static musl Rust binary (roughly 700 KiB
-  stripped), not a shell script.
-- Runtime state lives in `/etc/nmbl/config.toml`, rendered by
-  `lib/config-toml.nix` from your NixOS options. Changing
-  `boot.nmbl.*` regenerates the TOML; the binary itself does not
-  need rebuilding for config changes.
-- The TUI is a real `ratatui` interface — generation list, countdown
-  with first-key cancel, cmdline editor with caret, kernel-param
-  passthrough toggle, LUKS passphrase modal, emergency-shell key.
-  It works over `/dev/console`, including serial consoles.
-- Storage activation (LVM, LUKS via TPM / keyfile / passphrase,
-  mdraid, ZFS) is performed before mounting the target root.
-  Required tools are pulled into the initramfs conditionally based
-  on `boot.nmbl.activation.*`, so you do not pay for storage stacks
-  you don't use.
-- `nmbl-init` is forbidden from panicking: `panic`, `unwrap`,
-  `expect`, raw indexing, `todo!`, `unimplemented!`, and
-  `unreachable!` are clippy-denied. A panic hook installed at
-  startup re-`execve`s `/proc/self/exe` with `--errored=<path>` to
-  enter a recovery mode that drops to the emergency shell with the
-  panic report attached.
-- The `kexec-tools` and `kmod` userspace packages are no longer in
-  the initramfs; their work is done by the Rust binary directly.
+| Feature | Enabled by |
+|---------|------------|
+| `pretty-shell` | Always (default feature). An in-TUI terminal for the emergency shell. |
+| `image-splash` | `splash.enable` |
+| `network-rescue` | `rescue.network` |
+| `remote-tui` | `rescue.fullSystem.enable` |
+| `rescue-stages` | `rescue.mode = "external"` with `rescue.fullSystem.enable` |
+| `stateful` | `stateful.enable` |
+| `secure-boot` | Any signing, TPM measurement, secure-boot, driver-image or generation-image setting |
+| `staged-boot` | `staged.enable` |
+
+`nmbl-init-rs/PLAN.md` describes the boot phases and the crate layout in
+detail, and `ARCHITECTURE.md` gives the longer overview.
 
 ## Quick start
 
-Run a VM that exercises the full GPT+UEFI+GRUB bootstrap path into
-NMBL:
+This command starts a VM that boots GPT, UEFI and GRUB into NMBL:
 
 ```bash
 nix run .#test-gpt-uefi-grub
 ```
 
-Other prebuilt demo configurations:
+Other prebuilt test configurations:
 
 ```bash
-nix run .#test-gpt-bios                  # legacy BIOS via GRUB
-nix run .#test-gpt-uefi-systemd          # systemd-boot bootstrap
-nix run .#test-gpt-qemu-kernel-invoke    # QEMU -kernel direct boot
+nix run .#test-gpt-bios                    # legacy BIOS through GRUB
+nix run .#test-gpt-uefi-systemd            # systemd-boot
+nix run .#test-gpt-qemu-kernel-invoke      # QEMU -kernel direct boot
 nix run .#test-gpt-qemu-kernel-invoke -- --debug-shell
-nix run .#test-external-config           # config.toml on /boot
-nix run .#test-external-rescue           # rescue squashfs on /boot
-nix run .#test-external-rescue-network   # rescue + HTTP fallback
-nix run .#test-secure-boot               # signed generations + measured boot
-nix run .#test-secure-boot-tpm-roundtrip # TPM seal/unseal round trip
-nix run .#test-secure-boot-driver        # signed driver-image preload
-nix run .#test-secure-boot-staged        # staged config fragment behind LUKS
+nix run .#test-external-config             # config.toml on /boot
+nix run .#test-external-rescue             # rescue image on /boot
+nix run .#test-external-rescue-network     # rescue with the HTTP fallback
+nix run .#test-stateful                    # stateful boot tracking
+nix run .#test-external-splash-bg          # splash PNG on the boot partition
+nix run .#test-gpt-uefi-grub-luks-password # LUKS passphrase unlock
+nix run .#test-secure-boot                 # signed generations and measured boot
+nix run .#test-secure-boot-tpm-roundtrip   # TPM seal and unseal round trip
+nix run .#test-secure-boot-driver-image    # signed driver image
+nix run .#test-secure-boot-staged          # staged config fragment behind LUKS
+nix run .#test-rescue-ssh                  # full-system rescue over SSH
+nix run .#test-network-stage-vm            # staged rescue and network stage
 ```
 
-## Recommended setups
+Each test configuration also has a `tmux-serial-<name>` app that runs the VM
+in a tmux session. `flake.nix` lists every app under `apps` and the pure
+build checks under `checks`.
 
-The two post-v1 features (external config, external rescue) are
-independently togglable. Pick the combination that matches the
-operator's recovery story:
-
-| Profile         | `configLocation` | `rescue.mode` | `rescue.automatic` | `rescue.network` | When to pick |
-|-----------------|------------------|---------------|--------------------|------------------|--------------|
-| **Default install** | `embedded`   | `embedded`    | `false`            | `false`          | Single-user desktop or laptop. Smallest moving-parts surface; everything ships in the initramfs. |
-| **Power user**  | `external`       | `external`    | `false`            | `false`          | Workstation where the operator wants edit-and-reboot config changes and a richer rescue toolbox without bloating the initramfs. |
-| **Servers**     | `external`       | `external`    | `true`             | `true`           | Headless / remote machines. A failed boot enters the signed rescue unattended. The HTTP fallback recovers an unbootable system over the network when the boot partition's rescue blob is missing or stale. |
-| **Air-gapped / tiny** | `embedded` | `none`        | `false`            | `false`          | Appliances and air-gapped systems where rescue is handled out-of-band (e.g. yank the disk into another machine). NMBL halts cleanly with a banner instead of dropping to a shell. |
-
-All four profiles boot the same `nmbl-init` binary; only the
-initramfs contents and the on-boot-partition staging differ.
-
-For verified boot — post-quantum-signed generations, a TPM-measured
-handoff, a priority-file gate, and a guaranteed TPM lock on any rescue —
-layer `boot.nmbl.signing`, `boot.nmbl.tpm`, and `boot.nmbl.secureBoot`
-on top of any of these profiles; see *Verified loading and measured
-boot* below. A graphical boot menu over a DRM framebuffer is available
-with `boot.nmbl.splash.enable`.
-
-All VMs are wired through `vm-serial-man`, which exposes a serial
-console you can drive from another shell:
+The VM runners use `vm-serial-man`, which exposes the serial console to other
+shells:
 
 ```bash
 vm-serial-man status
 vm-serial-man send 'ls /mnt/system/nix/var/nix/profiles'
-vm-serial-man send $'\x1b[B'   # arrow keys etc. work too
+vm-serial-man send $'\x1b[B'   # arrow keys work too
 vm-serial-man stop
 ```
 
-To inspect the TOML config that would be embedded in the initramfs
-for a given configuration, evaluate the corresponding builder
-output:
+With more than one VM running, pass `--socket /tmp/vm-serial-man-<pid>.sock`
+to `status` and `stop` so they act on one VM.
+
+To build the initramfs of a test configuration:
 
 ```bash
 nix build .#nixosConfigurations.test-gpt-uefi-grub.config.system.build.nmblInitramfs
 ```
 
-The rendered config TOML is produced by `lib/config-toml.nix`.
+`nix build .#debugInfo.<name>` writes a text file that lists the
+configuration's filesystems, modules and other NMBL settings.
+
+## Recommended setups
+
+External configuration and external rescue are independent options. Pick
+the combination that fits how you recover the machine:
+
+| Profile | `configLocation` | `rescue.mode` | `rescue.automatic` | `rescue.network` | Use |
+|---------|------------------|---------------|--------------------|------------------|-----|
+| Default install | `embedded` | `embedded` | `false` | `false` | Desktop or laptop. Everything ships in the initramfs. |
+| Workstation | `external` | `external` | `false` | `false` | Edit the config on `/boot` and reboot. The rescue tools live on the boot partition. |
+| Server | `external` | `external` | `true` | optional | Headless machines. Add `rescue.fullSystem` for SSH into the rescue. A failed boot enters the rescue without input. |
+| Appliance | `embedded` | `none` | `false` | `false` | Recovery happens out of band. NMBL prints a banner and halts. |
+
+All profiles boot the same `nmbl-init` source. Only the enabled features, the
+initramfs contents and the files on the boot partition differ.
+
+For verified boot, add `boot.nmbl.signing`, `boot.nmbl.tpm` and
+`boot.nmbl.secureBoot` to any profile. See
+[Verified loading and measured boot](#verified-loading-and-measured-boot).
 
 ## NixOS module options
 
-Users normally only set a handful of options. The full surface is
-in `lib/options.nix` and `lib/modules/activation.nix`.
+Most installs set a few options. `lib/options.nix` defines the core options.
+`lib/modules/` and `lib/modules/security/` define the rest.
 
 ```nix
 {
@@ -183,13 +164,13 @@ in `lib/options.nix` and `lib/modules/activation.nix`.
     };
 
     timeoutSeconds = 3;           # countdown before auto-boot
-    instantBoot.enable = false;   # skip the countdown when healthy + untouched
-    serialConsole = "ttyS0,115200";  # null = video console
+    instantBoot.enable = false;   # skip the countdown after a healthy boot
+    serialConsole = "ttyS0,115200";  # null uses the video console
 
-    kernelModules = [ "nvme" "ahci" ];   # explicitly load at boot
+    kernelModules = [ "nvme" "ahci" ];   # loaded explicitly at boot
     blacklistedKernelModules = [ ];
 
-    # Storage activations — only what you actually use:
+    # Storage activation, only for what you use:
     activation.lvm.enable = true;
     activation.mdraid.enable = true;
     activation.zfs.pools = [ "rpool" ];
@@ -200,97 +181,118 @@ in `lib/options.nix` and `lib/modules/activation.nix`.
 }
 ```
 
-Notable points:
+Notes on these options:
 
-- `boot.nmbl.activation.{lvm,mdraid,zfs}` auto-detect from
-  `config.fileSystems`: if any filesystem sits on `/dev/mapper/*`,
-  `/dev/md*`, or has `fsType = "zfs"`, the corresponding activation
-  defaults to on.
-- `activation.luks[*].unlock` is one of `tpm` (TPM-sealed token),
-  `keyfile` (bundled into the initramfs), or `password` (entered in
-  the TUI passphrase modal).
-- `verbose` defaults to inheriting `boot.initrd.verbose`.
+- `activation.lvm.enable` defaults to on when a filesystem device is under
+  `/dev/mapper/` and `activation.luks` is empty. `activation.mdraid.enable`
+  defaults to on when a filesystem device is under `/dev/md`.
+  `activation.zfs.pools` defaults to `[ "rpool" ]` when a filesystem has
+  `fsType = "zfs"`.
+- `activation.luks` is a list. Each entry's `unlock` is `tpm` (a TPM-sealed
+  token in the LUKS header), `keyfile` (a key file bundled into the
+  initramfs) or `password` (typed into the TUI).
+- For `password` and `tpm` entries, `passToStage1` defaults to
+  `/etc/nmbl-luks/<name>`. NMBL passes the secret into the kexec'd initrd at
+  that path, and the NixOS stage 1 unlocks the volume with it. The operator
+  types the passphrase once. Set `passToStage1 = null` to turn this off.
+- The default NMBL kernel is `pkgs.linux_6_6`. An assertion rejects it
+  together with LUKS, because dm-crypt cannot create the mapping on that
+  series. Set `boot.nmbl.kernelPackage` to a newer kernel for LUKS hosts.
+  This option sets only NMBL's kernel. The target system's kernel is
+  independent.
+- `verbose` defaults to `boot.initrd.verbose`. `verbosity` (`quiet`, `info`
+  or `verbose`) is the runtime setting it maps to.
+- `earlyKernelModules` load before the boot console opens. Use them for DRM
+  drivers the splash needs. `kernelModules` load after the console is up.
+  NMBL also loads the filesystem drivers it derives from
+  `fileSystems.*.fsType`.
 
-#### Sealing a LUKS volume to the TPM (`nmbl-tpm-enroll`)
+Other options:
 
-For `unlock = "tpm"` devices, the volume key is sealed to the TPM with
-the host helper **`nmbl-tpm-enroll`** (shipped on the installed system,
-never inside the initramfs). It is a thin wrapper over
-`systemd-cryptenroll` — there is no bespoke TPM sealing code. Run it
-once, after the box has first-booted the installed system, against the
-LUKS header:
+| Option | Default | Effect |
+|--------|---------|--------|
+| `timeoutMillis` | `timeoutSeconds * 1000` | Selector countdown in milliseconds, for sub-second delays. |
+| `deviceTimeoutSeconds` | `30` | How long NMBL waits for each device. See [Device timeout](#device-timeout). |
+| `emergencyTimeoutSecs` | `null` (30 s built in) | Auto-reboot countdown on the emergency screen. |
+| `ignoreMissingDiskModules` | `false` | Skip the build check that storage drivers for your disks are in the initrd module lists. |
+| `refuseInvalidHardwareOnInstall` | `true` | Abort the install when `nmbl-init --validate-hardware` finds a missing device or LUKS header. With `false` the installer prints a warning and continues. |
+| `kernelParams` | `[ ]` | Command line of the NMBL kernel. The target generation keeps its own. |
+| `tui.enableEditor`, `tui.showKernelParams` | `true` | Command-line editor and display in the selector. |
+| `emergencyShell.extraConsoles` | `[ ]` | Extra `/dev/<tty>` devices the emergency shell may run on. |
+| `bootstrapper.bootDisks` | `[ ]` | Install targets. When empty, BIOS installs GRUB on every disk with an EF02 partition, and UEFI uses the mounted `/boot` ESP. |
+
+### Device timeout
+
+`boot.nmbl.deviceTimeoutSeconds` (default `30`) is the wait for each device.
+NMBL waits this long for each `fileSystems.<name>.device` to appear during the
+mount of the target system. It also waits this long for the devices that a
+cryptsetup, LVM or mdraid activation creates. Raise it for slow USB
+enclosures or controllers.
+
+### Sealing a LUKS volume to the TPM
+
+For `unlock = "tpm"` volumes, the host tool `nmbl-tpm-enroll` seals the
+volume key to the TPM. It is installed on the booted system and is not part
+of the initramfs. It wraps `systemd-cryptenroll`. Run it once after the
+first boot of the installed system:
 
 ```sh
-# Seal the volume key to the TPM, bound to PCRs 11+7 (the default), with
-# PCR 11 predicted for the NMBL UKI that will perform the unlock.
+# Seal to PCRs 11 and 7 (the default). PCR 11 is predicted for the NMBL UKI
+# that will unlock the volume.
 sudo nmbl-tpm-enroll --device /dev/disk/by-partlabel/disk-main-luks \
   --uki /boot/EFI/BOOT/BOOTX64.EFI
 
-# Or predict on the build host (no TPM or device needed) and seal to the
-# literal digest on the target:
-nmbl-tpm-enroll --uki result/BOOTX64.EFI --print-pcrs   # -> 11:sha256=<hex>+7
+# Or predict on the build host (no TPM or device needed), then seal to the
+# printed digest on the target:
+nmbl-tpm-enroll --uki result/BOOTX64.EFI --print-pcrs   # prints 11:sha256=<hex>+7
 sudo nmbl-tpm-enroll --device /dev/disk/by-partlabel/disk-main-luks \
   --pcrs "11:sha256=<hex>+7"
 ```
 
-**Pass `--uki` (or a literal PCR 11 digest).** NMBL unseals during
-storage activation, before it extends its own handoff into PCR 11, so
-the value the unseal sees is only systemd-stub's measurement of the NMBL
-UKI. By the time the installed system runs, NMBL has already extended
-its handoff, so the live PCR 11 value never recurs at unlock time.
-Sealing to it (plain `--pcrs 11+7` without `--uki`) produces a token
-that never unseals. `--uki` predicts the unlock-time value with
-`systemd-measure calculate` over the UKI's sections.
+Pass `--uki` or a literal PCR 11 digest. NMBL unseals during storage
+activation, before it extends PCR 11 with its own handoff. At that moment
+PCR 11 holds only systemd-stub's measurement of the NMBL UKI. The running
+system sees a later PCR 11 value that includes NMBL's handoff. A token
+sealed to that later value (plain `--pcrs 11+7` without `--uki`) does not
+unseal at boot. `--uki` predicts the unlock-time value with
+`systemd-measure calculate`.
 
-The **enroll → boot-unlock round trip**:
+The round trip has four steps:
 
-1. **Enroll (host, once).** `nmbl-tpm-enroll` runs
-   `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=11:sha256=<predicted>+7 <device>`,
-   which generates a random volume key, seals it to the TPM under the
-   `{11, 7}` PCR policy, adds a LUKS2 keyslot for it, and writes a
-   `systemd-tpm2` **token** into the LUKS2 header. PCR 11 is NMBL's
-   measure PCR (`boot.nmbl.tpm.pcrIndex`); PCR 7 is the firmware /
-   Secure-Boot-state PCR.
-2. **Boot-unlock (NMBL).** At boot NMBL runs its existing
-   `cryptsetup open --token-only <device> <name>`. `--token-only` makes
-   libcryptsetup consume that `systemd-tpm2` token and unseal the
-   volume key from the TPM **without any passphrase prompt** — but only
-   if PCR 11 (systemd-stub's measurement of the NMBL UKI) and PCR 7 (Secure-Boot state)
-   still match the values they had at enrol time.
-3. **Hand-off to stage 1.** The kexec drops NMBL's dm-crypt mapping, and
-   by the time NixOS stage 1 runs NMBL has extended its handoff into
-   PCR 11, so stage 1 cannot unseal the token itself. Right after the
-   unseal NMBL reads the token passphrase (`nmbl-tpm-passphrase`) and
-   injects it into the kexec'd initrd as the `passToStage1` keyfile
-   (default `/etc/nmbl-luks/<name>`), exactly as for a passphrase
-   unlock. A `tpm` initramfs ships the dynamic cryptsetup, systemd's
-   `systemd-tpm2` token plugin and its tpm2-tss closure; the static
-   cryptsetup cannot load token plugins.
-4. **Tamper / rescue ⇒ secrets safe.** PCR 11 is *capped* (extended with
-   a poison value) the moment NMBL diverts to rescue, and a tampered
-   kernel/initrd or a firmware that stopped enforcing Secure Boot moves
-   PCR 7. Either way the sealed PCR policy no longer matches, the
-   `--token-only` unseal **fails**, and the box falls back to the
-   passphrase modal instead of auto-unlocking — so the disk stays sealed
-   on an untampered-only basis.
+1. Enroll on the host, once. `nmbl-tpm-enroll` runs
+   `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=11:sha256=<predicted>+7 <device>`.
+   This adds a LUKS2 keyslot whose key is sealed to PCRs 11 and 7, and
+   writes a `systemd-tpm2` token into the LUKS2 header. PCR 11 is NMBL's
+   measure PCR (`boot.nmbl.tpm.pcrIndex`). PCR 7 holds the firmware's
+   Secure Boot state.
+2. Unlock at boot. NMBL runs `cryptsetup open --token-only <device> <name>`.
+   libcryptsetup reads the token and unseals the key without a prompt, if
+   PCRs 11 and 7 still have their enrolled values.
+3. Hand off to stage 1. The kexec drops NMBL's dm-crypt mapping, and stage 1
+   cannot unseal the token because PCR 11 has moved. Right after the unseal,
+   NMBL reads the token passphrase with `nmbl-tpm-passphrase` and passes it
+   to stage 1 as the `passToStage1` key file.
+4. Rescue or tampering. NMBL extends PCR 11 with a poison value before it
+   enters any rescue. A changed kernel or initrd, or firmware that stopped
+   enforcing Secure Boot, changes PCR 11 or PCR 7. In each case the unseal
+   fails and NMBL shows the passphrase prompt.
 
-Keep a passphrase keyslot as a recovery path, and re-run
-`nmbl-tpm-enroll --wipe-existing --uki <new UKI> …` after any change to the measured
-inputs (a new NMBL UKI, or a firmware update that moves PCR 7).
-The default PCR set is `11+7`; override with `--pcrs` if your
-`boot.nmbl.activation.luks.<name>.tpmPcrs` policy differs.
+Keep a passphrase keyslot for recovery. After a change to the measured
+inputs (a new NMBL UKI, or a firmware update that changes PCR 7), run
+`nmbl-tpm-enroll --wipe-existing --uki <new UKI> ...` again. Use `--pcrs` if
+your policy differs from `11+7`. NMBL warns at build time when an
+`activation.luks` entry lists `tpmPcrs` without both PCR 11 and PCR 7.
 
 ### efi-stub direct boot
 
-With `loader = "efi-stub"` (UEFI only) NMBL's kernel + initrd are
-combined into a single UKI (Unified Kernel Image) PE and written to
-the ESP — no GRUB or systemd-boot binary at all. By default it lands
-at the firmware removable/fallback path `EFI/BOOT/BOOTX64.EFI`, which
-firmware auto-boots with no NVRAM entry: ideal for a dedicated NMBL
-disk or a manually-uploaded image.
+With `loader = "efi-stub"` (UEFI only), the build combines NMBL's kernel and
+initrd into one UKI and writes it to the ESP. No GRUB or systemd-boot binary
+is installed. The default path is `EFI/BOOT/BOOTX64.EFI`, which firmware
+boots without an NVRAM entry. This suits a dedicated NMBL disk or an
+uploaded image.
 
-To install **alongside an existing bootloader** (e.g. GRUB) without
-overwriting its fallback binary, point the UKI at its own path:
+To install next to an existing bootloader without overwriting its fallback
+binary, give the UKI its own path:
 
 ```nix
 {
@@ -298,65 +300,135 @@ overwriting its fallback binary, point the UKI at its own path:
     bootMode = "uefi";
     loader   = "efi-stub";
     loader_extra_args = {
-      efiStubInstallPath  = "EFI/nmbl/nmbl.efi";  # own path, not BOOTX64
-      canTouchEfiVariables = true;                # register the NVRAM entry
+      efiStubInstallPath   = "EFI/nmbl/nmbl.efi";
+      canTouchEfiVariables = true;   # register the NVRAM entry
     };
   };
 }
 ```
 
-An own path is not auto-booted by firmware, so NMBL registers a UEFI
-NVRAM boot entry (`NMBL`, placed first in BootOrder) pointing at it,
-leaving the existing bootloader's entry intact as a fallback. The
-NVRAM write requires `canTouchEfiVariables = true`; with it `false`
-the file is written and a warning tells you to add the boot entry by
-hand.
+Firmware does not boot an own path by itself, so the installer registers a
+UEFI boot entry named `NMBL` and puts it first in BootOrder. The existing
+bootloader's entry stays as a fallback. This requires
+`canTouchEfiVariables = true`. With `false`, the installer writes the file
+and prints a warning that tells you to add the entry by hand.
+
+## Logging
+
+`nmbl-init` keeps its log lines in a 1 MiB ring buffer. Before kexec, reboot,
+`execve` or halt, it writes the ring to `/nmbl-log/nmbl.log` and calls
+`fsync`. NMBL adds this file to the kexec'd initrd as an extra cpio archive.
+
+The booted system imports it with the `nmbl-log-import` unit, tagged
+`nmbl-init`. With the systemd initrd, the unit runs in stage 1 before
+`initrd-switch-root.target`. With the scripted initrd, stage 1 copies the file
+to the root filesystem and a stage-2 unit imports it after journald starts.
+
+```
+journalctl -b -t nmbl-init
+```
+
+If the ring overflowed, the imported log starts with
+`=== nmbl-init: log truncated, earlier <N> bytes dropped ===`.
+
+`nix run .#check-log-import` checks this path in a VM.
+
+## Stateful boot tracking
+
+`boot.nmbl.stateful.enable = true` makes NMBL record which generations
+booted successfully, and roll back after failed boots. NMBL keeps a 16 KiB
+CBOR file, `state.bin`, in `stateful.stateDir` on the boot partition. It
+writes the file through a read-write mount of the boot partition at
+`stateful.rwMountpoint`.
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `stateful.maxRecoveryAttempts` | `5` | Rollbacks NMBL tries before the failure is final. |
+| `stateful.successTarget` | `multi-user.target` | The systemd target that marks a boot as successful. |
+| `stateful.stateDir` | `/boot/nmbl` | Directory of `state.bin`, as seen from the booted system. |
+| `stateful.rwMountpoint` | `/mnt/boot-state` | Where NMBL mounts the boot partition read-write. |
+
+The install hook runs `nmbl-init --init-state <stateDir>`. It creates
+`state.bin` when it is missing and validates an existing file without
+rewriting it. A unit named `nmbl-boot-succeeded` runs
+`nmbl-init --boot-succeeded <stateDir>` once the system reaches
+`successTarget`.
+
+At boot, NMBL checks whether the previous boot reached the success target.
+If it did not, NMBL boots a known-good generation from a list of the last 20
+good generations. After `maxRecoveryAttempts` failed rollbacks the failure
+is final, and `rescue.automatic` decides what happens next. See
+[Automatic rescue after a failed boot](#automatic-rescue-after-a-failed-boot).
+
+Fields added after the first version of `state.bin` have serde defaults, so
+an older `nmbl-init` reads a newer file. If the file has a
+`state_format_version` newer than the binary knows, NMBL logs a warning and
+boots without state tracking.
+
+## Instant boot and nmblctl
+
+`boot.nmbl.instantBoot.enable` skips the selector countdown when the last
+boot succeeded, no rollback or rescue is pending, and no key was pressed
+during early boot. It needs `stateful.enable` or a signed `generationImage`
+as a source of boot health.
+
+`nmblctl` is a root-only tool on the booted system. It shows the chain of
+boot stages and NMBL's handover, and it sets the default generation or a
+one-shot choice for the next boot. See [docs/nmblctl.md](docs/nmblctl.md).
+
+## Signed EROFS generations
+
+`boot.nmbl.generationImage` boots the Nix store of a generation from a
+signed EROFS image under `/boot/nmbl-generations`. NMBL verifies the image
+before kexec, and the target initrd verifies it again. With
+`generationImage.automaticRollback`, an untested generation rolls back to
+its tested predecessor when its boot does not complete. The tools `nmbl-erofsctl`, `nmbl-erofs-deploy` and
+`nmbl-erofs-receive` build, deploy and switch these images. See
+[docs/erofs-generations.md](docs/erofs-generations.md).
+
+`boot.nmbl.bootUpdate` adds an authenticated A/B updater for the boot set,
+with a separate unprivileged service user. See
+[docs/boot-set-updates.md](docs/boot-set-updates.md).
 
 ## External configuration
 
-By default the runtime TOML is baked into the initramfs at build
-time, so any change to a NMBL knob — even a timeout tweak — requires
-`nixos-rebuild`. Setting `boot.nmbl.configLocation = "external"`
-splits the config into two tiers:
+By default the build embeds the runtime TOML into the initramfs, so a change
+to any NMBL setting needs a rebuild. With
+`boot.nmbl.configLocation = "external"` the config has two parts:
 
-- **`/etc/nmbl/bootstrap.toml`** — embedded in the initramfs. Tiny.
-  Carries only what `nmbl-init` needs to reach the boot partition:
-  the boot device path, filesystem type, mount options, the kernel
-  modules required to expose that device, and the relative path to
-  the full config inside the boot partition.
-- **`/boot/nmbl/config.toml`** — staged onto the boot partition by
-  the install hook. Hand-editable. The full runtime schema
-  (filesystems, activations, modules, TUI, paths, ...).
+- `/etc/nmbl/bootstrap.toml` is in the initramfs. It holds what `nmbl-init`
+  needs to reach the boot partition: the device, filesystem type, mount
+  options, kernel modules and the path of the full config.
+- `config.toml` on the boot partition (default path `/nmbl/config.toml`,
+  relative to the boot partition) holds the full runtime config.
 
-The Rust /init runs a new **Phase 0.5** between pseudo-fs mount and
-the explicit module load: it loads the bootstrap config, brings up
-its module list, populates `/dev/disk/by-*` via a `blkid` sweep,
-mounts the boot partition, and loads the full `Config` from there.
-The boot mountpoint is then visible to the rescue dispatcher so the
-disk-rescue path can find `nmbl-rescue.sfs` against the same mount.
+`nmbl-init` reads `bootstrap.toml` early, loads its modules, runs `blkid` to
+create `/dev/disk/by-*` links, mounts the boot partition and loads
+`config.toml` from it. The rescue code uses the same mount to find the
+rescue image.
 
-Operator workflow:
+Without signing, you can edit the file and reboot:
 
 ```bash
-# edit anything in the runtime config
 sudo vi /boot/nmbl/config.toml
-
-# reboot, changes apply, no rebuild needed
 sudo reboot
 ```
 
-Failure handling: each Phase 0.5 failure leaves the boot mount in
-place (when it got that far) so the emergency shell can fix the
-on-disk config without re-flashing:
+With signing enabled, NMBL verifies the external config against a
+signature, so an edited file needs a new signature. See
+[docs/external-config-signing.md](docs/external-config-signing.md).
 
-| Failure                            | Emergency shell sees |
-|------------------------------------|----------------------|
-| `bootstrap.toml` parse fails       | nothing mounted (build bug — needs rebuild) |
-| bootstrap module load fails        | pseudo-fs only |
-| boot device never appears          | pseudo-fs + diagnostic |
-| boot partition mount fails         | pseudo-fs + diagnostic |
-| `config.toml` missing on partition | `/mnt/boot` mounted, can `cat` directory |
-| `config.toml` parse fails          | `/mnt/boot` mounted, error names the line |
+When a step fails, NMBL keeps whatever it already mounted, so the emergency
+shell can fix the file on disk:
+
+| Failure | Emergency shell sees |
+|---------|----------------------|
+| `bootstrap.toml` does not parse | Nothing mounted. This is a build bug and needs a rebuild. |
+| A bootstrap module fails to load | Pseudo-filesystems only. |
+| The boot device does not appear | Pseudo-filesystems and a diagnostic. |
+| The boot partition does not mount | Pseudo-filesystems and a diagnostic. |
+| `config.toml` is missing | `/mnt/boot` is mounted. |
+| `config.toml` does not parse | `/mnt/boot` is mounted, and the error names the line. |
 
 Minimal example:
 
@@ -380,32 +452,34 @@ Minimal example:
 }
 ```
 
-The default `configLocation = "embedded"` keeps v1 behaviour
-(full config inside the initramfs); `nmbl-init` probes for
-`/etc/nmbl/bootstrap.toml` at startup and falls through to the
-single-tier path when it is absent.
+These values are the defaults. With `configLocation = "embedded"`, the
+initramfs has no `bootstrap.toml` and `nmbl-init` reads
+`/etc/nmbl/config.toml`.
 
 ## External rescue
 
-`boot.nmbl.rescue.mode` is a three-way enum:
+`boot.nmbl.rescue.mode` has three values:
 
-- **`embedded`** (default) — busybox + storage activation tools live
-  in the initramfs at `/bin/sh`. Legacy v1 behaviour. The emergency
-  path is a bare `execve(/bin/sh, …)`.
-- **`external`** — `nmbl-rescue.sfs` is built at install time from
-  `boot.nmbl.rescue.squashfsContents` (default:
-  `busybox-sandbox-shell`, `cryptsetup`, `lvm2`, `mdadm`) via
-  `pkgs.squashfsTools` (`mksquashfs`) with zstd-19 compression. The blob is
-  staged on the boot partition. The Rust /init loop-mounts it on
-  demand via `LOOP_CTL_GET_FREE` + `LOOP_CONFIGURE`, then
-  `switch_root`s into it (chdir → `mount --move . /` → chroot . →
-  chdir /) and `execve`s `/bin/sh` from the squashfs. The initramfs
-  ships no in-band shell in this mode, so the size win is real (see
-  `nmbl-init-rs/PLAN.md` §13 for measured deltas).
-- **`none`** — no rescue tools at all. The emergency-shell path
-  prints a structured banner and halts via `reboot(RB_HALT_SYSTEM)`.
+- `embedded` (default). busybox and the storage tools are in the
+  initramfs. The rescue `execve`s `/bin/sh`, which replaces NMBL.
+- `external`. The rescue image lives on the boot partition at
+  `rescue.sfsPath` (default `nmbl-rescue.sfs`). NMBL opens it, verifies its
+  signature when signing is enabled, loop-mounts it read-only under a tmpfs
+  overlay at `/rescue`, and runs its entrypoint as a chrooted child. NMBL
+  stays PID 1. It reboots when the rescue exits.
+- `none`. No rescue tools ship. NMBL prints a banner and halts.
 
-Example: external rescue with extra debug tooling.
+Before NMBL enters any rescue, it extends the TPM lock PCR with a poison
+value and closes every TPM-unsealed LUKS mapping. If that fails, NMBL takes
+the refuse path described in
+[The priority-file gate](#the-priority-file-gate).
+
+### The flat rescue
+
+With `rescue.fullSystem.enable = false`, the external rescue is a squashfs
+built from `rescue.squashfsContents` (default `busybox-sandbox-shell`,
+`cryptsetup`, `lvm2` and `mdadm`) with zstd level 19. NMBL runs its
+`/bin/sh`.
 
 ```nix
 {
@@ -415,7 +489,6 @@ Example: external rescue with extra debug tooling.
       busybox-sandbox-shell
       cryptsetup lvm2 mdadm
       pkgsStatic.strace
-      pkgsStatic.tmux
     ];
   };
 }
@@ -423,90 +496,132 @@ Example: external rescue with extra debug tooling.
 
 ### Full-system rescue over SSH
 
-`boot.nmbl.rescue.fullSystem.enable = true` replaces the busybox tree with
-a recovery system that starts its own network and `sshd` (port
-`fullSystem.sshdPort`, keys `fullSystem.rootAuthorizedKeys`). NMBL stays
-PID 1 outside it, with its own root at `/nmbl-root`.
+`boot.nmbl.rescue.fullSystem.enable = true` replaces the busybox tree with a
+recovery system that starts its own network and `sshd`. NMBL stays PID 1
+outside it, and its own root is visible at `/nmbl-root`.
 
-It starts in two stages (`docs/rescue-stages.md`). Stage 1 is NMBL's own
-initramfs, which carries `erofs.ko`, and its config, which names the stage-2
-image and pins its SHA-512. Stage 2 is a host-independent LZ4HC EROFS image with
-the recovery system and its NIC drivers. Host data (network profile, keys,
-port, host key, module list) stays in NMBL's config and is handed to the
-rescue at runtime, so the image does not rebuild when a host's configuration
-changes. NMBL verifies, pins and
-loop-mounts it over one descriptor. The image ships storage tools only for the
-stacks the host uses (no `cryptsetup` without LUKS, and so on). An interactive SSH
-login prints a welcome after authentication:
+The rescue starts in two stages. [docs/rescue-stages.md](docs/rescue-stages.md)
+describes them in detail.
+
+- Stage 1 is NMBL's own initramfs. It carries `erofs.ko`, `loop` and
+  `overlay`. Its `config.toml` names the stage-2 image and pins its SHA-512
+  in `[rescue.image]`.
+- Stage 2 is an EROFS image with the recovery system and the NIC drivers
+  and firmware for NMBL's kernel. NMBL verifies the signature and the
+  SHA-512 pin over one file descriptor, then loop-mounts that descriptor.
+  A validly signed image with a different digest is refused.
+
+The stage-2 image does not depend on the host. The host's settings live in
+the `[rescue.system]` table of NMBL's config: the sshd port, the authorized
+keys, the host key path, the modules to load and the network profile. NMBL
+validates them at rescue entry and writes them to `/etc/nmbl-rescue/` in the
+rescue overlay. A host configuration change therefore does not rebuild the
+image. Two hosts with the same NMBL kernel and rescue packages share one
+image.
+
+`nmblctl` is built with the host's signing public keys, so it ships in a
+separate small EROFS at `fullSystem.toolsImagePath` (default
+`nmbl/rescue-tools.erofs`). `[rescue.tools]` pins it, and NMBL checks it
+like the stage-2 image before it mounts it at `/nmbl-tools`. The rescue puts
+`nmblctl` on `PATH`. If NMBL refuses the tools image, the rescue runs without
+`nmblctl`.
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `fullSystem.minimal` | `false` | Small profile without Nix, CA certificates, btop, cryptsetup, LVM or e2fsprogs. |
+| `fullSystem.compression` | `"lz4hc"` | EROFS compressor: `lz4hc`, `zstd` or `none`. `zstd` needs an NMBL kernel of 6.10 or later, and an assertion enforces this. |
+| `fullSystem.packages` | Profile packages and storage tools | Packages in the image. |
+| `fullSystem.firmware` | `[ ]` | Firmware packages. The image gets only the blobs its modules request. |
+| `fullSystem.sshdPort` | `22222` | sshd port, passed in `[rescue.system]`. |
+| `fullSystem.rootAuthorizedKeys` | `[ ]` | Root SSH keys, passed in `[rescue.system]`. Without keys, remote login is off. |
+| `fullSystem.hostKeyPath` | `null` | Persistent Ed25519 host key in NMBL's namespace. Without it, the rescue generates a host key per boot. |
+| `fullSystem.identityVolume` | `null` | A plaintext filesystem with the SSH identity, mounted read-only before rescue. |
+| `fullSystem.toolsImagePath` | `"nmbl/rescue-tools.erofs"` | Path of the `nmblctl` tools image on the boot partition. |
+| `fullSystem.networkStage.*` | off | A separate signed networking EROFS stage. See [docs/network-stage.md](docs/network-stage.md). |
+
+The default package list includes storage tools only for the stacks the
+host uses. `cryptsetup` comes only with LUKS, `btrfs-progs` only with Btrfs,
+`lvm2` only with LVM activation, and `mdadm` only with mdraid.
+
+An interactive SSH login shows this message after authentication:
 
 ```text
 NMBL rescue - run `nmbl` to enter the bootloader.
 ```
 
-`nmbl` attaches to NMBL's menu over its root-only socket
-(`/nmbl-root/nmbl-run/tui.sock`). The session survives a slow link and
-ends cleanly (Ctrl+E, or when the client or its SSH session goes away).
+`nmbl` is NMBL's own binary, which the rescue bind-mounts at `/bin/nmbl`.
+Run as a normal process, it connects to NMBL's root-only socket at
+`/nmbl-root/nmbl-run/tui.sock` and shows NMBL's menu remotely. From there
+the operator can boot a generation, retry or reboot. The session survives a
+slow link. It ends on Ctrl+E, or when the client or its SSH connection goes
+away. Pasted text reaches the menu whole, on the console and in remote
+sessions.
+
+When the operator commits an action in `nmbl`, NMBL stops every rescue
+process, including SSH sessions, syncs and unmounts the rescue, and then
+boots the chosen generation, retries or reboots.
 
 ### Automatic rescue after a failed boot
 
-`boot.nmbl.rescue.automatic` is the single setting that decides what
-happens when a boot fails and nothing is left to fall back to:
+`boot.nmbl.rescue.automatic` decides what happens when a boot fails and NMBL
+has nothing left to fall back to:
 
 | `rescue.automatic` | Outcome |
 |---|---|
-| `true` | Enter the configured rescue without operator input. |
-| `false` (default) | Open the interactive emergency menu. |
+| `true` | NMBL enters the configured rescue without input. |
+| `false` (default) | NMBL opens the interactive emergency menu. |
 
-It applies uniformly to every such path: a failed tested signed generation
-(`generationImage`), exhausted stateful retries (`stateful`), and any
-boot-phase failure (mount, storage activation, generation scan, kexec,
-config load, panic). No other option changes the decision:
+The setting applies to every such failure: a failed tested generation
+(`generationImage`), exhausted stateful rollbacks (`stateful`), and any
+failure during a boot phase (mount, storage activation, generation scan,
+kexec, config load or panic). Some rules around it:
 
-- `rescue.mode` only chooses WHICH rescue is entered (the signed external
-  squashfs, or the embedded shell). `rescue.automatic = true` with
-  `rescue.mode = "none"` is rejected at evaluation time, because there is
-  nothing to enter.
+- `rescue.mode` chooses which rescue NMBL enters. An assertion rejects
+  `rescue.automatic = true` with `rescue.mode = "none"`.
 - Rollback comes first. A failed untested generation rolls back to its
-  tested predecessor, and the stateful ring tries its known-good
-  generations, before any failure is declared.
-- Operator decisions (choosing reboot, aborting a device wait, leaving a
-  wrong-password shell) are not boot failures and return to the menu. A
-  rescue that itself fails falls back to the menu, never to another
-  rescue attempt.
+  tested predecessor, and stateful tracking tries its known-good
+  generations, before NMBL treats the boot as failed.
+- Operator choices (reboot, aborting a device wait, leaving a wrong-password
+  shell) return to the menu. A rescue that fails falls back to the menu.
+- After stateful recovery is exhausted, root on the booted or rescue system
+  can allow one more attempt of a generation with
+  `nmblctl retry-generation --generation N`. The failure counters stay as
+  they are.
 
-Unattended servers should set `rescue.automatic = true`. The former
-`generationImage.automaticRescue` option is renamed to this one.
+Unattended servers should set `rescue.automatic = true`. This option
+replaces the former `generationImage.automaticRescue`.
 
-**Automatic rescue is not the security refuse.** A bad or missing
-signature, the priority-file gate, or a failed TPM seal takes the
-*refuse* terminus instead: cap the TPM PCR, close TPM-unsealed mappers,
-relock storage, write the rescue sentinel, reboot. That happens regardless
-of `rescue.automatic`. Rescue entered automatically is sealed the same
-way: the TPM is capped and TPM-unsealed mappers are closed before the
-rescue system starts, and a failed seal diverts to the refuse terminus.
+Security refusals follow their own path. A bad or missing signature, the
+priority-file gate or a failed TPM seal takes the refuse path described in
+[The priority-file gate](#the-priority-file-gate), whatever
+`rescue.automatic` says.
 
 ### Network fallback
 
-`boot.nmbl.rescue.network = true` adds an HTTP/1.0 fallback for the
-rescue squashfs. It bundles the configured NIC drivers
-(`rescue.nicDrivers`, plus any NIC modules already required by
-`hardware-configuration.nix`), enables the `network-rescue` Cargo
-feature in `nmbl-init`, and turns on a ratatui flow that:
+`boot.nmbl.rescue.network = true` adds an HTTP/1.0 download for the rescue
+image when the copy on disk cannot be used. The build adds the NIC drivers
+from `rescue.nicDrivers` (default `virtio_net`, `e1000e`, `igb` and `r8169`),
+the NIC modules from `hardware-configuration.nix` and `af_packet`. It also
+enables the `network-rescue` Cargo feature. NMBL then:
 
-1. Brings up the first link-up interface and runs a one-shot DHCPv4
-   exchange (DISCOVER → OFFER → REQUEST → ACK).
-2. Applies the lease via `SIOCSIFADDR` / `SIOCSIFNETMASK` /
-   `SIOCADDRT`.
-3. Prompts the operator for a rescue URL (pre-filled from
-   `rescue.defaultUrl`), streams the body through `Sha256` into a
-   `memfd_create(2)` fd, then lets the operator confirm the
-   computed hex digest against `rescue.defaultSha256`.
-4. Loop-mounts the memfd and `switch_root`s into it just like the
-   disk path.
+1. Brings up the first interface with a link and runs a DHCPv4 exchange.
+2. Applies the lease with `SIOCSIFADDR`, `SIOCSIFNETMASK` and `SIOCADDRT`.
+3. Asks for a URL (pre-filled from `rescue.defaultUrl`) and streams the
+   body through SHA-256 into a sealed `memfd`.
+4. With signing enabled, downloads `<url>.sig` and verifies the image under
+   the `rescue-sfs` domain. Under enforcement a missing or bad signature
+   rejects the image. In audit mode NMBL warns and continues.
+5. If the config pins the stage-2 SHA-512, requires that exact image. A
+   different image boots only when the operator presses an upper-case `U` on
+   the warning screen.
+6. Shows the computed SHA-256 next to `rescue.defaultSha256` for the
+   operator to confirm.
+7. Loads `loop`, the image filesystem and `overlay`, loop-mounts the
+   `memfd` and runs it like the disk rescue.
 
-Operator-confirmed SHA-256 substitutes for transport integrity, so
-the implementation stays HTTP-only — no TLS / `rustls` / `openssl`.
-HTTPS, IPv6, Wi-Fi, and PXE are intentionally out of scope.
+NMBL mounts no image that fails these checks. The download uses plain HTTP,
+and the checks above provide the integrity. NMBL has no TLS, IPv6, Wi-Fi or
+PXE support in this path.
 
 ```nix
 {
@@ -514,39 +629,31 @@ HTTPS, IPv6, Wi-Fi, and PXE are intentionally out of scope.
     mode    = "external";
     network = true;
     defaultUrl    = "http://rescue.lan/nmbl-rescue.sfs";
-    defaultSha256 = "deadbeefcafe...";
-    nicDrivers    = [ "virtio_net" "e1000e" "igb" "r8169" ];
+    defaultSha256 = "<64 hex digits>";
   };
 }
 ```
 
-The whole network surface is conditionally compiled. With
-`rescue.network = false` (the default) none of `sha2`, `dhcproto`,
-or the network modules ship — the Nix store dedup keeps the
-`nmbl-init` binary byte-identical between the embedded-rescue and
-external-rescue-without-network configurations.
+With `rescue.network = false` (the default), the binary contains none of
+the network code.
 
 ## Graphical splash
 
-By default the TUI renders on a text console (`/dev/console`, VT or
-serial). With `boot.nmbl.splash.enable = true` NMBL instead renders the
-**same** menu — generation list, LUKS passphrase modal, rescue menu,
-download gauges — graphically onto a DRM/KMS framebuffer, composited over
-a PNG background. It is not a separate UI: the identical `ratatui` state
-machine drives both targets, so every feature behaves the same either
-way.
+By default the TUI runs on a text console (`/dev/console`, a VT or a serial
+port). With `boot.nmbl.splash.enable = true`, NMBL draws the same `ratatui`
+menu on a DRM framebuffer over a PNG background. Both outputs use the same
+state machine, so every menu works the same way.
 
-The splash is best-effort and never blocks boot. On a serial console
-(no `/dev/dri/card*`), or on any DRM / font / framebuffer failure, NMBL
-transparently falls back to the text TUI. It is gated behind the
-`image-splash` Cargo feature, so default builds stay byte-identical.
+When there is no `/dev/dri/card*`, or a DRM, font or framebuffer step fails,
+NMBL falls back to the text TUI. The splash code is behind the
+`image-splash` Cargo feature.
 
 | Option | Type | Default | Effect |
 |--------|------|---------|--------|
-| `splash.enable` | bool | `false` | Render the menu on a DRM framebuffer; fall back to the text TUI on any failure. |
-| `splash.backgroundImage` | path | a bundled wallpaper PNG | Background image (RGBA8 PNG). |
-| `splash.backgroundLocation` | `"initrd"` \| `"boot-partition"` | `"initrd"` | Bake the PNG into the initramfs, or stage it next to the initrd on the boot partition (needs `configLocation = "external"`; keeps the initramfs lean). |
-| `splash.font.{package,dir,variant}` | — | Source Code Pro Regular (OTF) | The monospace face to rasterize; resolved and validated at build time. |
+| `splash.enable` | bool | `false` | Draw the menu on a DRM framebuffer. |
+| `splash.backgroundImage` | path | The cosmic-greeter background, converted to PNG | Background image (RGBA8 PNG). |
+| `splash.backgroundLocation` | `"initrd"` or `"boot-partition"` | `"initrd"` | Embed the PNG in the initramfs, or store it as `nmblsplash.png` on the boot partition. The second needs `configLocation = "external"`. If the file is missing, NMBL draws a solid background. |
+| `splash.font.{package,dir,variant}` | | Adobe Source Code Pro Regular (OTF) | The monospace face. The build fails and lists the available faces if the file does not exist. |
 
 ```nix
 {
@@ -557,315 +664,296 @@ transparently falls back to the text TUI. It is gated behind the
 }
 ```
 
-The splash uses the kernel's generic `simpledrm` / EFI framebuffer by
-default; boards whose firmware hands off a real GPU framebuffer
-(virtio-gpu, amdgpu, …) must load that DRM driver early via
-`boot.nmbl.earlyKernelModules`, since it deregisters `simpledrm`. There
-is no GPU acceleration and no animation — a static background with the
-live menu drawn on top.
+The splash uses `simpledrm` or the EFI framebuffer by default. A board whose
+GPU driver replaces `simpledrm` (virtio-gpu, amdgpu and others) must load
+that driver through `boot.nmbl.earlyKernelModules`. The splash has no GPU
+acceleration and no animation.
 
 ## Driver images
 
-`boot.nmbl.driverImages` ships **out-of-tree kernel modules (and their
-firmware) out-of-band** in a signed squashfs blob on the boot partition,
-instead of bloating the initramfs. Before NMBL hands off to the chosen
-generation it locates each declared image, verifies its detached
-signature against the baked trust anchor, loop-mounts it read-only,
-registers its `lib/firmware`, and loads the declared modules in order —
-so a proprietary GPU module, or a NIC driver only needed for network
-rescue, can be added without rebuilding `nmbl-init`.
+`boot.nmbl.driverImages` ships out-of-tree kernel modules and their firmware
+in signed squashfs images on the boot partition. Before the handoff, NMBL
+finds each image, verifies its detached signature against the baked keys,
+loop-mounts it read-only, registers its `lib/firmware`, and loads the listed
+modules in order.
 
-Driver images are part of the secure-boot posture: enabling them
-**requires** an active signing configuration (see *Verified loading*
-below). A bad or missing signature refuses the boot — there is no
-"load unsigned drivers" mode.
+Driver images require an active signing configuration. A bad or missing
+signature refuses the boot.
 
 | Option | Type | Default | Effect |
 |--------|------|---------|--------|
-| `driverImages.enable` | bool | `false` | Master switch; requires secure boot + a signing key. |
-| `driverImages.images.<name>.modules` | list of str | `[ ]` | Out-of-tree module names to load, in dependency order. |
-| `driverImages.images.<name>.firmware` | list of pkg | `[ ]` | Firmware baked into the image's `/lib/firmware`. |
-| `driverImages.images.<name>.blacklist` | list of str | `[ ]` | In-tree modules to blacklist first (e.g. `nouveau` before NVIDIA). |
-| `driverImages.images.<name>.path` | str | `nmbl/driver-<name>.sfs` | Image location, relative to the boot partition. |
+| `driverImages.enable` | bool | `false` | Turns driver images on. Requires signing. |
+| `driverImages.images.<name>.modules` | list of str | `[ ]` | Module names to load, in dependency order. |
+| `driverImages.images.<name>.firmware` | list of package | `[ ]` | Firmware in the image's `/lib/firmware`. |
+| `driverImages.images.<name>.blacklist` | list of str | `[ ]` | In-tree modules to blacklist first, for example `nouveau`. |
+| `driverImages.images.<name>.path` | str | `nmbl/driver-<name>.sfs` | Image path relative to the boot partition. |
+| `driverImages.images.<name>.sigPath` | str | `<path>.sig` | Signature path. |
 
-Each image is built pure (no key) and **signed in place at install
-time** with `nmbl-sign` (reusing `boot.nmbl.signing.imageKeyFile` or
-`imageKeyCommand`), so the private key is only ever a runtime path or
-pipe, never a Nix derivation input.
+The build creates each image without a key. The installer signs it with
+`nmbl-sign` and `signing.imageKeyFile` or `signing.imageKeyCommand`.
 
 ## Staged boot
 
-Staged boot lets an operator place a **signed config fragment plus an
-extra-driver image on the encrypted (priority) volume** that NMBL only
-sees *after* it unlocks storage. Once the LUKS volume is open, NMBL's
-priority gate mounts the volume, cryptographically attests it, verifies
-both staged artifacts, **merges the fragment on top of the base config
-transactionally**, and re-runs the expanded config — loading any extra
-modules, driver images, and storage activations — before `kexec`. The
-point is capability expansion behind encryption: the early/initrd config
-stays minimal, while a fragment that lives behind LUKS (invisible to an
-offline attacker) can add modules and activations the early boot did not
-have, all under the same signature enforcement.
+Staged boot puts a signed config fragment and a driver image on the
+encrypted priority volume. NMBL reads them only after it unlocks storage.
+The priority gate mounts the volume and verifies it. NMBL then verifies the
+fragment and the image, merges the fragment onto the base config as one
+transaction, and runs the merged config before kexec. The merged config can
+load more modules, driver images and storage activations. The early config
+stays small, and the fragment is not readable without the LUKS key.
 
 | Option | Type | Default | Effect |
 |--------|------|---------|--------|
-| `staged.enable` | bool | `false` | Apply a signed config fragment from the priority volume after unlock. Requires `secureBoot.enable`. |
-| `staged.image` | str | `nmbl-staged.img` | Priority-volume-relative path to the staged driver squashfs. |
-| `staged.fragment` | str | `nmbl/fragment.toml` | Priority-volume-relative path to the signed config fragment. |
-| `staged.sig` | str | `nmbl/fragment.toml.sig` | Detached signature for the fragment. |
+| `staged.enable` | bool | `false` | Apply the fragment after unlock. Requires `secureBoot.enable`. |
+| `staged.image` | str | `nmbl-staged.img` | Driver squashfs, relative to the priority volume. |
+| `staged.fragment` | str | `nmbl/fragment.toml` | Signed config fragment, relative to the priority volume. |
+| `staged.sig` | str | `nmbl/fragment.toml.sig` | Detached signature of the fragment. |
+| `bootstrap.staged.{mountpoint,fragment,sig}` | str | `/mnt/staged`, `nmbl/fragment.toml`, `nmbl/fragment.toml.sig` | The same paths for the bootstrap stage. |
 
-The fragment can override any non-policy config table (modules,
-activations, filesystems, TPM, rescue, driver images), but **never** the
-signing / secure-boot / staged tables themselves — those are rejected at
-parse time, so a fragment can't relax enforcement or re-point its own
-source. Any failure (bad signature, unparseable fragment, failed re-run)
-rolls the merge back to a pristine base config and refuses into rescue
-with the TPM relocked.
+A fragment may change modules, activations, filesystems, TPM, rescue and
+driver-image tables. The parser rejects a fragment that touches the
+signing, secure-boot or staged tables. On any failure (bad signature,
+unparseable fragment, failed run), NMBL restores the base config and refuses
+into rescue with the TPM locked.
 
 ## Verified loading and measured boot
 
-On top of UEFI Secure Boot, NMBL can enforce a full secure-boot posture:
-post-quantum signature verification of everything it loads, a TPM
-measurement of the exact handoff, and a hard guarantee that dropping to
-any shell or rescue first locks the TPM.
+On top of UEFI Secure Boot, NMBL can verify everything it loads with
+post-quantum signatures, measure the handoff into the TPM, and lock the TPM
+before any shell or rescue.
 
-### Generation signing (post-quantum)
+### Generation signing
 
-With `boot.nmbl.signing.enable` (and `enforce`), NMBL refuses to `kexec`
-any generation whose kernel and initrd are not signed by a public key
-**baked into the `nmbl-init` binary itself**. Signatures are **FIPS-204
-ML-DSA** (ML-DSA-65 by default, ML-DSA-87 optional) over each blob's
-SHA-512 digest, carried in a detached `.sig` sidecar under a per-role
-domain tag. Verification is fail-closed and tries every baked key of the
-matching algorithm; there is no allow-unsigned bypass. The trust anchor
-is the *public* key compiled into the binary — not anything on the
-writable boot partition — so editing config or the boot FS cannot swap
-it.
+With `boot.nmbl.signing.enable` and `signing.enforce`, NMBL refuses to
+`kexec` a generation unless its kernel and initrd carry a valid signature
+from a public key compiled into `nmbl-init`. Signatures use FIPS 204 ML-DSA
+(ML-DSA-65 by default, ML-DSA-87 optional) over each file's SHA-512 digest.
+They are stored in a detached `.sig` file and bound to a domain tag per
+role. NMBL tries every baked key of the matching algorithm. No option allows
+unsigned generations. The keys are compiled into the binary, so editing the
+config or the boot partition cannot replace them.
 
-Generations are signed at **install time** by the `nmbl-sign` host tool
-using `boot.nmbl.signing.generationKeyFile`. That private key is only
-ever a runtime path string — an eval-time assertion aborts the build if
-a signing key resolves under the Nix store, so the secret can never
-become a derivation input. (`signing.deferInstallSigning` skips the
-in-installer signing step for sealed disk-image builds while leaving
-runtime enforcement intact.)
+`signing.enable` without `enforce` is audit mode: NMBL logs bad signatures
+and boots anyway. An assertion requires `secureBoot.allowAuditModeInsecure`
+for audit mode.
 
-The key need not exist as a file at all. Set
-`signing.generationKeyCommand` (and `imageKeyCommand` for driver/rescue
-images) to an argv whose stdout is the private key, and every
-install-time signature runs that command once and pipes it into
-`nmbl-sign sign --key-stdin`. Nothing is cached on disk. A secrets store
-plugs in directly:
+The installer signs generations with `nmbl-sign` and
+`signing.generationKeyFile`. That option holds a path string. An assertion
+fails the build if a key path resolves into the Nix store. This keeps the
+private key out of every derivation. `signing.deferInstallSigning` skips
+the signing step in the installer for sealed disk-image builds. Runtime
+enforcement stays on.
+
+The key does not need to exist as a file. Set
+`signing.generationKeyCommand` (and `imageKeyCommand` for driver, rescue, tools and
+network-stage images) to a command whose standard output is the private
+key. The installer runs it once per signature and pipes the key into
+`nmbl-sign sign --key-stdin`. Nothing is written to disk. A secrets store
+works directly:
 
 ```nix
 boot.nmbl.signing.generationKeyCommand = [ "nix-secrets" "pipe-secret" "nmbl-generation-key" ];
 ```
 
-The matching key pair can likewise be generated straight into pipes:
-`nmbl-sign keygen --alg ml-dsa-65 --stdio` writes the private key to
-stdout and the raw public key to fd 3, creating no files (see
-[Pipe-only signing keys](#pipe-only-signing-keys)).
+`nmbl-sign keygen --alg ml-dsa-65 --stdio` creates a key pair the same way.
+It writes the private key to stdout and the raw public key to fd 3. See
+[Pipe-only signing keys](#pipe-only-signing-keys).
 
 | Option | Type | Default | Effect |
 |--------|------|---------|--------|
-| `signing.enable` | bool | `false` | Compile the verifier into `/init` (audit mode on its own). |
-| `signing.enforce` | bool | `false` | Fail-closed: a bad/missing signature refuses into rescue. |
-| `signing.publicKeys` | list of path | `[ ]` | ML-DSA trust-anchor public keys baked into the binary. |
-| `signing.algorithm` | `"ml-dsa-65"` \| `"ml-dsa-87"` | `"ml-dsa-65"` | Signature variant. |
-| `signing.generationKeyFile` | null or path | `null` | Install-time private key (a path, never store-imported). |
-| `signing.generationKeyCommand` | null or list of str | `null` | Alternative: argv printing the private key on stdout, piped per signature. |
-| `signing.imageKeyFile` / `imageKeyCommand` | — | `null` | Same pair for driver, rescue and network-stage images. |
-| `signing.uki.*` | — | — | Optionally sign NMBL's own UKI with a firmware-`db` Secure-Boot key, and provide the signed-PCR-policy keypair for measured-boot auto-unseal. |
+| `signing.enable` | bool | `false` | Compile the verifier into `/init`. |
+| `signing.enforce` | bool | `false` | Refuse into rescue on a bad or missing signature. |
+| `signing.publicKeys` | list of path | `[ ]` | ML-DSA public keys compiled into the binary. |
+| `signing.algorithm` | `"ml-dsa-65"` or `"ml-dsa-87"` | `"ml-dsa-65"` | Signature algorithm. |
+| `signing.sigPathSuffix` | str | `".sig"` | Suffix of signature files. |
+| `signing.generationKeyFile` | null or path | `null` | Install-time private key path. |
+| `signing.generationKeyCommand` | null or list of str | `null` | Command that prints the private key. |
+| `signing.imageKeyFile`, `signing.imageKeyCommand` | | `null` | The same pair for driver, rescue, tools and network-stage images. |
+| `signing.uki.enable` | bool | `false` | Sign NMBL's UKI at install time with a key enrolled in the firmware `db`. |
+| `signing.uki.keyFile`, `signing.uki.certFile` | null or path | `null` | The `db` key and certificate, read at install time. |
+| `signing.uki.refuseInstallIfNotEnforcing` | bool | `false` | Abort the install when the firmware would boot an unsigned UKI. |
 
 ### Pipe-only signing keys
 
-`nmbl-sign` can create and use ML-DSA keys without any private-key file:
+`nmbl-sign` can create and use ML-DSA keys without a private-key file:
 
 ```console
-# private key -> stdout, raw public key -> fd 3; fails if fd 3 is closed
+# private key to stdout, raw public key to fd 3; fails if fd 3 is closed
 nmbl-sign keygen --alg ml-dsa-65 --stdio > >(store-secret nmbl-key) 3> nmbl.pub
 
-# private key <- stdin (bounded, zeroized); the input must be a file path
+# private key from stdin (bounded, zeroized); the input must be a file path
 print-secret nmbl-key | nmbl-sign sign --key-stdin --domain gen-kernel kernel --out kernel.sig
 ```
 
-`--key-stdin` refuses a terminal on stdin and refuses `-`, `/dev/stdin`
-or any path that is the same file as stdin as the input, since the key
-and the payload cannot share one stream. The key-file forms
-(`--out-priv`/`--out-pub`, `--key <FILE>`) keep working. Besides the
-install-time `*KeyCommand` options, the operator tools accept `-` as the
-private key: `nmbl-erofs-deploy` and `nmbl-erofsctl prepare` then run
-`NMBL_SIGN_KEY_COMMAND` (a shell command line) once per signature, and
-`nmbl-boot-update prepare A|B SRC OUT - PUB` reads the key once from
-stdin for the whole slot.
-The UEFI Secure-Boot `db` key (`signing.uki.keyFile`) is an RSA PEM
-consumed by `sbsign`, not an ML-DSA key, and stays file-based.
+`--key-stdin` refuses a terminal on stdin. It also refuses `-`,
+`/dev/stdin` and any input path that is the same file as stdin, because the
+key and the payload cannot share one stream. The key-file forms
+(`--out-priv`, `--out-pub` and `--key <FILE>`) still work.
+
+The operator tools also accept `-` as the private key. `nmbl-erofs-deploy`
+and `nmbl-erofsctl prepare` then run `NMBL_SIGN_KEY_COMMAND` (a shell
+command line) once per signature. `nmbl-boot-update prepare A|B SRC OUT - PUB`
+reads the key from stdin once for the whole slot.
+
+`nmbl-sign sign-digests` signs a deployment from its digests. It reads one
+JSON request of at most 64 KiB from stdin. The request carries the private
+key, the SHA-256 of the matching public key, and the SHA-512 and size of each
+artifact. The artifact roles are `generation-image`, `boot-config`,
+`gen-kernel`, `gen-initrd` and `rescue-sfs`, plus an optional
+`network-stage`. It prints the signatures as JSON and prints nothing if any
+check fails.
+
+The UEFI Secure Boot `db` key (`signing.uki.keyFile`) is an RSA PEM key for
+`sbsign` and stays file-based.
 
 ### Measured boot and the TPM lock
 
-With `boot.nmbl.tpm.measure`, NMBL extends **PCR 11** with the exact
-handoff — an NMBL identity marker, the kernel digest, the initrd digest,
-the kexec cmdline, and each verified driver image — *after* the
-signature gate passes and *before* `kexec`. A LUKS volume key sealed to
-PCR 11 (plus PCR 7 for Secure-Boot state) therefore only auto-unseals
-when the precise measured image is the one booting. NMBL never seals or
-unseals itself; LUKS auto-unlock is delegated to `systemd-cryptenroll` +
-`cryptsetup --token-only` — see *Sealing a LUKS volume to the TPM*
-above for the enroll → boot-unlock round trip.
+With `boot.nmbl.tpm.measure`, NMBL extends PCR 11 with the handoff after the
+signature check and before `kexec`. The measurement covers an NMBL marker,
+the kernel digest, the initrd digest, the kexec command line and each
+verified driver image. A LUKS key sealed to PCR 11 and PCR 7 then unseals
+only when that exact image boots. NMBL has no TPM seal or unseal code of its
+own. `systemd-cryptenroll` seals the key, and NMBL's
+`cryptsetup --token-only` call unseals it.
+See [Sealing a LUKS volume to the TPM](#sealing-a-luks-volume-to-the-tpm).
 
-The matching invariant: **any time NMBL is about to give the operator an
-interactive context** — emergency shell, rescue, remote attach, a
-wrong-password recovery shell, or a policy refuse — it first *caps*
-PCR 11 with an irreversible poison value and closes every TPM-unsealed
-LUKS mapper. A secret sealed to the pre-rescue PCR state is then
-unreachable for the rest of the power cycle. This is enforced *by type*
-(a shell cannot be spawned without a "sealed" token) and by a build-time
-check, so there is no rescue path that leaves the TPM open.
+Before NMBL gives the operator any interactive context, it extends PCR 11
+with a poison value and closes every TPM-unsealed LUKS mapping. This covers
+the emergency shell, rescue, remote attach, a wrong-password shell and a
+policy refusal. A secret sealed to the earlier PCR state then stays
+unreachable until the next power cycle. The type system enforces this,
+because a shell cannot start without a sealed token, and a build check
+verifies it too.
 
 | Option | Type | Default | Effect |
 |--------|------|---------|--------|
-| `tpm.measure` | bool | `false` | Extend the lock PCR with NMBL's boot events; force-loads `tpm_crb`/`tpm_tis` early. |
-| `tpm.pcrIndex` | int | `11` | PCR NMBL measures into / caps. |
-| `tpm.requireTpm` | bool | `measure \|\| secureBoot.enable` | Abort boot if no usable TPM, instead of degrading to an unmeasured boot. |
-| `tpm.device` | path | `/dev/tpmrm0` | TPM device (kernel resource-manager node). |
+| `tpm.measure` | bool | `false` | Extend the lock PCR with NMBL's boot events. Loads `tpm_crb` and `tpm_tis` early. |
+| `tpm.pcrIndex` | int | `11` | PCR that NMBL measures into and caps. |
+| `tpm.requireTpm` | bool | `true` when `tpm.measure` or `secureBoot.enable` is set | Abort the boot when no TPM works. |
+| `tpm.device` | path | `/dev/tpmrm0` | TPM device. |
 
 ### The priority-file gate
 
-`boot.nmbl.secureBoot` adds a first-load gate: NMBL mounts a configured
-priority volume read-only and verifies a signed file on it before it
-will proceed to a measured boot or consume a staged fragment. If the
-file is **valid**, boot proceeds. If it is **missing or wrong-signed**
-(and enforcing), NMBL fails closed hard: it caps the TPM, closes every
-TPM-unsealed mapper, writes a rescue sentinel, relocks LUKS/LVM/mdraid,
-and shows a non-interactive countdown whose **only** action is reboot —
-which, because the sentinel is now set, lands in rescue on the next
-cycle. No shell, no rescue handoff, nothing else is offered.
+`boot.nmbl.secureBoot` adds a gate before a measured boot or a staged
+fragment. NMBL mounts a priority volume read-only and verifies a signed
+file on it. If the file is valid, the boot continues. If the file is missing
+or has a bad signature and `enforce` is on, NMBL refuses. It caps the TPM,
+closes every TPM-unsealed mapping, writes the rescue sentinel, and locks
+LUKS, LVM and mdraid again. It then shows a countdown whose only action is
+reboot. Because the sentinel is set, the next boot goes to rescue.
 
 | Option | Type | Default | Effect |
 |--------|------|---------|--------|
-| `secureBoot.enable` | bool | `false` | Mount + verify the priority file before measured/staged boot. |
-| `secureBoot.priorityVolume.{device,mountpoint,fstype,options,insideLuks}` | — | — | The volume to mount RO and attest. `insideLuks = true` runs the gate after unlock. |
-| `secureBoot.signedFilePath` | str | `nmbl/priority.signed` | The signed file (with a `.sig` sidecar) on that volume. |
-| `secureBoot.allowedKeyIds` | list of str | `[ ]` | Restrict trust to specific baked-key fingerprints. |
-| `secureBoot.enforce` | bool | `false` | Fail-closed (refuse) on a bad/missing file. |
-| `secureBoot.sentinelPath` | str | `/boot/nmbl/rescue` | The rescue sentinel (see below). |
+| `secureBoot.enable` | bool | `false` | Verify the priority file before a measured or staged boot. |
+| `secureBoot.priorityVolume.device` | str | `null` | The volume to mount and verify. |
+| `secureBoot.priorityVolume.{mountpoint,fstype,options}` | str | `/mnt/nmbl-priority`, `ext4`, `ro,nosuid,nodev,noexec` | Mount settings. |
+| `secureBoot.priorityVolume.insideLuks` | bool | `false` | Run the gate after LUKS unlock. |
+| `secureBoot.signedFilePath` | str | `nmbl/priority.signed` | The signed file, with a `.sig` next to it. |
+| `secureBoot.allowedKeyIds` | list of str | `[ ]` | Limit trust to these key fingerprints. Needed when more than one key is baked. |
+| `secureBoot.enforce` | bool | `false` | Refuse on a bad or missing file. |
+| `secureBoot.allowAuditModeInsecure` | bool | `false` | Allow `enable` without `enforce`. |
+| `secureBoot.requireTpm` | bool | `false` | Abort when no TPM works. |
+| `secureBoot.refuseCountdownSeconds` | int | `30` | Countdown on the refuse screen. |
+| `secureBoot.sentinelPath` | str | `/boot/nmbl/rescue` | The rescue sentinel. |
 
 ### The rescue sentinel
 
-An **empty sentinel file** at `secureBoot.sentinelPath` (default
-`/boot/nmbl/rescue`) is consulted at the very start of boot. If present,
-NMBL skips the measured boot entirely and goes straight to rescue with
-the TPM kept locked. The refuse path above writes this sentinel before
-relocking, so a refused boot reliably lands in rescue (and only rescue)
-on the next cycle. Remove the sentinel to restore normal measured boot.
-It is honoured with both external and embedded config: embedded-config
-systems re-check it once `/boot` is mounted, before any generation is
-measured or kexec'd. The sentinel forces rescue regardless of
-`rescue.automatic`, because it is an explicit request, not a boot failure.
+NMBL checks for an empty file at `secureBoot.sentinelPath` (default
+`/boot/nmbl/rescue`) at the start of the boot. If it exists, NMBL skips the
+measured boot and goes to rescue with the TPM locked. The refuse path writes
+this file, so a refused boot comes up in rescue on the next start. Delete
+the file to return to normal boots. With embedded config, NMBL checks the
+sentinel once `/boot` is mounted, before it measures or starts a
+generation. The sentinel forces rescue whatever `rescue.automatic` says,
+because it is an explicit request.
+
+## Development tools
+
+`nix run .#nmbl-simbox` runs the real `nmbl-init` as PID 1 in a rootless
+container with simulated system calls. See
+[docs/nmbl-simbox.md](docs/nmbl-simbox.md). `nix run .#nmbl-ui-preview`
+shows NMBL's boot UI in an X11 window with mock state.
 
 ## Where to find things
 
-| Path | What it is |
-|------|------------|
-| `nmbl-init-rs/` | Rust crate — the `/init` binary. |
-| `nmbl-init-rs/PLAN.md` | Source-of-truth design contract. |
+| Path | Contents |
+|------|----------|
+| `nmbl-init-rs/` | Rust crate for the `/init` binary. |
+| `nmbl-init-rs/PLAN.md` | Design of `nmbl-init`: phases, config schema, crate layout. |
 | `nmbl-init-rs/src/config/` | Runtime TOML schema (`serde` types). |
-| `nmbl-init-rs/src/main.rs`, `src/main_parts/` | Phase orchestration, boot driver, panic recovery. |
-| `nmbl-init-rs/src/ui/` | `ratatui` TUI + console backends (text + splash). |
-| `nmbl-init-rs/src/splash/` | DRM/KMS graphical splash backend (`image-splash` feature). |
-| `nmbl-init-rs/src/sig/` | Post-quantum (ML-DSA) signature verify + baked trust anchor. |
-| `nmbl-init-rs/src/boot/handoff.rs` | verify → measure → `kexec_file_load` handoff. |
-| `nmbl-init-rs/src/tpm/` | TPM core: PCR-11 measure + irreversible lock cap. |
-| `nmbl-init-rs/src/policy/` | Priority gate, refuse screen, sentinel, seal-before-shell guard, relock. |
-| `nmbl-init-rs/src/imageload/` | Driver-image loop-mount + module load. |
-| `nmbl-init-rs/src/staged/` | Staged-boot fragment verify, transactional merge, re-run. |
-| `nmbl-init-rs/nmbl-host-tools/` | `nmbl-sign` host signer (install-time signing). |
-| `nmbl-init-rs/nmblctl/` | `nmblctl`, the root-only control tool (see `docs/nmblctl.md`). |
-| `lib/options.nix` | `boot.nmbl.*` NixOS option definitions. |
-| `lib/modules/security/` | `signing` / `tpm` / `secureBoot` / `staged-boot` / `driver-image` options + assertions. |
-| `lib/config.nix` | Module implementation (assembles the initramfs). |
-| `lib/config-toml.nix` | Renders `/etc/nmbl/config.toml` from `cfg`. |
-| `lib/modules/activation.nix` | Activation options + computed outputs. |
-| `lib/modules/kernel-modules.nix` | Module closure and `modprobe.conf`. |
-| `lib/install-bootloader.nix`, `lib/install-signing.nix`, `lib/install-gen-signing.nix` | Install hooks; install-runtime signing. |
-| `lib/rescue-sfs.nix`, `lib/staged-install.nix`, `lib/modules/driver-image.nix` | Build the rescue (flat squashfs or stage-2 EROFS) / staged / driver images. |
-| `lib/tpm-enroll.nix`, `lib/security-consts.nix` | `nmbl-tpm-enroll` helper; single source of security constants. |
-| `testing/` | VM harnesses and `nix run .#test-*` apps. |
-| `ARCHITECTURE.md` | Longer-form architecture notes. |
+| `nmbl-init-rs/src/main.rs`, `src/main_parts/` | Phase order, boot driver, panic recovery. |
+| `nmbl-init-rs/src/ui/` | `ratatui` TUI, console backends, remote TUI. |
+| `nmbl-init-rs/src/ipc/` | The TUI socket for remote sessions. |
+| `nmbl-init-rs/src/splash/` | DRM splash backend (`image-splash`). |
+| `nmbl-init-rs/src/rescue/` | Rescue dispatch, image verification and pinning, chrooted rescue child, network fallback. |
+| `nmbl-init-rs/src/state/` | `state.bin` for stateful boot tracking. |
+| `nmbl-init-rs/src/generations/`, `src/generation_*.rs` | Generation discovery and EROFS generation state. |
+| `nmbl-init-rs/src/sig/` | ML-DSA verification and the baked keys. |
+| `nmbl-init-rs/src/boot/` | Verify, measure and `kexec_file_load` handoff. |
+| `nmbl-init-rs/src/tpm/` | PCR measurement and the lock cap. |
+| `nmbl-init-rs/src/policy/` | Priority gate, refuse screen, sentinel, seal before shell, relock. |
+| `nmbl-init-rs/src/imageload/` | Driver-image loop mount and module load. |
+| `nmbl-init-rs/src/staged/` | Staged fragment verification, merge and re-run. |
+| `nmbl-init-rs/nmbl-host-tools/` | `nmbl-sign`, the install-time signer. |
+| `nmbl-init-rs/nmblctl/` | `nmblctl` (see `docs/nmblctl.md`). |
+| `nmbl-init-rs/nmbl-boot-update/` | `nmbl-boot-update` (see `docs/boot-set-updates.md`). |
+| `nmbl-init-rs/nmbl-simbox/`, `nmbl-init-rs/nmbl-ui-preview/` | Development tools. |
+| `lib/options.nix` | Core `boot.nmbl.*` options. |
+| `lib/modules/` | Activation, stateful, log import, rescue network stage and assertions. |
+| `lib/modules/security/` | Signing, TPM, secure boot, staged boot, driver images, generation images, boot updates. |
+| `lib/config.nix` | Module implementation, initramfs assembly. |
+| `lib/config-toml.nix`, `lib/bootstrap-toml.nix` | Render `config.toml` and `bootstrap.toml`. |
+| `lib/install-bootloader.nix`, `lib/install-signing.nix`, `lib/install-gen-signing.nix` | Install hook and install-time signing. |
+| `lib/rescue-sfs.nix`, `lib/rescue/` | Flat rescue squashfs and stage-2 EROFS rescue image. |
+| `lib/tpm-enroll.nix`, `lib/security-consts.nix` | `nmbl-tpm-enroll` and shared security constants. |
+| `tools/` | `nmbl-erofsctl`, `nmbl-erofs-deploy`, `nmbl-erofs-receive` and VM test scripts. |
+| `testing/` | VM tests and the `nix run .#test-*` apps. |
+| `docs/` | Feature documentation. |
+| `ARCHITECTURE.md` | Architecture overview. |
 
 ## Status
 
 Working:
 
-- Pseudo-fs mount, explicit kernel module load (with `MODULE_INIT_COMPRESSED_FILE` for `.ko.xz`/`.ko.zst`).
-- Device-wait poll and configured filesystem mount.
+- Pseudo-filesystem mount, explicit module load, device wait and mount of the
+  target filesystems.
 - NixOS generation discovery from `/nix/var/nix/profiles/`.
-- Ratatui TUI: generation list, countdown, cmdline editor, passthrough toggle, emergency shell, serial-console fallback.
-- Storage activation: LVM (`vgchange -ay`), mdraid (`mdadm --assemble --scan`), LUKS via TPM / keyfile / passphrase, ZFS (`zpool import -N`).
-- `kexec_file_load(2)` handover into the selected generation.
-- Panic hook with `--errored` recovery re-exec.
-- Bootstrapper installation via GRUB or systemd-boot on GPT for BIOS or UEFI, the `efi-stub` direct-boot UKI (fallback path or an own path alongside another bootloader), plus QEMU `-kernel` direct invocation.
-- **External configuration** on the boot partition
-  (`boot.nmbl.configLocation = "external"`): tiny bootstrap.toml
-  embedded in the initramfs, full config.toml staged on /boot and
-  edit-and-reboot at runtime.
-- **External rescue** (`boot.nmbl.rescue.mode = "external"`):
-  loop-mount + switch_root into `nmbl-rescue.sfs` (a busybox squashfs, or the
-  pinned stage-2 EROFS of the full-system rescue; see `docs/rescue-stages.md`)
-  on the boot partition, with `none` as a halt-only alternative.
-- **Network rescue fallback** (`boot.nmbl.rescue.network = true`):
-  HTTP/1.0 download of the rescue squashfs into a sealed `memfd`. With
-  signing enabled it must verify under the `rescue-sfs` domain against
-  `<url>.sig`; a config-pinned stage-2 SHA-512 must match unless the
-  operator explicitly boots another image; the operator also confirms
-  its SHA-256. Behind the `network-rescue` Cargo feature.
-- **Graphical splash** (`boot.nmbl.splash.enable`): the same `ratatui`
-  menu drawn on a DRM/KMS framebuffer over a PNG background, with
-  transparent fallback to the text TUI on serial or any failure
-  (`image-splash` Cargo feature).
-- **Post-quantum generation signing** (`boot.nmbl.signing`): fail-closed
-  FIPS-204 ML-DSA verification of every kernel+initrd against keys baked
-  into the binary; install-time signing with `nmbl-sign`, the private
-  key never a Nix derivation input.
-- **Measured boot** (`boot.nmbl.tpm.measure`): PCR-11 extended with the
-  exact handoff before kexec; TPM-sealed LUKS auto-unlock via
-  `nmbl-tpm-enroll`.
-- **Lock-on-rescue**: every shell/rescue path caps PCR-11 and closes
-  TPM-unsealed mappers first — enforced by type and a build-time check.
-- **Priority-file gate** (`boot.nmbl.secureBoot`): a signed file is
-  verified before measured/staged boot; a missing or wrong-signed file
-  relocks LUKS, caps the TPM, writes the rescue sentinel, and offers
-  only reboot-into-rescue.
-- **nmblctl** and **instant boot** (`boot.nmbl.instantBoot.enable`): see
-  `docs/nmblctl.md`.
-- **Rescue sentinel**: an empty `/boot/nmbl/rescue` forces
-  straight-to-rescue with the TPM kept locked.
-- **Driver images** (`boot.nmbl.driverImages`) and **staged boot**
-  (`boot.nmbl.staged`): signed, loop-mounted out-of-band drivers, and a
-  signed config fragment merged transactionally from behind LUKS.
+- `ratatui` TUI: generation list, countdown, command-line editor, passthrough
+  toggle, LUKS passphrase prompt, emergency menu with Pretty Shell and Raw
+  Shell, serial console.
+- Storage activation: LVM (`vgchange -ay`), mdraid (`mdadm --assemble --scan`),
+  LUKS with TPM, key file or passphrase, and ZFS (`zpool import -N`).
+- `kexec_file_load(2)` handoff, panic recovery with `--errored`.
+- Install through GRUB or systemd-boot on GPT for BIOS or UEFI, the
+  `efi-stub` UKI, and QEMU `-kernel`.
+- External configuration, optionally signed.
+- External rescue: the flat squashfs, and the staged full-system rescue with
+  SSH and the remote TUI.
+- Network rescue over HTTP/1.0 with signature, pin and SHA-256 checks.
+- Graphical splash with fallback to the text TUI.
+- ML-DSA generation signing, measured boot, the TPM lock before rescue, the
+  priority-file gate and the rescue sentinel.
+- Stateful boot tracking with rollback, instant boot and `nmblctl`.
+- Signed EROFS generations and authenticated boot-set updates.
+- Driver images and staged boot.
 
 Not supported:
 
-- `LABEL=`, `UUID=`, `PARTUUID=` filesystem specifiers in the
-  operator's full config — `nmbl-init` has no udev for the runtime
-  phase, so only raw `/dev/*` paths are resolved. The config loader
-  rejects the others up front. (Phase 0.5's `blkid` sweep populates
-  `/dev/disk/by-*` only for the bootstrap stage's own boot device.)
-- LUKS unlock via FIDO2 / YubiKey / smartcard.
-- MBR partition tables (only GPT is supported by the bootstrapper).
+- `LABEL=`, `UUID=` and `PARTUUID=` device names in the runtime config. The
+  config loader rejects them. Use the `/dev/disk/by-label/...`,
+  `by-uuid`, `by-partlabel` or `by-partuuid` form, which NMBL creates with
+  `blkid` at boot.
+- LUKS unlock with FIDO2, YubiKey or smartcards.
+- MBR partition tables. The bootstrapper supports GPT only.
 
 Roadmap:
 
-- **erofs as the preferred read-only image format.** NMBL currently
-  builds and mounts every image it owns (rescue, driver-image, staged)
-  as squashfs. The next goal is to support — and prefer — **erofs** for
-  these images (smaller, faster random reads, mature mainline support),
-  keeping squashfs as a fallback. erofs is already accepted as a generic
-  `fileSystems` fsType for operator-provided volumes; this goal is about
-  the images NMBL produces and loop-mounts itself.
+- Generations, the stage-2 rescue and the network stage use EROFS. Driver
+  images, the staged image and the flat rescue still use squashfs. The goal
+  is EROFS for these images too.
 
 ## License
 
-MIT License. The scripts and Rust source in this tree are MIT; the
-content rendered into the initramfs (kernel, busybox, storage
-tools, etc.) carries its own licenses.
+MIT License. The scripts and Rust source in this tree are MIT. The content
+in the initramfs (kernel, busybox, storage tools and others) carries its own
+licenses.

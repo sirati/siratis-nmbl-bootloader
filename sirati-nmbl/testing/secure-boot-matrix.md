@@ -1,219 +1,210 @@
-# Secure-boot VM test matrix (#57 runner spec)
+# Secure-boot VM test matrix
 
-This is the manifest the **#57 Sonnet VM runner** consumes. Every secure-boot
-scenario is listed with its app name, the exact assertion, the expected PASS
-signal, and whether it is **FULLY WIRED** (an assertion script + app exist and
-are ready to run) or **STUBBED** (described here; the harness still needs the
-listed work). BUILD-ONLY artifacts here; the actual VM runs are #57's job.
+This file lists every secure-boot VM scenario with its flake app, the config
+it boots, what its assertion script checks, and what a pass looks like. All
+scenarios are wired as flake apps in `sirati-nmbl/flake.nix`. The assertion
+scripts are in `testing/assertions/`.
 
-All scenarios boot the **`test-secure-boot`** NixOS config
-(`testing/build_configurations.nix`), which wires the whole chain:
+## The configs
 
-* `boot.nmbl.signing.{enable=true, enforce=true, algorithm="ml-dsa-87",
-  publicKeys=[insecure-test-ml-dsa-87.pub], generationKeyFile=<impure>}`
-* `boot.nmbl.signing.uki.{enable=true, keyFile=<impure>, certFile=<impure>}`
-  — the NMBL UKI is `sbsign`'d at install with the INSECURE-TEST `db` key so
-  the enforcing firmware ACCEPTS it (audit F1).
-* `boot.nmbl.tpm.{measure=true, requireTpm=true, pcrIndex=11}`
-* `boot.nmbl.secureBoot.{enable=true, enforce=true, requireTpm=true}`
-  (`priorityVolume.device=null` ⇒ no priority mount in the core flow)
-* a luks-tpm `cryptroot` device (`unlock="tpm"`, `tpmPcrs=[11 7]`)
-* `loader="efi-stub"` ⇒ NMBL boots as a UKI
+`testing/build_configurations.nix` defines the base config
+`test-secure-boot`:
 
-Run under the **swtpm "tis" + SB-OVMF (smm=on)** seam via
-`mkRunner { tpm="tis"; secureBoot=true; dbCert=<insecure-test-sb-db.crt>; }`.
+- `boot.nmbl.signing`: `enable = true`, `enforce = true`,
+  `algorithm = "ml-dsa-87"`, `publicKeys = [ ./keys/insecure-test-ml-dsa-87.pub ]`,
+  and `generationKeyFile = "/var/lib/nmbl-test-keys/insecure-test-gen.key"`;
+- `boot.nmbl.signing.uki`: `enable = true`, with `keyFile` and `certFile` under
+  `/var/lib/nmbl-test-keys/`. The install step `sbsign`s the NMBL UKI with the
+  test `db` key, so the enforcing firmware accepts it;
+- `boot.nmbl.tpm`: `measure = true`, `requireTpm = true`, `pcrIndex = 11`;
+- `boot.nmbl.secureBoot`: `enable = true`, `enforce = true`,
+  `requireTpm = true`, with no priority volume;
+- a `cryptroot` LUKS device with `unlock = "tpm"`, `tpmPcrs = [ 11 7 ]` and
+  `passToStage1`;
+- `loader = "efi-stub"`, so NMBL boots as a UKI.
 
-**Firmware `db` enrollment (audit F1, load-bearing).** The three NMBL
-scenarios boot under an ENFORCING Secure-Boot OVMF whose `db` VARS is the
-Microsoft `OVMF_VARS.ms.fd` with the INSECURE-TEST `db` cert
-(`testing/keys/insecure-test-sb-db.crt`) ADDITIONALLY enrolled (`virt-fw-vars
---add-db`). Because the NMBL UKI is `sbsign`'d at install with the matching key
-(`insecure-test-sb-db.key`), the firmware launches it — NMBL actually runs.
-Anything NOT signed by MS or this test cert is still refused, so the
-`check-sb-unsigned-uki` smoke (which keeps the MS-ONLY `db`, `dbCert` unset)
-still correctly proves firmware-refusal of an unsigned UKI. Net: the NMBL-
-behaviour rows boot NMBL under real enforcing SB; the unsigned-UKI smoke still
-proves the firmware enforces.
+The environment variables `NMBL_GEN_KEY_FILE`, `NMBL_SB_DB_KEY_FILE` and
+`NMBL_SB_DB_CERT_FILE` override the key paths at evaluation time.
 
-`requireTpm=true` is load-bearing for the negatives: a TPM-less VM aborts the
-boot rather than degrading, so a negative can never false-green on a box
-without `/dev/tpmrm0`.
+The scenarios also use these variants, defined in
+`testing/build_configurations.nix` and `flake.nix`:
 
-## How the test disk is signed (AT INSTALL RUNTIME — no key in any derivation)
+| Config | Difference from `test-secure-boot` |
+|---|---|
+| `test-secure-boot-enroll` | `cryptroot` opens with the install passphrase. Same signed generation. |
+| `test-secure-boot-driver` | Passphrase `cryptroot`, plus a signed driver image (see [Driver-image config prerequisites](#driver-image-config-prerequisites)). |
+| `test-secure-boot-staged` | Passphrase `cryptroot`, plus a priority volume inside LUKS that carries a signed config fragment and staged image. |
 
-HARD PROJECT PRINCIPLE: a signing PRIVATE key must NEVER be an input to a Nix
-derivation (a derivation's inputs land in the world-readable `/nix/store`). The
-secure-boot test disk is therefore signed AT INSTALL RUNTIME by NMBL's normal
-install-time path-based code — exactly like production — NOT by a build-time
-derivation that store-imports the keys.
+Each runner is `testRunners.mkRunner` with `tpm = "tis"`, `secureBoot = true`,
+`tpmPersist = true` and `dbCert = ./testing/keys/insecure-test-sb-db.crt`.
+It boots OVMFFull with `smm=on` and a `db` that is the Microsoft
+`OVMF_VARS.ms.fd` with the test `db` certificate added (`virt-fw-vars
+--add-db`). The firmware starts the install-signed NMBL UKI and refuses
+anything signed by neither Microsoft nor the test certificate. The
+`check-sb-unsigned-uki` smoke test leaves `dbCert` unset, keeps the
+Microsoft-only `db`, and proves that the firmware refuses an unsigned UKI.
 
-The `test-secure-boot` config already declares its signing keys as on-disk
-PATHs, not Nix path literals:
+`requireTpm = true` matters for the negative scenarios. A VM without a TPM
+aborts the boot, so a negative scenario cannot pass on a machine without
+`/dev/tpmrm0`.
 
-* `signing.generationKeyFile = "/var/lib/nmbl-test-keys/insecure-test-gen.key"`
-* `signing.uki.keyFile = "/var/lib/nmbl-test-keys/insecure-test-sb-db.key"`
-* `signing.uki.certFile = "/var/lib/nmbl-test-keys/insecure-test-sb-db.crt"`
+## How the test disk is signed
 
-The signed disk is produced by the RUNTIME orchestrator
-`.#sb-install-test-secure-boot` (`testing/sb-install.nix`), which mirrors the
-production `install-test-*` nixos-anywhere flow:
+A signing private key must stay out of every Nix derivation, because
+derivation inputs land in the world-readable `/nix/store`. NMBL's normal
+install-time code therefore signs the test disk from key paths, as in
+production.
 
-1. Boots a SystemRescue VM with a fresh 16G disk.
-2. Runs `nixos-anywhere --phases kexec,disko` (kexec into the installer, lay
-   out the disko LUKS layout) against the **install variant** of the config
-   (`boot.nmbl.signing.deferInstallSigning = lib.mkForce false`, so in-installer
-   signing actually runs).
-3. `scp`s the committed test keys into the freshly-installed root fs (mounted at
-   `/mnt` after disko) at
-   `/mnt/var/lib/nmbl-test-keys/insecure-test-{gen.key,sb-db.key,sb-db.crt}` —
-   read from a RUNTIME directory (`--keys-dir`, default `$NMBL_TEST_KEYS_DIR`
-   else `$PWD/testing/keys`), never imported into a derivation. `/var/lib` (not
-   `/run`) because the install phase's `installBootLoader` runs inside the
+The orchestrator `nix run .#sb-install-test-secure-boot` (`testing/sb-install.nix`)
+follows the nixos-anywhere install flow:
+
+1. It boots a SystemRescue VM with a fresh 16G disk.
+2. It runs `nixos-anywhere --phases kexec,disko` against the install variant of
+   the config (`boot.nmbl.signing.deferInstallSigning = lib.mkForce false`, so
+   signing runs in the installer).
+3. It copies the committed test keys into the installed root, mounted at
+   `/mnt` after disko, as `/mnt/var/lib/nmbl-test-keys/insecure-test-gen.key`,
+   `insecure-test-image.key`, `insecure-test-sb-db.key` and
+   `insecure-test-sb-db.crt`. It reads them from `--keys-dir`, else
+   `$NMBL_TEST_KEYS_DIR`, else `$PWD/testing/keys`. The keys go under
+   `/var/lib` because the install phase runs `installBootLoader` in the
    `nixos-install` chroot, whose activation mounts a fresh tmpfs over `/run`
-   right before signing — a `/run`-staged key would be shadowed and unreadable.
-4. Runs `nixos-anywhere --phases install`. NMBL's `installBootLoader` runs in
-   the install chroot where the `/var/lib/nmbl-test-keys/...` paths now exist:
-   `lib/install-signing.nix` `sbsign`s the NMBL UKI with the staged `db`
-   key/cert and writes
-   `EFI/BOOT/BOOTX64.EFI`; `lib/install-gen-signing.nix` signs each generation's
-   kernel/initrd with the staged ML-DSA key (per-role `gen-kernel`/`gen-initrd`)
-   into `/nmbl/sigs/<gen-id>/{kernel,initrd}.sig`. All from PATHS, at runtime.
-5. Leaves the SIGNED disk at `$WORK_DIR/disk1.qcow2`.
+   before signing.
+4. It runs `nixos-anywhere --phases install`. In the chroot,
+   `lib/install-signing.nix` `sbsign`s the NMBL UKI and writes
+   `EFI/BOOT/BOOTX64.EFI`. `lib/install-gen-signing.nix` signs each
+   generation's kernel and initrd with the ML-DSA key (domains `gen-kernel` and
+   `gen-initrd`) into `/boot/nmbl/sigs/<gen-id>/{kernel,initrd}.sig`.
+5. It deletes the staged keys from the installed disk and leaves the signed
+   disk at `$WORK_DIR/disk1.qcow2`.
 
-The booted disk is thus signed by the real install-time path-based code, and NO
-signing key is in any derivation closure. The closure guard
-`.#checks.x86_64-linux.test-secure-boot-no-private-key` (mirroring the prod
-`insecure-test-key-absent` guard) asserts the install `--store-paths`
-(diskoScript + toplevel) reference NEITHER the ML-DSA generation key NOR the SB
-`db` private key.
+`sb-install-test-secure-boot-enroll`, `-driver` and `-staged` do the same for
+the variants. The closure guards
+`nix build .#checks.x86_64-linux.test-secure-boot-no-private-key` and
+`.#checks.x86_64-linux.test-secure-boot-driver-no-private-key` check that the
+install store paths (disko script and toplevel) reference neither the ML-DSA
+key nor the `db` private key. See [keys/README.md](keys/README.md).
 
-## Runner prerequisites (set by the flake apps, but listed for #57)
+## Running a scenario
 
-Each scenario app FIRST runs the install orchestrator to produce the signed
-disk, then boots it. The apps require an SSH key for nixos-anywhere:
+Each scenario app first runs the matching orchestrator to produce a signed
+disk, then boots it. Inputs:
 
-* `NMBL_SSH_KEY` (or `SSH_PRIVATE_KEY`, or `--ssh-key`) — a passphrase-less SSH
-  PRIVATE key file; nixos-anywhere needs it for its bootstrap. Pass it through
-  to the orchestrator (the scenario apps forward the environment).
-* `NMBL_TEST_KEYS_DIR` (optional) — directory holding the committed install-time
-  signing keys (`insecure-test-gen.key` or `insecure-test-ml-dsa-87.key`, plus
-  `insecure-test-sb-db.{key,crt}`). Defaults to `$PWD/testing/keys` (run the app
-  from the `sirati-nmbl` checkout, or set this). These are read by PATH at
-  install time and are NEVER a derivation input.
-* `$NMBL_RUNNER` / `$NMBL_ENROLL_RUNNER` — exported by each app to the
-  per-scenario runner. `$NMBL_DISK_IMAGE` is exported to the
-  install-runtime-SIGNED `disk1.qcow2`, so the runner boots THAT disk.
-* `$NMBL_SB_DISK` — exported by the bad-sig app to the same signed disk; the
-  bad-sig script tampers a copy (removing a signed `initrd.sig` sidecar).
-* `$NMBL_SB_TPM_UKI` — for the roundtrip, the real config's INSTALL-SIGNED UKI,
-  extracted from the installed disk's ESP (no host-side `sbsign` derivation).
+- `NMBL_SSH_KEY` or `--ssh-key PATH`: a passphrase-less SSH private key file
+  for nixos-anywhere. `SSH_PRIVATE_KEY` can hold the key text instead. Any
+  throwaway key works. Only the installer VM authorizes it.
+- `NMBL_TEST_KEYS_DIR` (optional): the directory with the install-time keys
+  (`insecure-test-gen.key` or `insecure-test-ml-dsa-87.key`, plus
+  `insecure-test-sb-db.key` and `insecure-test-sb-db.crt`). The default
+  `$PWD/testing/keys` works when you run the app from the `sirati-nmbl`
+  checkout.
+- `NMBL_SB_SIGNED_DISK` and `NMBL_SB_ENROLL_DISK` (optional): reuse an existing
+  signed disk and skip the install.
+- `NMBL_SB_INSTALL_WORK` (optional): the install work directory. The default
+  is `$PWD/.sb-install-work`, with one subdirectory per config (`real`,
+  `enroll`, `driver`, `staged`).
+- `NMBL_WALL_TIMEOUT` (optional): the wall-clock limit for the assertion
+  script in seconds (default 1800, 3000 for the TPM roundtrip).
 
-To pre-stage the signed disk by hand:
+The apps export `NMBL_RUNNER` (and `NMBL_ENROLL_RUNNER` for the roundtrip),
+`NMBL_DISK_IMAGE` and `NMBL_SB_DISK` (the signed disk) to the assertion
+script. The roundtrip also exports `NMBL_SB_TPM_UKI`, the install-signed UKI
+of the tpm-unlock config, which it extracts from that disk's ESP.
+
+To produce a signed disk by hand:
 
     nix run .#sb-install-test-secure-boot -- --ssh-key ~/.ssh/id_ed25519
-    # → leaves $PWD/.sb-install-test-secure-boot/disk1.qcow2 (signed)
+    # leaves $PWD/.sb-install-test-secure-boot/disk1.qcow2 (signed)
 
-The scenario apps run this for you; set `NMBL_SB_SIGNED_DISK` /
-`NMBL_SB_ENROLL_DISK` to reuse an already-produced disk and skip the install.
+## Firmware smoke test
 
-## CORE scenarios — FULLY WIRED
-
-| id | app | scenario | exact assertion | expected PASS signal |
+| id | app | scenario | assertion | pass |
 |---|---|---|---|---|
-| #3a-pre | `test-secure-boot-tpm-roundtrip` | TPM seal/unseal roundtrip | **Precondition**: `/dev/tpmrm0` present + measured boot (PCR 11 extended) — reaching the measured path under `requireTpm=true` proves a real TPM. Then the TPM-sealed `cryptroot` AUTO-unseals (NO password answered) and the system reaches the post-kexec root shell. | `assertions/sb-tpm-roundtrip.sh` exits 0: TPM-present marker seen, auto-unseal marker seen (NOT the password modal), `root@test-secure-boot` shell reached and interactive. |
-| #4a | `test-secure-boot-signed-gen-happy` | signed generation boots | A correctly-signed generation verifies → measures → kexecs. NO refuse / reboot-into-rescue / signature-failure marker appears; the system reaches the booted root shell. | `assertions/sb-signed-gen-happy.sh` exits 0: no refusal marker in history, `root@test-secure-boot` shell reached and interactive. |
-| #4b | `test-secure-boot-bad-sig-refused` | tampered sidecar refused (NEG) | An `initrd.sig` sidecar is REMOVED from the FAT32 boot partition before boot → verify fails → NMBL refuses and reboots into rescue. Assert (a) a refuse/rescue/signature-failure marker appears, (b) the bad generation NEVER boots (no `root@test-secure-boot`), (c) **NO emergency shell is offered** — assert the ABSENCE of the emergency-shell prompt markers (R-1/R-13/FIX-35). | `assertions/sb-bad-sig-refused.sh` exits 0: refuse marker present; booted-bad-gen marker ABSENT; emergency-shell markers ABSENT. |
-| #1 | `test-secure-boot-driver-image` | driver-image load | A signed squashfs carrying `dummy` (a module NOT in the base initrd): single-fd verify ⇒ loop-mounted ⇒ `init_module` pre-init. The `test-secure-boot-driver` config opens cryptroot with the install passphrase so the boot reaches the post-kexec shell; NMBL emits `driver-image loaded: … dummy …` before the cpio-log freeze, so it lands in the post-kexec `nmbl-init` journal. (`/proc/modules` cannot prove it — kexec resets module state.) | `assertions/sb-driver-image.sh` exits 0: no refusal; `root@test-secure-boot-driver` shell reached+interactive; the `driver-image loaded` marker AND `dummy` present in the `nmbl-init` journal. |
-| #1-NEG | `test-secure-boot-driver-image-bad-refused` | corrupt driver image refused (NEG) | The driver squashfs (`/boot/nmbl/driver-extra.sfs`) is CORRUPTED on the ESP before boot → single-fd verify fails → NMBL refuses (enforce: `imageload/verify.rs` → `policy::refuse_unsigned` → `RebootIntoRescue`, R-1; the image is NEVER mounted). The refuse fires BEFORE the LUKS modal/console (driver-image load precedes `open_console`). Assert (a) a refuse marker, (b) `driver-image loaded` ABSENT, (c) the gen never boots un-refused, (d) NO emergency shell. | `assertions/sb-driver-image-bad-refused.sh` exits 0: refuse marker present; `driver-image loaded` ABSENT; booted-gen ABSENT (un-refused); emergency-shell markers ABSENT. |
-| #2 | `test-secure-boot-staged` | staged boot apply (FEATURE #2) | The inside-LUKS priority volume (`cryptroot`) carries a signed config fragment + staged image NMBL loads as a SECOND STAGE. cryptroot opens with the install passphrase → the POST-UNLOCK priority gate attests the volume → `apply_staged_boot` single-fd verifies the image (`--domain driver-image`) AND the fragment (`--domain staged-fragment`), transactionally merges the fragment (which adds ONE extra explicit kernel module the base never loads), re-runs the merged config's effects, then the system kexecs + boots. All three artifacts (priority file, image, fragment) are signed AT INSTALL RUNTIME by `nmbl-sign` from a PATH (no key in any derivation; `lib/staged-install.nix`). | `assertions/sb-staged.sh` exits 0: no refuse marker; `root@test-secure-boot-staged` shell reached + interactive; the `nmbl-init` journal carries the post-unlock gate `signature VALID`, `staged-boot: fragment applied`, and the staged `re-loading explicit kernel modules` markers. |
+| SB | `check-sb-unsigned-uki` | firmware refuses an unsigned UKI | Boots an unsigned UKI under SB-OVMF (`smm=on`, Microsoft-only `db`). The firmware refuses it and NMBL does not run. | `assertions/sb-unsigned-uki.sh` exits 0: a Secure Boot refusal banner or the UEFI shell appears, and no NMBL marker (`nmbl-init starting`, `phase N:`) appears. Run it first, so the rest of the matrix cannot pass on non-enforcing firmware. |
 
-### Driver-image config prerequisites (learned wiring #1, both VM-verified GREEN)
+## Core scenarios
 
-A `boot.nmbl.driverImages`-enabled config has two non-obvious requirements the
-`test-secure-boot-driver` config encodes (each was a real refuse caught in the VM):
-
-* **Bootstrap (external) config is REQUIRED.** The loader resolves the boot-
-  relative image path against the runtime boot mountpoint, which only exists once
-  Phase 0.5 mounts `/boot` (bootstrap mode). In embedded-config mode the loader
-  refuses with *"driver images require bootstrap mode"*. So set
-  `boot.nmbl.configLocation = "external"` + `boot.nmbl.bootstrap.bootFs.device`.
-* **`loop` + `squashfs` must be loaded EARLY.** The loader loop-mounts the
-  squashfs but does NOT modprobe these itself, so they must be present before the
-  driver-image phase: `boot.nmbl.earlyKernelModules = [ "loop" "squashfs" ]`. A
-  missing `loop` surfaces as *"loop-alloc failed: opening /dev/loop-control"*.
-
-A product gap fixed in passing: `lib/install-bootloader.nix` now defers the
-driver-image `nmbl-sign` step under `deferInstallSigning` (like the UKI/gen
-signing), so a disko/sealed image build — which lacks the impure `imageKeyFile` —
-no longer fails trying to sign the driver squashfs.
-
-### Wire-in note for the SB smoke precondition (already landed, F6a)
-
-| id | app | scenario | exact assertion | expected PASS signal |
+| id | app | config | assertion | pass |
 |---|---|---|---|---|
-| SB | `check-sb-unsigned-uki` | firmware refuses an unsigned UKI | Boots a deliberately-UNSIGNED UKI under SB-OVMF (`smm=on`, db-enrolled). The firmware REFUSES it (Secure-Boot violation banner / UEFI shell) and NMBL NEVER runs. Distinguishes "firmware refused" (PASS) from "NMBL refused". | `assertions/sb-unsigned-uki.sh` exits 0: a SB-refusal banner appears AND no NMBL marker is present. This is the literal precondition for #29 — run it FIRST so the rest of the SB matrix cannot false-green on a non-enforcing firmware. |
+| #3a | `test-secure-boot-tpm-roundtrip` | `-enroll`, then `test-secure-boot` | Phase 1 boots the enroll twin with the install passphrase and runs `nmbl-tpm-enroll` with the PCRs that `nmbl-tpm-enroll --uki "$NMBL_SB_TPM_UKI" --print-pcrs` predicts. The script then swaps the ESP UKI for the tpm-unlock UKI and power-cycles against the same persisted swtpm. Phase 2 types nothing. | `assertions/sb-tpm-roundtrip.sh` exits 0: phase 1 sealed a `systemd-tpm2` token, phase 2 reaches `root@test-secure-boot` with no passphrase prompt, no boot-failure terminus and no refusal. |
+| #4a | `test-secure-boot-signed-gen-happy` | `-enroll` | A correctly signed generation verifies, is measured and kexecs. | `assertions/sb-signed-gen-happy.sh` exits 0: no refusal marker, and `root@test-secure-boot-enroll` is reached and interactive. |
+| #4b | `test-secure-boot-bad-sig-refused` | `-enroll` | The script overwrites the leading bytes of every kernel and initrd sidecar under `/nmbl/sigs/` on the ESP of a disk copy. Verification fails, NMBL refuses and reboots into rescue. | `assertions/sb-bad-sig-refused.sh` exits 0: a refuse marker appears, the tampered generation does not boot, and no emergency shell prompt appears. |
+| #1 | `test-secure-boot-driver-image` | `-driver` | A signed squashfs carries `dummy`, a module absent from the base initrd. NMBL verifies it over one descriptor, loop-mounts it and loads the module before the kexec. `/proc/modules` cannot prove this because kexec resets module state. | `assertions/sb-driver-image.sh` exits 0: no refusal, `root@test-secure-boot-driver` is reached, and the `nmbl-init` journal has the `driver-image loaded:` marker with `dummy`. |
+| #1-NEG | `test-secure-boot-driver-image-bad-refused` | `-driver` | The script corrupts `/boot/nmbl/driver-extra.sfs` on the ESP. Verification fails, and NMBL refuses (`imageload/verify.rs`, then `policy::refuse_unsigned`, then `RebootIntoRescue`) before it mounts the image and before the LUKS prompt. | `assertions/sb-driver-image-bad-refused.sh` exits 0: a refuse marker appears, `driver-image loaded` is absent, the generation does not boot, and no emergency shell appears. |
+| #2 | `test-secure-boot-staged` | `-staged` | `cryptroot` opens with the install passphrase. The post-unlock priority gate attests the volume. `apply_staged_boot` verifies the image (domain `driver-image`) and the fragment (domain `staged-fragment`), merges the fragment, which adds one explicit kernel module, and re-runs the merged config's effects. Then the system kexecs. `lib/staged-install.nix` signs all three artifacts at install time. | `assertions/sb-staged.sh` exits 0: no refuse marker, `root@test-secure-boot-staged` is reached, and the `nmbl-init` journal has `signature VALID`, `fragment applied`, `re-loading explicit kernel modules` and `staged rerun: loaded` with `dummy`. |
 
-## Formerly stubbed scenarios — now wired
+### Driver-image config prerequisites
 
-All six share the core harness. The three disk-preparation negatives and the
-sentinel scenario use `testing/assertions/sb-disk-tamper-refused.sh`, selected
-by `NMBL_SB_TAMPER`; #3b is an opt-in third phase of `sb-tpm-roundtrip.sh`.
+A config with `boot.nmbl.driverImages` has two requirements. The
+`test-secure-boot-driver` config meets both, and each one caused a refusal in
+the VM before it was added:
 
-Running any scenario needs `NMBL_TEST_KEYS_DIR` (the committed test signing
-keys) and `NMBL_SSH_KEY` (any throwaway passphrase-less key; the installer
-authorises it only inside its own nixos-anywhere VM). Point
-`NMBL_SB_SIGNED_DISK` / `NMBL_SB_ENROLL_DISK` at an existing install to skip
-reinstalling.
+- The config must be external (bootstrap mode). The loader resolves the
+  boot-relative image path against the runtime boot mountpoint, which exists
+  only after phase 0.5 mounts `/boot`. With an embedded config the loader
+  refuses with "driver images require bootstrap mode". The config therefore
+  sets `boot.nmbl.configLocation = "external"` and
+  `boot.nmbl.bootstrap.bootFs.device`.
+- `loop` and `squashfs` must load early. The driver-image loader loop-mounts
+  the squashfs without loading these modules itself, so the config sets
+  `boot.nmbl.earlyKernelModules` to include them. A missing `loop` shows as
+  "loop-alloc failed: opening /dev/loop-control".
 
-| id | app | disk preparation | PASS requires |
-|---|---|---|---|
-| #4c | `test-secure-boot-wrong-key-refused` | every kernel/initrd sidecar replaced by a VALID signature from a fresh key that is not baked into NMBL | refuse; the generation never boots un-refused; no emergency shell |
-| #4d | `test-secure-boot-domain-transplant-refused` | the kernel sidecar replaced by the BAKED key's signature over the same kernel bytes under the `driver-image` domain | same as #4c: per-role domain separation rejects it |
-| #5a | `test-secure-boot-sentinel-rescue` | empty `/boot/nmbl/rescue` on the ESP | the sentinel is detected, rescue is entered after `seal: lock PCR capped`, and the generation never boots |
-| #5b | `test-secure-boot-staged` (existing) | none; the install-signed priority file | `priority-gate (PostUnlock): signature VALID` and the staged boot completes |
-| #5c | `test-secure-boot-bad-priority-refused` | the signed priority file on the inside-LUKS priority volume is overwritten (cryptsetup inside the guestfish appliance) | NMBL's `SECURE BOOT: REFUSED` screen; no shell; the generation never boots |
-| #3b | `test-secure-boot-rescue-locks-tpm` | after the enrol and TPM-unseal phases, the sentinel is dropped and the tpm-unlock config boots a third time | the TPM unseal happens, then `seal: lock PCR capped` and `seal: closed TPM-unsealed mapper cryptroot`; in rescue `/dev/mapper/cryptroot` is absent and `cryptsetup open --token-only` fails |
+`lib/install-bootloader.nix` defers the driver-image `nmbl-sign` step under
+`deferInstallSigning`, like the UKI and generation signing, so a disko or
+sealed image build without `imageKeyFile` can build.
 
-**The TPM roundtrip was broken in three independent ways**, all fixed (the
-roundtrip and #3b now pass):
+## Tamper and rescue scenarios
+
+The disk-preparation negatives and the sentinel scenario use
+`testing/assertions/sb-disk-tamper-refused.sh`, selected by `NMBL_SB_TAMPER`.
+#3b is an opt-in third phase of `sb-tpm-roundtrip.sh`
+(`NMBL_SB_TPM_PHASE3=1`).
+
+| id | app | config | disk preparation | pass requires |
+|---|---|---|---|---|
+| #4c | `test-secure-boot-wrong-key-refused` | `-enroll` | every kernel and initrd sidecar replaced by a valid signature from a fresh key that NMBL does not have | refuse, the generation does not boot, no emergency shell |
+| #4d | `test-secure-boot-domain-transplant-refused` | `-enroll` | the kernel sidecar replaced by the baked key's signature over the same kernel bytes under the `driver-image` domain | the same as #4c. Per-role domain separation rejects it. |
+| #5a | `test-secure-boot-sentinel-rescue` | `-enroll` | an empty `/boot/nmbl/rescue` on the ESP | the sentinel is detected, rescue starts after `seal: lock PCR capped`, and the generation does not boot |
+| #5b | `test-secure-boot-staged` | `-staged` | none. The install-signed priority file. | `signature VALID` from the post-unlock priority gate, and the staged boot completes |
+| #5c | `test-secure-boot-bad-priority-refused` | `-staged` | the signed priority file (`/nmbl-staged/priority.signed`) on the priority volume inside LUKS is overwritten with cryptsetup in the guestfish appliance | NMBL's `SECURE BOOT: REFUSED` screen, no shell, the generation does not boot |
+| #3b | `test-secure-boot-rescue-locks-tpm` | `-enroll`, then `test-secure-boot` | after the enroll and unseal phases, the sentinel is added and the tpm-unlock config boots a third time | the TPM unseal happens, then `seal: lock PCR capped` and `seal: closed TPM-unsealed mapper cryptroot`. In rescue, `/dev/mapper/cryptroot` is absent and `cryptsetup open --token-only` fails. |
+
+## Fixes found by the matrix (2026-09-26)
+
+Commits `95183a2` and `2e04c39` wired the last stubbed scenarios. The TPM
+roundtrip was broken in three independent ways, all fixed in `2e04c39`:
 
 1. The initramfs shipped the static cryptsetup, which is built with
-   `--disable-external-tokens` and so can never load systemd's
-   `systemd-tpm2` token plugin: every `--token-only` open failed with "No
-   usable token is available", whatever the PCRs. A `luks-tpm` initramfs now
-   ships a dynamic cryptsetup with the plugin directory compiled in, plus
-   the plugin and its tpm2-tss closure.
+   `--disable-external-tokens` and cannot load systemd's `systemd-tpm2` token
+   plugin. Every `--token-only` open failed with "No usable token is
+   available". A `luks-tpm` initramfs now ships a dynamic cryptsetup with the
+   plugin directory compiled in, plus the plugin and its tpm2-tss closure.
 2. The enroll step sealed to the booted system's live PCR 11, which already
    includes NMBL's handoff extension. The unseal runs before that extension,
-   so the value never recurred. `nmbl-tpm-enroll --uki <UKI>` now predicts the
-   unlock-time PCR 11 of the UKI that will perform the unlock (systemd-stub's
-   measurement only) with `systemd-measure`, and the roundtrip seals to the
-   tpm-unlock UKI's prediction. Which generation the enroll phase booted no
-   longer matters.
+   so the value did not recur. `nmbl-tpm-enroll --uki <UKI>` now predicts
+   the unlock-time PCR 11 of the UKI that performs the unlock (only
+   systemd-stub's measurement) with `systemd-measure`. The roundtrip seals to
+   the tpm-unlock UKI's prediction.
 3. The kexec drops the mapping NMBL opened, and NixOS stage 1 cannot unseal
    the token again because PCR 11 has moved. A `luks-tpm` volume now hands
-   the unsealed token passphrase to stage 1 through `passToStage1`, like a
+   the unsealed token passphrase to stage 1 through `passToStage1`, as a
    `luks-password` volume does (`nmbl-tpm-passphrase` reads it right after
    the unseal).
 
-#3b then found that a rescue forced after phase 3b (the embedded-config
-sentinel re-check) could not close the TPM-unsealed mapper, because the root
-filesystem was still mounted on it: the seal failed and diverted to the refuse
-reboot. The strict seal now lazily detaches every mount backed by the mapper
-(matched by `major:minor` in `/proc/self/mountinfo`) before `cryptsetup close`.
+#3b found that a rescue forced after phase 3b (the embedded-config sentinel
+re-check) could not close the TPM-unsealed mapper, because the root
+filesystem was still mounted on it. The seal failed and diverted to the
+refuse reboot. The strict seal now lazily detaches every mount backed by the
+mapper (matched by `major:minor` in `/proc/self/mountinfo`) before
+`cryptsetup close`.
 
-The relock of password-unlocked volumes on a refuse runs while NMBL holds the
-console, so it is not visible on serial; its order (cap, close TPM mappers,
-sentinel, relock) is pinned by the policy unit tests.
+On a refuse, NMBL relocks password-unlocked volumes while it has the console,
+so serial output does not show the relock. The policy unit tests pin its
+order: cap, close TPM mappers, sentinel, relock.
 
-#5a found that an embedded-config system never read the rescue sentinel (it
-looked at the literal `/boot/nmbl/rescue` before `/boot` was mounted), so a
-refuse's "next boot enters rescue" did not happen. The sentinel now resolves
-through the boot mountpoint and is re-checked after phase 3b mounts `/boot`.
-
-## Status summary
-
-* **Wired:** `test-secure-boot-tpm-roundtrip`, `test-secure-boot-signed-gen-happy`,
-  `test-secure-boot-bad-sig-refused`, `test-secure-boot-driver-image` +
-  `test-secure-boot-driver-image-bad-refused`, `test-secure-boot-staged`,
-  `check-sb-unsigned-uki`, and the six scenarios above.
+#5a found that an embedded-config system did not read the rescue sentinel. It
+looked at the literal `/boot/nmbl/rescue` before `/boot` was mounted, so the
+"next boot enters rescue" step of a refuse did not happen. The sentinel now
+resolves through the boot mountpoint, and NMBL checks it again after phase 3b
+mounts `/boot`.
