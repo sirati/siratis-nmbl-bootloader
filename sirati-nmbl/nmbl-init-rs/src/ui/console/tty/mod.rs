@@ -37,20 +37,19 @@
 //!
 //! ## Input pipeline
 //!
-//! We own the read path. Bytes come off the same fd through `rustix::io::read`, get pre-filtered by
-//! [`ResizeFilter`] to extract `CSI 8;rows;cols t` host-size reports
-//! (which termwiz drops because it only synthesises `Resized` from
-//! SIGWINCH, never from the in-band report a serial-attached
-//! terminal sends), and the leftover bytes go through
-//! [`TermwizToCrossterm`] which wraps `termwiz::input::InputParser`.
-//! See `src/ui/console/parser.rs` for the byte-level state machine.
+//! We own the read path. Each poll reads the fd through `rustix::io::read`
+//! until it would block and hands every read to [`InputDecoder`], which
+//! extracts `CSI 8;rows;cols t` host-size reports (which termwiz drops
+//! because it only synthesises `Resized` from SIGWINCH, never from the
+//! in-band report a serial-attached terminal sends) and feeds the rest
+//! to `termwiz::input::InputParser`. A paste of any length is decoded
+//! whole; an escape sequence split across reads waits for its rest.
+//! See `src/ui/console/parser/` for the byte-level state machine.
 
-use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crossterm::event::KeyEvent;
 use ratatui::Terminal;
 use rustix::event::{PollFd, PollFlags, poll};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
@@ -62,7 +61,7 @@ use crate::nmbl_warn;
 use crate::sys::printk::PrintkQuiet;
 use crate::sys::tty::{enter_raw, open_console as open_console_fd};
 use crate::ui::console::ConsoleEvent;
-use crate::ui::console::parser::{ResizeFilter, TermwizToCrossterm};
+use crate::ui::console::parser::InputDecoder;
 
 use self::caps::caps_from_env_with_fallback;
 use self::kd::enter_kd_text;
@@ -106,6 +105,9 @@ fn pty_seed_size(winsize: (u16, u16)) -> (u16, u16) {
 /// How long dropping or suspending a console may wait for queued output
 /// to reach the primary console (a slow serial line) before giving up.
 const PRIMARY_DRAIN_BUDGET: Duration = Duration::from_secs(5);
+/// Most input bytes one poll reads before returning to the event loop;
+/// whatever is left waits in the kernel for the next poll.
+const MAX_READ_PER_POLL: usize = 64 * 1024;
 /// The same bound for a remote pty. The session is over by then; a
 /// stalled peer must not hold PID 1 for long.
 const REMOTE_DRAIN_BUDGET: Duration = Duration::from_millis(500);
@@ -135,18 +137,10 @@ pub struct TtyConsole {
     printk_quiet: Option<PrintkQuiet>,
     /// Ratatui terminal over the queued termwiz renderer.
     terminal: Terminal<QueuedBackend>,
-    /// Input pre-filter for `CSI 8;rows;cols t` host-resize reports.
-    /// Drains bytes between `rustix::io::read` and the termwiz parser.
-    resize_filter: ResizeFilter,
-    /// Termwiz input parser that produces crossterm `KeyEvent`s. Owns
-    /// the lone-ESC state, partial-sequence buffering, etc.
-    key_parser: TermwizToCrossterm,
-    /// Translated key events drained from `key_parser` but not yet
-    /// surfaced to the caller. `poll_event` pops one per call.
-    pending_keys: VecDeque<KeyEvent>,
-    /// Mouse-wheel scroll notches drained from `key_parser` but not yet
-    /// surfaced. `poll_event` pops one per call after pending keys.
-    pending_scrolls: VecDeque<ConsoleEvent>,
+    /// Input decoder (resize pre-filter + termwiz) and its queue of
+    /// decoded keys, wheel notches and the latest resize. `poll_event`
+    /// surfaces one event per call.
+    input: InputDecoder,
     /// Latest grid size observed via a CSI 8;rows;cols t report from
     /// the host terminal. Wins over the backend's reported size.
     last_resize: Option<(u16, u16)>,
@@ -191,10 +185,7 @@ impl TtyConsole {
             previous_kd_mode,
             printk_quiet,
             terminal,
-            resize_filter: ResizeFilter::new(),
-            key_parser: TermwizToCrossterm::new(),
-            pending_keys: VecDeque::new(),
-            pending_scrolls: VecDeque::new(),
+            input: InputDecoder::new(),
             last_resize: None,
             owns_global_tui_state: true,
         })
@@ -233,10 +224,7 @@ impl TtyConsole {
             previous_kd_mode: None,
             printk_quiet: None,
             terminal,
-            resize_filter: ResizeFilter::new(),
-            key_parser: TermwizToCrossterm::new(),
-            pending_keys: VecDeque::new(),
-            pending_scrolls: VecDeque::new(),
+            input: InputDecoder::new(),
             // Seed the cached size so the first render and any modal
             // layout use the client's reported geometry immediately,
             // before the in-band `CSI 8;rows;cols t` report (if any).
@@ -363,91 +351,46 @@ impl TtyConsole {
             )));
         }
         self.input_at_eof = true;
-        self.drain_after_eagain()
+        Ok(self.input.resize.take())
     }
 
-    /// Read whatever bytes are ready on `self.fd`, run them through
-    /// the resize pre-filter, feed the leftovers to termwiz's input
-    /// parser, and stash any emitted key events into
-    /// `self.pending_keys`. Returns at most one [`ConsoleEvent::Resize`]
-    /// extracted from the byte stream (the pre-filter emits at most
-    /// one per call).
+    /// Read every byte that is ready on `self.fd` (until the read would
+    /// block) and decode it, queueing the keys and wheel notches.
+    /// Returns the latest [`ConsoleEvent::Resize`] the bytes carried.
+    ///
+    /// One call reads at most [`MAX_READ_PER_POLL`] bytes so a flood
+    /// cannot hold the poll loop; the rest stays in the kernel for the
+    /// next call. Nothing read is ever dropped.
     fn refill(&mut self, timeout_ms: i32) -> Result<Option<ConsoleEvent>> {
         self.input_at_eof = false;
         let mut pfd = [PollFd::new(&self.fd, PollFlags::IN)];
         let ready = poll(&mut pfd, timeout_ms).map_err(rustix_io_err)?;
-        if ready == 0 {
-            // No bytes arrived — tell the termwiz parser there's
-            // nothing more right now so a dangling ESC commits.
-            return self.drain_after_eagain();
-        }
         let revents = pfd
             .first()
             .map(PollFd::revents)
             .unwrap_or_else(PollFlags::empty);
-        if !revents.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
-            return self.drain_after_eagain();
+        if ready == 0 || !revents.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
+            return Ok(self.input.resize.take());
         }
 
-        // Drain in a loop: a single resize burst can deliver dozens
-        // of bytes and may interleave keystrokes. 256-byte chunks.
-        loop {
-            let mut chunk = [0u8; 256];
+        let mut chunk = [0u8; 4096];
+        let mut total = 0usize;
+        while total < MAX_READ_PER_POLL {
             match rustix::io::read(&self.fd, &mut chunk) {
-                Ok(0) => {
-                    // EOF: the terminal hung up.
-                    return self.input_eof();
-                }
+                // EOF: the terminal hung up.
+                Ok(0) => return self.input_eof(),
                 Ok(n) => {
-                    let slice = chunk.get(..n).unwrap_or(&[]);
-                    self.resize_filter.push(slice);
-                    // Drain everything classified so far. If the
-                    // filter emits a Resize, return immediately so
-                    // the caller can react; remaining bytes stay in
-                    // the filter for the next call.
-                    if let Some(ev) = self.drain_filter_once(/*maybe_more=*/ true)? {
-                        return Ok(Some(ev));
-                    }
-                    if n < chunk.len() {
-                        continue;
-                    }
+                    self.input.feed(chunk.get(..n).unwrap_or(&[]));
+                    total = total.saturating_add(n);
                 }
+                Err(rustix::io::Errno::INTR) => {}
                 Err(e) if e == rustix::io::Errno::AGAIN || e == rustix::io::Errno::WOULDBLOCK => {
-                    return self.drain_after_eagain();
+                    break;
                 }
                 Err(e) => return Err(rustix_io_err(e)),
             }
         }
-    }
-
-    /// Drain one resize from the pre-filter and feed the
-    /// pre-resize bytes into termwiz. `maybe_more` controls whether
-    /// a lone ESC commits this round.
-    fn drain_filter_once(&mut self, maybe_more: bool) -> Result<Option<ConsoleEvent>> {
-        let mut scratch = [0u8; 256];
-        let (n, ev) = self.resize_filter.drain(&mut scratch);
-        if n > 0 {
-            let bytes = scratch.get(..n).unwrap_or(&[]);
-            let mut keys = Vec::new();
-            let mut scrolls = Vec::new();
-            self.key_parser
-                .feed_events(bytes, maybe_more, &mut keys, &mut scrolls);
-            for k in keys {
-                self.pending_keys.push_back(k);
-            }
-            for s in scrolls {
-                self.pending_scrolls.push_back(s);
-            }
-        }
-        Ok(ev)
-    }
-
-    /// Drain pending bytes assuming no more input will arrive in this
-    /// poll cycle. This flushes any dangling ESC sequences (so a lone
-    /// ESC commits as `KeyCode::Esc`) and emits one final Resize if
-    /// the filter has one queued.
-    fn drain_after_eagain(&mut self) -> Result<Option<ConsoleEvent>> {
-        self.drain_filter_once(/*maybe_more=*/ false)
+        Ok(self.input.resize.take())
     }
 
     /// Side-effect helper used by [`Console::poll_event`]: if the

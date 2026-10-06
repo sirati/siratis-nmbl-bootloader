@@ -158,3 +158,54 @@ fn tolerated_hangup_does_not_spin() {
         "polled {polls} times in 500ms: busy loop on EOF"
     );
 }
+
+/// A paste far longer than any single read reaches the console whole:
+/// every byte a pty delivers in one burst decodes to a key, including
+/// escape sequences the line splits across reads.
+#[test]
+#[allow(clippy::indexing_slicing, reason = "test data")]
+fn pasted_burst_over_a_pty_loses_no_keys() {
+    use crate::ui::console::{Console, ConsoleEvent};
+    use crossterm::event::KeyCode;
+    use std::time::{Duration, Instant};
+
+    let pty = nix::pty::openpty(None, None).expect("openpty");
+    let mut console = TtyConsole::from_pty(pty.slave, (24, 80)).expect("console");
+    let mut burst = Vec::new();
+    let mut expected = Vec::new();
+    for i in 0..3000u32 {
+        let c = char::from(b"0123456789abcdef"[(i % 16) as usize]);
+        burst.push(c as u8);
+        expected.push(KeyCode::Char(c));
+        if i % 5 == 0 {
+            burst.extend_from_slice(b"\x1b[A");
+            expected.push(KeyCode::Up);
+        }
+    }
+    burst.extend_from_slice(b"\r");
+    expected.push(KeyCode::Enter);
+    assert!(burst.len() >= 4096, "{}", burst.len());
+
+    let master = pty.master;
+    let writer = std::thread::spawn(move || {
+        let mut rest = burst.as_slice();
+        while !rest.is_empty() {
+            let n = nix::unistd::write(&master, rest).expect("write pty master");
+            rest = &rest[n..];
+        }
+        master
+    });
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while got.len() < expected.len() && Instant::now() < deadline {
+        if let Some(ConsoleEvent::Key(k)) = console
+            .poll_event_blocking(Duration::from_millis(50))
+            .expect("poll")
+        {
+            got.push(k.code);
+        }
+    }
+    let _master = writer.join().expect("writer");
+    assert_eq!(got.len(), expected.len());
+    assert_eq!(got, expected);
+}

@@ -5,7 +5,6 @@ import argparse
 import contextlib
 import json
 import os
-import select
 import selectors
 import signal
 import socket
@@ -375,21 +374,11 @@ def remote_tui_resilience(args, transcript, qemu):
     remote_tui(args, transcript, qemu)
 
 
-def type_keys(proc, text, transcript):
-    """Type into NMBL's serial TUI one key at a time, as an operator would.
-    A 65-byte burst into the TCG guest stalled after 42 keys."""
-    for index, key in enumerate(text):
-        proc.stdin.write(key.encode())
-        proc.stdin.flush()
-        if index == len(text) - 1:
-            return  # what the last key triggers belongs to the caller's wait
-        deadline = time.monotonic() + 0.15
-        while (left := deadline - time.monotonic()) > 0:
-            ready, _, _ = select.select([proc.stdout], [], [], left)
-            if ready:
-                chunk = os.read(proc.stdout.fileno(), 65536)
-                transcript.write(chunk)
-                transcript.flush()
+def paste(proc, text):
+    """Send `text` to NMBL's serial TUI in one write, as a terminal paste
+    delivers it: the console must take a burst of any length whole."""
+    proc.stdin.write(text.encode())
+    proc.stdin.flush()
 
 
 @contextlib.contextmanager
@@ -423,9 +412,9 @@ def network_rescue(args, proc, transcript):
         proc.stdin.write(b"n")
         proc.stdin.flush()
         wait_for(proc, ["Enter rescue URL"], 240, transcript)
-        type_keys(proc, url + "\r", transcript)
+        paste(proc, url + "\r")
         wait_for(proc, ["Computed (SHA-256)"], 600, transcript)
-        type_keys(proc, digest + "\r", transcript)
+        paste(proc, digest + "\r")
         wait_for(proc, ["recovery system ready"], 240, transcript,
                  forbidden=("network-rescue-failed",))
     proc.stdin.write(b"findmnt -n -o FSTYPE / | grep -qx overlay && echo NMBL_NETWORK_RESCUE_\"PASS\"\n")

@@ -1,141 +1,78 @@
 use crate::ui::console::ConsoleEvent;
 
-/// Maximum bytes the pre-filter retains while waiting for the rest of
-/// a partial `CSI 8;rows;cols t` sequence to arrive. 64 is comfortably
-/// larger than the longest legal report (`CSI 8;65535;65535t` at 18
-/// bytes); overflow forces a resync.
-pub(crate) const BUF: usize = 64;
+/// Longest escape sequence the pre-filter holds back while waiting for
+/// the rest of a possible `CSI 8;rows;cols t` report (the longest legal
+/// one, `CSI 8;65535;65535t`, is 18 bytes). It bounds only the
+/// unfinished sequence carried over to the next read: a longer run is
+/// forwarded to termwiz verbatim, never dropped.
+pub(crate) const MAX_PARTIAL: usize = 256;
 
 /// Streaming byte filter that splits an input stream into
 /// [`ConsoleEvent::Resize`] reports plus the leftover byte stream
 /// (which the caller hands to [`termwiz::input::InputParser`] to
 /// produce key / mouse / paste events).
 ///
-/// `push(bytes)` appends incoming bytes; `drain(scratch)` extracts up
-/// to one Resize event from the front of the buffer, returning the
-/// non-resize prefix to forward to termwiz. Partial sequences are
-/// retained across calls so `\x1b[8;5` then `0;200t` still parses.
+/// [`Self::feed`] takes a read of any length. Every byte is forwarded,
+/// consumed as part of a resize report, or held back as the unfinished
+/// escape sequence ending the read, which the next read completes, so
+/// `\x1b[8;5` then `0;200t` still parses.
 pub(crate) struct ResizeFilter {
-    buf: [u8; BUF],
-    len: usize,
+    partial: Vec<u8>,
 }
 
 impl ResizeFilter {
     pub(crate) fn new() -> Self {
         Self {
-            buf: [0u8; BUF],
-            len: 0,
+            partial: Vec::new(),
         }
     }
 
-    /// Append `bytes` to the internal buffer. Bytes that overflow the
-    /// buffer drop on the floor — a pathological overflow means the
-    /// producer is feeding garbage and the resync path below will
-    /// recover. Returns the number actually retained.
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> usize {
-        let room = BUF.saturating_sub(self.len);
-        let take = bytes.len().min(room);
-        for i in 0..take {
-            let dst = self.len.saturating_add(i);
-            if let (Some(d), Some(s)) = (self.buf.get_mut(dst), bytes.get(i)) {
-                *d = *s;
-            }
-        }
-        self.len = self.len.saturating_add(take);
-        take
-    }
-
-    /// Drain the buffer once: emit at most one [`ConsoleEvent::Resize`]
-    /// and copy any preceding non-Resize bytes into `scratch`. After
-    /// the call, the buffer holds either (a) nothing (everything
-    /// classified), (b) a partial sequence (caller pushes more and
-    /// retries), or (c) bytes after the Resize.
-    ///
-    /// Returns `(forwarded_byte_count, Option<Resize>)`. The caller
-    /// hands the first `forwarded_byte_count` bytes of `scratch` to
-    /// termwiz's `InputParser`.
-    pub(crate) fn drain(&mut self, scratch: &mut [u8]) -> (usize, Option<ConsoleEvent>) {
-        let mut idx: usize = 0;
-        let mut written: usize = 0;
-        let buf_len = self.len;
-        while idx < buf_len {
-            // Look for the ESC introducing a possible CSI 8t.
-            let head = self.buf.get(idx).copied().unwrap_or(0);
+    /// Classify `bytes`, appended to any held-back partial sequence.
+    /// Non-resize bytes go to `forward` in stream order and each
+    /// complete report to `resize`; an unfinished sequence at the end
+    /// is kept for the next call.
+    pub(crate) fn feed(
+        &mut self,
+        bytes: &[u8],
+        forward: &mut Vec<u8>,
+        mut resize: impl FnMut(ConsoleEvent),
+    ) {
+        let mut stream = std::mem::take(&mut self.partial);
+        stream.extend_from_slice(bytes);
+        let mut idx = 0usize;
+        while let Some(&head) = stream.get(idx) {
             if head != 0x1b {
-                // Plain byte — forward to scratch and move on.
-                Self::copy_into(scratch, written, head);
-                written = written.saturating_add(1);
+                forward.push(head);
                 idx = idx.saturating_add(1);
                 continue;
             }
-            // Try to recognise CSI 8;<rows>;<cols>t starting at idx.
-            match recognise_csi_8t(self.buf.get(idx..buf_len).unwrap_or(&[])) {
+            let rest = stream.get(idx..).unwrap_or(&[]);
+            match recognise_csi_8t(rest) {
                 CsiOutcome::Resize {
                     rows,
                     cols,
                     consumed,
                 } => {
-                    // Drop the bytes BEFORE the CSI (already forwarded
-                    // into scratch) AND the CSI itself (consumed). Shift
-                    // the trailing tail down to buf[0] so the next call
-                    // starts from a clean head.
-                    let after = idx.saturating_add(consumed);
-                    self.shift_tail_left(after, 0);
-                    self.len = self.len.saturating_sub(after);
-                    return (written, Some(ConsoleEvent::Resize { rows, cols }));
-                }
-                CsiOutcome::NotMine { consumed } => {
-                    // The bytes at `idx..idx+consumed` are an escape
-                    // sequence we don't claim — forward them all to
-                    // termwiz verbatim.
-                    for j in 0..consumed {
-                        if let Some(&b) = self.buf.get(idx.saturating_add(j)) {
-                            Self::copy_into(scratch, written, b);
-                            written = written.saturating_add(1);
-                        }
-                    }
+                    resize(ConsoleEvent::Resize { rows, cols });
                     idx = idx.saturating_add(consumed);
                 }
+                CsiOutcome::NotMine { consumed } => {
+                    // An escape sequence we don't claim: termwiz gets
+                    // it verbatim.
+                    forward.extend_from_slice(rest.get(..consumed).unwrap_or(rest));
+                    idx = idx.saturating_add(consumed.max(1));
+                }
                 CsiOutcome::NeedMore => {
-                    // Partial sequence at the tail — leave it in the
-                    // buffer and emit only what we've classified so
-                    // far. The next push fills in the rest.
-                    self.shift_tail_left(idx, 0);
-                    self.len = self.len.saturating_sub(idx);
-                    return (written, None);
+                    self.partial = rest.to_vec();
+                    return;
                 }
             }
-        }
-        // Drained the whole buffer; nothing partial left.
-        self.len = 0;
-        (written, None)
-    }
-
-    /// Move `self.buf[src..]` to `self.buf[dst..]` in place. `dst <=
-    /// src` by contract.
-    fn shift_tail_left(&mut self, src: usize, dst: usize) {
-        if src == dst {
-            return;
-        }
-        let tail_len = self.len.saturating_sub(src);
-        for i in 0..tail_len {
-            let from = src.saturating_add(i);
-            let to = dst.saturating_add(i);
-            if let (Some(b), Some(slot)) = (self.buf.get(from).copied(), self.buf.get_mut(to)) {
-                *slot = b;
-            }
-        }
-    }
-
-    fn copy_into(scratch: &mut [u8], at: usize, byte: u8) {
-        if let Some(slot) = scratch.get_mut(at) {
-            *slot = byte;
         }
     }
 
     #[cfg(test)]
     pub(crate) fn buffered_len(&self) -> usize {
-        self.len
+        self.partial.len()
     }
 }
 
@@ -177,8 +114,8 @@ fn recognise_csi_8t(bytes: &[u8]) -> CsiOutcome {
             Some(&b) if (0x40..=0x7e).contains(&b) => break idx,
             Some(_) => idx = idx.saturating_add(1),
         }
-        if idx >= BUF {
-            // Pathological sequence longer than our buffer — give up
+        if idx >= MAX_PARTIAL {
+            // Pathological sequence longer than any report — give up
             // and let termwiz handle whatever it can.
             return CsiOutcome::NotMine { consumed: idx };
         }
@@ -246,25 +183,25 @@ fn parse_u32(bytes: &[u8]) -> Option<u32> {
 mod tests {
     use super::*;
 
-    fn drain_all(f: &mut ResizeFilter) -> (Vec<u8>, Vec<ConsoleEvent>) {
+    fn feed_all(f: &mut ResizeFilter, bytes: &[u8]) -> (Vec<u8>, Vec<ConsoleEvent>) {
         let mut forwarded = Vec::new();
         let mut resizes = Vec::new();
-        loop {
-            let mut scratch = [0u8; BUF];
-            let (n, ev) = f.drain(&mut scratch);
-            forwarded.extend_from_slice(scratch.get(..n).unwrap_or(&[]));
-            match ev {
-                Some(r) => resizes.push(r),
-                None if n == 0 => return (forwarded, resizes),
-                None => return (forwarded, resizes),
-            }
+        f.feed(bytes, &mut forwarded, |ev| resizes.push(ev));
+        (forwarded, resizes)
+    }
+
+    fn only_resize(ev: &[ConsoleEvent]) -> (u16, u16) {
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        match ev[0] {
+            ConsoleEvent::Resize { rows, cols } => (rows, cols),
+            other => panic!("expected Resize, got {other:?}"),
         }
     }
 
     #[test]
-    fn empty_input_drains_to_nothing() {
+    fn empty_input_forwards_nothing() {
         let mut f = ResizeFilter::new();
-        let (fwd, ev) = drain_all(&mut f);
+        let (fwd, ev) = feed_all(&mut f, b"");
         assert!(fwd.is_empty());
         assert!(ev.is_empty());
     }
@@ -272,8 +209,7 @@ mod tests {
     #[test]
     fn plain_ascii_forwards_verbatim() {
         let mut f = ResizeFilter::new();
-        f.push(b"abc");
-        let (fwd, ev) = drain_all(&mut f);
+        let (fwd, ev) = feed_all(&mut f, b"abc");
         assert_eq!(fwd, b"abc");
         assert!(ev.is_empty());
     }
@@ -281,82 +217,44 @@ mod tests {
     #[test]
     fn csi_8_50_200_emits_resize_and_consumes_bytes() {
         let mut f = ResizeFilter::new();
-        f.push(b"\x1b[8;50;200t");
-        let (fwd, ev) = drain_all(&mut f);
+        let (fwd, ev) = feed_all(&mut f, b"\x1b[8;50;200t");
         assert!(fwd.is_empty(), "resize bytes must NOT be forwarded");
-        assert_eq!(ev.len(), 1);
-        match ev[0] {
-            ConsoleEvent::Resize { rows, cols } => {
-                assert_eq!(rows, 50);
-                assert_eq!(cols, 200);
-            }
-            other => panic!("expected Resize, got {other:?}"),
-        }
+        assert_eq!(only_resize(&ev), (50, 200));
     }
 
     #[test]
     fn csi_8_1_1_degenerate_but_valid() {
         let mut f = ResizeFilter::new();
-        f.push(b"\x1b[8;1;1t");
-        let (_, ev) = drain_all(&mut f);
-        assert_eq!(ev.len(), 1);
-        match ev[0] {
-            ConsoleEvent::Resize { rows, cols } => {
-                assert_eq!(rows, 1);
-                assert_eq!(cols, 1);
-            }
-            _ => panic!(),
-        }
+        let (_, ev) = feed_all(&mut f, b"\x1b[8;1;1t");
+        assert_eq!(only_resize(&ev), (1, 1));
     }
 
     #[test]
     fn interleaved_char_resize_char() {
         let mut f = ResizeFilter::new();
-        f.push(b"a\x1b[8;30;120tb");
-        // First drain: emits 'a' before the resize, then the resize.
-        let mut scratch = [0u8; BUF];
-        let (n, ev) = f.drain(&mut scratch);
-        assert_eq!(&scratch[..n], b"a");
-        match ev {
-            Some(ConsoleEvent::Resize { rows, cols }) => {
-                assert_eq!(rows, 30);
-                assert_eq!(cols, 120);
-            }
-            other => panic!("expected Resize, got {other:?}"),
-        }
-        // Second drain: emits 'b'.
-        let (n2, ev2) = f.drain(&mut scratch);
-        assert_eq!(&scratch[..n2], b"b");
-        assert!(ev2.is_none());
+        let (fwd, ev) = feed_all(&mut f, b"a\x1b[8;30;120tb");
+        assert_eq!(fwd, b"ab");
+        assert_eq!(only_resize(&ev), (30, 120));
     }
 
     #[test]
     fn partial_then_completion() {
         let mut f = ResizeFilter::new();
-        f.push(b"\x1b[8;5");
-        let mut scratch = [0u8; BUF];
-        let (n, ev) = f.drain(&mut scratch);
-        assert_eq!(n, 0, "partial CSI must not forward bytes yet");
-        assert!(ev.is_none());
+        let (fwd, ev) = feed_all(&mut f, b"\x1b[8;5");
+        assert!(fwd.is_empty(), "partial CSI must not forward bytes yet");
+        assert!(ev.is_empty());
         assert!(f.buffered_len() > 0, "partial buffer retained");
-        f.push(b"0;200t");
-        let (n2, ev2) = f.drain(&mut scratch);
-        assert_eq!(n2, 0);
-        match ev2 {
-            Some(ConsoleEvent::Resize { rows, cols }) => {
-                assert_eq!(rows, 50);
-                assert_eq!(cols, 200);
-            }
-            other => panic!("expected Resize, got {other:?}"),
-        }
+        let (fwd2, ev2) = feed_all(&mut f, b"0;200t");
+        assert!(fwd2.is_empty());
+        assert_eq!(only_resize(&ev2), (50, 200));
+        assert_eq!(f.buffered_len(), 0);
     }
 
     #[test]
     fn unknown_csi_forwarded_to_termwiz() {
         let mut f = ResizeFilter::new();
         // ESC [ A is "Up". Not ours; must forward verbatim.
-        f.push(b"\x1b[A");
-        let (fwd, ev) = drain_all(&mut f);
+        let (fwd, ev) = feed_all(&mut f, b"\x1b[A");
         assert_eq!(fwd, b"\x1b[A");
         assert!(ev.is_empty());
     }
@@ -366,9 +264,27 @@ mod tests {
         // `CSI 8;rows;cols;extra t` — we don't accept the 4-param form.
         // Forward verbatim so termwiz can ignore it itself.
         let mut f = ResizeFilter::new();
-        f.push(b"\x1b[8;1;2;3t");
-        let (fwd, ev) = drain_all(&mut f);
+        let (fwd, ev) = feed_all(&mut f, b"\x1b[8;1;2;3t");
         assert_eq!(fwd, b"\x1b[8;1;2;3t");
         assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn a_read_longer_than_any_buffer_is_forwarded_whole() {
+        let mut f = ResizeFilter::new();
+        let burst: Vec<u8> = (0..8192u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let (fwd, ev) = feed_all(&mut f, &burst);
+        assert_eq!(fwd, burst);
+        assert!(ev.is_empty());
+    }
+
+    #[test]
+    fn an_overlong_unterminated_csi_is_forwarded_not_held() {
+        let mut f = ResizeFilter::new();
+        let mut burst = b"\x1b[".to_vec();
+        burst.extend(std::iter::repeat_n(b'1', MAX_PARTIAL * 2));
+        let (fwd, _) = feed_all(&mut f, &burst);
+        assert!(f.buffered_len() <= MAX_PARTIAL, "{}", f.buffered_len());
+        assert_eq!(fwd.len() + f.buffered_len(), burst.len());
     }
 }

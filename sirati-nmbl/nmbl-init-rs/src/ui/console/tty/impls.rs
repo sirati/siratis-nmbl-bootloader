@@ -34,7 +34,7 @@ impl Console for TtyConsole {
         Box::pin(async move {
             // A key or scroll already classified from a previous cycle
             // is ready now — no need to touch the fd / reactor.
-            if self.pending_keys.front().is_some() || self.pending_scrolls.front().is_some() {
+            if !self.input.keys.is_empty() || !self.input.scrolls.is_empty() {
                 return self.poll_event_blocking(Duration::from_millis(0));
             }
             // Await readability (or the slice deadline) on the console
@@ -68,10 +68,10 @@ impl Console for TtyConsole {
         self.pump_output()?;
         // First: drain any keys / scrolls already classified from a
         // previous poll cycle without going to the fd again.
-        if let Some(k) = self.pending_keys.pop_front() {
+        if let Some(k) = self.input.keys.pop_front() {
             return Ok(Some(ConsoleEvent::Key(k)));
         }
-        if let Some(s) = self.pending_scrolls.pop_front() {
+        if let Some(s) = self.input.scrolls.pop_front() {
             return Ok(Some(s));
         }
 
@@ -88,10 +88,10 @@ impl Console for TtyConsole {
             self.apply_resize(&ev);
             return Ok(Some(ev));
         }
-        if let Some(k) = self.pending_keys.pop_front() {
+        if let Some(k) = self.input.keys.pop_front() {
             return Ok(Some(ConsoleEvent::Key(k)));
         }
-        if let Some(s) = self.pending_scrolls.pop_front() {
+        if let Some(s) = self.input.scrolls.pop_front() {
             return Ok(Some(s));
         }
         Ok(None)
