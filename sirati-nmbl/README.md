@@ -336,10 +336,13 @@ The unit runs `nmbl-log-import` from nmbl-host-tools. It reads at most 2 MiB
 control characters, invalid UTF-8 and backslashes as `\xNN`, `\u{N}` and
 `\\`, caps each line at 4 KiB, and sends it over journald's native socket.
 If journald refuses a line, the line goes to `/dev/kmsg` instead. The file is
-kept if a line could not be logged.
+kept if a line could not be logged. A failed import reports its error and
+still succeeds, so it never fails the boot or withholds its blessing.
 
 `nix run .#check-log-import` (scripted initrd) and
-`nix run .#check-log-import-systemd` check this path in a VM.
+`nix run .#check-log-import-systemd` check this path in a VM. The
+`log-import-production` check boots a server-shaped stateful host whose
+importer comes from another nixpkgs than the system.
 
 ## Stateful boot tracking
 

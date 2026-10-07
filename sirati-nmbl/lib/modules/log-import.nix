@@ -38,15 +38,32 @@ let
   stage2Src = "/var/lib/nmbl/nmbl-log.txt";
 
   # Just the importer binary, so the initrd does not carry the signer. It
-  # has no RUNPATH and finds libgcc_s only through ld.so's built-in libgcc
-  # dir, which the systemd initrd does not copy; the RUNPATH lets the initrd
-  # builder resolve and copy it.
+  # has no RUNPATH: ld.so finds libc and libgcc_s in its own built-in glibc
+  # directory, but the initrd builder copies only libraries a RUNPATH names.
+  # That only worked while the system's glibc was the same derivation. When
+  # nmbl-host-tools comes from another nixpkgs (a consumer re-locking
+  # nmbl-init-rs), the initrd got that glibc's ld.so without its libc.so.6
+  # and the importer exited 127 before main. Name the interpreter's own
+  # directory, and refuse a binary with a library no RUNPATH entry holds.
   logImport = pkgs.runCommand "nmbl-log-import" {
     nativeBuildInputs = [ pkgs.patchelf ];
     meta.mainProgram = "nmbl-log-import";
   } ''
-    install -Dm755 ${nmblSign}/bin/nmbl-log-import $out/bin/nmbl-log-import
-    patchelf --add-rpath ${lib.getLib pkgs.stdenv.cc.cc}/lib $out/bin/nmbl-log-import
+    bin=$out/bin/nmbl-log-import
+    install -Dm755 ${nmblSign}/bin/nmbl-log-import $bin
+    glibc=$(dirname "$(patchelf --print-interpreter $bin)")
+    patchelf --add-rpath "$glibc:${lib.getLib pkgs.stdenv.cc.cc}/lib" $bin
+    rpath=$(patchelf --print-rpath $bin)
+    for needed in $(patchelf --print-needed $bin); do
+      found=
+      for dir in ''${rpath//:/ }; do
+        if [ -e "$dir/$needed" ]; then found=1; fi
+      done
+      if [ -z "$found" ]; then
+        echo "nmbl-log-import: $needed is not in RUNPATH $rpath" >&2
+        exit 1
+      fi
+    done
   '';
   importBin = "${logImport}/bin/nmbl-log-import";
 in
@@ -68,11 +85,16 @@ in
         wants = [ "systemd-journald.socket" ];
         after = [ "cryptsetup.target" "systemd-journald.socket" ];
         before = [ "initrd-switch-root.target" "sysroot.mount" ];
-        unitConfig.DefaultDependencies = false;
+        unitConfig = {
+          DefaultDependencies = false;
+          ConditionPathExists = "/nmbl-log/nmbl.log";
+        };
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          ExecStart = "${importBin} /nmbl-log/nmbl.log";
+          # The importer reports its own errors and exits 0; `-` also keeps a
+          # loader failure from failing the boot and its NMBL blessing.
+          ExecStart = "-${importBin} /nmbl-log/nmbl.log";
         };
       };
     })
@@ -94,10 +116,11 @@ in
         description = "Import NMBL pre-kexec log into the booted journal";
         wantedBy = [ "multi-user.target" ];
         after = [ "systemd-journald.service" ];
+        unitConfig.ConditionPathExists = stage2Src;
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
-          ExecStart = "${importBin} ${stage2Src}";
+          ExecStart = "-${importBin} ${stage2Src}";
         };
       };
     })

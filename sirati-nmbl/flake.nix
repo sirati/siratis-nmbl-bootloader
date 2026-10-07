@@ -1556,6 +1556,15 @@
           };
         };
         generation-root-store-eval = rootStoreEvalCheck;
+        # nmbl-init-rs locked on its own: the glibc of its own nixpkgs pin.
+        log-import-production = import ./testing/log-import-production-vm.nix {
+          inherit pkgs nmblSign;
+          nmblModule = self.nixosModules.default;
+          foreignGlibc = let
+            lock = builtins.fromJSON (builtins.readFile ./nmbl-init-rs/flake.lock);
+            source = builtins.fetchTree lock.nodes.${lock.nodes.root.inputs.nixpkgs}.locked;
+          in (import source { inherit system; }).glibc;
+        };
         nmbl-erofs-bios-host-eval = erofsBiosHostEvalCheck;
         rescue-ssh-welcome = rescueSshWelcomeCheck;
         rescue-storage-tools-eval = rescueStorageToolsEvalCheck;

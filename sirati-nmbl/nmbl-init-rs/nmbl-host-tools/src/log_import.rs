@@ -7,7 +7,9 @@
 //! control characters, line/paragraph separators and bidi controls are
 //! escaped, a literal backslash becomes `\\`, and each entry is capped at
 //! [`MAX_LINE`] bytes. Entries go to journald over its native socket under
-//! `SYSLOG_IDENTIFIER=nmbl-init`, falling back to `/dev/kmsg` per line.
+//! `SYSLOG_IDENTIFIER=nmbl-init`, falling back to `/dev/kmsg` per line. A
+//! failed import is reported and still exits successfully: the transcript is
+//! diagnostics and must never fail the boot.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -192,11 +194,42 @@ impl Sink {
         match (journal, &mut self.kmsg) {
             (Ok(()), _) => Ok(()),
             (Err(_), Some(kmsg)) => {
-                kmsg.write_all(format!("<6>{IDENTIFIER}: {message}\n").as_bytes())
+                kmsg.write_all(format!("<6>{IDENTIFIER}: {}\n", fit(message, KMSG_LINE)).as_bytes())
             }
             (Err(e), None) => Err(e),
         }
     }
+
+    /// Report the importer's own failure on stderr and, when available, as a
+    /// kernel warning, which reaches the console even without a journal.
+    pub fn report(&mut self, message: &str) {
+        eprintln!("{message}");
+        if let Some(kmsg) = &mut self.kmsg {
+            let _ = kmsg.write_all(format!("<4>{}\n", fit(message, KMSG_LINE)).as_bytes());
+        }
+    }
+}
+
+/// Room for one `/dev/kmsg` record: the kernel refuses writes over 1024 bytes.
+const KMSG_LINE: usize = 960;
+
+/// Cut an already printable entry to at most `max` bytes on a character
+/// boundary, marking what was dropped.
+fn fit(message: &str, max: usize) -> String {
+    if message.len() <= max {
+        return message.to_owned();
+    }
+    let room = max.saturating_sub(line_marker(message.len()).len());
+    let mut out = String::new();
+    for c in message.chars() {
+        if out.len() + c.len_utf8() > room {
+            break;
+        }
+        out.push(c);
+    }
+    let rest = message.len() - out.len();
+    out.push_str(&line_marker(rest));
+    out
 }
 
 /// Open the transcript without following symlinks or blocking on a FIFO, and
@@ -251,7 +284,13 @@ pub fn main_with(args: Vec<OsString>) -> Result<(), String> {
         },
     };
     let kmsg = OpenOptions::new().write(true).open("/dev/kmsg").ok();
-    import(Path::new(&src), &mut Sink::new(socket, kmsg)).map(|_| ())
+    let mut sink = Sink::new(socket, kmsg);
+    if let Err(error) = import(Path::new(&src), &mut sink) {
+        // The transcript is diagnostics only; losing it must never fail the
+        // boot (a failed unit also withholds NMBL's boot blessing).
+        sink.report(&format!("nmbl-log-import: {error}"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -537,6 +576,28 @@ mod tests {
         assert!(res.is_err());
         assert!(got.is_empty());
         assert!(dir.path().join("secret").exists());
+    }
+
+    #[test]
+    fn kmsg_records_fit_the_kernel_limit() {
+        assert_eq!(fit("short", KMSG_LINE), "short");
+        let got = fit(&"é".repeat(3000), KMSG_LINE);
+        assert!(got.len() <= KMSG_LINE, "{}", got.len());
+        assert!(got.ends_with(" bytes truncated]"), "{got}");
+    }
+
+    #[test]
+    fn failed_import_reports_and_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("nmbl.log");
+        std::fs::write(&src, b"phase 1\n").unwrap();
+        let args = vec![
+            OsString::from("--socket"),
+            dir.path().join("no-journal").into_os_string(),
+            src.clone().into_os_string(),
+        ];
+        assert_eq!(main_with(args), Ok(()));
+        assert!(src.exists());
     }
 
     #[test]
