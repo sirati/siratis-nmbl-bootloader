@@ -25,7 +25,7 @@ use crate::sig::wire::{self, Header};
 /// A signer over one deterministic ML-DSA key pair, used to mint real sidecars
 /// for the verify KATs. Mirrors what the host `nmbl-sign` tool does: pre-hash
 /// the SAME digest under `Ph::SHA512` with the per-role domain as the ctx.
-pub(super) struct TestSigner {
+pub(crate) struct TestSigner {
     alg: AlgId,
     sk65: Option<ml_dsa_65::PrivateKey>,
     sk87: Option<ml_dsa_87::PrivateKey>,
@@ -34,7 +34,7 @@ pub(super) struct TestSigner {
 
 impl TestSigner {
     /// Deterministic key pair from `seed` for `alg`.
-    pub(super) fn new(alg: AlgId, seed: u8) -> Self {
+    pub(crate) fn new(alg: AlgId, seed: u8) -> Self {
         match alg {
             AlgId::MlDsa65 => {
                 let (pk, sk) = ml_dsa_65::KG::keygen_from_seed(&[seed; 32]);
@@ -58,7 +58,7 @@ impl TestSigner {
     }
 
     /// The baked (verifying) key this signer corresponds to.
-    pub(super) fn baked_key(&self) -> BakedKey {
+    pub(crate) fn baked_key(&self) -> BakedKey {
         BakedKey::parse(&self.pk_bytes, self.alg).unwrap()
     }
 
@@ -87,7 +87,7 @@ impl TestSigner {
 
     /// Build a complete, parseable sidecar buffer (header + signature) binding
     /// `digest` to `domain`. `key_id` is the order hint (any value is fine).
-    pub(super) fn sidecar_bytes(&self, digest: &[u8; 64], domain: &[u8], key_id: u32) -> Vec<u8> {
+    pub(crate) fn sidecar_bytes(&self, digest: &[u8; 64], domain: &[u8], key_id: u32) -> Vec<u8> {
         let signature = self.sign(digest, domain);
         let header = Header {
             alg: self.alg,

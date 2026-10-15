@@ -40,11 +40,16 @@ pub fn locate_sfs(config: &Config) -> Result<PathBuf> {
                 }),
             })?;
 
-    let relative: PathBuf = match config.rescue.sfs_path.as_deref() {
+    Ok(mountpoint.join(sfs_relative(config)))
+}
+
+/// The rescue image path relative to the boot partition root:
+/// `rescue.sfs_path` without a leading `/`, or [`DEFAULT_SFS_BASENAME`].
+pub(crate) fn sfs_relative(config: &Config) -> PathBuf {
+    match config.rescue.sfs_path.as_deref() {
         Some(p) => strip_leading_slash(p).to_path_buf(),
         None => PathBuf::from(DEFAULT_SFS_BASENAME),
-    };
-    Ok(mountpoint.join(relative))
+    }
 }
 
 /// Strip a single leading `/` so [`Path::join`] keeps the mountpoint

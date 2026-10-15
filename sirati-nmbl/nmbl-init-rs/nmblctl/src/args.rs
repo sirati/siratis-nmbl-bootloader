@@ -38,6 +38,11 @@ pub enum Command {
         latest: bool,
         show: bool,
     },
+    /// Check the installed external full-system rescue images. `boot_root`
+    /// is the mounted boot partition (default `/boot`).
+    VerifyRescue {
+        boot_root: Option<std::path::PathBuf>,
+    },
     /// Print top-level usage.
     Help,
 }
@@ -76,6 +81,8 @@ COMMANDS:
                            retry an installed profile once despite exhaustion
   default [--generation N | --latest | --show]
                            set or show the persistent default generation
+  verify-rescue [--json] [--boot-root PATH]
+                           check the rescue images, pins and signatures
 
 GLOBAL OPTIONS:
   --color=auto|always|never  colourise output (default: auto)
@@ -85,6 +92,7 @@ GLOBAL OPTIONS:
   --profiles-dir PATH        explicit installed profiles directory
   --state-dir PATH           installed persistent NMBL state directory
   --no-reboot                retry-generation: record request without reboot
+  --boot-root PATH           verify-rescue: mounted boot partition (default /boot)
   -h, --help                 print this help";
 
 /// Parse `args` (argv without the program name) into a [`Cli`].
@@ -107,6 +115,7 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut generation: Option<u32> = None;
     let mut latest = false;
     let mut show = false;
+    let mut boot_root = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -115,7 +124,7 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
             "--no-pager" => no_pager = true,
             "--json" => json = true,
             "--no-reboot" => no_reboot = true,
-            "--config" | "--state-dir" | "--profiles-dir" | "--system-root" => {
+            "--config" | "--state-dir" | "--profiles-dir" | "--system-root" | "--boot-root" => {
                 let path = std::path::PathBuf::from(
                     it.next().ok_or_else(|| format!("{arg} needs a path"))?,
                 );
@@ -126,6 +135,7 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
                     "--config" => config = Some(path),
                     "--state-dir" => state_dir = Some(path),
                     "--system-root" => system_root = Some(path),
+                    "--boot-root" => boot_root = Some(path),
                     _ => profiles_dir = Some(path),
                 }
             }
@@ -161,6 +171,9 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
             "retry-generation" if command.is_none() => {
                 command = Some(Command::RetryGeneration { generation: 0 });
             }
+            "verify-rescue" if command.is_none() => {
+                command = Some(Command::VerifyRescue { boot_root: None });
+            }
             "default" if command.is_none() => {
                 command = Some(Command::Default {
                     generation: None,
@@ -187,6 +200,14 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
                     .ok_or("retry-generation requires --generation N (1..u32::MAX)")?,
             }
         }
+        Some(Command::VerifyRescue { .. }) => {
+            if yes || latest || show || generation.is_some() {
+                return Err("verify-rescue accepts only --json and --boot-root".into());
+            }
+            Command::VerifyRescue {
+                boot_root: boot_root.take(),
+            }
+        }
         Some(Command::Default { .. }) => {
             if latest && generation.is_some() {
                 return Err("--latest and --generation are mutually exclusive".to_string());
@@ -200,8 +221,11 @@ pub fn parse_args(args: &[String]) -> Result<Cli, String> {
         Some(other) => other,
     };
 
-    if json && command != Command::Status {
-        return Err("--json requires status".into());
+    if json && !matches!(command, Command::Status | Command::VerifyRescue { .. }) {
+        return Err("--json requires status or verify-rescue".into());
+    }
+    if boot_root.is_some() {
+        return Err("--boot-root requires verify-rescue".into());
     }
     if no_reboot && !matches!(command, Command::RetryGeneration { .. }) {
         return Err("--no-reboot requires retry-generation".into());
@@ -372,6 +396,41 @@ mod tests {
             &["retry-generation", "--latest"],
         ] {
             assert!(parse(args).is_err());
+        }
+    }
+    #[test]
+    fn verify_rescue_takes_json_config_and_boot_root() {
+        let c = parse(&[
+            "verify-rescue",
+            "--json",
+            "--config",
+            "/mnt/boot/nmbl/config.toml",
+            "--boot-root",
+            "/mnt/boot",
+        ])
+        .expect("verify-rescue");
+        assert_eq!(
+            c.command,
+            Command::VerifyRescue {
+                boot_root: Some(std::path::PathBuf::from("/mnt/boot"))
+            }
+        );
+        assert!(c.json);
+        assert_eq!(
+            c.config.as_deref(),
+            Some(std::path::Path::new("/mnt/boot/nmbl/config.toml"))
+        );
+        assert_eq!(
+            parse(&["verify-rescue"]).expect("bare").command,
+            Command::VerifyRescue { boot_root: None }
+        );
+        for args in [
+            &["verify-rescue", "--boot-root", "relative"][..],
+            &["verify-rescue", "--generation", "3"],
+            &["status", "--boot-root", "/boot"],
+            &["chain", "--json"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?}");
         }
     }
 }

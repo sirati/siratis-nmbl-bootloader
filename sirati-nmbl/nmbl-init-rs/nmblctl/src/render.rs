@@ -3,6 +3,7 @@
 //! pages; keeping them as pure string builders (no I/O of their own beyond what
 //! `System` already read) makes them straightforward to eyeball and to smoke-test.
 
+use nmbl_init::rescue::inspect::{ImageRole, PinStatus, SignatureStatus};
 use nmblctl::color::{Palette, Style};
 
 use crate::state::System;
@@ -301,6 +302,79 @@ fn render_handover(out: &mut String, p: &Palette) {
             &leftover.join(", "),
         );
     }
+}
+
+/// Render `nmblctl verify-rescue` as a human table.
+pub fn rescue_check(report: &nmblctl::rescue_check::RescueReport, p: Palette) -> String {
+    let mut out = String::new();
+    push_title(&mut out, &p, "NMBL rescue verification");
+    let signing = match (report.signing_enabled, report.signing_enforced) {
+        (false, _) => "disabled",
+        (true, false) => "enabled (audit)",
+        (true, true) => "enabled (enforced)",
+    };
+    line(&mut out, &p, "signing", Style::Value, signing);
+    for image in &report.inspection.images {
+        section(&mut out, &p, image.role.as_str());
+        line(
+            &mut out,
+            &p,
+            "path",
+            Style::Value,
+            &image.path.display().to_string(),
+        );
+        line(
+            &mut out,
+            &p,
+            "present",
+            if image.present {
+                Style::Good
+            } else {
+                Style::Bad
+            },
+            if image.present { "yes" } else { "no" },
+        );
+        let sha512 = image.sha512.as_str();
+        let sha_style = match image.sha512 {
+            PinStatus::Matches => Style::Good,
+            PinStatus::Unpinned if image.role != ImageRole::Tools => Style::Dim,
+            _ => Style::Bad,
+        };
+        line(&mut out, &p, "sha512", sha_style, sha512);
+        let sig_style = match image.signature {
+            SignatureStatus::Verified => Style::Good,
+            SignatureStatus::NotRequired => Style::Dim,
+            _ => Style::Bad,
+        };
+        line(
+            &mut out,
+            &p,
+            "signature",
+            sig_style,
+            image.signature.as_str(),
+        );
+    }
+    section(&mut out, &p, "rescue ssh");
+    let port = report
+        .sshd_port
+        .map_or_else(|| "not configured".to_string(), |port| port.to_string());
+    line(&mut out, &p, "sshd port", Style::Value, &port);
+    if report.authorized_keys.is_empty() {
+        line(&mut out, &p, "authorized key", Style::Warn, "none");
+    }
+    for key in &report.authorized_keys {
+        line(&mut out, &p, "authorized key", Style::Value, key);
+    }
+    section(&mut out, &p, "result");
+    if report.ok() {
+        line(&mut out, &p, "status", Style::Good, "ok");
+    } else {
+        line(&mut out, &p, "status", Style::Bad, "FAILED");
+    }
+    for problem in &report.inspection.problems {
+        line(&mut out, &p, "problem", Style::Bad, problem);
+    }
+    out
 }
 
 // ---- section helpers -------------------------------------------------------

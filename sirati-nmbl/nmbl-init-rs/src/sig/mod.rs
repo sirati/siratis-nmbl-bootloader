@@ -51,7 +51,7 @@ pub mod verify;
 
 // Cross-cutting KATs (round-trip, domain-cross-reject, whole-set fail-closed).
 #[cfg(all(test, feature = "secure-boot"))]
-mod tests;
+pub(crate) mod tests;
 
 // `AlgId`/`HashId` are part of the always-compiled leaf so the wire codec and
 // the host signer share one definition.

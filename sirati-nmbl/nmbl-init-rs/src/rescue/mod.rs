@@ -33,6 +33,10 @@ mod embedded;
 mod host;
 mod identity;
 pub mod image;
+// Host-side check of the installed external full-system rescue images
+// (`nmblctl verify-rescue`); needs the signature pipeline.
+#[cfg(feature = "secure-boot")]
+pub mod inspect;
 mod locate;
 mod network_profile;
 #[cfg(feature = "secure-boot")]

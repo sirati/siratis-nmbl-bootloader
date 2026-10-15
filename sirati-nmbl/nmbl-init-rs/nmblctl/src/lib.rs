@@ -6,6 +6,7 @@
 //! * `reboot-rescue` — set the rescue sentinel durably, then reboot.
 //! * `reboot-into`   — one-shot "boot this generation next", then reboot.
 //! * `default`       — set/show the persistent default generation.
+//! * `verify-rescue` — check the installed full-system rescue images.
 //!
 //! The library half holds the pieces that are worth testing without a live
 //! system: colour rendering, the pager fallback decision, argument parsing,
@@ -16,6 +17,7 @@ pub mod args;
 pub mod color;
 pub mod flags;
 pub mod pager;
+pub mod rescue_check;
 
 pub use args::{Cli, ColorChoice, Command, parse_args};
 pub use color::{Palette, Style};

@@ -70,6 +70,7 @@ fn run(cli: &nmblctl::Cli) -> Result<(), String> {
             latest,
             show,
         } => default_cmd(&sys, *generation, *latest, *show, cli),
+        Command::VerifyRescue { boot_root } => verify_rescue(&sys, cli, boot_root.as_deref()),
         Command::Help => {
             println!("{}", nmblctl::args::USAGE);
             Ok(())
@@ -211,6 +212,36 @@ fn persist_retry_and_clear_rescue(
     nmbl_init::policy::sentinel::consume_after_rescue_booted(config).map_err(|e| {
         format!("operator retry recorded but rescue request could not be cleared: {e}")
     })
+}
+
+/// Check the installed rescue; the exit status is 1 when anything is wrong.
+fn verify_rescue(
+    sys: &state::System,
+    cli: &nmblctl::Cli,
+    boot_root: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let config = sys
+        .config
+        .as_ref()
+        .ok_or("verify-rescue requires a readable NMBL config (use --config)")?;
+    let boot_root = match boot_root {
+        Some(path) => {
+            state::validate_operator_path(path, true)?;
+            path.to_path_buf()
+        }
+        None => PathBuf::from("/boot"),
+    };
+    let report = nmblctl::rescue_check::verify(config, &boot_root);
+    if cli.json {
+        println!("{}", report.to_json());
+    } else {
+        print!("{}", render::rescue_check(&report, palette(cli, false)));
+    }
+    if report.ok() {
+        Ok(())
+    } else {
+        Err("rescue verification found problems".into())
+    }
 }
 
 fn default_cmd(
