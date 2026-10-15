@@ -43,10 +43,10 @@ mod mounts;
 mod ready_paths;
 #[path = "child_stop.rs"]
 mod stop;
+pub(crate) use mounts::reveal_installed_mounts;
 #[cfg(test)]
 use mounts::{MountStep, child_boot_target, mount_plan, preserved_roots, umount_plan};
 use mounts::{apply_mount_plan, teardown_mounts};
-pub(crate) use mounts::reveal_installed_mounts;
 
 /// Conventional exit code surfaced when the post-fork `execve(2)` (or a
 /// pre-exec syscall) fails in the child. Matches `sys::pty`.

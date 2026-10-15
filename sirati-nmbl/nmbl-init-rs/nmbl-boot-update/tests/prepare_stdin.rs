@@ -112,6 +112,9 @@ fn prepare_reads_private_key_from_stdin() {
             )
         };
         verify_under(expected).unwrap_or_else(|e| panic!("{name} under {expected}: {e}"));
-        assert!(verify_under(foreign).is_err(), "{name} also verifies under {foreign}");
+        assert!(
+            verify_under(foreign).is_err(),
+            "{name} also verifies under {foreign}"
+        );
     }
 }

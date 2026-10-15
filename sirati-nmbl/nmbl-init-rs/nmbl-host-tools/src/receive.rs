@@ -92,14 +92,19 @@ fn read_line(input: &mut impl BufRead) -> Result<String> {
 }
 
 fn valid_id(value: &str) -> bool {
-    value.len() == 128 && value.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    value.len() == 128
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn size(value: &str) -> Result<u64> {
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!("invalid payload size: {value}"));
     }
-    let size: u64 = value.parse().map_err(|_| "payload is too large".to_string())?;
+    let size: u64 = value
+        .parse()
+        .map_err(|_| "payload is too large".to_string())?;
     if size > MAX_PAYLOAD {
         return Err("payload is too large".into());
     }
@@ -115,7 +120,8 @@ pub fn parse_header(input: &mut impl BufRead) -> Result<Header> {
     let magic = field(&first, 0);
     if magic == PREVIOUS_MAGIC {
         return Err(
-            "sender speaks NMBL-EROFS-BUNDLE-3; NMBL-EROFS-BUNDLE-4 adds the rescue tools image".into(),
+            "sender speaks NMBL-EROFS-BUNDLE-3; NMBL-EROFS-BUNDLE-4 adds the rescue tools image"
+                .into(),
         );
     }
     if magic != MAGIC {
@@ -228,7 +234,8 @@ fn receive_file(input: &mut impl Read, size: u64, path: &Path) -> Result<()> {
         .mode(0o600)
         .open(path)
         .map_err(io_error(path.display()))?;
-    let copied = io::copy(&mut input.by_ref().take(size), &mut file).map_err(io_error(path.display()))?;
+    let copied =
+        io::copy(&mut input.by_ref().take(size), &mut file).map_err(io_error(path.display()))?;
     if copied != size {
         return Err("truncated payload".into());
     }
@@ -239,7 +246,11 @@ fn sha512_hex(path: &Path) -> Result<String> {
     let mut file = File::open(path).map_err(io_error(path.display()))?;
     let mut hasher = Sha512::new();
     io::copy(&mut file, &mut hasher).map_err(io_error(path.display()))?;
-    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// Whether two files have the same contents, compared in chunks like `cmp -s`.
@@ -274,14 +285,20 @@ fn verify(public_key: &[u8], role: &str, input: &Path, signature: &Path) -> Resu
 
 fn pins_rescue_tools(config: &Path) -> Result<bool> {
     let text = fs::read(config).map_err(io_error(config.display()))?;
-    Ok(text.split(|b| *b == b'\n').any(|line| line == b"[rescue.tools]"))
+    Ok(text
+        .split(|b| *b == b'\n')
+        .any(|line| line == b"[rescue.tools]"))
 }
 
 fn syncfs(path: &Path) -> Result<()> {
     let dir = File::open(path).map_err(io_error(path.display()))?;
     // SAFETY: syncfs only reads the descriptor, which `dir` keeps open.
     if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
-        return Err(format!("sync {}: {}", path.display(), io::Error::last_os_error()));
+        return Err(format!(
+            "sync {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        ));
     }
     Ok(())
 }
@@ -289,7 +306,9 @@ fn syncfs(path: &Path) -> Result<()> {
 fn install_copy(from: &Path, to: &Path) -> Result<()> {
     fs::copy(from, to).map_err(io_error(to.display()))?;
     fs::set_permissions(to, fs::Permissions::from_mode(0o444)).map_err(io_error(to.display()))?;
-    File::open(to).and_then(|file| file.sync_all()).map_err(io_error(to.display()))
+    File::open(to)
+        .and_then(|file| file.sync_all())
+        .map_err(io_error(to.display()))
 }
 
 fn validate_generation(root: &Path, id: &str) -> Result<()> {
@@ -323,11 +342,20 @@ fn install(bundle: &Path, root: &Path, id: &str) -> Result<()> {
     if !target.is_dir() {
         let incoming = generations.join(format!(".incoming-{id}.{}", std::process::id()));
         let _ = fs::remove_dir_all(&incoming);
-        fs::DirBuilder::new().mode(0o700).create(&incoming).map_err(io_error(incoming.display()))?;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&incoming)
+            .map_err(io_error(incoming.display()))?;
         let guard = Scratch(incoming.clone());
-        for member in ["nix.erofs", "nix.erofs.sig", "system", "config.toml", "config.toml.sig"]
-            .iter()
-            .chain(EXTRA_MEMBERS.iter())
+        for member in [
+            "nix.erofs",
+            "nix.erofs.sig",
+            "system",
+            "config.toml",
+            "config.toml.sig",
+        ]
+        .iter()
+        .chain(EXTRA_MEMBERS.iter())
         {
             let source = bundle.join(member);
             if source.is_file() {
@@ -335,10 +363,13 @@ fn install(bundle: &Path, root: &Path, id: &str) -> Result<()> {
             }
         }
         let generation_file = incoming.join("generation");
-        fs::write(&generation_file, format!("{id}\n")).map_err(io_error(generation_file.display()))?;
+        fs::write(&generation_file, format!("{id}\n"))
+            .map_err(io_error(generation_file.display()))?;
         fs::set_permissions(&generation_file, fs::Permissions::from_mode(0o444))
             .map_err(io_error(generation_file.display()))?;
-        File::open(&incoming).and_then(|dir| dir.sync_all()).map_err(io_error(incoming.display()))?;
+        File::open(&incoming)
+            .and_then(|dir| dir.sync_all())
+            .map_err(io_error(incoming.display()))?;
         fs::rename(&incoming, &target).map_err(io_error(target.display()))?;
         std::mem::forget(guard);
         syncfs(&generations)?;
@@ -367,7 +398,9 @@ fn replace_link(root: &Path, name: &str, id: &str) -> Result<()> {
 
 fn remove_if_present(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
-        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(format!("remove {}: {error}", path.display())),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            Err(format!("remove {}: {error}", path.display()))
+        }
         _ => Ok(()),
     }
 }
@@ -380,7 +413,11 @@ fn activate(root: &Path, id: &str) -> Result<()> {
     // SAFETY: flock only operates on the descriptor `lock` keeps open; the
     // lock is released when it is closed at the end of this function.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(format!("lock {}: {}", root.display(), io::Error::last_os_error()));
+        return Err(format!(
+            "lock {}: {}",
+            root.display(),
+            io::Error::last_os_error()
+        ));
     }
     validate_generation(root, id)?;
     let old = target_id(root, "active");
@@ -403,12 +440,21 @@ fn activate(root: &Path, id: &str) -> Result<()> {
 }
 
 fn absolute_outside_store(path: &Path) -> bool {
-    path.is_absolute() && !path.as_os_str().as_encoded_bytes().starts_with(b"/nix/store")
+    path.is_absolute()
+        && !path
+            .as_os_str()
+            .as_encoded_bytes()
+            .starts_with(b"/nix/store")
 }
 
 /// Receive one bundle from `input` into `image_root`; returns the
 /// generation id and whether the sender asked for a reboot.
-pub fn receive(input: &mut impl BufRead, incoming: &Path, image_root: &Path, public_key: &Path) -> Result<(String, bool)> {
+pub fn receive(
+    input: &mut impl BufRead,
+    incoming: &Path,
+    image_root: &Path,
+    public_key: &Path,
+) -> Result<(String, bool)> {
     if !absolute_outside_store(incoming) {
         return Err("invalid incoming root".into());
     }
@@ -424,7 +470,10 @@ pub fn receive(input: &mut impl BufRead, incoming: &Path, image_root: &Path, pub
 
     ensure_private_dir(incoming)?;
     let tmp = incoming.join(format!(".receive-{id}.{}", random_suffix()?));
-    fs::DirBuilder::new().mode(0o700).create(&tmp).map_err(io_error(tmp.display()))?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&tmp)
+        .map_err(io_error(tmp.display()))?;
     let scratch = Scratch(tmp);
     let tmp = scratch.0.as_path();
 
@@ -446,16 +495,26 @@ pub fn receive(input: &mut impl BufRead, incoming: &Path, image_root: &Path, pub
         (header.rescue_signature, "rescue.sfs.sig"),
     ]);
     if header.network > 0 {
-        payloads.extend([(header.network, "network.erofs"), (header.network_signature, "network.erofs.sig")]);
+        payloads.extend([
+            (header.network, "network.erofs"),
+            (header.network_signature, "network.erofs.sig"),
+        ]);
     }
     if header.tools > 0 {
-        payloads.extend([(header.tools, "rescue-tools.erofs"), (header.tools_signature, "rescue-tools.erofs.sig")]);
+        payloads.extend([
+            (header.tools, "rescue-tools.erofs"),
+            (header.tools_signature, "rescue-tools.erofs.sig"),
+        ]);
     }
     for (size, name) in &payloads {
         receive_file(input, *size, &tmp.join(name))?;
     }
     let mut extra = [0u8; 1];
-    if input.read(&mut extra).map_err(io_error("read trailing data"))? != 0 {
+    if input
+        .read(&mut extra)
+        .map_err(io_error("read trailing data"))?
+        != 0
+    {
         return Err("trailing protocol data".into());
     }
     fs::write(tmp.join("generation"), format!("{id}\n")).map_err(io_error("write generation"))?;
@@ -488,11 +547,17 @@ pub fn receive(input: &mut impl BufRead, incoming: &Path, image_root: &Path, pub
         signed.push(("rescue-tools", "rescue-tools.erofs"));
     }
     for (role, name) in &signed {
-        verify(&public, role, &tmp.join(name), &tmp.join(format!("{name}.sig")))?;
+        verify(
+            &public,
+            role,
+            &tmp.join(name),
+            &tmp.join(format!("{name}.sig")),
+        )?;
     }
     for entry in fs::read_dir(tmp).map_err(io_error(tmp.display()))? {
         let entry = entry.map_err(io_error(tmp.display()))?;
-        fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o444)).map_err(io_error(entry.path().display()))?;
+        fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o444))
+            .map_err(io_error(entry.path().display()))?;
     }
 
     let mut compared: Vec<&str> = REQUIRED_MEMBERS.to_vec();
@@ -510,11 +575,21 @@ pub fn receive(input: &mut impl BufRead, incoming: &Path, image_root: &Path, pub
         if !same(&tmp.join("nix.erofs"), &existing.join("nix.erofs")) {
             return Err("existing generation image differs".into());
         }
-        verify(&public, "generation-image", &existing.join("nix.erofs"), &existing.join("nix.erofs.sig"))?;
+        verify(
+            &public,
+            "generation-image",
+            &existing.join("nix.erofs"),
+            &existing.join("nix.erofs.sig"),
+        )?;
         if !same(&tmp.join("config.toml"), &existing.join("config.toml")) {
             return Err("existing config differs".into());
         }
-        verify(&public, "boot-config", &existing.join("config.toml"), &existing.join("config.toml.sig"))?;
+        verify(
+            &public,
+            "boot-config",
+            &existing.join("config.toml"),
+            &existing.join("config.toml.sig"),
+        )?;
         for member in &compared {
             if !same(&tmp.join(member), &existing.join(member)) {
                 return Err(format!("existing {member} differs"));
@@ -527,7 +602,12 @@ pub fn receive(input: &mut impl BufRead, incoming: &Path, image_root: &Path, pub
     if !same(&tmp.join("config.toml"), &installed.join("config.toml")) {
         return Err("installed config differs".into());
     }
-    verify(&public, "boot-config", &installed.join("config.toml"), &installed.join("config.toml.sig"))?;
+    verify(
+        &public,
+        "boot-config",
+        &installed.join("config.toml"),
+        &installed.join("config.toml.sig"),
+    )?;
     for member in &compared {
         if !same(&tmp.join(member), &installed.join(member)) {
             return Err(format!("installed {member} differs"));
@@ -550,7 +630,9 @@ pub fn main_with(args: Vec<OsString>) -> Result<()> {
         &PathBuf::from(public_key),
     )?;
     let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{id}").and_then(|()| stdout.flush()).map_err(io_error("write generation id"))?;
+    writeln!(stdout, "{id}")
+        .and_then(|()| stdout.flush())
+        .map_err(io_error("write generation id"))?;
     if reboot {
         let status = std::process::Command::new(SYSTEMCTL)
             .arg("reboot")
@@ -583,8 +665,19 @@ mod tests {
     }
 
     fn good_lines(id: &str) -> Vec<String> {
-        let mut lines = vec![id.to_owned(), "5".into(), "4".into(), "0".into(), id.to_owned()];
-        lines.extend(["3", "2", "1", "1", "1", "1", "1", "1", "0", "0", "0", "0", "1"].map(String::from));
+        let mut lines = vec![
+            id.to_owned(),
+            "5".into(),
+            "4".into(),
+            "0".into(),
+            id.to_owned(),
+        ];
+        lines.extend(
+            [
+                "3", "2", "1", "1", "1", "1", "1", "1", "0", "0", "0", "0", "1",
+            ]
+            .map(String::from),
+        );
         lines
     }
 
@@ -604,7 +697,10 @@ mod tests {
         let id = "a".repeat(128);
         let header = parse(MAGIC, &good_lines(&id))?;
         assert_eq!(header.id, id);
-        assert_eq!((header.image, header.image_signature, header.config), (5, 4, 3));
+        assert_eq!(
+            (header.image, header.image_signature, header.config),
+            (5, 4, 3)
+        );
         assert!(header.reboot);
         Ok(())
     }
@@ -641,7 +737,9 @@ mod tests {
             let error = parse(MAGIC, &lines).err().unwrap_or_default();
             assert!(error.contains(expected), "{expected}: {error}");
         }
-        let previous = parse(PREVIOUS_MAGIC, &good_lines(&id)).err().unwrap_or_default();
+        let previous = parse(PREVIOUS_MAGIC, &good_lines(&id))
+            .err()
+            .unwrap_or_default();
         assert!(previous.contains("NMBL-EROFS-BUNDLE-3"), "{previous}");
         assert!(parse("NMBL-EROFS-BUNDLE-5", &good_lines(&id)).is_err());
     }
@@ -649,9 +747,13 @@ mod tests {
     #[test]
     fn header_lines_are_bounded() {
         let long = format!("{}\n", "9".repeat(MAX_HEADER_LINE + 10));
-        let error = read_line(&mut io::Cursor::new(long.into_bytes())).err().unwrap_or_default();
+        let error = read_line(&mut io::Cursor::new(long.into_bytes()))
+            .err()
+            .unwrap_or_default();
         assert!(error.contains("too long"), "{error}");
-        let error = read_line(&mut io::Cursor::new(b"no newline".to_vec())).err().unwrap_or_default();
+        let error = read_line(&mut io::Cursor::new(b"no newline".to_vec()))
+            .err()
+            .unwrap_or_default();
         assert!(error.contains("truncated"), "{error}");
     }
 
