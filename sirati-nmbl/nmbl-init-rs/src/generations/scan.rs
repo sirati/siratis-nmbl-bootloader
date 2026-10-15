@@ -148,6 +148,17 @@ pub fn active_profile_generation(profiles_dir: &Path) -> std::result::Result<u32
     })
 }
 
+/// The system store path that `<profiles_dir>/system-<number>-link` names,
+/// or `None` when the link cannot be read.
+pub fn profile_generation_system(profiles_dir: &Path, number: u32) -> Option<String> {
+    let link = profiles_dir.join(format!("system-{number}-link"));
+    std::fs::read_link(link)
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()
+}
+
 /// Resolve the index of the generation that `<profiles_dir>/system`
 /// currently points at, or `0` (highest-numbered, the historical
 /// default) when that pointer cannot be honoured.

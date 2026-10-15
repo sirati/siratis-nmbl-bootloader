@@ -369,3 +369,40 @@ fn mark_unproven_is_a_noop_without_state_or_profile() {
     crate::state::mark_unproven(dir.path(), empty.path()).expect("bogus profile");
     assert_eq!(std::fs::read(&path).expect("after"), before);
 }
+
+#[test]
+fn mark_unproven_records_the_profile_system_and_survives_older_files() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("state.bin");
+    let profiles = profiles_naming(8);
+    std::os::unix::fs::symlink(
+        "/nix/store/aaaa-system-8",
+        profiles.path().join("system-8-link"),
+    )
+    .expect("generation link");
+    let seed = State {
+        last_attempted_generation: NonMaxU32::new(7),
+        unproven_generation: NonMaxU32::new(8),
+        unproven_failed: true,
+        unproven_system: Some("/nix/store/bbbb-system-8".into()),
+        ..State::default()
+    };
+    write_padded(&path, &seed).expect("seed");
+    crate::state::mark_unproven(dir.path(), profiles.path()).expect("mark");
+    let after = read(&path).expect("read").expect("Some");
+    assert_eq!(after.unproven_generation, NonMaxU32::new(8));
+    assert!(
+        !after.unproven_failed,
+        "a reused number naming another system kept the failure"
+    );
+    assert_eq!(
+        after.unproven_system.as_deref(),
+        Some("/nix/store/aaaa-system-8")
+    );
+
+    // An unset system is not encoded, so files of older binaries keep
+    // their exact bytes.
+    let mut plain = Vec::new();
+    ciborium::into_writer(&State::default(), &mut plain).expect("encode");
+    assert!(!plain.windows(15).any(|w| w == b"unproven_system"));
+}

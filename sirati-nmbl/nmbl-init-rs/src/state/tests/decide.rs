@@ -423,7 +423,7 @@ fn attempt(state: &mut State, gs: &[Generation], idx: usize) {
 fn live_commit_after_blessed_boot_is_unproven_and_not_instant() {
     // Blessed boot of 7; the updater commits 8 live and the installer marks it.
     let mut state = blessed(7);
-    crate::state::io::apply_unproven_mark(&mut state, NonMaxU32::new(8).unwrap());
+    crate::state::io::apply_unproven_mark(&mut state, NonMaxU32::new(8).unwrap(), None);
     assert_eq!(state.unproven_generation, nm(8));
     assert!(!state.unproven_failed);
 
@@ -442,7 +442,7 @@ fn live_commit_after_blessed_boot_is_unproven_and_not_instant() {
 fn failed_unproven_falls_back_then_stays_on_known_good_without_budget() {
     let gs = gens(&[8, 7]);
     let mut state = blessed(7);
-    crate::state::io::apply_unproven_mark(&mut state, NonMaxU32::new(8).unwrap());
+    crate::state::io::apply_unproven_mark(&mut state, NonMaxU32::new(8).unwrap(), None);
     assert_eq!(decide(&mut state, &gs, 0, 3), StatefulDecision::HonourTui);
     attempt(&mut state, &gs, 0); // boots 8, which never succeeds
 
@@ -588,7 +588,7 @@ fn mark_unproven_rule_table() {
         state.unproven_failed = failed;
         state.recovery_attempt = 2;
         state.known_good_generations[0] = nm(3);
-        apply_unproven_mark(&mut state, g(active));
+        apply_unproven_mark(&mut state, g(active), None);
         assert_eq!(
             (state.unproven_generation, state.unproven_failed),
             (want.map(g), want_failed),
@@ -599,4 +599,78 @@ fn mark_unproven_rule_table() {
         assert_eq!(state.recovery_attempt, 2);
         assert_eq!(state.known_good_generations[0], nm(3));
     }
+}
+
+#[test]
+fn rollback_to_a_known_good_generation_is_not_marked_unproven() {
+    use crate::state::io::apply_unproven_mark;
+    // Blessed boot of 8; `nixos-rebuild switch --rollback` makes 7 active.
+    let mut state = blessed(8);
+    state.known_good_generations[0] = nm(8);
+    state.known_good_generations[1] = nm(7);
+    apply_unproven_mark(
+        &mut state,
+        NonMaxU32::new(7).unwrap(),
+        Some("/nix/store/a-7"),
+    );
+    assert_eq!(state.unproven_generation, None);
+    assert!(!crate::state::active_is_unproven(&state, Some(7)));
+    // A failed unproven 9 keeps its record when the operator rolls back.
+    state.unproven_generation = nm(9);
+    state.unproven_failed = true;
+    apply_unproven_mark(
+        &mut state,
+        NonMaxU32::new(7).unwrap(),
+        Some("/nix/store/a-7"),
+    );
+    assert_eq!(
+        (state.unproven_generation, state.unproven_failed),
+        (nm(9), true)
+    );
+}
+
+#[test]
+fn a_reused_generation_number_with_another_system_is_a_new_deployment() {
+    use crate::state::io::apply_unproven_mark;
+    let gs = gens(&[8, 7]);
+    let mut state = blessed(7);
+    state.known_good_generations[0] = nm(7);
+    apply_unproven_mark(
+        &mut state,
+        NonMaxU32::new(8).unwrap(),
+        Some("/nix/store/broken-8"),
+    );
+    attempt(&mut state, &gs, 0);
+    assert_eq!(
+        decide(&mut state, &gs, 0, 3),
+        StatefulDecision::ForcePick(1)
+    );
+    assert!(state.unproven_failed);
+    attempt(&mut state, &gs, 1);
+    state.last_boot_succeeded = true;
+
+    // Installing the same system again is no new deployment: still failed.
+    apply_unproven_mark(
+        &mut state,
+        NonMaxU32::new(8).unwrap(),
+        Some("/nix/store/broken-8"),
+    );
+    assert!(state.unproven_failed);
+    assert_eq!(
+        decide(&mut state, &gs, 0, 3),
+        StatefulDecision::ForcePick(1)
+    );
+
+    // The failed link was deleted and a fixed system reuses number 8.
+    apply_unproven_mark(
+        &mut state,
+        NonMaxU32::new(8).unwrap(),
+        Some("/nix/store/fixed-8"),
+    );
+    assert_eq!(
+        (state.unproven_generation, state.unproven_failed),
+        (nm(8), false)
+    );
+    assert_eq!(state.unproven_system.as_deref(), Some("/nix/store/fixed-8"));
+    assert_eq!(decide(&mut state, &gs, 0, 3), StatefulDecision::HonourTui);
 }

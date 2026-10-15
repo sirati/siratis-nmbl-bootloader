@@ -73,6 +73,14 @@ pub struct State {
     /// known-good generation instead; only an operator retry boots it again.
     #[serde(default)]
     pub unproven_failed: bool,
+
+    /// The system store path `unproven_generation` named when it was
+    /// marked. A profile generation number is reused once its link was
+    /// deleted, so the number alone cannot tell a new deployment from the
+    /// one that failed. Not written while unset, so older files keep their
+    /// encoding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unproven_system: Option<String>,
 }
 
 pub(crate) fn default_known_good() -> [Option<NonMaxU32>; 20] {
@@ -98,6 +106,7 @@ impl Default for State {
             known_good_generations: [None; 20],
             unproven_generation: None,
             unproven_failed: false,
+            unproven_system: None,
         }
     }
 }

@@ -269,6 +269,7 @@ pub fn mark_boot_succeeded(dir: &Path) -> Result<(), NmblError> {
     {
         state.unproven_generation = None;
         state.unproven_failed = false;
+        state.unproven_system = None;
     }
     // state.state_format_version is deliberately NOT touched — see the
     // forward-compat contract on the struct definition.
@@ -302,24 +303,50 @@ pub fn mark_unproven(dir: &Path, profiles_dir: &Path) -> Result<(), NmblError> {
         nmbl_info!("profile generation {number} cannot be recorded; --mark-unproven is a no-op");
         return Ok(());
     };
-    let before = (state.unproven_generation, state.unproven_failed);
-    apply_unproven_mark(&mut state, generation);
-    if (state.unproven_generation, state.unproven_failed) == before {
+    let system = crate::generations::profile_generation_system(profiles_dir, number);
+    let before = state.clone();
+    apply_unproven_mark(&mut state, generation, system.as_deref());
+    if state == before {
         return Ok(());
     }
     write_padded(&path, &state)
 }
 
-/// The `--mark-unproven` rule for the active profile generation `active`:
-/// the running, proven boot clears the marker; the generation already
-/// marked keeps its failure record; any other generation becomes the new,
-/// not-yet-failed unproven generation.
-pub(crate) fn apply_unproven_mark(state: &mut State, active: nonmax::NonMaxU32) {
+/// The `--mark-unproven` rule for the active profile generation `active`,
+/// whose link names the system store path `system`:
+///
+/// * the running, proven boot clears the marker;
+/// * a generation in the known-good ring has booted successfully, so it is
+///   never marked: `nixos-rebuild --rollback` to it deploys nothing new;
+/// * the generation already marked keeps its failure record while it names
+///   the same system, or when either system is unknown;
+/// * anything else, including a reused generation number that now names
+///   another system, becomes the new, not-yet-failed unproven generation.
+pub(crate) fn apply_unproven_mark(
+    state: &mut State,
+    active: nonmax::NonMaxU32,
+    system: Option<&str>,
+) {
     if state.last_boot_succeeded && state.last_attempted_generation == Some(active) {
         state.unproven_generation = None;
         state.unproven_failed = false;
-    } else if state.unproven_generation != Some(active) {
-        state.unproven_generation = Some(active);
-        state.unproven_failed = false;
+        state.unproven_system = None;
+        return;
     }
+    if state.known_good_generations.contains(&Some(active)) {
+        return;
+    }
+    if state.unproven_generation == Some(active) {
+        match (state.unproven_system.as_deref(), system) {
+            (Some(marked), Some(now)) if marked != now => {}
+            (None, Some(now)) => {
+                state.unproven_system = Some(now.to_owned());
+                return;
+            }
+            _ => return,
+        }
+    }
+    state.unproven_generation = Some(active);
+    state.unproven_failed = false;
+    state.unproven_system = system.map(str::to_owned);
 }
