@@ -6,8 +6,12 @@ use nmbl_init::error::format_chain;
 
 use super::args::Args;
 
-/// Handle the `--validate-config` / `--init-state` / `--boot-succeeded`
-/// early-exit modes. `Some(code)` exits; `None` continues a normal boot.
+/// The booted system's Nix profiles directory, read by `--mark-unproven`.
+#[cfg(feature = "stateful")]
+const SYSTEM_PROFILES_DIR: &str = "/nix/var/nix/profiles";
+
+/// Handle the `--validate-config` / `--init-state` / `--boot-succeeded` /
+/// `--mark-unproven` early-exit modes. `Some(code)` exits; `None` continues a normal boot.
 pub(super) fn handle_early_exit_modes(args: &Args) -> Option<ExitCode> {
     // Build-time validation hook: load and validate the given config
     // file, print the outcome, and exit.
@@ -146,6 +150,20 @@ pub(super) fn handle_early_exit_modes(args: &Args) -> Option<ExitCode> {
                 Err(err) => {
                     eprintln!(
                         "nmbl-init: --boot-succeeded failed for {}: {}",
+                        dir.display(),
+                        format_chain(&err as &dyn std::error::Error),
+                    );
+                    ExitCode::from(1)
+                }
+            });
+        }
+        if let Some(dir) = args.mark_unproven_dir.as_deref() {
+            let profiles = std::path::Path::new(SYSTEM_PROFILES_DIR);
+            return Some(match nmbl_init::state::mark_unproven(dir, profiles) {
+                Ok(()) => ExitCode::from(0),
+                Err(err) => {
+                    eprintln!(
+                        "nmbl-init: --mark-unproven failed for {}: {}",
                         dir.display(),
                         format_chain(&err as &dyn std::error::Error),
                     );

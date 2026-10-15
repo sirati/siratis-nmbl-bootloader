@@ -263,7 +263,63 @@ pub fn mark_boot_succeeded(dir: &Path) -> Result<(), NmblError> {
     state.rescue_exit_retry_in_progress = false;
     state.last_boot_succeeded = true;
     state.recovery_attempt = 0;
+    // The generation that just reached its success target is proven.
+    if state.unproven_generation.is_some()
+        && state.unproven_generation == state.last_attempted_generation
+    {
+        state.unproven_generation = None;
+        state.unproven_failed = false;
+    }
     // state.state_format_version is deliberately NOT touched — see the
     // forward-compat contract on the struct definition.
     write_padded(&path, &state)
+}
+
+/// Installer entry point for `--mark-unproven`: record the generation the
+/// system profile under `profiles_dir` now names as unproven until a boot
+/// of it succeeds. Only the unproven fields change; boot health, recovery
+/// budget and the known-good ring are left alone.
+///
+/// An absent or unsupported state.bin, or an unreadable profile, is a
+/// logged no-op so a bootloader install never fails on it.
+pub fn mark_unproven(dir: &Path, profiles_dir: &Path) -> Result<(), NmblError> {
+    let path = dir.join("state.bin");
+    let Some(mut state) = read(&path)? else {
+        nmbl_info!(
+            "nmbl state file at {} absent or unsupported; --mark-unproven is a no-op",
+            path.display()
+        );
+        return Ok(());
+    };
+    let number = match crate::generations::active_profile_generation(profiles_dir) {
+        Ok(number) => number,
+        Err(reason) => {
+            nmbl_info!("{reason}; --mark-unproven is a no-op");
+            return Ok(());
+        }
+    };
+    let Some(generation) = nonmax::NonMaxU32::new(number) else {
+        nmbl_info!("profile generation {number} cannot be recorded; --mark-unproven is a no-op");
+        return Ok(());
+    };
+    let before = (state.unproven_generation, state.unproven_failed);
+    apply_unproven_mark(&mut state, generation);
+    if (state.unproven_generation, state.unproven_failed) == before {
+        return Ok(());
+    }
+    write_padded(&path, &state)
+}
+
+/// The `--mark-unproven` rule for the active profile generation `active`:
+/// the running, proven boot clears the marker; the generation already
+/// marked keeps its failure record; any other generation becomes the new,
+/// not-yet-failed unproven generation.
+pub(crate) fn apply_unproven_mark(state: &mut State, active: nonmax::NonMaxU32) {
+    if state.last_boot_succeeded && state.last_attempted_generation == Some(active) {
+        state.unproven_generation = None;
+        state.unproven_failed = false;
+    } else if state.unproven_generation != Some(active) {
+        state.unproven_generation = Some(active);
+        state.unproven_failed = false;
+    }
 }

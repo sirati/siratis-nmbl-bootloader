@@ -99,6 +99,24 @@ let
   cryptsetupToolArg =
     lib.optionalString (cryptsetupPkg != null)
       "--tool=cryptsetup:${cryptsetupPkg}/bin/cryptsetup";
+
+  # Stateful mode: initialise (or validate) state.bin under
+  # cfg.stateful.stateDir on /boot so the Rust /init has a known-good slot to
+  # track boot attempts against, then mark the generation the system profile
+  # now names as unproven: until a boot of it succeeds, NMBL neither instant-
+  # boots it nor treats it as known-good, and after a failed boot it keeps
+  # falling back to the last known-good generation. The marking is a no-op
+  # (exit 0) when the profile or state file is unreadable.
+  statefulStateShell =
+    let
+      nmblInit = "${config.system.build.nmblInit}/bin/nmbl-init";
+      stateDir = lib.escapeShellArg cfg.stateful.stateDir;
+    in ''
+      echo "Initializing NMBL state at ${cfg.stateful.stateDir}/state.bin..."
+      ${nmblInit} --init-state ${stateDir}
+      ${nmblInit} --mark-unproven ${stateDir}
+      echo "✓ State file initialised"
+    '';
 in
 
 pkgs.writeScript "install-nmbl-bootloader" ''
@@ -161,14 +179,7 @@ pkgs.writeScript "install-nmbl-bootloader" ''
     echo "✓ Bootloader files installed: /boot/nmbl-kernel, /boot/nmbl-initrd"
   ''}
 
-  ${lib.optionalString cfg.stateful.enable ''
-    # Stateful mode: initialise (or upgrade) the persistent state.bin
-    # under cfg.stateful.stateDir on /boot so the Rust /init has a
-    # known-good slot to track boot attempts against on the next boot.
-    echo "Initializing NMBL state at ${cfg.stateful.stateDir}/state.bin..."
-    ${config.system.build.nmblInit}/bin/nmbl-init --init-state ${cfg.stateful.stateDir}
-    echo "✓ State file initialised"
-  ''}
+  ${lib.optionalString cfg.stateful.enable statefulStateShell}
 
   ${lib.optionalString (configLocation == "external" && !(cfg.bootUpdate.enable or false) && !generationOwnsRuntime) externalConfigInstallShell}
 

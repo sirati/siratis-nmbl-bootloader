@@ -201,7 +201,9 @@ impl System {
             "pending_retry_generation": retry.map(|r| r.generation), "installed_generations": self.generations,
             "signing_enabled": self.config.as_ref().map(|c| c.signing.enable),
             "signing_enforced": self.config.as_ref().map(|c| c.signing.enforce),
-            "signed_erofs": self.is_signed_erofs(), "active_generation": self.active_generation
+            "signed_erofs": self.is_signed_erofs(), "active_generation": self.active_generation,
+            "unproven_generation": state.unproven_generation.map(|n| n.get()),
+            "unproven_failed": state.unproven_failed
         })).map_err(|e| format!("serializing policy state: {e}"))
     }
 
@@ -478,6 +480,53 @@ mod tests {
             Some(false)
         );
         assert_eq!(nmbl_init::state::read(&path).expect("read"), Some(original));
+    }
+    #[test]
+    fn json_status_reports_the_unproven_generation() {
+        let dir = tempfile::tempdir().expect("state");
+        // nonmax is not an nmblctl dependency; decode the fields instead.
+        let state: nmbl_init::state::State = serde_json::from_value(serde_json::json!({
+            "state_format_version": 1, "last_boot_succeeded": true,
+            "unproven_generation": 43, "unproven_failed": true,
+        }))
+        .expect("state");
+        nmbl_init::state::write_padded(&dir.path().join("state.bin"), &state).expect("write");
+        let sys = System {
+            config: None,
+            config_source: None,
+            rescue_mode: None,
+            state_dir: dir.path().to_path_buf(),
+            cmdline: String::new(),
+            generations: vec![43, 42],
+            active_generation: Some(43),
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&sys.status_json().expect("status")).expect("json");
+        assert_eq!(json.get("version").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            json.get("unproven_generation").and_then(|v| v.as_u64()),
+            Some(43)
+        );
+        assert_eq!(
+            json.get("unproven_failed").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        nmbl_init::state::write_padded(
+            &dir.path().join("state.bin"),
+            &nmbl_init::state::State::default(),
+        )
+        .expect("write");
+        let json: serde_json::Value =
+            serde_json::from_str(&sys.status_json().expect("status")).expect("json");
+        assert_eq!(
+            json.get("unproven_generation"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            json.get("unproven_failed").and_then(|v| v.as_bool()),
+            Some(false)
+        );
     }
     #[test]
     fn stale_temporary_file_or_symlink_does_not_block_or_get_truncated() {

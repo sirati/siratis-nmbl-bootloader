@@ -289,3 +289,83 @@ fn init_state_refuses_nonzero_padding_or_truncated_prior_state_without_rewriting
         assert_eq!(std::fs::read(path).expect("unchanged damaged bytes"), bytes);
     }
 }
+
+/// A profiles dir whose `system` link names `system-<n>-link`.
+fn profiles_naming(n: u32) -> tempfile::TempDir {
+    let dir = tempdir().expect("profiles");
+    std::os::unix::fs::symlink(format!("system-{n}-link"), dir.path().join("system"))
+        .expect("system link");
+    dir
+}
+
+#[test]
+fn mark_boot_succeeded_proves_the_unproven_generation_only() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("state.bin");
+    let seed = State {
+        last_boot_succeeded: false,
+        last_attempted_generation: NonMaxU32::new(8),
+        unproven_generation: NonMaxU32::new(8),
+        unproven_failed: true,
+        ..State::default()
+    };
+    write_padded(&path, &seed).expect("seed");
+    mark_boot_succeeded(dir.path()).expect("bless");
+    let after = read(&path).expect("read").expect("Some");
+    assert_eq!(after.unproven_generation, None);
+    assert!(!after.unproven_failed);
+
+    // A blessed fallback boot of 7 leaves the failed unproven 8 marked.
+    let seed = State {
+        last_attempted_generation: NonMaxU32::new(7),
+        ..seed
+    };
+    write_padded(&path, &seed).expect("seed");
+    mark_boot_succeeded(dir.path()).expect("bless");
+    let after = read(&path).expect("read").expect("Some");
+    assert_eq!(after.unproven_generation, NonMaxU32::new(8));
+    assert!(after.unproven_failed);
+}
+
+#[test]
+fn mark_unproven_reads_the_system_profile_and_touches_nothing_else() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("state.bin");
+    let mut seed = State {
+        last_attempted_generation: NonMaxU32::new(7),
+        recovery_attempt: 1,
+        ..State::default()
+    };
+    seed.known_good_generations[0] = NonMaxU32::new(7);
+    write_padded(&path, &seed).expect("seed");
+
+    crate::state::mark_unproven(dir.path(), profiles_naming(8).path()).expect("mark");
+    let after = read(&path).expect("read").expect("Some");
+    assert_eq!(
+        after,
+        State {
+            unproven_generation: NonMaxU32::new(8),
+            ..seed.clone()
+        }
+    );
+
+    // The running, proven generation clears it again.
+    crate::state::mark_unproven(dir.path(), profiles_naming(7).path()).expect("mark");
+    assert_eq!(read(&path).expect("read").expect("Some"), seed);
+}
+
+#[test]
+fn mark_unproven_is_a_noop_without_state_or_profile() {
+    let dir = tempdir().expect("tempdir");
+    crate::state::mark_unproven(dir.path(), profiles_naming(8).path()).expect("no state");
+    assert!(!dir.path().join("state.bin").exists());
+
+    let path = dir.path().join("state.bin");
+    write_padded(&path, &State::default()).expect("seed");
+    let before = std::fs::read(&path).expect("before");
+    let empty = tempdir().expect("profiles");
+    crate::state::mark_unproven(dir.path(), empty.path()).expect("no profile");
+    std::os::unix::fs::symlink("not-a-generation", empty.path().join("system")).expect("link");
+    crate::state::mark_unproven(dir.path(), empty.path()).expect("bogus profile");
+    assert_eq!(std::fs::read(&path).expect("after"), before);
+}

@@ -61,6 +61,18 @@ pub struct State {
     /// 16 KiB on-disk slot. Empty slots are `None`.
     #[serde(default = "default_known_good")]
     pub known_good_generations: [Option<NonMaxU32>; 20],
+
+    /// A profile generation the installer made active (`--mark-unproven`)
+    /// that has not completed a successful boot yet. It is never trusted
+    /// for instant boot and never chosen as a rollback target.
+    #[serde(default)]
+    pub unproven_generation: Option<NonMaxU32>,
+
+    /// `unproven_generation` was booted and that boot failed. While it is
+    /// still the active profile, a healthy boot force-picks the newest
+    /// known-good generation instead; only an operator retry boots it again.
+    #[serde(default)]
+    pub unproven_failed: bool,
 }
 
 pub(crate) fn default_known_good() -> [Option<NonMaxU32>; 20] {
@@ -84,6 +96,8 @@ impl Default for State {
             rescue_booted_generation: None,
             rescue_exit_retry_in_progress: false,
             known_good_generations: [None; 20],
+            unproven_generation: None,
+            unproven_failed: false,
         }
     }
 }

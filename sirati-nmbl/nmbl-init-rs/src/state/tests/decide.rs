@@ -403,3 +403,200 @@ fn operator_retry_failure_preserves_exhaustion_success_rearms_normally() {
     assert_eq!(state.recovery_attempt, 0);
     assert_eq!(state.known_good_generations[0], nm(42));
 }
+
+/// Blessed boot of `n`, as `mark_boot_succeeded` leaves it after `decide`
+/// recorded the attempt.
+fn blessed(n: u32) -> State {
+    let mut state = State::default();
+    state.last_attempted_generation = nm(n);
+    state.last_boot_succeeded = true;
+    state
+}
+
+/// The boot-time bookkeeping `record_attempt` performs before kexec.
+fn attempt(state: &mut State, gs: &[Generation], idx: usize) {
+    state.last_attempted_generation = nm(gs[idx].number);
+    state.last_boot_succeeded = false;
+}
+
+#[test]
+fn live_commit_after_blessed_boot_is_unproven_and_not_instant() {
+    // Blessed boot of 7; the updater commits 8 live and the installer marks it.
+    let mut state = blessed(7);
+    crate::state::io::apply_unproven_mark(&mut state, NonMaxU32::new(8).unwrap());
+    assert_eq!(state.unproven_generation, nm(8));
+    assert!(!state.unproven_failed);
+
+    // Reboot: the profile names 8. The operator's choice is honoured, but
+    // instant boot must not treat 8 as healthy.
+    let gs = gens(&[8, 7]);
+    assert_eq!(decide(&mut state, &gs, 0, 3), StatefulDecision::HonourTui);
+    assert!(crate::state::active_is_unproven(&state, Some(8)));
+    assert!(crate::state::active_is_unproven(&state, None));
+    assert!(!crate::state::active_is_unproven(&state, Some(7)));
+    assert_eq!(state.known_good_generations[0], nm(7));
+    assert_eq!(state.recovery_attempt, 0);
+}
+
+#[test]
+fn failed_unproven_falls_back_then_stays_on_known_good_without_budget() {
+    let gs = gens(&[8, 7]);
+    let mut state = blessed(7);
+    crate::state::io::apply_unproven_mark(&mut state, NonMaxU32::new(8).unwrap());
+    assert_eq!(decide(&mut state, &gs, 0, 3), StatefulDecision::HonourTui);
+    attempt(&mut state, &gs, 0); // boots 8, which never succeeds
+
+    // First failure: fall back to known-good 7 and remember 8 failed.
+    assert_eq!(
+        decide(&mut state, &gs, 0, 3),
+        StatefulDecision::ForcePick(1)
+    );
+    assert!(state.unproven_failed);
+    assert_eq!(state.unproven_generation, nm(8));
+    assert_eq!(state.recovery_attempt, 1);
+    attempt(&mut state, &gs, 1);
+
+    // 7 is blessed. Every later reboot keeps booting 7, not the profile's 8,
+    // and spends no recovery budget.
+    for _ in 0..3 {
+        state.last_boot_succeeded = true;
+        state.recovery_attempt = 0;
+        assert_eq!(
+            decide(&mut state, &gs, 0, 3),
+            StatefulDecision::ForcePick(1)
+        );
+        assert_eq!(state.recovery_attempt, 0);
+        assert!(state.unproven_failed);
+        attempt(&mut state, &gs, 1);
+    }
+}
+
+#[test]
+fn operator_retry_of_failed_unproven_boots_it_and_success_proves_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.bin");
+    let gs = gens(&[8, 7]);
+    let mut state = blessed(7);
+    state.known_good_generations[0] = nm(7);
+    state.unproven_generation = nm(8);
+    state.unproven_failed = true;
+
+    assert_eq!(
+        crate::state::record_operator_retry(&mut state, &gs, 8),
+        Some(0)
+    );
+    assert_eq!(state.last_attempted_generation, nm(8));
+    assert_eq!(state.unproven_generation, nm(8), "retry keeps the marker");
+    crate::state::write_padded(&path, &state).unwrap();
+
+    // The retried boot reaches its success target.
+    crate::state::mark_boot_succeeded(dir.path()).unwrap();
+    let mut state = crate::state::read(&path).unwrap().unwrap();
+    assert_eq!(state.unproven_generation, None);
+    assert!(!state.unproven_failed);
+    assert_eq!(decide(&mut state, &gs, 0, 3), StatefulDecision::HonourTui);
+    assert_eq!(state.known_good_generations[0], nm(8));
+}
+
+#[test]
+fn failed_operator_retry_of_unproven_falls_back_to_known_good() {
+    let gs = gens(&[8, 7]);
+    let mut state = blessed(7);
+    state.known_good_generations[0] = nm(7);
+    state.unproven_generation = nm(8);
+    state.unproven_failed = true;
+    crate::state::record_operator_retry(&mut state, &gs, 8).unwrap();
+    assert_eq!(
+        decide(&mut state, &gs, 0, 3),
+        StatefulDecision::ForcePick(1)
+    );
+    assert!(state.unproven_failed);
+}
+
+#[test]
+fn unproven_generation_is_never_a_rollback_target() {
+    // The profile was rolled back to 5 while 7 (known-good in the ring) is
+    // marked unproven; 5 fails. Neither the ring nor the older walk may
+    // pick 7, so recovery continues with 3.
+    let gs = gens(&[7, 5, 3]);
+    let mut state = State::default();
+    state.last_attempted_generation = nm(5);
+    state.last_boot_succeeded = false;
+    state.known_good_generations[0] = nm(7);
+    state.unproven_generation = nm(7);
+    assert_eq!(
+        decide(&mut state, &gs, 1, 3),
+        StatefulDecision::ForcePick(2)
+    );
+
+    // Ring empty, active is the newest: the walk skips unproven 7 too.
+    let gs = gens(&[9, 7, 3]);
+    let mut state = State::default();
+    state.last_attempted_generation = nm(9);
+    state.last_boot_succeeded = false;
+    state.unproven_generation = nm(7);
+    assert_eq!(
+        decide(&mut state, &gs, 0, 3),
+        StatefulDecision::ForcePick(2)
+    );
+}
+
+#[test]
+fn failed_unproven_without_known_good_on_disk_honours_selector() {
+    let gs = gens(&[8]);
+    let mut state = blessed(8);
+    state.unproven_generation = nm(8);
+    state.unproven_failed = true;
+    state.last_attempted_generation = nm(6); // GC'd, not rotated in
+    assert_eq!(decide(&mut state, &gs, 0, 3), StatefulDecision::HonourTui);
+}
+
+#[test]
+fn failed_unproven_no_longer_active_honours_selector() {
+    // The operator rolled the profile back to 7: nothing to avoid.
+    let gs = gens(&[8, 7]);
+    let mut state = blessed(7);
+    state.known_good_generations[0] = nm(7);
+    state.unproven_generation = nm(8);
+    state.unproven_failed = true;
+    assert_eq!(decide(&mut state, &gs, 1, 3), StatefulDecision::HonourTui);
+}
+
+#[test]
+fn mark_unproven_rule_table() {
+    use crate::state::io::apply_unproven_mark;
+    let g = |n| NonMaxU32::new(n).unwrap();
+    // (last_attempted, succeeded, unproven, failed, active) → (unproven, failed)
+    let cases = [
+        // Running, proven boot of the active generation: cleared.
+        (Some(7), true, Some(7), true, 7, None, false),
+        (Some(7), true, None, false, 7, None, false),
+        // Same generation, but its boot has not succeeded: unproven.
+        (Some(7), false, None, false, 7, Some(7), false),
+        // Already marked: kept, including its failure record.
+        (Some(7), true, Some(8), true, 8, Some(8), true),
+        (Some(7), false, Some(8), false, 8, Some(8), false),
+        // A different generation replaces the marker, not yet failed.
+        (Some(7), true, Some(8), true, 9, Some(9), false),
+        (None, true, None, false, 1, Some(1), false),
+    ];
+    for (last, ok, unproven, failed, active, want, want_failed) in cases {
+        let mut state = State::default();
+        state.last_attempted_generation = last.map(g);
+        state.last_boot_succeeded = ok;
+        state.unproven_generation = unproven.map(g);
+        state.unproven_failed = failed;
+        state.recovery_attempt = 2;
+        state.known_good_generations[0] = nm(3);
+        apply_unproven_mark(&mut state, g(active));
+        assert_eq!(
+            (state.unproven_generation, state.unproven_failed),
+            (want.map(g), want_failed),
+            "{last:?} {ok} {unproven:?} {failed} {active}"
+        );
+        assert_eq!(state.last_attempted_generation, last.map(g));
+        assert_eq!(state.last_boot_succeeded, ok);
+        assert_eq!(state.recovery_attempt, 2);
+        assert_eq!(state.known_good_generations[0], nm(3));
+    }
+}

@@ -53,4 +53,4 @@ pub struct Generation {
 }
 
 pub use gen_id::{gen_id, gen_id_of_path};
-pub use scan::{active_generation_index, scan_generations};
+pub use scan::{active_generation_index, active_profile_generation, scan_generations};

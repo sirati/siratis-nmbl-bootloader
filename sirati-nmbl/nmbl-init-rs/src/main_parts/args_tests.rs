@@ -219,3 +219,44 @@ fn validate_hardware_and_closure_are_mutually_exclusive() {
     .expect_err("hardware + closure at once must be rejected");
     assert!(err.contains("mutually exclusive"), "{err}");
 }
+
+#[cfg(feature = "stateful")]
+#[test]
+fn mark_unproven_parses_both_forms() {
+    let a = parse_args_from(["--mark-unproven", "/boot/nmbl"]).expect("space form");
+    assert_eq!(
+        a.mark_unproven_dir.as_deref(),
+        Some(Path::new("/boot/nmbl"))
+    );
+    assert!(a.init_state_dir.is_none());
+    let b = parse_args_from(["--mark-unproven=/boot/nmbl"]).expect("equals form");
+    assert_eq!(
+        b.mark_unproven_dir.as_deref(),
+        Some(Path::new("/boot/nmbl"))
+    );
+    let err = parse_args_from(["--mark-unproven"]).expect_err("missing dir");
+    assert!(err.contains("requires a directory argument"), "{err}");
+}
+
+#[cfg(feature = "stateful")]
+#[test]
+fn mark_unproven_is_mutually_exclusive_with_other_early_exits() {
+    for other in [
+        &["--init-state", "/a"][..],
+        &["--boot-succeeded", "/a"],
+        &["--validate-config", "/c"],
+        &["--print-gen-id", "/t"],
+    ] {
+        let mut args = vec!["--mark-unproven", "/b"];
+        args.extend_from_slice(other);
+        let err = parse_args_from(args).expect_err("must be rejected");
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+}
+
+#[cfg(not(feature = "stateful"))]
+#[test]
+fn mark_unproven_without_feature_errors() {
+    let err = parse_args_from(["--mark-unproven", "/a"]).expect_err("needs stateful");
+    assert!(err.contains("stateful"), "{err}");
+}

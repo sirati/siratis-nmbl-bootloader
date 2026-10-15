@@ -44,12 +44,17 @@ pub(super) struct Args {
     /// exclusive with `validate_config` and `init_state_dir`.
     #[cfg(feature = "stateful")]
     pub(super) boot_succeeded_dir: Option<PathBuf>,
+    /// Installer side: mark the active system profile generation unproven
+    /// in state.bin under the given directory and exit. Mutually exclusive
+    /// with the other early-exit modes.
+    #[cfg(feature = "stateful")]
+    pub(super) mark_unproven_dir: Option<PathBuf>,
 }
 
 /// Hand-rolled arg parsing: clap is too big for the size budget. We
 /// recognise `--config=<v>` / `--config <v>` and the same two forms
-/// for `--errored`, `--validate-config`, `--init-state`, and
-/// `--boot-succeeded`. Anything else is silently ignored — PID 1 has
+/// for `--errored`, `--validate-config`, `--init-state`,
+/// `--boot-succeeded` and `--mark-unproven`. Anything else is silently ignored — PID 1 has
 /// no useful "usage" target to print to.
 ///
 /// Returns `Err(String)` when the caller asked for a stateful flag in
@@ -84,6 +89,8 @@ where
     let mut init_state_dir: Option<PathBuf> = None;
     #[cfg(feature = "stateful")]
     let mut boot_succeeded_dir: Option<PathBuf> = None;
+    #[cfg(feature = "stateful")]
+    let mut mark_unproven_dir: Option<PathBuf> = None;
 
     let mut iter = args.into_iter().map(Into::into);
     while let Some(arg_os) = iter.next() {
@@ -165,16 +172,26 @@ where
             {
                 let _ = value;
             }
+        } else if let Some(value) = parse_stateful_flag(&arg, "--mark-unproven", &mut iter)? {
+            #[cfg(feature = "stateful")]
+            {
+                mark_unproven_dir = Some(value);
+            }
+            #[cfg(not(feature = "stateful"))]
+            {
+                let _ = value;
+            }
         }
     }
 
     // Mutual exclusion across all early-exit modes. Each funnels into a
     // different exit path; combining them would silently pick one and
     // drop the rest, masking an operator typo. The three validate modes
-    // are always present; the stateful pair only in stateful builds.
+    // are always present; the stateful modes only in stateful builds.
     #[cfg(feature = "stateful")]
-    let stateful_modes =
-        u8::from(init_state_dir.is_some()) + u8::from(boot_succeeded_dir.is_some());
+    let stateful_modes = u8::from(init_state_dir.is_some())
+        + u8::from(boot_succeeded_dir.is_some())
+        + u8::from(mark_unproven_dir.is_some());
     #[cfg(not(feature = "stateful"))]
     let stateful_modes = 0u8;
     #[cfg(feature = "staged-boot")]
@@ -191,7 +208,7 @@ where
         return Err(
             "the early-exit modes (--validate-config, --validate-config-fragment, \
              --validate-hardware, --validate-nix-filesystem-closure, --print-gen-id, \
-             --init-state, --boot-succeeded) are mutually exclusive"
+             --init-state, --boot-succeeded, --mark-unproven) are mutually exclusive"
                 .to_string(),
         );
     }
@@ -216,10 +233,13 @@ where
         init_state_dir,
         #[cfg(feature = "stateful")]
         boot_succeeded_dir,
+        #[cfg(feature = "stateful")]
+        mark_unproven_dir,
     })
 }
 
-/// Recognise a stateful-only flag (`--init-state` / `--boot-succeeded`)
+/// Recognise a stateful-only flag (`--init-state` / `--boot-succeeded` /
+/// `--mark-unproven`)
 /// in both `--flag=<v>` and `--flag <v>` forms. Returns `Ok(None)` when
 /// `arg` is not this flag, `Ok(Some(path))` when it matched and the path
 /// was consumed (stateful builds only), `Err` when the path argument is

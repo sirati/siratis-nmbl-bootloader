@@ -367,6 +367,14 @@ fn gather_instant_boot_inputs(
             // generation. Instant boot must not skip the menu in that case.
             inputs.stateful_rollback_active =
                 !state.last_boot_succeeded && state.last_attempted_generation.is_some();
+            // A profile installed but never proven by a successful boot gets
+            // the menu and its timeout, like any other untested generation.
+            let active =
+                nmbl_init::generations::active_profile_generation(&config.paths.nix_profiles_dir)
+                    .ok();
+            if nmbl_init::state::active_is_unproven(&state, active) {
+                inputs.pending_untested_generation = true;
+            }
         }
     }
 

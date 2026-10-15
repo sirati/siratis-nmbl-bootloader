@@ -124,6 +124,30 @@ pub fn scan_generations(
     Ok(generations)
 }
 
+/// Read the generation number `<profiles_dir>/system` points at
+/// (`system-N-link`). The `Err` carries an operator-facing reason.
+pub fn active_profile_generation(profiles_dir: &Path) -> std::result::Result<u32, String> {
+    let link = profiles_dir.join("system");
+    let target = std::fs::read_link(&link).map_err(|err| {
+        format!(
+            "active generation symlink {} unreadable: {err}",
+            link.display()
+        )
+    })?;
+    let Some(name) = target.file_name().and_then(|s| s.to_str()) else {
+        return Err(format!(
+            "active generation symlink {} target {target:?} has no usable filename",
+            link.display(),
+        ));
+    };
+    parse_generation_number(name).ok_or_else(|| {
+        format!(
+            "active generation symlink {} target {target:?} does not match system-N-link",
+            link.display(),
+        )
+    })
+}
+
 /// Resolve the index of the generation that `<profiles_dir>/system`
 /// currently points at, or `0` (highest-numbered, the historical
 /// default) when that pointer cannot be honoured.
@@ -134,35 +158,12 @@ pub fn scan_generations(
 /// by max generation number would silently boot the entry the operator
 /// just rolled away from.
 pub fn active_generation_index(generations: &[Generation], profiles_dir: &Path) -> usize {
-    let link = profiles_dir.join("system");
-    let target = match std::fs::read_link(&link) {
-        Ok(t) => t,
-        Err(err) => {
-            nmbl_warn!(
-                "active generation symlink {} unreadable, falling back to newest: {err}",
-                link.display()
-            );
+    let number = match active_profile_generation(profiles_dir) {
+        Ok(number) => number,
+        Err(reason) => {
+            nmbl_warn!("{reason}, falling back to newest");
             return 0;
         }
-    };
-    let name = match target.file_name().and_then(|s| s.to_str()) {
-        Some(n) => n,
-        None => {
-            nmbl_warn!(
-                "active generation symlink {} target {:?} has no usable filename, falling back to newest",
-                link.display(),
-                target,
-            );
-            return 0;
-        }
-    };
-    let Some(number) = parse_generation_number(name) else {
-        nmbl_warn!(
-            "active generation symlink {} target {:?} does not match system-N-link, falling back to newest",
-            link.display(),
-            target,
-        );
-        return 0;
     };
     match generations.iter().position(|g| g.number == number) {
         Some(idx) => idx,
