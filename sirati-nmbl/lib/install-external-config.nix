@@ -37,16 +37,24 @@ let
 in
 assert checked;
 ''
+  # Each file reaches the ESP through a synced temporary and a rename
+  # (install_nmbl_file_if_changed, install-file-shell.nix): a power loss
+  # right after an update must not leave a truncated config behind.
   echo "Staging external NMBL config to ${lib.escapeShellArg destination}..."
-  install -D -m 0644 ${nmblConfigToml} ${lib.escapeShellArg destination}
   ${lib.optionalString (signingEnabled && !deferInstallSigning) ''
     echo "Signing external NMBL config..."
+    mkdir -p "$(dirname ${lib.escapeShellArg signature})"
+    temporary_signature=${lib.escapeShellArg signature}.new.$$
     ${signer.sign {
       domain = "boot-config";
-      out = lib.escapeShellArg signature;
-      input = lib.escapeShellArg destination;
+      out = "\"$temporary_signature\"";
+      input = toString nmblConfigToml;
     }}
-    chmod 0644 ${lib.escapeShellArg signature}
+  ''}
+  install_nmbl_file_if_changed ${nmblConfigToml} ${lib.escapeShellArg destination} 0644
+  ${lib.optionalString (signingEnabled && !deferInstallSigning) ''
+    install_nmbl_file_if_changed "$temporary_signature" ${lib.escapeShellArg signature} 0644
+    rm -f "$temporary_signature"
   ''}
   ${lib.optionalString (signingEnabled && deferInstallSigning) ''
     echo "WARNING: external config signature deferred; sign ${destination} out of band." >&2

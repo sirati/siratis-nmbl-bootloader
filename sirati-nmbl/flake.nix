@@ -1543,6 +1543,9 @@
         nmblctl-vfat-rename-durability = import ./testing/nmblctl-vfat-durability-vm.nix {
           inherit pkgs nmblCtl;
         };
+        external-config-vfat-durability = import ./testing/external-config-vfat-durability-vm.nix {
+          inherit pkgs lib;
+        };
         nmbl-erofsctl = nmblErofsCtlCheck;
         nmbl-erofs-receive = nmblErofsReceiveCheck;
         nmbl-boot-update-eval = bootUpdateEvalCheck;
